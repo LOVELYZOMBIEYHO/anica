@@ -80,6 +80,72 @@ impl AcpAgentProvider {
     }
 }
 
+const AI_CHAT_MAX_CONVERSATION_MESSAGES: usize = 1000;
+
+fn is_counted_ai_chat_role(role: AiChatRole) -> bool {
+    !matches!(role, AiChatRole::System)
+}
+
+fn rebase_ai_chat_index(
+    idx: Option<usize>,
+    removed_prefix: usize,
+    remaining_len: usize,
+) -> Option<usize> {
+    idx.and_then(|old| old.checked_sub(removed_prefix))
+        .filter(|new_idx| *new_idx < remaining_len)
+}
+
+fn prune_ai_chat_history(messages: &mut Vec<AiChatMessage>) -> usize {
+    let mut counted = messages
+        .iter()
+        .filter(|msg| is_counted_ai_chat_role(msg.role))
+        .count();
+    if counted <= AI_CHAT_MAX_CONVERSATION_MESSAGES {
+        return 0;
+    }
+
+    let mut remove_upto = 0usize;
+    while counted > AI_CHAT_MAX_CONVERSATION_MESSAGES && remove_upto < messages.len() {
+        while remove_upto < messages.len()
+            && matches!(messages[remove_upto].role, AiChatRole::System)
+        {
+            remove_upto += 1;
+        }
+        if remove_upto >= messages.len() {
+            break;
+        }
+
+        let first_role = messages[remove_upto].role;
+        remove_upto += 1;
+        counted = counted.saturating_sub(1);
+
+        while remove_upto < messages.len()
+            && matches!(messages[remove_upto].role, AiChatRole::System)
+        {
+            remove_upto += 1;
+        }
+
+        if matches!(first_role, AiChatRole::User)
+            && remove_upto < messages.len()
+            && matches!(messages[remove_upto].role, AiChatRole::Assistant)
+        {
+            remove_upto += 1;
+            counted = counted.saturating_sub(1);
+
+            while remove_upto < messages.len()
+                && matches!(messages[remove_upto].role, AiChatRole::System)
+            {
+                remove_upto += 1;
+            }
+        }
+    }
+
+    if remove_upto > 0 {
+        messages.drain(0..remove_upto);
+    }
+    remove_upto
+}
+
 #[derive(Clone, Debug)]
 enum AgentLoginStatus {
     LoggedIn {
@@ -1215,7 +1281,8 @@ impl AiAgentsPage {
         cx: &mut Context<Self>,
     ) -> usize {
         let text = text.into();
-        let mut removed_head = false;
+        let mut removed_prefix = 0usize;
+        let mut remaining_len = 0usize;
         let mut idx = 0usize;
         self.global.update(cx, |gs, cx| {
             gs.ai_chat_messages.push(AiChatMessage {
@@ -1223,16 +1290,13 @@ impl AiAgentsPage {
                 text: text.clone(),
                 pending,
             });
-            if gs.ai_chat_messages.len() > 200 {
-                gs.ai_chat_messages.remove(0);
-                removed_head = true;
-            }
+            removed_prefix = prune_ai_chat_history(&mut gs.ai_chat_messages);
+            remaining_len = gs.ai_chat_messages.len();
             idx = gs.ai_chat_messages.len().saturating_sub(1);
             cx.notify();
         });
-        if removed_head && let Some(active_idx) = self.active_assistant_idx {
-            self.active_assistant_idx = active_idx.checked_sub(1);
-        }
+        self.active_assistant_idx =
+            rebase_ai_chat_index(self.active_assistant_idx, removed_prefix, remaining_len);
         idx
     }
 
@@ -1240,7 +1304,8 @@ impl AiAgentsPage {
         let text = text.into();
         let active_idx_before = self.active_assistant_idx;
         let mut inserted_before_assistant = false;
-        let mut removed_head = false;
+        let mut removed_prefix = 0usize;
+        let mut remaining_len = 0usize;
 
         self.global.update(cx, |gs, cx| {
             if let Some(active_idx) = active_idx_before
@@ -1265,24 +1330,18 @@ impl AiAgentsPage {
                 });
             }
 
-            if gs.ai_chat_messages.len() > 200 {
-                gs.ai_chat_messages.remove(0);
-                removed_head = true;
-            }
+            removed_prefix = prune_ai_chat_history(&mut gs.ai_chat_messages);
+            remaining_len = gs.ai_chat_messages.len();
             cx.notify();
         });
 
-        if inserted_before_assistant {
-            if let Some(active_idx) = active_idx_before {
-                let mut next_active = active_idx.saturating_add(1);
-                if removed_head {
-                    next_active = next_active.saturating_sub(1);
-                }
-                self.active_assistant_idx = Some(next_active);
-            }
-        } else if removed_head && let Some(active_idx) = self.active_assistant_idx {
-            self.active_assistant_idx = active_idx.checked_sub(1);
-        }
+        let rebased_active = if inserted_before_assistant {
+            active_idx_before.map(|active_idx| active_idx.saturating_add(1))
+        } else {
+            self.active_assistant_idx
+        };
+        self.active_assistant_idx =
+            rebase_ai_chat_index(rebased_active, removed_prefix, remaining_len);
     }
 
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2491,5 +2550,56 @@ impl Render for AiAgentsPage {
                         ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AI_CHAT_MAX_CONVERSATION_MESSAGES, prune_ai_chat_history};
+    use crate::core::global_state::{AiChatMessage, AiChatRole};
+
+    fn msg(role: AiChatRole, text: &str) -> AiChatMessage {
+        AiChatMessage {
+            role,
+            text: text.to_string(),
+            pending: false,
+        }
+    }
+
+    #[test]
+    fn prune_history_ignores_system_messages_for_limit() {
+        let mut messages = vec![
+            msg(AiChatRole::System, "boot"),
+            msg(AiChatRole::User, "u1"),
+            msg(AiChatRole::System, "tool"),
+            msg(AiChatRole::Assistant, "a1"),
+        ];
+
+        let removed = prune_ai_chat_history(&mut messages);
+
+        assert_eq!(removed, 0);
+        assert_eq!(messages.len(), 4);
+    }
+
+    #[test]
+    fn prune_history_removes_oldest_user_assistant_turn() {
+        let mut messages = Vec::new();
+        for idx in 0..(AI_CHAT_MAX_CONVERSATION_MESSAGES / 2 + 1) {
+            messages.push(msg(AiChatRole::User, &format!("u{idx}")));
+            messages.push(msg(AiChatRole::System, &format!("s{idx}")));
+            messages.push(msg(AiChatRole::Assistant, &format!("a{idx}")));
+        }
+
+        let removed = prune_ai_chat_history(&mut messages);
+
+        assert!(removed >= 3);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|msg| !matches!(msg.role, AiChatRole::System))
+                .count(),
+            AI_CHAT_MAX_CONVERSATION_MESSAGES
+        );
+        assert_eq!(messages.first().map(|msg| msg.text.as_str()), Some("u1"));
     }
 }

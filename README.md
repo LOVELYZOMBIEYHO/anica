@@ -43,6 +43,10 @@ Instead of jumping between timeline tools, subtitle utilities, and export dialog
 - **Subtitle Translation** - Translate existing subtitles with LLM-backed workflows.
 - **Timeline Re-import** - Bring translated subtitles back into the project with timing preserved.
 
+<p align="center">
+  <img src="./assets/README/readme_showcase2.png" alt="Anica subtitle translation workflow screenshot" width="1200">
+</p>
+
 ### Media Intelligence and Export
 
 - **Smart Export Workflows** - Trigger export flows from the editor or through agent actions.

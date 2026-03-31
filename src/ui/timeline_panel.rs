@@ -3061,6 +3061,7 @@ impl TimelinePanel {
         px_per_sec: f32,
     ) -> gpui::Div {
         let w = dur_to_px(duration, px_per_sec).max(2.0);
+        let label_single = label.split_whitespace().collect::<Vec<_>>().join(" ");
         let (bg, border) = if selected {
             (rgb(0x93c5fd), rgb(0x3b82f6))
         } else {
@@ -3079,12 +3080,13 @@ impl TimelinePanel {
             .items_center()
             .gap_2()
             .text_xs()
-            .text_color(rgb(0x111111));
+            .text_color(rgb(0x111111))
+            .min_w_0();
         if w > 36.0 {
             node = node.child("CC");
         }
         if w > 56.0 {
-            node = node.child(label.to_string());
+            node = node.child(div().flex_1().min_w_0().truncate().child(label_single));
         }
         node
     }
