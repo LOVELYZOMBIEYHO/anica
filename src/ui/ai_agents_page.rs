@@ -8,8 +8,8 @@ use std::sync::{Arc, atomic::AtomicBool, mpsc};
 use std::time::Duration;
 
 use gpui::{
-    ClipboardItem, Context, Entity, MouseButton, Render, SharedString, Subscription, Timer, Window,
-    div, prelude::*, px, rgb,
+    ClipboardItem, Context, Entity, Focusable, MouseButton, Render, SharedString, Subscription,
+    Timer, Window, div, prelude::*, px, rgb,
 };
 use gpui_component::{
     input::{Input, InputEvent, InputState},
@@ -37,7 +37,7 @@ use crate::core::global_state::{
     SilencePreviewCandidate, SilencePreviewModalState,
 };
 use crate::core::user_settings::{
-    SettingsScope, load_settings, resolve_workspace_root, save_auto_connect,
+    SettingsScope, load_settings, resolve_workspace_root, save_acp_cli_paths, save_auto_connect,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,11 +222,9 @@ impl AgentLoginStatus {
             },
             AcpAgentProvider::Claude => match self {
                 AgentLoginStatus::LoggedIn { .. } => {
-                    "Ready for ACP chat. CLI login or ANTHROPIC_API_KEY is supported."
+                    "Ready for ACP chat. Claude CLI login is supported."
                 }
-                AgentLoginStatus::LoggedOut { .. } => {
-                    "Run `claude auth login` (or set ANTHROPIC_API_KEY)."
-                }
+                AgentLoginStatus::LoggedOut { .. } => "Run `claude auth login`.",
                 AgentLoginStatus::CliMissing { .. } => {
                     "Install Claude Code CLI, then run `claude auth login`."
                 }
@@ -245,35 +243,25 @@ fn first_non_empty_line(text: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn cli_command_exists(bin: &str) -> bool {
-    if bin.is_empty() {
-        return false;
+fn normalize_cli_override(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn resolve_cli_bin_for_ui(override_value: &str, env_var: &str, bin: &str) -> Option<PathBuf> {
+    if let Some(explicit) = normalize_cli_override(override_value) {
+        let explicit_path = PathBuf::from(&explicit);
+        if explicit_path.components().count() > 1 {
+            return explicit_path.is_file().then_some(explicit_path);
+        }
+        return crate::runtime_paths::resolve_cli_bin(env_var, &explicit);
     }
 
-    if bin.contains('/') || bin.contains('\\') {
-        return PathBuf::from(bin).is_file();
-    }
-
-    let Some(path_var) = env::var_os("PATH") else {
-        return false;
-    };
-
-    std::env::split_paths(&path_var).any(|dir| {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return true;
-        }
-
-        if cfg!(windows) {
-            for ext in [".exe", ".bat", ".cmd"] {
-                if dir.join(format!("{bin}{ext}")).is_file() {
-                    return true;
-                }
-            }
-        }
-
-        false
-    })
+    crate::runtime_paths::resolve_cli_bin(env_var, bin)
 }
 
 fn codex_install_hint() -> String {
@@ -486,8 +474,10 @@ fn detect_from_auth_file() -> Option<AgentLoginStatus> {
     })
 }
 
-fn detect_codex_login_status() -> AgentLoginStatus {
-    match Command::new("codex").args(["login", "status"]).output() {
+fn detect_codex_login_status_with_override(codex_cli_bin_override: &str) -> AgentLoginStatus {
+    let codex_bin = resolve_cli_bin_for_ui(codex_cli_bin_override, "ANICA_CODEX_CLI_BIN", "codex")
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    match Command::new(&codex_bin).args(["login", "status"]).output() {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -538,7 +528,7 @@ fn detect_codex_login_status() -> AgentLoginStatus {
                 status
             } else {
                 AgentLoginStatus::CliMissing {
-                    detail: "Cannot find `codex` in PATH. Install Codex CLI or launch app from a shell where `codex` is available.".to_string(),
+                    detail: "Cannot find `codex`. Install Codex CLI, or set ANICA_CODEX_CLI_BIN to the absolute path of the codex executable.".to_string(),
                 }
             }
         }
@@ -548,10 +538,13 @@ fn detect_codex_login_status() -> AgentLoginStatus {
     }
 }
 
-fn detect_gemini_login_status(gemini_api_key: &str) -> AgentLoginStatus {
-    if !cli_command_exists("gemini") {
+fn detect_gemini_login_status(
+    gemini_api_key: &str,
+    gemini_cli_bin_override: &str,
+) -> AgentLoginStatus {
+    if resolve_cli_bin_for_ui(gemini_cli_bin_override, "ANICA_GEMINI_CLI_BIN", "gemini").is_none() {
         return AgentLoginStatus::CliMissing {
-            detail: "Cannot find `gemini` in PATH. Install Gemini CLI or set ACP Agent Command to a Gemini ACP-capable command.".to_string(),
+            detail: "Cannot find `gemini`. Install Gemini CLI, or set a Gemini CLI path in AI Agents settings.".to_string(),
         };
     }
 
@@ -585,12 +578,16 @@ fn detect_gemini_login_status(gemini_api_key: &str) -> AgentLoginStatus {
     }
 }
 
-fn detect_claude_login_status() -> AgentLoginStatus {
-    if !cli_command_exists("claude") {
+fn detect_claude_login_status_with_override(claude_cli_bin_override: &str) -> AgentLoginStatus {
+    if resolve_cli_bin_for_ui(claude_cli_bin_override, "ANICA_CLAUDE_CLI_BIN", "claude").is_none() {
         return AgentLoginStatus::CliMissing {
-            detail: "Cannot find `claude` in PATH. Install Claude Code CLI or set ACP Agent Command to a Claude-capable command.".to_string(),
+            detail: "Cannot find `claude`. Install Claude Code CLI, or set a Claude CLI path in AI Agents settings.".to_string(),
         };
     }
+
+    let claude_bin =
+        resolve_cli_bin_for_ui(claude_cli_bin_override, "ANICA_CLAUDE_CLI_BIN", "claude")
+            .unwrap_or_else(|| PathBuf::from("claude"));
 
     let parse_status_output = |out: std::process::Output, source: &'static str| {
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -626,7 +623,7 @@ fn detect_claude_login_status() -> AgentLoginStatus {
         }
     };
 
-    match Command::new("claude")
+    match Command::new(&claude_bin)
         .args(["auth", "status", "--text"])
         .output()
     {
@@ -641,7 +638,7 @@ fn detect_claude_login_status() -> AgentLoginStatus {
                     || stdout.contains("unknown option: --text")
                     || stdout.contains("unrecognized option '--text'"));
             if unknown_text_flag {
-                return match Command::new("claude").args(["auth", "status"]).output() {
+                return match Command::new(&claude_bin).args(["auth", "status"]).output() {
                     Ok(fallback) => parse_status_output(fallback, "claude auth status"),
                     Err(err) => AgentLoginStatus::Error(format!(
                         "Failed to execute `claude auth status`: {err}"
@@ -901,11 +898,20 @@ pub struct AiAgentsPage {
     auto_connect_scope: SettingsScope,
 
     agent_command: String,
+    codex_cli_bin: String,
+    gemini_cli_bin: String,
+    claude_cli_bin: String,
     prompt_text: String,
     last_status: String,
 
     command_input: Option<Entity<InputState>>,
     command_input_sub: Option<Subscription>,
+    codex_cli_input: Option<Entity<InputState>>,
+    codex_cli_input_sub: Option<Subscription>,
+    gemini_cli_input: Option<Entity<InputState>>,
+    gemini_cli_input_sub: Option<Subscription>,
+    claude_cli_input: Option<Entity<InputState>>,
+    claude_cli_input_sub: Option<Subscription>,
 
     gemini_api_key: String,
     gemini_key_input: Option<Entity<InputState>>,
@@ -922,14 +928,19 @@ pub struct AiAgentsPage {
 
     poll_running: bool,
     poll_token: u64,
+    pending_input_resync: bool,
 }
 
 impl AiAgentsPage {
     fn refresh_agent_status(&mut self) {
         self.agent_status = match self.agent_provider {
-            AcpAgentProvider::Codex => detect_codex_login_status(),
-            AcpAgentProvider::Gemini => detect_gemini_login_status(&self.gemini_api_key),
-            AcpAgentProvider::Claude => detect_claude_login_status(),
+            AcpAgentProvider::Codex => detect_codex_login_status_with_override(&self.codex_cli_bin),
+            AcpAgentProvider::Gemini => {
+                detect_gemini_login_status(&self.gemini_api_key, &self.gemini_cli_bin)
+            }
+            AcpAgentProvider::Claude => {
+                detect_claude_login_status_with_override(&self.claude_cli_bin)
+            }
         };
     }
 
@@ -947,6 +958,27 @@ impl AiAgentsPage {
         }
     }
 
+    fn rebuild_command_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_input = None;
+        self.command_input_sub = None;
+
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("ACP agent command"));
+        let current = self.agent_command.clone();
+        input.update(cx, |this, cx| {
+            this.set_value(current.clone(), window, cx);
+        });
+
+        let sub = cx.subscribe(&input, |this, input, ev, cx| {
+            if !matches!(ev, InputEvent::Change) {
+                return;
+            }
+            this.agent_command = input.read(cx).value().to_string();
+        });
+
+        self.command_input = Some(input);
+        self.command_input_sub = Some(sub);
+    }
+
     fn select_agent_provider(
         &mut self,
         provider: AcpAgentProvider,
@@ -957,7 +989,11 @@ impl AiAgentsPage {
             return;
         }
         self.agent_provider = provider;
-        self.set_agent_command_value(provider.default_command(), window, cx);
+        let default_command = normalize_agent_command_for_ui(provider.default_command());
+        self.agent_command = default_command.clone();
+        self.rebuild_command_input(window, cx);
+        self.set_agent_command_value(default_command, window, cx);
+        self.pending_input_resync = true;
         self.refresh_agent_status();
         self.push_system_message(
             format!(
@@ -996,6 +1032,21 @@ impl AiAgentsPage {
             .ok()
             .or_else(|| env::var("GOOGLE_API_KEY").ok())
             .unwrap_or_default();
+        let codex_cli_bin = loaded_settings
+            .effective
+            .acp_codex_cli_bin
+            .clone()
+            .unwrap_or_default();
+        let gemini_cli_bin = loaded_settings
+            .effective
+            .acp_gemini_cli_bin
+            .clone()
+            .unwrap_or_default();
+        let claude_cli_bin = loaded_settings
+            .effective
+            .acp_claude_cli_bin
+            .clone()
+            .unwrap_or_default();
 
         cx.observe(&global, |this, _global, cx| {
             this.sync_worker_media_pool_snapshot(cx);
@@ -1024,11 +1075,20 @@ impl AiAgentsPage {
             auto_connect_scope,
 
             agent_command,
+            codex_cli_bin,
+            gemini_cli_bin,
+            claude_cli_bin,
             prompt_text: String::new(),
             last_status: "Idle".to_string(),
 
             command_input: None,
             command_input_sub: None,
+            codex_cli_input: None,
+            codex_cli_input_sub: None,
+            gemini_cli_input: None,
+            gemini_cli_input_sub: None,
+            claude_cli_input: None,
+            claude_cli_input_sub: None,
 
             gemini_api_key,
             gemini_key_input: None,
@@ -1045,6 +1105,7 @@ impl AiAgentsPage {
 
             poll_running: false,
             poll_token: 0,
+            pending_input_resync: true,
         };
         this.refresh_agent_status();
 
@@ -1057,17 +1118,12 @@ impl AiAgentsPage {
             ),
             cx,
         );
-        match this.agent_provider {
-            AcpAgentProvider::Codex if !cli_command_exists("codex") => {
-                this.push_system_message(codex_install_hint(), cx);
+        if matches!(this.agent_status, AgentLoginStatus::CliMissing { .. }) {
+            match this.agent_provider {
+                AcpAgentProvider::Codex => this.push_system_message(codex_install_hint(), cx),
+                AcpAgentProvider::Gemini => this.push_system_message(gemini_install_hint(), cx),
+                AcpAgentProvider::Claude => this.push_system_message(claude_install_hint(), cx),
             }
-            AcpAgentProvider::Gemini if !cli_command_exists("gemini") => {
-                this.push_system_message(gemini_install_hint(), cx);
-            }
-            AcpAgentProvider::Claude if !cli_command_exists("claude") => {
-                this.push_system_message(claude_install_hint(), cx);
-            }
-            _ => {}
         }
         this.ensure_worker_poller(cx);
         if this.auto_connect_enabled {
@@ -1192,6 +1248,44 @@ impl AiAgentsPage {
             }
             Err(err) => {
                 self.push_system_message(format!("Failed to save Auto Connect setting: {err}"), cx);
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn on_save_cli_paths(&mut self, cx: &mut Context<Self>) {
+        let workspace_root = self.current_workspace_root(cx);
+        let saved_provider = self.agent_provider;
+        let active_override = match saved_provider {
+            AcpAgentProvider::Codex => normalize_cli_override(&self.codex_cli_bin),
+            AcpAgentProvider::Gemini => normalize_cli_override(&self.gemini_cli_bin),
+            AcpAgentProvider::Claude => normalize_cli_override(&self.claude_cli_bin),
+        };
+        match save_acp_cli_paths(
+            SettingsScope::User,
+            &workspace_root,
+            Some(&self.codex_cli_bin),
+            Some(&self.gemini_cli_bin),
+            Some(&self.claude_cli_bin),
+        ) {
+            Ok(path) => {
+                let action_summary = if active_override.is_some() {
+                    format!("Saved {} CLI path override", saved_provider.label())
+                } else {
+                    format!(
+                        "Cleared {} CLI path override and reverted to auto-detect/default path",
+                        saved_provider.label()
+                    )
+                };
+                self.push_system_message(
+                    format!("{action_summary} in user settings: {}.", path.display()),
+                    cx,
+                );
+                self.refresh_agent_status();
+            }
+            Err(err) => {
+                self.push_system_message(format!("Failed to save CLI path overrides: {err}"), cx);
             }
         }
 
@@ -1346,8 +1440,15 @@ impl AiAgentsPage {
 
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.command_input.is_none() {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("ACP agent command"));
-            let current = self.agent_command.clone();
+            self.rebuild_command_input(window, cx);
+        }
+
+        if self.codex_cli_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Optional absolute path to codex executable")
+            });
+            let current = self.codex_cli_bin.clone();
             input.update(cx, |this, cx| {
                 this.set_value(current.clone(), window, cx);
             });
@@ -1356,11 +1457,65 @@ impl AiAgentsPage {
                 if !matches!(ev, InputEvent::Change) {
                     return;
                 }
-                this.agent_command = input.read(cx).value().to_string();
+                this.codex_cli_bin = input.read(cx).value().to_string();
+                if this.agent_provider == AcpAgentProvider::Codex {
+                    this.refresh_agent_status();
+                    cx.notify();
+                }
             });
 
-            self.command_input = Some(input);
-            self.command_input_sub = Some(sub);
+            self.codex_cli_input = Some(input);
+            self.codex_cli_input_sub = Some(sub);
+        }
+
+        if self.gemini_cli_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Optional absolute path to gemini executable")
+            });
+            let current = self.gemini_cli_bin.clone();
+            input.update(cx, |this, cx| {
+                this.set_value(current.clone(), window, cx);
+            });
+
+            let sub = cx.subscribe(&input, |this, input, ev, cx| {
+                if !matches!(ev, InputEvent::Change) {
+                    return;
+                }
+                this.gemini_cli_bin = input.read(cx).value().to_string();
+                if this.agent_provider == AcpAgentProvider::Gemini {
+                    this.refresh_agent_status();
+                    cx.notify();
+                }
+            });
+
+            self.gemini_cli_input = Some(input);
+            self.gemini_cli_input_sub = Some(sub);
+        }
+
+        if self.claude_cli_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Optional absolute path to claude executable")
+            });
+            let current = self.claude_cli_bin.clone();
+            input.update(cx, |this, cx| {
+                this.set_value(current.clone(), window, cx);
+            });
+
+            let sub = cx.subscribe(&input, |this, input, ev, cx| {
+                if !matches!(ev, InputEvent::Change) {
+                    return;
+                }
+                this.claude_cli_bin = input.read(cx).value().to_string();
+                if this.agent_provider == AcpAgentProvider::Claude {
+                    this.refresh_agent_status();
+                    cx.notify();
+                }
+            });
+
+            self.claude_cli_input = Some(input);
+            self.claude_cli_input_sub = Some(sub);
         }
 
         if self.gemini_key_input.is_none() {
@@ -1407,6 +1562,59 @@ impl AiAgentsPage {
             self.prompt_input = Some(input);
             self.prompt_input_sub = Some(sub);
         }
+    }
+
+    fn sync_input_entity_value(
+        input: &Entity<InputState>,
+        desired: &str,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let should_sync = {
+            let state = input.read(cx);
+            let focused = state.focus_handle(cx).is_focused(window);
+            let current = state.value().to_string();
+            force || (!focused && current != desired)
+        };
+
+        if should_sync {
+            let desired = desired.to_string();
+            input.update(cx, |this, cx| {
+                this.set_value(desired.clone(), window, cx);
+            });
+        }
+    }
+
+    fn sync_visible_input_values(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let force = self.pending_input_resync;
+
+        if let Some(input) = self.command_input.as_ref() {
+            Self::sync_input_entity_value(input, &self.agent_command, force, window, cx);
+        }
+
+        match self.agent_provider {
+            AcpAgentProvider::Codex => {
+                if let Some(input) = self.codex_cli_input.as_ref() {
+                    Self::sync_input_entity_value(input, &self.codex_cli_bin, force, window, cx);
+                }
+            }
+            AcpAgentProvider::Gemini => {
+                if let Some(input) = self.gemini_key_input.as_ref() {
+                    Self::sync_input_entity_value(input, &self.gemini_api_key, force, window, cx);
+                }
+                if let Some(input) = self.gemini_cli_input.as_ref() {
+                    Self::sync_input_entity_value(input, &self.gemini_cli_bin, force, window, cx);
+                }
+            }
+            AcpAgentProvider::Claude => {
+                if let Some(input) = self.claude_cli_input.as_ref() {
+                    Self::sync_input_entity_value(input, &self.claude_cli_bin, force, window, cx);
+                }
+            }
+        }
+
+        self.pending_input_resync = false;
     }
 
     fn clear_prompt_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1956,6 +2164,15 @@ impl AiAgentsPage {
                 self.codex_reasoning_mode.env_value().to_string(),
             ));
         }
+        if let Some(path) = normalize_cli_override(&self.codex_cli_bin) {
+            acp_env.push(("ANICA_CODEX_CLI_BIN".to_string(), path));
+        }
+        if let Some(path) = normalize_cli_override(&self.gemini_cli_bin) {
+            acp_env.push(("ANICA_GEMINI_CLI_BIN".to_string(), path));
+        }
+        if let Some(path) = normalize_cli_override(&self.claude_cli_bin) {
+            acp_env.push(("ANICA_CLAUDE_CLI_BIN".to_string(), path));
+        }
         if self.agent_provider == AcpAgentProvider::Gemini && !self.gemini_api_key.trim().is_empty()
         {
             acp_env.push(("GEMINI_API_KEY".to_string(), self.gemini_api_key.clone()));
@@ -2076,9 +2293,43 @@ impl Render for AiAgentsPage {
 
         self.sync_worker_media_pool_snapshot(cx);
         self.ensure_inputs(window, cx);
+        self.sync_visible_input_values(window, cx);
         self.ensure_worker_poller(cx);
 
         let command_input_elem = if let Some(input) = self.command_input.as_ref() {
+            Input::new(input).h(px(32.0)).w_full().into_any_element()
+        } else {
+            div()
+                .h(px(32.0))
+                .w_full()
+                .rounded_sm()
+                .bg(white().opacity(0.05))
+                .into_any_element()
+        };
+
+        let codex_cli_input_elem = if let Some(input) = self.codex_cli_input.as_ref() {
+            Input::new(input).h(px(32.0)).w_full().into_any_element()
+        } else {
+            div()
+                .h(px(32.0))
+                .w_full()
+                .rounded_sm()
+                .bg(white().opacity(0.05))
+                .into_any_element()
+        };
+
+        let gemini_cli_input_elem = if let Some(input) = self.gemini_cli_input.as_ref() {
+            Input::new(input).h(px(32.0)).w_full().into_any_element()
+        } else {
+            div()
+                .h(px(32.0))
+                .w_full()
+                .rounded_sm()
+                .bg(white().opacity(0.05))
+                .into_any_element()
+        };
+
+        let claude_cli_input_elem = if let Some(input) = self.claude_cli_input.as_ref() {
             Input::new(input).h(px(32.0)).w_full().into_any_element()
         } else {
             div()
@@ -2254,7 +2505,13 @@ impl Render for AiAgentsPage {
         let status_title = self.agent_status.title(self.agent_provider);
         let status_detail = self.agent_status.detail_text();
         let status_hint = self.agent_status.action_hint(self.agent_provider);
-        let mut provider_specific_help = div().flex().flex_col().gap_2();
+        let mut provider_specific_help = div()
+            .w_full()
+            .min_w_0()
+            .overflow_x_hidden()
+            .flex()
+            .flex_col()
+            .gap_2();
         if self.agent_provider == AcpAgentProvider::Codex {
             provider_specific_help = provider_specific_help
                 .child(
@@ -2316,13 +2573,14 @@ impl Render for AiAgentsPage {
                         .text_color(white().opacity(0.55))
                         .child("Gemini API Key (optional)"),
                 )
-                .child(gemini_key_input_elem)
+                .child(div().w_full().min_w_0().child(gemini_key_input_elem))
                 .child(
                     div()
                         .text_xs()
                         .text_color(white().opacity(0.5))
+                        .whitespace_normal()
                         .child(
-                            "Gemini mode uses the same bundled anica-acp tool bridge as Codex. Backend model routing is selected via provider (Codex/Gemini/Claude). You can use API key or CLI login (`gemini`, then `/auth`). If provided, GEMINI_API_KEY / GOOGLE_API_KEY is forwarded on connect.",
+                            "Gemini uses the same bundled anica-acp tool bridge as Codex. Use CLI login (`gemini`, then `/auth`) or provide an API key, which is forwarded on connect.",
                         ),
                 );
         } else {
@@ -2337,11 +2595,67 @@ impl Render for AiAgentsPage {
                     div()
                         .text_xs()
                         .text_color(white().opacity(0.5))
+                        .whitespace_normal()
                         .child(
-                            "Claude mode uses the same bundled anica-acp tool bridge as Codex/Gemini. Login in terminal: `claude auth login`, verify with `claude auth status`. You can also use ANTHROPIC_API_KEY.",
+                            "Claude mode uses the same bundled anica-acp tool bridge as Codex/Gemini. Login in terminal: `claude auth login`, then verify with `claude auth status`.",
                         ),
-                );
+                  );
         }
+        let (active_cli_label, active_cli_input_elem, active_cli_save_label) =
+            match self.agent_provider {
+                AcpAgentProvider::Codex => (
+                    "Codex CLI Path",
+                    codex_cli_input_elem,
+                    "Save Codex CLI Path",
+                ),
+                AcpAgentProvider::Gemini => (
+                    "Gemini CLI Path",
+                    gemini_cli_input_elem,
+                    "Save Gemini CLI Path",
+                ),
+                AcpAgentProvider::Claude => (
+                    "Claude CLI Path",
+                    claude_cli_input_elem,
+                    "Save Claude CLI Path",
+                ),
+            };
+        let cli_paths_section = div()
+            .w_full()
+            .min_w_0()
+            .overflow_x_hidden()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(white().opacity(0.55))
+                    .child("CLI Path Override (optional, saved locally)"),
+            )
+            .child(div().text_xs().text_color(white().opacity(0.45)).child(
+                "Use this only when the GUI app cannot auto-detect the selected provider CLI.",
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(white().opacity(0.45))
+                    .child("Leave it blank and save to go back to auto-detect/default path."),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(white().opacity(0.55))
+                    .child(active_cli_label),
+            )
+            .child(div().w_full().min_w_0().child(active_cli_input_elem))
+            .child(div().flex().gap_2().child(
+                Self::action_button(active_cli_save_label).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.on_save_cli_paths(cx);
+                    }),
+                ),
+            ));
 
         div()
             .size_full()
@@ -2349,6 +2663,7 @@ impl Render for AiAgentsPage {
             .p_5()
             .flex()
             .flex_col()
+            .overflow_y_scrollbar()
             .gap_4()
             .child(
                 div()
@@ -2382,18 +2697,22 @@ impl Render for AiAgentsPage {
                         div()
                             .text_xs()
                             .text_color(white().opacity(0.72))
+                            .whitespace_normal()
                             .child(status_detail),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(white().opacity(0.6))
+                            .whitespace_normal()
                             .child(status_hint),
                     ),
             )
             .child(
                 div()
                     .rounded_lg()
+                    .min_w_0()
+                    .overflow_x_hidden()
                     .border_1()
                     .border_color(white().opacity(0.14))
                     .bg(white().opacity(0.03))
@@ -2433,7 +2752,15 @@ impl Render for AiAgentsPage {
                             .text_color(white().opacity(0.55))
                             .child("ACP Agent Command"),
                     )
-                    .child(command_input_elem)
+                    .child(div().w_full().min_w_0().child(command_input_elem))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(white().opacity(0.45))
+                            .child(
+                                "Default: resolved automatically at connect time. You can still enter an absolute path to your ACP binary.",
+                            ),
+                    )
                     .child(provider_specific_help)
                     .child(
                         div()
@@ -2492,6 +2819,7 @@ impl Render for AiAgentsPage {
                                     }),
                             ),
                     )
+                    .child(cli_paths_section)
                     .child(
                         div()
                             .text_xs()

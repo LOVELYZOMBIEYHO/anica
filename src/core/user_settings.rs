@@ -80,6 +80,9 @@ pub struct EffectiveSettings {
     pub acp_auto_connect: bool,
     pub acp_agent_command: Option<String>,
     pub acp_reasoning_mode: Option<String>,
+    pub acp_codex_cli_bin: Option<String>,
+    pub acp_gemini_cli_bin: Option<String>,
+    pub acp_claude_cli_bin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,12 @@ struct AcpLayer {
     agent_command: Option<String>,
     #[serde(default)]
     reasoning_mode: Option<String>,
+    #[serde(default)]
+    codex_cli_bin: Option<String>,
+    #[serde(default)]
+    gemini_cli_bin: Option<String>,
+    #[serde(default)]
+    claude_cli_bin: Option<String>,
 }
 
 pub fn resolve_workspace_root(project_file_path: Option<&Path>) -> PathBuf {
@@ -212,6 +221,61 @@ pub fn save_auto_connect(
     Ok(path)
 }
 
+pub fn save_acp_cli_paths(
+    scope: SettingsScope,
+    workspace_root: &Path,
+    codex_cli_bin: Option<&str>,
+    gemini_cli_bin: Option<&str>,
+    claude_cli_bin: Option<&str>,
+) -> Result<PathBuf, UserSettingsError> {
+    let path = match scope {
+        SettingsScope::User => user_settings_path(),
+        SettingsScope::Workspace => workspace_settings_path(workspace_root),
+    };
+
+    let codex_cli_bin = normalize_non_empty(codex_cli_bin);
+    let gemini_cli_bin = normalize_non_empty(gemini_cli_bin);
+    let claude_cli_bin = normalize_non_empty(claude_cli_bin);
+
+    update_settings_file(&path, |root| {
+        root.insert(
+            "schema_version".to_string(),
+            Value::from(SETTINGS_SCHEMA_VERSION),
+        );
+
+        let acp = ensure_child_object(root, "acp");
+
+        match &codex_cli_bin {
+            Some(value) => {
+                acp.insert("codex_cli_bin".to_string(), Value::String(value.clone()));
+            }
+            None => {
+                acp.remove("codex_cli_bin");
+            }
+        }
+
+        match &gemini_cli_bin {
+            Some(value) => {
+                acp.insert("gemini_cli_bin".to_string(), Value::String(value.clone()));
+            }
+            None => {
+                acp.remove("gemini_cli_bin");
+            }
+        }
+
+        match &claude_cli_bin {
+            Some(value) => {
+                acp.insert("claude_cli_bin".to_string(), Value::String(value.clone()));
+            }
+            None => {
+                acp.remove("claude_cli_bin");
+            }
+        }
+    })?;
+
+    Ok(path)
+}
+
 fn apply_layer(loaded: &mut LoadedSettings, layer: &SettingsLayer, source: SettingSource) {
     let Some(acp) = layer.acp.as_ref() else {
         return;
@@ -230,6 +294,16 @@ fn apply_layer(loaded: &mut LoadedSettings, layer: &SettingsLayer, source: Setti
     if let Some(mode) = normalize_non_empty(acp.reasoning_mode.as_deref()) {
         loaded.effective.acp_reasoning_mode = Some(mode.to_ascii_lowercase());
         loaded.reasoning_mode_source = source;
+    }
+
+    if let Some(path) = normalize_non_empty(acp.codex_cli_bin.as_deref()) {
+        loaded.effective.acp_codex_cli_bin = Some(path);
+    }
+    if let Some(path) = normalize_non_empty(acp.gemini_cli_bin.as_deref()) {
+        loaded.effective.acp_gemini_cli_bin = Some(path);
+    }
+    if let Some(path) = normalize_non_empty(acp.claude_cli_bin.as_deref()) {
+        loaded.effective.acp_claude_cli_bin = Some(path);
     }
 }
 

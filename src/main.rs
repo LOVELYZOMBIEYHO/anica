@@ -43,6 +43,7 @@ fn main() {
     install_panic_logging();
     env_logger::init();
     configure_bundled_media_runtime_environment();
+    runtime_paths::apply_common_agent_cli_env_overrides();
 
     println!("--- Starting Anica Editor ---");
 

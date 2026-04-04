@@ -2622,11 +2622,10 @@ impl AnicaAcpAgent {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "codex".to_string());
         if provider == "gemini" {
-            let gemini_bin = std::env::var("ANICA_GEMINI_CLI_BIN")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "gemini".to_string());
+            let gemini_bin = runtime_paths::resolve_cli_bin("ANICA_GEMINI_CLI_BIN", "gemini")
+                .unwrap_or_else(|| PathBuf::from("gemini"))
+                .to_string_lossy()
+                .to_string();
             if !command_exists(&gemini_bin) {
                 anyhow::bail!(
                     "Gemini CLI not found: `{}`. Install Gemini CLI or set ANICA_GEMINI_CLI_BIN to a valid path.",
@@ -2679,11 +2678,10 @@ impl AnicaAcpAgent {
         }
 
         if provider == "claude" {
-            let claude_bin = std::env::var("ANICA_CLAUDE_CLI_BIN")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "claude".to_string());
+            let claude_bin = runtime_paths::resolve_cli_bin("ANICA_CLAUDE_CLI_BIN", "claude")
+                .unwrap_or_else(|| PathBuf::from("claude"))
+                .to_string_lossy()
+                .to_string();
             if !command_exists(&claude_bin) {
                 anyhow::bail!(
                     "Claude CLI not found: `{}`. Install Claude CLI or set ANICA_CLAUDE_CLI_BIN to a valid path.",
@@ -2773,11 +2771,10 @@ impl AnicaAcpAgent {
             return Ok(stdout);
         }
 
-        let codex_bin = std::env::var("ANICA_CODEX_CLI_BIN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "codex".to_string());
+        let codex_bin = runtime_paths::resolve_cli_bin("ANICA_CODEX_CLI_BIN", "codex")
+            .unwrap_or_else(|| PathBuf::from("codex"))
+            .to_string_lossy()
+            .to_string();
 
         if !command_exists(&codex_bin) {
             anyhow::bail!(
