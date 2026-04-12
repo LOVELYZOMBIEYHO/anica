@@ -38,6 +38,12 @@ Crate boundary rule:
 - ACP runtime chat behavior is defined separately by `anica/src/api/AGENTS.md`.
 - That ACP-specific file does not replace or weaken the repository coding/development rules in this file.
 
+## ACP tool-call language policy
+- User-facing chat replies can follow the user's language (for example Chinese, Japanese, English).
+- ACP tool-call arguments must use canonical English values.
+- Before any ACP tool call, normalize/translate non-English user intent into English argument values.
+- Do not pass non-English routing keywords or enum-like values into ACP tool arguments.
+
 ## MotionLoom DSL Stability Contract
 Hard rule: do not introduce breaking MotionLoom DSL changes without explicit owner approval in the same task.
 

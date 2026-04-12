@@ -12,6 +12,9 @@ use crate::core::export::{ExportMode, ExportPreset, ExportRange, ExportSettings}
 use crate::core::global_state::{
     AudioTrack, GlobalState, LayerEffectClip, SubtitleGroupTransform, SubtitleTrack, VideoTrack,
 };
+use crate::export_resolution::{
+    format_resolution_label, normalize_export_resolution_hint, parse_resolution_dims,
+};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AcpExportRunRequest {
@@ -46,6 +49,11 @@ pub struct AcpExportRunResponse {
     pub mode: String,
     pub preset: String,
     pub out_path: Option<String>,
+    pub layout_resolution: String,
+    pub export_resolution: String,
+    pub export_width: u32,
+    pub export_height: u32,
+    pub resolution_source: String,
     pub message: String,
 }
 
@@ -69,6 +77,9 @@ pub struct ResolvedAcpExportRun {
     pub export_mode: ExportMode,
     pub export_preset: ExportPreset,
     pub export_settings: ExportSettings,
+    pub layout_resolution: String,
+    pub export_resolution: String,
+    pub resolution_source: String,
     pub out_path: String,
 }
 
@@ -84,6 +95,14 @@ pub enum AcpExportApiError {
     TimelineEmpty,
     #[error("range_end_sec must be greater than range_start_sec")]
     InvalidRange,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTargetResolution {
+    width: u32,
+    height: u32,
+    normalized: String,
+    source: &'static str,
 }
 
 fn default_export_dir() -> PathBuf {
@@ -120,24 +139,54 @@ fn sanitize_output_stem(raw: &str) -> String {
     }
 }
 
-fn parse_target_resolution(raw: Option<&str>, canvas_w: f32, canvas_h: f32) -> (f32, f32) {
+pub(crate) fn infer_target_resolution_from_text(raw: &str) -> Option<String> {
+    normalize_export_resolution_hint(raw)
+}
+
+fn resolve_target_resolution(
+    raw: Option<&str>,
+    canvas_w: f32,
+    canvas_h: f32,
+) -> ResolvedTargetResolution {
+    let canvas_width = canvas_w.round().max(2.0) as u32;
+    let canvas_height = canvas_h.round().max(2.0) as u32;
+    let canvas_label = format_resolution_label(canvas_width, canvas_height);
+
     let Some(raw) = raw else {
-        return (canvas_w, canvas_h);
+        return ResolvedTargetResolution {
+            width: canvas_width,
+            height: canvas_height,
+            normalized: canvas_label,
+            source: "canvas",
+        };
     };
     let token = raw.trim();
     if token.is_empty() || token.eq_ignore_ascii_case("canvas") {
-        return (canvas_w, canvas_h);
+        return ResolvedTargetResolution {
+            width: canvas_width,
+            height: canvas_height,
+            normalized: canvas_label,
+            source: "canvas",
+        };
     }
-    let Some((w, h)) = token.split_once('x') else {
-        return (canvas_w, canvas_h);
-    };
-    let Ok(w) = w.parse::<u32>() else {
-        return (canvas_w, canvas_h);
-    };
-    let Ok(h) = h.parse::<u32>() else {
-        return (canvas_w, canvas_h);
-    };
-    (w.max(2) as f32, h.max(2) as f32)
+
+    if let Some(normalized) = infer_target_resolution_from_text(token)
+        && let Some((width, height)) = parse_resolution_dims(&normalized)
+    {
+        return ResolvedTargetResolution {
+            width,
+            height,
+            normalized,
+            source: "explicit_target_resolution",
+        };
+    }
+
+    ResolvedTargetResolution {
+        width: canvas_width,
+        height: canvas_height,
+        normalized: canvas_label,
+        source: "canvas_fallback_invalid_target_resolution",
+    }
 }
 
 fn parse_export_range(
@@ -226,10 +275,16 @@ pub fn resolve_acp_export_run_request(
         .map(|v| v.duration())
         .unwrap_or(timeline_total)
         .max(Duration::from_millis(1));
-    let (export_w, export_h) = parse_target_resolution(
+    let resolved_target = resolve_target_resolution(
         request.target_resolution.as_deref(),
         gs.canvas_w,
         gs.canvas_h,
+    );
+    let export_w = resolved_target.width as f32;
+    let export_h = resolved_target.height as f32;
+    let layout_resolution = format_resolution_label(
+        gs.canvas_w.round().max(2.0) as u32,
+        gs.canvas_h.round().max(2.0) as u32,
     );
 
     let out_path = if let Some(path) = request.output_path {
@@ -268,6 +323,45 @@ pub fn resolve_acp_export_run_request(
         export_mode,
         export_preset,
         export_settings,
+        layout_resolution,
+        export_resolution: resolved_target.normalized,
+        resolution_source: resolved_target.source.to_string(),
         out_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_target_resolution_from_text, resolve_target_resolution};
+
+    #[test]
+    fn infer_target_resolution_from_text_maps_orientation_keywords() {
+        assert_eq!(
+            infer_target_resolution_from_text("portrait"),
+            Some("1080x1920".to_string())
+        );
+        assert_eq!(
+            infer_target_resolution_from_text("landscape"),
+            Some("1920x1080".to_string())
+        );
+        assert_eq!(
+            infer_target_resolution_from_text("QHD"),
+            Some("2560x1440".to_string())
+        );
+        assert_eq!(
+            infer_target_resolution_from_text("DCI 4K"),
+            Some("4096x2160".to_string())
+        );
+        assert_eq!(
+            infer_target_resolution_from_text("Vertical (720x1280) 9:16"),
+            Some("720x1280".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_resolution_falls_back_to_canvas_for_invalid_hint() {
+        let resolved = resolve_target_resolution(Some("unknown-shape"), 1080.0, 1920.0);
+        assert_eq!(resolved.normalized, "1080x1920");
+        assert_eq!(resolved.source, "canvas_fallback_invalid_target_resolution");
+    }
 }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod api;
 mod app;
 mod core;
+mod export_resolution;
 mod runtime_paths;
 mod ui;
 

@@ -1,6 +1,6 @@
 [package]
 name = "anica"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 default-run = "anica"
@@ -62,7 +62,7 @@ gpui = { git = "https://github.com/LOVELYZOMBIEYHO/zed.git", branch = "anica-edi
 name = "Anica Editor"
 identifier = "com.lovelyzombieyho.anica"
 # icon = ["assets/icon.icns"]
-version = "0.1.0"
+version = "0.1.1"
 copyright = "Copyright © 2026 Anica contributors. All rights reserved."
 category = "public.app-category.video"
 short_description = "An agentic AI video editor that automates the editing process."

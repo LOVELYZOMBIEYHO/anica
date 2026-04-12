@@ -159,40 +159,12 @@ const EXPORT_SHARPEN_YUV420P_COMP_PCT_DEFAULT: f64 = 0.0;
 const EXPORT_SHARPEN_YUV420P_COMP_PCT_MIN: f64 = 0.0;
 const EXPORT_SHARPEN_YUV420P_COMP_PCT_MAX: f64 = 30.0;
 
-pub const UI_EXPORT_RESOLUTION_CHOICES: [(&str, &str); 25] = [
-    ("canvas", "Match Canvas"),
-    ("7680x4320", "8K UHD 7680x4320"),
-    ("4320x7680", "Vertical 4320x7680 (8K)"),
-    ("5120x2880", "5K UHD 5120x2880"),
-    ("2880x5120", "Vertical 2880x5120 (5K)"),
-    ("4096x2160", "DCI 4K 4096x2160"),
-    ("3840x2160", "4K UHD 3840x2160"),
-    ("2560x1440", "QHD 2560x1440"),
-    ("1920x1080", "Full HD 1920x1080"),
-    ("1080x1920", "Vertical 1080x1920"),
-    ("1600x1200", "UXGA 1600x1200 (4:3)"),
-    ("1200x1600", "Vertical 1200x1600 (4:3)"),
-    ("1440x1080", "HDV 1440x1080 (4:3)"),
-    ("1080x1440", "Vertical 1080x1440 (4:3)"),
-    ("1024x768", "XGA 1024x768 (4:3)"),
-    ("768x1024", "Vertical 768x1024 (4:3)"),
-    ("854x480", "SD 480p 854x480"),
-    ("480x854", "Vertical 480x854"),
-    ("1280x720", "HD 1280x720"),
-    ("720x1280", "Vertical 720x1280"),
-    ("640x360", "SD 360p 640x360"),
-    ("360x640", "Vertical 360x640"),
-    ("256x144", "Low 144p 256x144"),
-    ("144x256", "Vertical 144x256"),
-    ("1080x1080", "Square 1080x1080"),
-];
-
 pub const fn export_fps_choices_for_ui() -> &'static [u32] {
     &UI_EXPORT_FPS_CHOICES
 }
 
-pub const fn export_resolution_choices_for_ui() -> &'static [(&'static str, &'static str)] {
-    &UI_EXPORT_RESOLUTION_CHOICES
+pub fn export_resolution_choices_for_ui() -> &'static [(&'static str, &'static str)] {
+    crate::export_resolution::export_resolution_choices_for_ui()
 }
 
 impl ExportPreset {

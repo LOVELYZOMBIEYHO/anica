@@ -1726,8 +1726,19 @@ impl AiAgentsPage {
         let out_path = resolved.out_path.clone();
         let mode_id = resolved.export_mode.id().to_string();
         let preset_id = resolved.export_preset.id().to_string();
+        let export_resolution = resolved.export_resolution.clone();
+        let layout_resolution = resolved.layout_resolution.clone();
+        let resolution_source = resolved.resolution_source.clone();
+        let export_width = resolved.export_w.round().max(1.0) as u32;
+        let export_height = resolved.export_h.round().max(1.0) as u32;
 
-        self.push_system_message(format!("ACP export started: {}", out_path), cx);
+        self.push_system_message(
+            format!(
+                "ACP export started: {} [{} | layout {}]",
+                out_path, export_resolution, layout_resolution
+            ),
+            cx,
+        );
         self.busy = true;
 
         let cancel_signal = Arc::new(AtomicBool::new(false));
@@ -1844,13 +1855,21 @@ impl AiAgentsPage {
         })
         .detach();
 
+        let response_message = format!(
+            "Export job started at {export_resolution} (layout {layout_resolution}, source {resolution_source})."
+        );
         Ok(AcpExportRunResponse {
             ok: true,
             started: true,
             mode: mode_id,
             preset: preset_id,
             out_path: Some(out_path),
-            message: "Export job started.".to_string(),
+            layout_resolution,
+            export_resolution: export_resolution.clone(),
+            export_width,
+            export_height,
+            resolution_source: resolution_source.clone(),
+            message: response_message,
         })
     }
 

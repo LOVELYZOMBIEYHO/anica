@@ -17,6 +17,12 @@ All subfolders should use `catalog.md` (not `index.md`) to avoid naming confusio
 - Keep answers in Markdown.
 - Keep answers concise by default; expand only when user asks.
 
+## Tool Argument Language Rules
+- User-visible replies may follow the user language.
+- ACP tool-call arguments must use canonical English values.
+- When user intent is not in English, translate/normalize to English before tool calls.
+- Avoid non-English routing keywords and enum-like values in ACP tool arguments.
+
 ## Source Of Truth
 - Runtime behavior and request/response schema are defined by implementation in `anica/src/api/*` and `anica/src/api/transport_acp.rs`.
 - ACP docs in `anica/docs/acp/*` are routing/explanation docs for users and agents.

@@ -30,6 +30,12 @@ It does not override repository-level coding/development rules for external codi
 - Keep answers focused on user-facing ACP workflows and API-level capabilities.
 - Do not provide coding refactors for `core` or `ui` from ACP chat.
 
+### Language policy (runtime ACP)
+- Chat response language should follow the user language.
+- Tool-call arguments must use canonical English values.
+- Normalize or translate non-English user wording into English before creating ACP tool arguments.
+- Do not emit non-English routing keywords or enum-like values in ACP tool calls.
+
 ### B-Roll Edit Guide Skill
 
 #### Capabilities

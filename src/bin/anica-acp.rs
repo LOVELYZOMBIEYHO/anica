@@ -21,6 +21,8 @@ use tokio::task::LocalSet;
 use tokio::time::sleep;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+#[path = "../export_resolution.rs"]
+mod export_resolution;
 #[path = "../runtime_paths.rs"]
 mod runtime_paths;
 
@@ -31,6 +33,7 @@ struct SessionState {
     running_pid: Option<u32>,
     last_audio_silence_args: Option<Value>,
     last_validated_operations: Option<Value>,
+    last_export_resolution_preference: Option<String>,
 }
 
 #[derive(Debug)]
@@ -561,21 +564,13 @@ impl AnicaAcpAgent {
         let lower = user_prompt.to_lowercase();
         let hints = [
             ("english", "English"),
-            ("英文", "English"),
             ("japanese", "Japanese"),
-            ("日文", "Japanese"),
             ("korean", "Korean"),
-            ("韓文", "Korean"),
             ("french", "French"),
-            ("法文", "French"),
             ("german", "German"),
-            ("德文", "German"),
             ("spanish", "Spanish"),
-            ("西班牙文", "Spanish"),
             ("italian", "Italian"),
-            ("意大利文", "Italian"),
             ("chinese", "Chinese"),
-            ("中文", "Chinese"),
         ];
         for (needle, language) in hints {
             if lower.contains(needle) {
@@ -1020,6 +1015,160 @@ impl AnicaAcpAgent {
         }
 
         obj.insert("operations".to_string(), Value::Array(normalized_ops));
+        Value::Object(obj)
+    }
+
+    fn normalize_export_resolution_hint(raw: &str) -> Option<String> {
+        export_resolution::normalize_export_resolution_hint(raw)
+    }
+
+    fn normalize_export_target_resolution_value(raw: &str) -> Option<String> {
+        let token = raw.trim();
+        if token.eq_ignore_ascii_case("canvas") {
+            return Some("canvas".to_string());
+        }
+        Self::normalize_export_resolution_hint(token)
+    }
+
+    fn prompt_export_orientations(raw: &str) -> (bool, bool) {
+        let lower = raw.to_ascii_lowercase();
+        let has_portrait =
+            lower.contains("portrait") || lower.contains("vertical") || lower.contains("tall");
+        let has_landscape =
+            lower.contains("landscape") || lower.contains("horizontal") || lower.contains("wide");
+        (has_portrait, has_landscape)
+    }
+
+    fn normalize_export_tool_args(
+        user_prompt: &str,
+        tool_args: Value,
+        export_call_index: usize,
+    ) -> Value {
+        let Some(mut obj) = tool_args.as_object().cloned() else {
+            return tool_args;
+        };
+
+        // Prefer explicit tool args so batch export calls can carry different sizes safely.
+        let target_resolution = obj
+            .get("target_resolution")
+            .and_then(|v| v.as_str())
+            .and_then(Self::normalize_export_resolution_hint)
+            .or_else(|| {
+                obj.get("output_name")
+                    .and_then(|v| v.as_str())
+                    .and_then(Self::normalize_export_resolution_hint)
+            })
+            .or_else(|| {
+                obj.get("output_path")
+                    .and_then(|v| v.as_str())
+                    .and_then(Self::normalize_export_resolution_hint)
+            })
+            .or_else(|| Self::normalize_export_resolution_hint(user_prompt))
+            .or_else(|| {
+                // When one prompt asks for both portrait and landscape batch outputs and
+                // no per-job hint is present, alternate deterministically by call order.
+                let (has_portrait, has_landscape) = Self::prompt_export_orientations(user_prompt);
+                match (has_portrait, has_landscape) {
+                    (true, true) => {
+                        if export_call_index % 2 == 0 {
+                            Some("1080x1920".to_string())
+                        } else {
+                            Some("1920x1080".to_string())
+                        }
+                    }
+                    _ => None,
+                }
+            });
+
+        if let Some(target_resolution) = target_resolution {
+            obj.insert(
+                "target_resolution".to_string(),
+                Value::String(target_resolution),
+            );
+        } else if obj
+            .get("target_resolution")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            // Drop invalid target resolution hints so later fallback can apply cleanly.
+            obj.remove("target_resolution");
+        }
+
+        Value::Object(obj)
+    }
+
+    fn session_last_export_resolution_preference(&self, session_id: &SessionId) -> Option<String> {
+        self.inner
+            .sessions
+            .borrow()
+            .get(session_id)
+            .and_then(|s| s.last_export_resolution_preference.clone())
+    }
+
+    fn set_session_last_export_resolution_preference(
+        &self,
+        session_id: &SessionId,
+        resolution: Option<String>,
+    ) {
+        if let Some(s) = self.inner.sessions.borrow_mut().get_mut(session_id) {
+            s.last_export_resolution_preference = resolution;
+        }
+    }
+
+    fn update_export_resolution_preference_from_prompt(
+        &self,
+        session_id: &SessionId,
+        user_prompt: &str,
+    ) {
+        let trimmed = user_prompt.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        if let Some(normalized) = Self::normalize_export_resolution_hint(trimmed) {
+            self.set_session_last_export_resolution_preference(session_id, Some(normalized));
+            return;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("match canvas")
+            || lower.contains("use canvas")
+            || lower.contains("canvas resolution")
+            || lower == "canvas"
+        {
+            self.set_session_last_export_resolution_preference(
+                session_id,
+                Some("canvas".to_string()),
+            );
+        }
+    }
+
+    fn resolve_export_tool_args(&self, session_id: &SessionId, tool_args: Value) -> Value {
+        let Some(mut obj) = tool_args.as_object().cloned() else {
+            return tool_args;
+        };
+
+        if let Some(explicit) = obj
+            .get("target_resolution")
+            .and_then(|v| v.as_str())
+            .and_then(Self::normalize_export_target_resolution_value)
+        {
+            obj.insert(
+                "target_resolution".to_string(),
+                Value::String(explicit.clone()),
+            );
+            self.set_session_last_export_resolution_preference(session_id, Some(explicit));
+            return Value::Object(obj);
+        }
+
+        if obj.get("target_resolution").is_some() {
+            obj.remove("target_resolution");
+        }
+
+        if let Some(preferred) = self.session_last_export_resolution_preference(session_id) {
+            obj.insert("target_resolution".to_string(), Value::String(preferred));
+        }
+
         Value::Object(obj)
     }
 
@@ -3303,6 +3452,27 @@ Rules:\n\
             if let Some(ok) = obj.get("ok").and_then(|v| v.as_bool()) {
                 parts.push(format!("ok={ok}"));
             }
+            if let Some(started) = obj.get("started").and_then(|v| v.as_bool()) {
+                parts.push(format!("started={started}"));
+            }
+            if let Some(mode) = obj.get("mode").and_then(|v| v.as_str()) {
+                parts.push(format!("mode={mode}"));
+            }
+            if let Some(preset) = obj.get("preset").and_then(|v| v.as_str()) {
+                parts.push(format!("preset={preset}"));
+            }
+            if let Some(out_path) = obj.get("out_path").and_then(|v| v.as_str()) {
+                parts.push(format!("out_path={out_path}"));
+            }
+            if let Some(export_resolution) = obj.get("export_resolution").and_then(|v| v.as_str()) {
+                parts.push(format!("export_resolution={export_resolution}"));
+            }
+            if let Some(layout_resolution) = obj.get("layout_resolution").and_then(|v| v.as_str()) {
+                parts.push(format!("layout_resolution={layout_resolution}"));
+            }
+            if let Some(resolution_source) = obj.get("resolution_source").and_then(|v| v.as_str()) {
+                parts.push(format!("resolution_source={resolution_source}"));
+            }
             if let Some(rev) = obj.get("timeline_revision").and_then(|v| v.as_str()) {
                 parts.push(format!("revision={rev}"));
             }
@@ -3357,10 +3527,12 @@ Rules:\n\
         let mut tool_results: Vec<String> = Vec::new();
         let mut tool_trace: Vec<(String, String)> = Vec::new();
         let mut last_raw = String::new();
+        let mut export_call_index = 0usize;
         let max_turns = Self::router_max_turns();
         let direct_cut_kind = Self::detect_direct_cut_kind(user_prompt);
         let low_confidence_cut_intent = Self::is_low_confidence_cut_intent(user_prompt);
         let llm_similarity_cut_intent = self.is_llm_similarity_cut_intent(user_prompt);
+        self.update_export_resolution_preference_from_prompt(session_id, user_prompt);
 
         if llm_similarity_cut_intent {
             self.emit_status("acp.status.llm_similarity_only_mode", &[]);
@@ -3616,6 +3788,12 @@ Rules:\n\
                 continue;
             }
 
+            if tool_name == "anica.export/run" {
+                tool_args =
+                    Self::normalize_export_tool_args(user_prompt, tool_args, export_call_index);
+                tool_args = self.resolve_export_tool_args(session_id, tool_args);
+                export_call_index = export_call_index.saturating_add(1);
+            }
             tool_args = Self::normalize_timeline_edit_tool_args(&tool_name, tool_args);
             let tool_json = self
                 .execute_router_tool(session_id, &tool_name, tool_args)
@@ -3789,6 +3967,7 @@ impl Agent for AnicaAcpAgent {
                 running_pid: None,
                 last_audio_silence_args: None,
                 last_validated_operations: None,
+                last_export_resolution_preference: None,
             },
         );
         Ok(NewSessionResponse::new(session_id))
@@ -3879,4 +4058,84 @@ fn main() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to build runtime: {err}"))?;
     let local = LocalSet::new();
     runtime.block_on(local.run_until(async_main()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnicaAcpAgent;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_export_tool_args_maps_single_orientation_prompt() {
+        let args = json!({});
+        let normalized =
+            AnicaAcpAgent::normalize_export_tool_args("please export portrait video", args, 0);
+        assert_eq!(
+            normalized
+                .get("target_resolution")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "1080x1920"
+        );
+    }
+
+    #[test]
+    fn normalize_export_tool_args_alternates_for_dual_orientation_batch_prompt() {
+        let prompt = "please batch export portrait and landscape versions";
+        let first = AnicaAcpAgent::normalize_export_tool_args(prompt, json!({}), 0);
+        let second = AnicaAcpAgent::normalize_export_tool_args(prompt, json!({}), 1);
+        assert_eq!(
+            first
+                .get("target_resolution")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "1080x1920"
+        );
+        assert_eq!(
+            second
+                .get("target_resolution")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "1920x1080"
+        );
+    }
+
+    #[test]
+    fn normalize_export_tool_args_maps_named_resolution_hint() {
+        let normalized =
+            AnicaAcpAgent::normalize_export_tool_args("please export DCI 4K version", json!({}), 0);
+        assert_eq!(
+            normalized
+                .get("target_resolution")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "4096x2160"
+        );
+    }
+
+    #[test]
+    fn normalize_export_tool_args_maps_2k_portrait_hint() {
+        let normalized =
+            AnicaAcpAgent::normalize_export_tool_args("please export 2K portrait", json!({}), 0);
+        assert_eq!(
+            normalized
+                .get("target_resolution")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "1440x2560"
+        );
+    }
+
+    #[test]
+    fn normalize_export_tool_args_maps_4k_portrait_hint() {
+        let normalized =
+            AnicaAcpAgent::normalize_export_tool_args("please export 4K portrait", json!({}), 0);
+        assert_eq!(
+            normalized
+                .get("target_resolution")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "2160x3840"
+        );
+    }
 }
