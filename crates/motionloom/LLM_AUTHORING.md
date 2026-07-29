@@ -113,6 +113,43 @@ blend mode, opacity animation, masking, clipping, or scene-local layering.
 - Use `Skeleton`, `Bone`, and `Action` for reusable FK animation.
 - Use IK for target-driven limb or joint-chain solving.
 - Use `Puppet` with `Pin` and auto mesh for ordinary image deformation.
+- Choose one Puppet Warp target mode:
+  - Use `target="GROUP_ID"` for a semantic arm, eye, hair lock, or other
+    isolated part.
+  - Use `target="@layer" capture="before"` when the current Layer should act as
+    one universal surface and no Group id should be required.
+- Place an `@layer` Puppet directly inside the Layer after every node that must
+  deform. Put guides, labels, and other undeformed overlays after it.
+- For `target="@layer"`, either omit `capture` (it defaults to `before`) or
+  write `capture="before"` explicitly. Never invent other `@...` selectors.
+- Use `PuppetWarp solver="bones"` for an arm or leg that must preserve rigid
+  upper/lower segment lengths. Author three pins with `role="anchor"`,
+  `role="joint"`, and `role="control"`, then bind topology vertices with
+  `bone="upper|forearm|hand|joint"`. Use `bone="fixed"` for the static side of
+  a shoulder or hip seam.
+- When the limb is not a uniform-width capsule, add exactly one closed
+  `<LimbEnvelope d="M ... Z" alphaClip="true" handFrom="control_pin_id" />`.
+  Keep Anchor, Joint, Control, and envelope coordinates in the same space.
+  Prefer this over guessing a wide rectangular `MeshTopology`; use explicit
+  topology only when individual vertex weights are required.
+- When the three functional parts can be outlined separately, prefer three
+  closed `<LimbRegion>` nodes with `role="anchor"`, `role="joint"`, and
+  `role="control"`. The anchor region follows the upper bone, the joint region
+  blends both bones, and the control region follows the lower bone/hand.
+  Slight overlap at the seams prevents gaps. Do not combine `LimbRegion` with
+  a legacy `LimbEnvelope` or generated `MeshTopology` in the same warp.
+- Use `PuppetWarp solver="chain"` for one non-branching tail, hair lock, rope,
+  or tentacle. Give every pin an id, keep the root fixed, and link every later
+  pin with `parent="PREVIOUS_PIN_ID"`. Add a sibling `SpringChain` whose target
+  is the PuppetWarp id when follow-through is required.
+- Do not rewrite surface-pin rigs as chain rigs or three-point bone rigs. The
+  `soft`, `bones`, and `chain` solvers are separate authored behaviors.
+- For a hard-bending elbow or knee, duplicate the seam vertices for the two
+  adjacent bones and bridge them with triangles. Set `sampleX/sampleY` on the
+  bridge vertices to interior skin or clothing coordinates, preventing the
+  joint completion patch from sampling a transparent or background edge.
+- Set `preserveOutside="true"` only when a local limb mesh targets a larger
+  character Group; leave it false for already isolated artwork.
 - Add `MeshTopology` only when advanced users need manual vertices, triangles,
   edges, or regions. Do not require topology in normal examples.
 
@@ -125,6 +162,103 @@ blend mode, opacity animation, masking, clipping, or scene-local layering.
   documented scopes instead of duplicating them across nodes.
 - Prefer existing primitives and features over approximating them with many
   unrelated nodes.
+
+## Parametric Components
+
+Declare typed inputs inside a `Component`, then bind them from `Use.params`:
+
+```xml
+<Component id="data_bar">
+  <Param name="height" type="number" default="120" />
+  <Param name="paint" type="color" default="#22D3EE" />
+  <Param name="enabled" type="boolean" default="true" />
+  <Param name="align" type="enum" values={["left","center"]} default="left" />
+  <Derived name="halfHeight" value={param("height") * 0.5} />
+  <Rect x="0" y="0" width="80" height={param("height")}
+        fill={param("paint")} opacity={param("enabled")} />
+  <Slot name="label">
+    <Text x="0" y={derived("halfHeight")} value="DEFAULT" />
+  </Slot>
+</Component>
+
+<Use ref="data_bar" params={{ height: "240", paint: "#4ADE80" }}>
+  <Fill slot="label">
+    <Text x="0" y="120" value="CUSTOM" />
+  </Fill>
+</Use>
+```
+
+- Supported parameter types are `number`, `color`, `text`, `path`, `boolean`,
+  and `enum`. Enum parameters require `values={[...]}`.
+- Number, color, path, boolean, and enum bindings are validated when parsed.
+- Boolean values lower to numeric `1` or `0`, making them suitable for
+  opacity-like numeric attributes.
+- Parameter binding replaces `param("name")` in component attributes.
+- `Derived` values resolve in declaration order and can reference parameters or
+  earlier derived values with `derived("name")`.
+- `Slot` supplies default scene children. A block `Use` can replace them with
+  one matching `Fill`.
+- Every parameter needs a non-empty default or an explicit `Use.params` value.
+- Parameterized uses currently require `blend="normal"`.
+- Do not invent arbitrary component props; declare every accepted value with
+  `Param`.
+
+## Seeded Repeat Variation
+
+Use deterministic scatter when repeated artwork should not form a linear grid:
+
+```xml
+<Repeat count="80" distribution="scatter"
+        bounds={[100,120,900,500]} seed="61001">
+  <Variants choose="weighted" seed="42">
+    <Circle x="0" y="0" radius="6" color="#67E8F9" weight="5" />
+    <Rect x="-5" y="-5" width="10" height="10" color="#67E8F9" weight="2" />
+  </Variants>
+  <Vary property="color" values={["#67E8F9","#FDE047","#F472B6"]} />
+  <Vary property="scale" range={[0.5,1.5]} />
+  <Vary property="rotation" range={[-20,20]} />
+</Repeat>
+```
+
+- `Variants choose="weighted"` accepts one or more direct scene children with a
+  positive literal `weight`.
+- `Vary` accepts exactly one literal `values` list or numeric `range`.
+- `x`, `y`, `rotation`, `scale`, and `opacity` vary instance transforms.
+  Other properties update matching attributes inside the selected artwork;
+  `color` updates both primitive `color` and path `fill` fields.
+- Advanced variation works with `linear`, `grid`, and `scatter` distribution.
+- Advanced Repeat count, seed, bounds, weights, and ranges are literal values.
+- `seed` makes all generated instance transforms reproducible.
+- `Variants.seed` controls choices and `Vary` independently from the Repeat
+  seed used for scatter placement.
+
+## Declarative Scene Layout
+
+Use `Layout` when children share a regular row, column, or grid structure:
+
+```xml
+<Layout id="cards" mode="grid" x="80" y="120"
+        width="840" height="520" columns="3"
+        itemWidth="240" itemHeight="160"
+        padding={[40,60]} rowGap="24" columnGap="32"
+        align="center" justify="spaceBetween">
+  <Group layoutSpan="2">...</Group>
+  <Group>...</Group>
+  <Group>...</Group>
+</Layout>
+```
+
+- Supported modes are `row`, `column`, and `grid`.
+- `itemWidth`, `itemHeight`, `gap`, `rowGap`, and `columnGap` define placement.
+- `columns` applies to grid mode.
+- `padding` accepts one value, vertical/horizontal values, or top/right/bottom/left.
+- `align` accepts `start`, `center`, or `end`.
+- `justify` accepts `start`, `center`, `end`, `spaceBetween`, `spaceAround`, or
+  `spaceEvenly`. Explicit `width` or `height` provides the distributable space.
+- `layoutSpan` reserves multiple cells along the main axis or within a grid.
+- Layout accepts normal group transforms such as `x`, `y`, `rotation`,
+  `scale`, and `opacity`.
+- Wrap a Layout in an animated `Group` when its entrance or exit needs a curve.
 
 ## Reliable Generation Workflow
 

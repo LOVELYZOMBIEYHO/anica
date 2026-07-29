@@ -4541,7 +4541,7 @@ impl FfmpegExporter {
                 if c.start > cursor {
                     let gap = (c.start - cursor).as_secs_f64();
                     filter_parts.push(format!(
-                        "color=c=black:s={}x{}:r={}:d={},format=bgra[{}_gap_{}]",
+                        "color=c=black@0.0:s={}x{}:r={}:d={},format=bgra[{}_gap_{}]",
                         canvas_w_i, canvas_h_i, fps, gap, label, local_i
                     ));
                     concat_str.push_str(&format!("[{}_gap_{}]", label, local_i));
@@ -4578,7 +4578,7 @@ impl FfmpegExporter {
             if cursor < timeline_max {
                 let gap = (timeline_max - cursor).as_secs_f64();
                 filter_parts.push(format!(
-                    "color=c=black:s={}x{}:r={}:d={},format=bgra[{}_gap_end]",
+                    "color=c=black@0.0:s={}x{}:r={}:d={},format=bgra[{}_gap_end]",
                     canvas_w_i, canvas_h_i, fps, gap, label
                 ));
                 concat_str.push_str(&format!("[{}_gap_end]", label));
@@ -4892,6 +4892,30 @@ impl FfmpegExporter {
 
     /// [Helper] Process a single clip (BGRA Pipeline + Effects + Tint Overlay + Transform)
     /// [Helper] Process a single clip (BGRA pipeline + effects + tint overlay + transform)
+    fn source_trim_range_for_path(
+        file_path: &str,
+        source_in: Duration,
+        duration: Duration,
+    ) -> (f64, f64) {
+        // A still image has no temporal source to seek. Split image clips may
+        // carry a non-zero source_in for timeline bookkeeping, but applying it
+        // to FFmpeg trim produces an empty stream.
+        if is_image_ext(file_path) {
+            return (0.0, duration.as_secs_f64());
+        }
+        (
+            source_in.as_secs_f64(),
+            (source_in + duration).as_secs_f64(),
+        )
+    }
+
+    fn clip_canvas_color(opacity_mode: OpacityMode) -> &'static str {
+        match opacity_mode {
+            OpacityMode::AlphaOnly => "black@0.0",
+            OpacityMode::MultiplyRgb => "black",
+        }
+    }
+
     fn build_single_clip_video_filter(
         filter_parts: &mut Vec<String>,
         c: &Clip,
@@ -4910,8 +4934,7 @@ impl FfmpegExporter {
         sharpen_compensation_multiplier: f64,
         disable_local_mask_filters: bool,
     ) -> String {
-        let start = c.source_in.as_secs_f64();
-        let end = (c.source_in + c.duration).as_secs_f64();
+        let (start, end) = Self::source_trim_range_for_path(&c.file_path, c.source_in, c.duration);
         let scale = c.get_scale();
         let pos_x = c.get_pos_x();
         let pos_y = c.get_pos_y();
@@ -5013,8 +5036,10 @@ impl FfmpegExporter {
         let canvas_tag = format!("[{}_canvas_{}]", label_prefix, local_i);
         let canvas_w_i = canvas_w.round().max(1.0) as u32;
         let canvas_h_i = canvas_h.round().max(1.0) as u32;
+        let canvas_color = Self::clip_canvas_color(opacity_mode);
         filter_parts.push(format!(
-            "color=c=black:s={}x{}:r={}:d={},format=bgra{}",
+            "color=c={}:s={}x{}:r={}:d={},format=bgra{}",
+            canvas_color,
             canvas_w_i,
             canvas_h_i,
             output_fps,
@@ -6824,7 +6849,7 @@ fn hsla_to_rgb_components(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlurMode, FfmpegExporter, LayerColorBlurEffects};
+    use super::{BlurMode, FfmpegExporter, LayerColorBlurEffects, OpacityMode};
     use motionloom::LayerEffectClip;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -6856,6 +6881,40 @@ mod tests {
         assert!(filter.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"));
         assert!(!filter.contains("black@0"));
         assert!(!filter.contains("colorkey="));
+    }
+
+    #[test]
+    fn split_still_image_ignores_source_in_when_building_trim_range() {
+        let (start, end) = FfmpegExporter::source_trim_range_for_path(
+            "caption.png",
+            Duration::from_millis(1_078),
+            Duration::from_millis(624),
+        );
+        assert_eq!(start, 0.0);
+        assert!((end - 0.624).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn video_trim_range_keeps_source_in() {
+        let (start, end) = FfmpegExporter::source_trim_range_for_path(
+            "clip.mp4",
+            Duration::from_millis(1_078),
+            Duration::from_millis(624),
+        );
+        assert!((start - 1.078).abs() < 0.000_001);
+        assert!((end - 1.702).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn overlay_clip_canvas_is_transparent_but_base_canvas_is_opaque() {
+        assert_eq!(
+            FfmpegExporter::clip_canvas_color(OpacityMode::AlphaOnly),
+            "black@0.0"
+        );
+        assert_eq!(
+            FfmpegExporter::clip_canvas_color(OpacityMode::MultiplyRgb),
+            "black"
+        );
     }
 
     #[test]

@@ -70,7 +70,9 @@
 //!   layer for `.motionloom` keyframe editing.
 //! - [`PuppetNode`] and [`PinNode`] provide AE-style pin deformation with auto
 //!   mesh by default; [`MeshTopologyNode`] plus [`VertexNode`] and
-//!   [`TriangleNode`] provide optional manual topology.
+//!   [`TriangleNode`] provide optional manual topology. `PuppetWarp` can target
+//!   one Group id or capture earlier artwork in its current Layer with
+//!   `target="@layer" capture="before"`.
 //! - [`SkeletonNode`], [`ActionNode`], [`CharacterNode`], [`PartNode`], and
 //!   [`ApplyActionNode`] provide 2D character rigging. Actions can contain
 //!   two-bone IK or CCD-chain IK targets.
@@ -194,13 +196,14 @@ pub use scene::editor_keyframes::{
     replace_editable_animation_targets, upsert_editable_animation_target,
 };
 pub use scene::model::{
-    BrushDef, CameraNode, CharacterNode, CircleNode, ComponentNode, DefsNode, EdgeNode,
-    FaceJawNode, FilterDef, FilterStepDef, FontDef, GradientDef, GradientStop, GroupNode, LineNode,
-    LinearGradientDef, MaskNode, MeshTopologyNode, PaletteColorDef, PaletteNode, PartNode,
-    PathNode, PinNode, PixelGridNode, PolylineNode, PrecomposeNode, PuppetNode, RadialGradientDef,
-    RectNode, RegionNode, RepeatNode, SceneChainNode, SceneLayerNode, SceneNode, SceneRootNode,
-    SceneSequenceNode, SceneTimelineNode, SceneTrackNode, ShadowNode, TriangleNode, UseNode,
-    VertexNode,
+    BrushDef, CameraNode, CharacterNode, CircleNode, ComponentDerivedDef, ComponentNode,
+    ComponentParamDef, ComponentParamValue, ComponentSlotDef, ComponentSlotValue, DefsNode,
+    EdgeNode, FaceJawNode, FilterDef, FilterStepDef, FontDef, GradientDef, GradientStop, GroupNode,
+    LineNode, LinearGradientDef, MaskNode, MeshTopologyNode, PaletteColorDef, PaletteNode,
+    PartNode, PathNode, PinNode, PixelGridNode, PolylineNode, PrecomposeNode, PuppetNode,
+    RadialGradientDef, RectNode, RegionNode, RepeatNode, SceneChainNode, SceneLayerNode, SceneNode,
+    SceneRootNode, SceneSequenceNode, SceneTimelineNode, SceneTrackNode, ShadowNode, TriangleNode,
+    UseNode, VertexNode,
 };
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 pub use scene::render::DmabufPlane;

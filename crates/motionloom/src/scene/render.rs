@@ -1352,6 +1352,8 @@ fn collect_scene_gradient_refs(nodes: &[SceneNode], out: &mut Vec<(String, Strin
             | SceneNode::Svg(_)
             | SceneNode::Use(_)
             | SceneNode::Pin(_)
+            | SceneNode::LimbEnvelope(_)
+            | SceneNode::LimbRegion(_)
             | SceneNode::MeshTopology(_)
             | SceneNode::Vertex(_)
             | SceneNode::Triangle(_)
@@ -2166,6 +2168,8 @@ fn scene_node_id(node: &SceneNode) -> Option<&str> {
         SceneNode::Group(node) => node.id.as_deref(),
         SceneNode::Puppet(node) => node.id.as_deref(),
         SceneNode::Pin(node) => node.id.as_deref(),
+        SceneNode::LimbEnvelope(node) => node.id.as_deref(),
+        SceneNode::LimbRegion(node) => node.id.as_deref(),
         SceneNode::MeshTopology(node) => node.id.as_deref(),
         SceneNode::Vertex(node) => Some(node.id.as_str()),
         SceneNode::Triangle(node) => node.id.as_deref(),
@@ -6429,6 +6433,8 @@ impl SceneFrameRenderer {
                                 !matches!(
                                     child,
                                     SceneNode::Pin(_)
+                                        | SceneNode::LimbEnvelope(_)
+                                        | SceneNode::LimbRegion(_)
                                         | SceneNode::MeshTopology(_)
                                         | SceneNode::Vertex(_)
                                         | SceneNode::Triangle(_)
@@ -6481,6 +6487,8 @@ impl SceneFrameRenderer {
                         });
                     }
                     SceneNode::Pin(_)
+                    | SceneNode::LimbEnvelope(_)
+                    | SceneNode::LimbRegion(_)
                     | SceneNode::MeshTopology(_)
                     | SceneNode::Vertex(_)
                     | SceneNode::Triangle(_)
@@ -7944,6 +7952,8 @@ impl SceneFrameRenderer {
                     pending_shadow = None;
                 }
                 SceneNode::Pin(_)
+                | SceneNode::LimbEnvelope(_)
+                | SceneNode::LimbRegion(_)
                 | SceneNode::MeshTopology(_)
                 | SceneNode::Vertex(_)
                 | SceneNode::Triangle(_)
@@ -9336,6 +9346,8 @@ impl SceneFrameRenderer {
                     composite_layer(canvas, &layer);
                 }
                 SceneNode::Pin(_)
+                | SceneNode::LimbEnvelope(_)
+                | SceneNode::LimbRegion(_)
                 | SceneNode::MeshTopology(_)
                 | SceneNode::Vertex(_)
                 | SceneNode::Triangle(_)
@@ -11848,6 +11860,8 @@ fn collect_gpu_scene_commands_with_depth(
                 pending_shadow = None;
             }
             SceneNode::Pin(_)
+            | SceneNode::LimbEnvelope(_)
+            | SceneNode::LimbRegion(_)
             | SceneNode::MeshTopology(_)
             | SceneNode::Vertex(_)
             | SceneNode::Triangle(_)
@@ -13316,7 +13330,7 @@ fn push_gpu_filled_path_triangles_with_blend(
     }
 }
 
-fn triangulate_polygon(points: &[Point2]) -> Vec<[Point2; 3]> {
+pub(crate) fn triangulate_polygon(points: &[Point2]) -> Vec<[Point2; 3]> {
     let polygon = sanitize_polygon(points);
     if polygon.len() < 3 {
         return Vec::new();
@@ -18665,6 +18679,53 @@ mod tests {
         assert!(
             face[2] > 200 && face[0] < 30,
             "expected the later blue vector to remain above the Puppet texture, got {face:?}"
+        );
+    }
+
+    #[test]
+    fn scene_cpu_universal_puppet_captures_once_and_keeps_later_overlay() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[64,48]}>
+  <Background color="#000000" />
+  <Scene id="universal_order">
+    <Timeline>
+      <Track id="content" space="screen" z="0">
+        <Sequence from="0s" duration="1s" out="hold">
+          <Layer>
+            <Rect x="0" y="0" width="32" height="48"
+                  color="#FF0000" opacity="0.5" />
+            <PuppetWarp id="layer_warp" target="@layer" capture="before"
+                        width="64" height="48" density="high">
+              <PuppetPin id="anchor" x="16" y="24"
+                         targetX="16" targetY="24" fixed="true" radius="48" />
+            </PuppetWarp>
+            <Rect x="32" y="0" width="32" height="48" color="#0000FF" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="universal_order" />
+</Graph>
+"##,
+        )
+        .expect("universal Puppet source-order graph parse");
+
+        let mut renderer =
+            pollster::block_on(SceneFrameRenderer::new_for_profile(SceneRenderProfile::Cpu));
+        let rendered =
+            pollster::block_on(renderer.render_frame(&graph, 0)).expect("CPU Puppet render");
+        let captured = rendered.get_pixel(8, 24);
+        let overlay = rendered.get_pixel(48, 24);
+
+        assert!(
+            (100..=155).contains(&captured[0]) && captured[1] < 20 && captured[2] < 20,
+            "expected one half-opacity red capture instead of duplicate artwork, got {captured:?}"
+        );
+        assert!(
+            overlay[2] > 220 && overlay[0] < 20,
+            "expected the later blue overlay to remain outside the capture, got {overlay:?}"
         );
     }
 

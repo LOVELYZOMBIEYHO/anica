@@ -2760,7 +2760,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             return Ok(input.clone());
         }
 
-        let uniform = puppet_deform_uniform(width, height, triangle_count as u32);
+        let uniform =
+            puppet_deform_uniform(width, height, triangle_count as u32, grid.preserve_outside);
         let uniform_buffer = self.make_post_uniform_buffer(&uniform);
         let triangle_buffer =
             self.make_storage_buffer("anica-motionloom-scene-puppet-deform-triangles", &triangles);
@@ -4567,12 +4568,17 @@ fn downsample_uniform(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> [u8; 32
     out
 }
 
-fn puppet_deform_uniform(width: u32, height: u32, triangle_count: u32) -> [u8; 16] {
+fn puppet_deform_uniform(
+    width: u32,
+    height: u32,
+    triangle_count: u32,
+    preserve_outside: bool,
+) -> [u8; 16] {
     let values = [
         width.max(1) as f32,
         height.max(1) as f32,
         triangle_count as f32,
-        0.0,
+        if preserve_outside { 1.0 } else { 0.0 },
     ];
     let mut out = [0u8; 16];
     for (ix, value) in values.iter().enumerate() {
@@ -4613,18 +4619,36 @@ fn push_deform_triangle_bytes(grid: &EvaluatedDeformGrid, triangle: [usize; 3], 
         return;
     }
     let src = [
-        grid.from[triangle[0]],
-        grid.from[triangle[1]],
-        grid.from[triangle[2]],
+        grid.sample_from[triangle[0]],
+        grid.sample_from[triangle[1]],
+        grid.sample_from[triangle[2]],
     ];
     let dst = [
         grid.to[triangle[0]],
         grid.to[triangle[1]],
         grid.to[triangle[2]],
     ];
-    push_deform_vec4(out, src[0].x, src[0].y, 0.0, 0.0);
-    push_deform_vec4(out, src[1].x, src[1].y, 0.0, 0.0);
-    push_deform_vec4(out, src[2].x, src[2].y, 0.0, 0.0);
+    push_deform_vec4(
+        out,
+        src[0].x,
+        src[0].y,
+        grid.from[triangle[0]].x,
+        grid.from[triangle[0]].y,
+    );
+    push_deform_vec4(
+        out,
+        src[1].x,
+        src[1].y,
+        grid.from[triangle[1]].x,
+        grid.from[triangle[1]].y,
+    );
+    push_deform_vec4(
+        out,
+        src[2].x,
+        src[2].y,
+        grid.from[triangle[2]].x,
+        grid.from[triangle[2]].y,
+    );
     push_deform_vec4(out, dst[0].x, dst[0].y, 0.0, 0.0);
     push_deform_vec4(out, dst[1].x, dst[1].y, 0.0, 0.0);
     push_deform_vec4(out, dst[2].x, dst[2].y, 0.0, 0.0);

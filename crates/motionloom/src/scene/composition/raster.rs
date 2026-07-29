@@ -529,22 +529,53 @@ pub(crate) fn draw_rgba_image(
 }
 
 pub(crate) fn apply_deform_grid(source: &RgbaImage, grid: &EvaluatedDeformGrid) -> RgbaImage {
-    let mut out = RgbaImage::from_pixel(source.width(), source.height(), Rgba([0, 0, 0, 0]));
+    let mut out = if grid.preserve_outside {
+        source.clone()
+    } else {
+        RgbaImage::from_pixel(source.width(), source.height(), Rgba([0, 0, 0, 0]))
+    };
     if !grid.triangles.is_empty() {
+        if grid.preserve_outside {
+            // Clear the bind-pose region before compositing the solved mesh so
+            // local arm rigs do not leave a duplicate static limb behind.
+            for triangle in &grid.triangles {
+                if triangle.iter().any(|index| *index >= grid.from.len()) {
+                    continue;
+                }
+                let moved = triangle.iter().any(|index| {
+                    let from = grid.from[*index];
+                    let to = grid.to[*index];
+                    (from.x - to.x).hypot(from.y - to.y) > 0.01
+                });
+                if !moved {
+                    continue;
+                }
+                clear_deform_triangle(
+                    &mut out,
+                    [
+                        grid.from[triangle[0]],
+                        grid.from[triangle[1]],
+                        grid.from[triangle[2]],
+                    ],
+                    true,
+                );
+            }
+        }
         for triangle in &grid.triangles {
-            if triangle
-                .iter()
-                .any(|index| *index >= grid.from.len() || *index >= grid.to.len())
-            {
+            if triangle.iter().any(|index| {
+                *index >= grid.from.len()
+                    || *index >= grid.sample_from.len()
+                    || *index >= grid.to.len()
+            }) {
                 continue;
             }
             raster_deform_triangle(
                 &mut out,
                 source,
                 [
-                    grid.from[triangle[0]],
-                    grid.from[triangle[1]],
-                    grid.from[triangle[2]],
+                    grid.sample_from[triangle[0]],
+                    grid.sample_from[triangle[1]],
+                    grid.sample_from[triangle[2]],
                 ],
                 [
                     grid.to[triangle[0]],
@@ -564,18 +595,92 @@ pub(crate) fn apply_deform_grid(source: &RgbaImage, grid: &EvaluatedDeformGrid) 
             raster_deform_triangle(
                 &mut out,
                 source,
-                [grid.from[i00], grid.from[i10], grid.from[i11]],
+                [
+                    grid.sample_from[i00],
+                    grid.sample_from[i10],
+                    grid.sample_from[i11],
+                ],
                 [grid.to[i00], grid.to[i10], grid.to[i11]],
             );
             raster_deform_triangle(
                 &mut out,
                 source,
-                [grid.from[i00], grid.from[i11], grid.from[i01]],
+                [
+                    grid.sample_from[i00],
+                    grid.sample_from[i11],
+                    grid.sample_from[i01],
+                ],
                 [grid.to[i00], grid.to[i11], grid.to[i01]],
             );
         }
     }
     out
+}
+
+fn clear_deform_triangle(out: &mut RgbaImage, triangle: [Point2; 3], moved: bool) {
+    // Vector artwork is antialiased beyond the mathematical path boundary.
+    // Clearing only the exact bind-pose triangles can therefore leave a
+    // one-pixel outline of the original limb after a local Puppet move.
+    let clear_fringe_px: f32 = if moved { 2.0 } else { 0.0 };
+    let min_x = triangle
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i32
+        - clear_fringe_px.ceil() as i32;
+    let min_y = triangle
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i32
+        - clear_fringe_px.ceil() as i32;
+    let max_x = triangle
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i32
+        + clear_fringe_px.ceil() as i32;
+    let max_y = triangle
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i32
+        + clear_fringe_px.ceil() as i32;
+    let denominator = triangle_barycentric_denominator(triangle);
+    for y in min_y.max(0)..max_y.min(out.height() as i32) {
+        for x in min_x.max(0)..max_x.min(out.width() as i32) {
+            let point = Point2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let Some((w0, w1, w2)) = triangle_barycentric(point, triangle, denominator) else {
+                continue;
+            };
+            let inside = w0 >= -0.001 && w1 >= -0.001 && w2 >= -0.001;
+            let on_antialiased_fringe = triangle
+                .iter()
+                .zip(triangle.iter().cycle().skip(1))
+                .take(3)
+                .any(|(start, end)| {
+                    clear_fringe_px > 0.0
+                        && point_to_segment_distance(point, *start, *end) <= clear_fringe_px
+                });
+            if inside || on_antialiased_fringe {
+                out.put_pixel(x as u32, y as u32, Rgba([0, 0, 0, 0]));
+            }
+        }
+    }
+}
+
+fn point_to_segment_distance(point: Point2, start: Point2, end: Point2) -> f32 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= 0.000001 {
+        return (point.x - start.x).hypot(point.y - start.y);
+    }
+    let t =
+        (((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared).clamp(0.0, 1.0);
+    let nearest_x = start.x + dx * t;
+    let nearest_y = start.y + dy * t;
+    (point.x - nearest_x).hypot(point.y - nearest_y)
 }
 
 fn raster_deform_triangle(

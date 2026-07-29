@@ -1,4 +1,5 @@
 // =========================================
+// =========================================
 // crates/motionloom/src/scene/dsl.rs
 
 use crate::dsl::{
@@ -651,36 +652,58 @@ pub(crate) fn parse_scene_root_block(
         .transpose()?;
     let mut child_ctx = brush_ctx.clone();
     let mut children = parse_scene_root_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
-    resolve_puppet_targets(&mut children);
+    resolve_puppet_targets(&mut children)?;
     Ok((SceneRootNode { id, size, children }, close_ix))
 }
 
 // PuppetWarp is authored beside its target so the DSL remains easy to edit.
 // The renderer's stable Puppet AST owns visual children, so resolve the target
 // into that internal shape after parsing without changing the source DSL.
-fn resolve_puppet_targets(nodes: &mut Vec<SceneNode>) {
+fn resolve_puppet_targets(nodes: &mut Vec<SceneNode>) -> Result<(), GraphParseError> {
+    resolve_puppet_targets_in_scope(nodes, false)
+}
+
+fn resolve_puppet_targets_in_scope(
+    nodes: &mut Vec<SceneNode>,
+    is_layer_scope: bool,
+) -> Result<(), GraphParseError> {
     for node in nodes.iter_mut() {
-        let children = match node {
-            SceneNode::Timeline(node) => Some(&mut node.children),
-            SceneNode::Track(node) => Some(&mut node.children),
-            SceneNode::Sequence(node) => Some(&mut node.children),
-            SceneNode::Chain(node) => Some(&mut node.children),
-            SceneNode::Group(node) => Some(&mut node.children),
-            SceneNode::Part(node) => Some(&mut node.children),
-            SceneNode::Repeat(node) => Some(&mut node.children),
-            SceneNode::Mask(node) => Some(&mut node.children),
-            SceneNode::Precompose(node) => Some(&mut node.children),
-            SceneNode::Layer(node) => Some(&mut node.children),
-            SceneNode::Camera(node) => Some(&mut node.children),
-            SceneNode::Character(node) => Some(&mut node.children),
-            SceneNode::Puppet(node) => Some(&mut node.children),
-            _ => None,
+        let (children, child_is_layer_scope) = match node {
+            SceneNode::Timeline(node) => (Some(&mut node.children), false),
+            SceneNode::Track(node) => (Some(&mut node.children), false),
+            SceneNode::Sequence(node) => (Some(&mut node.children), false),
+            SceneNode::Chain(node) => (Some(&mut node.children), false),
+            SceneNode::Group(node) => (Some(&mut node.children), false),
+            SceneNode::Part(node) => (Some(&mut node.children), false),
+            SceneNode::Repeat(node) => (Some(&mut node.children), false),
+            SceneNode::Mask(node) => (Some(&mut node.children), false),
+            SceneNode::Precompose(node) => (Some(&mut node.children), false),
+            SceneNode::Layer(node) => (Some(&mut node.children), true),
+            SceneNode::Camera(node) => (Some(&mut node.children), false),
+            SceneNode::Character(node) => (Some(&mut node.children), false),
+            SceneNode::Puppet(node) => (Some(&mut node.children), false),
+            _ => (None, false),
         };
         if let Some(children) = children {
-            resolve_puppet_targets(children);
+            resolve_puppet_targets_in_scope(children, child_is_layer_scope)?;
         }
     }
 
+    resolve_group_puppet_targets(nodes);
+    if is_layer_scope {
+        resolve_layer_puppet_targets(nodes)?;
+    } else if nodes.iter().any(is_unresolved_layer_target_puppet) {
+        return Err(GraphParseError {
+            line: 1,
+            message: "PuppetWarp target=\"@layer\" must be a direct child of <Layer>.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+// Existing Group-id targets retain their original sibling-binding behavior.
+// Reserved selectors are handled separately so Group mode remains unchanged.
+fn resolve_group_puppet_targets(nodes: &mut Vec<SceneNode>) {
     let mut target_bindings = std::collections::HashMap::<usize, (usize, PuppetNode)>::new();
     let mut consumed_puppets = std::collections::HashSet::<usize>::new();
     for (puppet_index, node) in nodes.iter().enumerate() {
@@ -694,6 +717,9 @@ fn resolve_puppet_targets(nodes: &mut Vec<SceneNode>) {
         else {
             continue;
         };
+        if target.starts_with('@') {
+            continue;
+        }
         if puppet
             .children
             .iter()
@@ -726,6 +752,101 @@ fn resolve_puppet_targets(nodes: &mut Vec<SceneNode>) {
             nodes.push(node);
         }
     }
+}
+
+// Universal Layer mode captures all earlier siblings into one Puppet surface.
+// Moving those nodes rather than cloning them prevents duplicate bind-pose art.
+fn resolve_layer_puppet_targets(nodes: &mut Vec<SceneNode>) -> Result<(), GraphParseError> {
+    if !nodes.iter().any(is_layer_target_puppet) {
+        return Ok(());
+    }
+
+    let original = std::mem::take(nodes);
+    let mut resolved = Vec::<SceneNode>::with_capacity(original.len());
+    for node in original {
+        let SceneNode::Puppet(mut puppet) = node else {
+            resolved.push(node);
+            continue;
+        };
+        if !puppet
+            .target
+            .as_deref()
+            .is_some_and(|target| target.eq_ignore_ascii_case("@layer"))
+        {
+            resolved.push(SceneNode::Puppet(puppet));
+            continue;
+        }
+        if puppet.children.iter().any(is_puppet_visual_child) {
+            resolved.push(SceneNode::Puppet(puppet));
+            continue;
+        }
+        if resolved.is_empty() {
+            return Err(GraphParseError {
+                line: 1,
+                message: "PuppetWarp target=\"@layer\" found no drawable nodes before it."
+                    .to_string(),
+            });
+        }
+
+        let captured = std::mem::take(&mut resolved);
+        puppet.children.splice(0..0, captured);
+        resolved.push(SceneNode::Puppet(puppet));
+    }
+    *nodes = resolved;
+    Ok(())
+}
+
+fn is_puppet_visual_child(node: &SceneNode) -> bool {
+    !matches!(
+        node,
+        SceneNode::Pin(_)
+            | SceneNode::LimbEnvelope(_)
+            | SceneNode::LimbRegion(_)
+            | SceneNode::MeshTopology(_)
+            | SceneNode::Vertex(_)
+            | SceneNode::Triangle(_)
+            | SceneNode::Edge(_)
+            | SceneNode::Region(_)
+    )
+}
+
+fn is_layer_target_puppet(node: &SceneNode) -> bool {
+    matches!(
+        node,
+        SceneNode::Puppet(puppet)
+            if puppet
+                .target
+                .as_deref()
+                .is_some_and(|target| target.eq_ignore_ascii_case("@layer"))
+    )
+}
+
+// A later universal rig wraps earlier rigs, so subsequent lowering passes must
+// accept the already captured internal Puppet tree while rejecting raw nesting.
+fn is_unresolved_layer_target_puppet(node: &SceneNode) -> bool {
+    matches!(
+        node,
+        SceneNode::Puppet(puppet)
+            if puppet
+                .target
+                .as_deref()
+                .is_some_and(|target| target.eq_ignore_ascii_case("@layer"))
+                && !puppet.children.iter().any(is_puppet_visual_child)
+    )
+}
+
+/// Parametric Components are lowered after the first scene parse pass. Resolve
+/// PuppetWarp targets again so a reusable deformation preset can bind artwork
+/// authored beside its `<Use>` instance.
+pub(crate) fn resolve_lowered_puppet_targets(
+    scene_nodes: &mut Vec<SceneNode>,
+    scenes: &mut [SceneRootNode],
+) -> Result<(), GraphParseError> {
+    resolve_puppet_targets(scene_nodes)?;
+    for scene in scenes {
+        resolve_puppet_targets(&mut scene.children)?;
+    }
+    Ok(())
 }
 
 fn scene_node_id(node: &SceneNode) -> Option<&str> {
@@ -1791,16 +1912,511 @@ pub(crate) fn parse_part_block(
     Ok((parse_part_node(&open_tag, start + 1, children)?, close_ix))
 }
 
+pub(crate) fn parse_layout_block(
+    lines: &[&str],
+    start: usize,
+    brush_ctx: &BrushParseContext,
+) -> Result<(GroupNode, usize), GraphParseError> {
+    let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Layout")?;
+    let mut child_ctx = brush_ctx.clone();
+    let raw_children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let spans = parse_layout_child_spans(lines, open_end_ix + 1, close_ix)?;
+    if spans.len() != raw_children.len() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "Could not map Layout children to their layoutSpan values.".to_string(),
+        });
+    }
+    let mode = attr_value(&open_tag, "mode")
+        .map(|value| strip_wrappers(&value).trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "row".to_string());
+    if !matches!(mode.as_str(), "row" | "column" | "grid") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("Invalid Layout mode=\"{mode}\". Expected row, column, or grid."),
+        });
+    }
+    let item_width = literal_f32_attr(&open_tag, &["itemWidth", "item_width"], 240.0).max(0.0);
+    let item_height = literal_f32_attr(&open_tag, &["itemHeight", "item_height"], 160.0).max(0.0);
+    let gap = literal_f32_attr(&open_tag, &["gap"], 24.0);
+    let row_gap = literal_f32_attr(&open_tag, &["rowGap", "row_gap"], gap);
+    let column_gap = literal_f32_attr(&open_tag, &["columnGap", "column_gap"], gap);
+    let columns = literal_f32_attr(&open_tag, &["columns"], 1.0)
+        .round()
+        .clamp(1.0, 1024.0) as usize;
+    let align = normalize_layout_keyword(
+        attr_value(&open_tag, "align")
+            .as_deref()
+            .map(strip_wrappers)
+            .unwrap_or("start"),
+    );
+    let justify = normalize_layout_keyword(
+        attr_value(&open_tag, "justify")
+            .as_deref()
+            .map(strip_wrappers)
+            .unwrap_or("start"),
+    );
+    if !matches!(align.as_str(), "start" | "center" | "end") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "Layout align must be start, center, or end.".to_string(),
+        });
+    }
+    if !matches!(
+        justify.as_str(),
+        "start" | "center" | "end" | "spacebetween" | "spacearound" | "spaceevenly"
+    ) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "Layout justify must be start, center, end, spaceBetween, spaceAround, or spaceEvenly."
+                .to_string(),
+        });
+    }
+    let padding = parse_layout_padding(&open_tag, start + 1)?;
+    let layout_id = attr_value(&open_tag, "id")
+        .map(|value| strip_wrappers(&value).to_string())
+        .unwrap_or_else(|| "layout".to_string());
+    // Placement records reserve grid cells before transforms are lowered to Groups.
+    let mut placements = Vec::with_capacity(raw_children.len());
+    let mut cursor_column = 0_usize;
+    let mut cursor_row = 0_usize;
+    let mut cursor_linear = 0_usize;
+    for span in spans.iter().copied() {
+        let span = span.max(1).min(columns);
+        match mode.as_str() {
+            "grid" => {
+                if cursor_column + span > columns {
+                    cursor_column = 0;
+                    cursor_row += 1;
+                }
+                placements.push((cursor_column, cursor_row, span));
+                cursor_column += span;
+                if cursor_column == columns {
+                    cursor_column = 0;
+                    cursor_row += 1;
+                }
+            }
+            "column" => {
+                placements.push((0, cursor_linear, span));
+                cursor_linear += span;
+            }
+            _ => {
+                placements.push((cursor_linear, 0, span));
+                cursor_linear += span;
+            }
+        }
+    }
+    let occupied_columns = match mode.as_str() {
+        "grid" => columns,
+        "row" => spans.iter().sum::<usize>().max(1),
+        _ => 1,
+    };
+    let occupied_rows = match mode.as_str() {
+        "grid" => placements
+            .iter()
+            .map(|(_, row, _)| row + 1)
+            .max()
+            .unwrap_or(1),
+        "column" => spans.iter().sum::<usize>().max(1),
+        _ => 1,
+    };
+    let natural_width = occupied_columns as f32 * item_width
+        + occupied_columns.saturating_sub(1) as f32 * column_gap;
+    let natural_height =
+        occupied_rows as f32 * item_height + occupied_rows.saturating_sub(1) as f32 * row_gap;
+    let width = literal_f32_attr(
+        &open_tag,
+        &["width"],
+        natural_width + padding[1] + padding[3],
+    )
+    .max(padding[1] + padding[3]);
+    let height = literal_f32_attr(
+        &open_tag,
+        &["height"],
+        natural_height + padding[0] + padding[2],
+    )
+    .max(padding[0] + padding[2]);
+    let inner_width = (width - padding[1] - padding[3]).max(0.0);
+    let inner_height = (height - padding[0] - padding[2]).max(0.0);
+    let main_count = if mode == "column" {
+        occupied_rows
+    } else {
+        occupied_columns
+    };
+    let natural_main = if mode == "column" {
+        natural_height
+    } else {
+        natural_width
+    };
+    let available_main = if mode == "column" {
+        inner_height
+    } else {
+        inner_width
+    };
+    let base_gap = if mode == "column" {
+        row_gap
+    } else {
+        column_gap
+    };
+    let (main_offset, distributed_gap) =
+        resolve_layout_justify(&justify, available_main, natural_main, main_count, base_gap);
+    let cross_offset = if mode == "column" {
+        resolve_layout_align(&align, inner_width, item_width)
+    } else {
+        resolve_layout_align(&align, inner_height, natural_height)
+    };
+
+    let mut children = Vec::with_capacity(raw_children.len());
+    for (index, (child, (column, row, _span))) in raw_children
+        .into_iter()
+        .zip(placements.into_iter())
+        .enumerate()
+    {
+        let (x, y) = match mode.as_str() {
+            "column" => (
+                padding[3] + cross_offset,
+                padding[0] + main_offset + row as f32 * (item_height + distributed_gap),
+            ),
+            "grid" => (
+                padding[3] + main_offset + column as f32 * (item_width + distributed_gap),
+                padding[0] + cross_offset + row as f32 * (item_height + row_gap),
+            ),
+            _ => (
+                padding[3] + main_offset + column as f32 * (item_width + distributed_gap),
+                padding[0] + cross_offset,
+            ),
+        };
+        let item_tag = format!("<Group id=\"{layout_id}__item_{index:03}\" x=\"{x}\" y=\"{y}\">");
+        children.push(SceneNode::Group(parse_group_node(
+            &item_tag,
+            start + 1,
+            vec![child],
+        )?));
+    }
+    Ok((
+        parse_group_node(
+            &procedural_group_tag(&open_tag, &layout_id),
+            start + 1,
+            children,
+        )?,
+        close_ix,
+    ))
+}
+
+fn parse_layout_child_spans(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+) -> Result<Vec<usize>, GraphParseError> {
+    let mut spans = Vec::new();
+    let mut i = start;
+    while i < end {
+        let line = lines[i].trim();
+        if line.is_empty() || line.starts_with("//") {
+            i += 1;
+            continue;
+        }
+        let (tag, _, child_end) = scene_element_bounds(lines, i, end)?;
+        let span = attr_value(&tag, "layoutSpan")
+            .or_else(|| attr_value(&tag, "layout_span"))
+            .map(|value| strip_wrappers(&value).trim().parse::<usize>())
+            .transpose()
+            .map_err(|_| GraphParseError {
+                line: i + 1,
+                message: "layoutSpan must be a positive literal integer.".to_string(),
+            })?
+            .unwrap_or(1);
+        if span == 0 {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: "layoutSpan must be greater than zero.".to_string(),
+            });
+        }
+        spans.push(span);
+        i = child_end + 1;
+    }
+    Ok(spans)
+}
+
+fn parse_layout_padding(block: &str, line: usize) -> Result<[f32; 4], GraphParseError> {
+    let Some(raw) = attr_value(block, "padding") else {
+        return Ok([0.0; 4]);
+    };
+    let body = strip_wrappers(&raw);
+    let body = body.trim().trim_start_matches('[').trim_end_matches(']');
+    let values = split_scene_top_level_csv(body)
+        .into_iter()
+        .map(|value| value.trim().parse::<f32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: "Layout padding requires literal numeric values.".to_string(),
+        })?;
+    match values.as_slice() {
+        [all] => Ok([*all; 4]),
+        [vertical, horizontal] => Ok([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, right, bottom, left] => Ok([*top, *right, *bottom, *left]),
+        _ => Err(GraphParseError {
+            line,
+            message: "Layout padding accepts one, two, or four values.".to_string(),
+        }),
+    }
+}
+
+fn normalize_layout_keyword(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn resolve_layout_align(align: &str, available: f32, content: f32) -> f32 {
+    let free = (available - content).max(0.0);
+    match align {
+        "center" => free * 0.5,
+        "end" => free,
+        _ => 0.0,
+    }
+}
+
+fn resolve_layout_justify(
+    justify: &str,
+    available: f32,
+    natural: f32,
+    count: usize,
+    base_gap: f32,
+) -> (f32, f32) {
+    let free = (available - natural).max(0.0);
+    match justify {
+        "center" => (free * 0.5, base_gap),
+        "end" => (free, base_gap),
+        "spacebetween" if count > 1 => (0.0, base_gap + free / (count - 1) as f32),
+        "spacearound" if count > 0 => {
+            let share = free / count as f32;
+            (share * 0.5, base_gap + share)
+        }
+        "spaceevenly" => {
+            let share = free / (count + 1).max(1) as f32;
+            (share, base_gap + share)
+        }
+        _ => (0.0, base_gap),
+    }
+}
+
 pub(crate) fn parse_repeat_block(
     lines: &[&str],
     start: usize,
     brush_ctx: &BrushParseContext,
-) -> Result<(RepeatNode, usize), GraphParseError> {
+) -> Result<(SceneNode, usize), GraphParseError> {
     let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Repeat")?;
-    let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
-    Ok((parse_repeat_node(&open_tag, start + 1, children)?, close_ix))
+    let (children, variants, varies, variant_seed) =
+        parse_repeat_contents(lines, open_end_ix + 1, close_ix, brush_ctx)?;
+    let repeat = parse_repeat_node(&open_tag, start + 1, children)?;
+    let distribution = attr_value(&open_tag, "distribution")
+        .map(|value| strip_wrappers(&value).trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "linear".to_string());
+    let has_advanced_variation = !variants.is_empty() || !varies.is_empty();
+    let node = match distribution.as_str() {
+        "linear" | "grid" if !has_advanced_variation => SceneNode::Repeat(repeat),
+        "linear" | "grid" | "scatter" => SceneNode::Group(lower_advanced_repeat(
+            &open_tag,
+            repeat,
+            &distribution,
+            variants,
+            varies,
+            variant_seed,
+            start + 1,
+        )?),
+        _ => {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "Invalid Repeat distribution=\"{distribution}\". Expected linear, grid, or scatter."
+                ),
+            });
+        }
+    };
+    Ok((node, close_ix))
+}
+
+#[derive(Debug, Clone)]
+struct RepeatVariantDef {
+    weight: f32,
+    children: Vec<SceneNode>,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatVaryDef {
+    property: String,
+    values: Vec<String>,
+    range: Option<[f32; 2]>,
+}
+
+type RepeatContents = (
+    Vec<SceneNode>,
+    Vec<RepeatVariantDef>,
+    Vec<RepeatVaryDef>,
+    Option<u32>,
+);
+
+fn parse_repeat_contents(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    brush_ctx: &BrushParseContext,
+) -> Result<RepeatContents, GraphParseError> {
+    let mut children = Vec::new();
+    let mut variants = Vec::new();
+    let mut varies = Vec::new();
+    let mut variant_seed = None;
+    let mut i = start;
+    while i < end {
+        let line = lines[i].trim();
+        if line.is_empty() || line.starts_with("//") {
+            i += 1;
+            continue;
+        }
+        if starts_open_tag(line, "Variants") {
+            if !variants.is_empty() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "<Repeat> accepts at most one <Variants> block.".to_string(),
+                });
+            }
+            let (tag, open_end) = collect_tag_block(lines, i, '>', false)?;
+            let close = find_matching_close_tag(lines, open_end + 1, "Variants")?;
+            let choose = attr_value(&tag, "choose")
+                .map(|value| strip_wrappers(&value).trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "weighted".to_string());
+            if choose != "weighted" {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "<Variants choose> currently supports only weighted.".to_string(),
+                });
+            }
+            variant_seed = attr_value(&tag, "seed")
+                .map(|value| strip_wrappers(&value).trim().parse::<u32>())
+                .transpose()
+                .map_err(|_| GraphParseError {
+                    line: i + 1,
+                    message: "<Variants seed> must be a literal unsigned integer.".to_string(),
+                })?;
+            let mut j = open_end + 1;
+            while j < close {
+                let variant_line = lines[j].trim();
+                if variant_line.is_empty() || variant_line.starts_with("//") {
+                    j += 1;
+                    continue;
+                }
+                let (variant_tag, _, variant_end) = scene_element_bounds(lines, j, close)?;
+                let weight = attr_value(&variant_tag, "weight")
+                    .map(|value| strip_wrappers(&value).trim().parse::<f32>())
+                    .transpose()
+                    .map_err(|_| GraphParseError {
+                        line: j + 1,
+                        message: "Variant weight must be a literal number.".to_string(),
+                    })?
+                    .unwrap_or(1.0);
+                if !weight.is_finite() || weight <= 0.0 {
+                    return Err(GraphParseError {
+                        line: j + 1,
+                        message: "Variant weight must be greater than zero.".to_string(),
+                    });
+                }
+                let mut child_ctx = brush_ctx.clone();
+                let parsed = parse_scene_nodes(lines, j, variant_end + 1, &mut child_ctx)?;
+                if parsed.len() != 1 {
+                    return Err(GraphParseError {
+                        line: j + 1,
+                        message:
+                            "Each direct <Variants> child must produce exactly one scene node."
+                                .to_string(),
+                    });
+                }
+                variants.push(RepeatVariantDef {
+                    weight,
+                    children: parsed,
+                });
+                j = variant_end + 1;
+            }
+            if variants.is_empty() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "<Variants> requires at least one weighted child.".to_string(),
+                });
+            }
+            i = close + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Vary") {
+            let (tag, tag_end) = collect_self_closing_block(lines, i)?;
+            let property = strip_wrappers(&required_attr_value(&tag, "property", i + 1)?)
+                .trim()
+                .to_string();
+            let values = parse_literal_string_array(&tag, "values", i + 1)?.unwrap_or_default();
+            let range = parse_literal_float_array(&tag, "range", 2, i + 1)?
+                .map(|values| [values[0], values[1]]);
+            if property.is_empty() || (values.is_empty() == range.is_none()) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "<Vary> requires property and exactly one of values or range."
+                        .to_string(),
+                });
+            }
+            varies.push(RepeatVaryDef {
+                property,
+                values,
+                range,
+            });
+            i = tag_end + 1;
+            continue;
+        }
+        let (_, _, child_end) = scene_element_bounds(lines, i, end)?;
+        let mut child_ctx = brush_ctx.clone();
+        children.extend(parse_scene_nodes(lines, i, child_end + 1, &mut child_ctx)?);
+        i = child_end + 1;
+    }
+    if !variants.is_empty() && !children.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "<Repeat> cannot mix direct artwork with a <Variants> block.".to_string(),
+        });
+    }
+    Ok((children, variants, varies, variant_seed))
+}
+
+fn scene_element_bounds(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+) -> Result<(String, usize, usize), GraphParseError> {
+    let (tag, open_end) = collect_tag_block(lines, start, '>', false)?;
+    if is_self_closing_tag(&tag) {
+        return Ok((tag, open_end, open_end));
+    }
+    let name = tag
+        .trim_start()
+        .strip_prefix('<')
+        .and_then(|rest| {
+            rest.split(|ch: char| ch.is_whitespace() || ch == '>')
+                .next()
+        })
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| GraphParseError {
+            line: start + 1,
+            message: "Could not determine scene child tag name.".to_string(),
+        })?;
+    let close = find_matching_close_tag(lines, open_end + 1, name)?;
+    if close >= end {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("Scene child <{name}> extends beyond its parent."),
+        });
+    }
+    Ok((tag, open_end, close))
 }
 
 pub(crate) fn parse_mask_any(
@@ -1903,7 +2519,131 @@ fn parse_use_node(block: &str, line: usize) -> Result<UseNode, GraphParseError> 
         ),
         opacity: scene_attr_or_default(block, &["opacity"], "1"),
         blend: scene_attr_or_default(block, &["blend"], "normal"),
+        params: parse_component_param_values(block, line)?,
+        slots: Vec::new(),
     })
+}
+
+fn parse_use_any(
+    lines: &[&str],
+    start: usize,
+    brush_ctx: &BrushParseContext,
+) -> Result<(UseNode, usize), GraphParseError> {
+    let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    let mut use_node = parse_use_node(&open_tag, start + 1)?;
+    if is_self_closing_tag(&open_tag) {
+        return Ok((use_node, open_end_ix));
+    }
+
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Use")?;
+    let mut seen = HashSet::new();
+    let mut i = open_end_ix + 1;
+    while i < close_ix {
+        let line = lines[i].trim();
+        if line.is_empty() || line.starts_with("//") {
+            i += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "Fill") {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: format!("<Use> only accepts <Fill slot=\"...\"> children, got: {line}"),
+            });
+        }
+        let (fill_tag, fill_open_end) = collect_tag_block(lines, i, '>', false)?;
+        let fill_close = find_matching_close_tag(lines, fill_open_end + 1, "Fill")?;
+        let name = strip_wrappers(&required_attr_value(&fill_tag, "slot", i + 1)?)
+            .trim()
+            .to_string();
+        if name.is_empty() || !seen.insert(name.clone()) {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: format!("Duplicate or empty <Fill slot=\"{name}\">."),
+            });
+        }
+        let mut child_ctx = brush_ctx.clone();
+        let children = parse_scene_nodes(lines, fill_open_end + 1, fill_close, &mut child_ctx)?;
+        use_node.slots.push(ComponentSlotValue { name, children });
+        i = fill_close + 1;
+    }
+    Ok((use_node, close_ix))
+}
+
+fn parse_component_param_values(
+    block: &str,
+    line: usize,
+) -> Result<Vec<ComponentParamValue>, GraphParseError> {
+    let Some(raw) = attr_value(block, "params") else {
+        return Ok(Vec::new());
+    };
+    let body = strip_wrappers(&raw);
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in split_scene_top_level_csv(body) {
+        let Some((name, value)) = entry.split_once(':') else {
+            return Err(GraphParseError {
+                line,
+                message: format!("Invalid <Use params> entry '{entry}'. Expected name: value."),
+            });
+        };
+        let name = strip_wrappers(name).trim().to_string();
+        let value = strip_wrappers(value).trim().to_string();
+        if name.is_empty() || value.is_empty() {
+            return Err(GraphParseError {
+                line,
+                message: "<Use params> names and values must not be empty.".to_string(),
+            });
+        }
+        if !seen.insert(name.clone()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate <Use params> value '{name}'."),
+            });
+        }
+        values.push(ComponentParamValue { name, value });
+    }
+    Ok(values)
+}
+
+fn split_scene_top_level_csv(input: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut depth = 0_i32;
+    for ch in input.chars() {
+        if let Some(active) = quote {
+            current.push(ch);
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    entries.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        entries.push(current.trim().to_string());
+    }
+    entries
 }
 
 pub(crate) fn parse_camera_block(
@@ -2092,6 +2832,12 @@ fn parse_scene_nodes(
             i = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "Layout") {
+            let (layout, end_ix) = parse_layout_block(lines, i, brush_ctx)?;
+            nodes.push(SceneNode::Group(layout));
+            i = end_ix + 1;
+            continue;
+        }
         if starts_open_tag(line, "Puppet") || starts_open_tag(line, "PuppetWarp") {
             let (puppet, end_ix) = parse_puppet_block(lines, i, brush_ctx)?;
             nodes.push(SceneNode::Puppet(puppet));
@@ -2101,6 +2847,21 @@ fn parse_scene_nodes(
         if starts_open_tag(line, "Pin") || starts_open_tag(line, "PuppetPin") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
             nodes.push(SceneNode::Pin(parse_pin_node(&tag, i + 1)?));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "LimbEnvelope") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes.push(SceneNode::LimbEnvelope(parse_limb_envelope_node(
+                &tag,
+                i + 1,
+            )?));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "LimbRegion") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes.push(SceneNode::LimbRegion(parse_limb_region_node(&tag, i + 1)?));
             i = end_ix + 1;
             continue;
         }
@@ -2118,7 +2879,7 @@ fn parse_scene_nodes(
         }
         if starts_open_tag(line, "Repeat") {
             let (repeat, end_ix) = parse_repeat_block(lines, i, brush_ctx)?;
-            nodes.push(SceneNode::Repeat(repeat));
+            nodes.push(repeat);
             i = end_ix + 1;
             continue;
         }
@@ -2135,8 +2896,8 @@ fn parse_scene_nodes(
             continue;
         }
         if starts_open_tag(line, "Use") {
-            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
-            nodes.push(SceneNode::Use(parse_use_node(&tag, i + 1)?));
+            let (use_node, end_ix) = parse_use_any(lines, i, brush_ctx)?;
+            nodes.push(SceneNode::Use(use_node));
             i = end_ix + 1;
             continue;
         }
@@ -3048,9 +3809,545 @@ fn parse_component_block(
     let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Component")?;
     let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
+    let mut params = Vec::new();
+    let mut derived = Vec::new();
+    let mut slots = Vec::new();
+    let mut param_names = HashSet::new();
+    let mut derived_names = HashSet::new();
+    let mut slot_names = HashSet::new();
+    let mut child_lines = Vec::<String>::new();
+    let mut i = open_end_ix + 1;
+    while i < close_ix {
+        let line = lines[i].trim();
+        if starts_open_tag(line, "Param") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let name = strip_wrappers(&required_attr_value(&tag, "name", i + 1)?)
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "<Param name> must not be empty.".to_string(),
+                });
+            }
+            if !param_names.insert(name.clone()) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!("Duplicate <Param name=\"{name}\"> in Component '{id}'."),
+                });
+            }
+            let value_type = attr_value(&tag, "type")
+                .map(|value| strip_wrappers(&value).trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "number".to_string());
+            if !matches!(
+                value_type.as_str(),
+                "number" | "color" | "text" | "path" | "boolean" | "enum"
+            ) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Invalid <Param type=\"{value_type}\">. Expected number, color, text, path, boolean, or enum."
+                    ),
+                });
+            }
+            let default = attr_value(&tag, "default")
+                .map(|value| strip_wrappers(&value).to_string())
+                .unwrap_or_default();
+            let values = parse_literal_string_array(&tag, "values", i + 1)?.unwrap_or_default();
+            if value_type == "enum" && values.is_empty() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Enum parameter '{name}' requires non-empty values={{[...]}}."
+                    ),
+                });
+            }
+            params.push(ComponentParamDef {
+                name,
+                value_type,
+                default,
+                values,
+            });
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Derived") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let name = strip_wrappers(&required_attr_value(&tag, "name", i + 1)?)
+                .trim()
+                .to_string();
+            if name.is_empty() || param_names.contains(&name) || !derived_names.insert(name.clone())
+            {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Duplicate or empty <Derived name=\"{name}\"> in Component '{id}'."
+                    ),
+                });
+            }
+            let value = strip_wrappers(&required_attr_value(&tag, "value", i + 1)?).to_string();
+            derived.push(ComponentDerivedDef { name, value });
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Slot") {
+            let (tag, tag_end_ix) = collect_tag_block(lines, i, '>', false)?;
+            let name = strip_wrappers(&required_attr_value(&tag, "name", i + 1)?)
+                .trim()
+                .to_string();
+            if name.is_empty() || !slot_names.insert(name.clone()) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Duplicate or empty <Slot name=\"{name}\"> in Component '{id}'."
+                    ),
+                });
+            }
+            slots.push(ComponentSlotDef { name: name.clone() });
+            child_lines.push(format!("<Group id=\"__motionloom_slot__{name}\">"));
+            if is_self_closing_tag(&tag) {
+                child_lines.push("</Group>".to_string());
+                i = tag_end_ix + 1;
+                continue;
+            }
+            let slot_close = find_matching_close_tag(lines, tag_end_ix + 1, "Slot")?;
+            child_lines.extend(
+                lines[tag_end_ix + 1..slot_close]
+                    .iter()
+                    .map(|line| (*line).to_string()),
+            );
+            child_lines.push("</Group>".to_string());
+            i = slot_close + 1;
+            continue;
+        }
+        child_lines.push(lines[i].to_string());
+        i += 1;
+    }
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
-    Ok((ComponentNode { id, children }, close_ix))
+    let child_refs = child_lines.iter().map(String::as_str).collect::<Vec<_>>();
+    let children = parse_scene_nodes(&child_refs, 0, child_refs.len(), &mut child_ctx)?;
+    Ok((
+        ComponentNode {
+            id,
+            params,
+            derived,
+            slots,
+            children,
+        },
+        close_ix,
+    ))
+}
+
+pub(crate) fn lower_parametric_component_uses(
+    scene_nodes: &mut [SceneNode],
+    scenes: &mut [SceneRootNode],
+) -> Result<(), GraphParseError> {
+    let mut components = HashMap::<String, ComponentNode>::new();
+    collect_parametric_components(scene_nodes, &mut components);
+    for scene in scenes.iter() {
+        collect_parametric_components(&scene.children, &mut components);
+    }
+    lower_parametric_uses_in_nodes(scene_nodes, &components)?;
+    for scene in scenes {
+        lower_parametric_uses_in_nodes(&mut scene.children, &components)?;
+    }
+    Ok(())
+}
+
+fn collect_parametric_components(
+    nodes: &[SceneNode],
+    components: &mut HashMap<String, ComponentNode>,
+) {
+    for node in nodes {
+        match node {
+            SceneNode::Defs(defs) => {
+                for component in &defs.components {
+                    components.insert(component.id.clone(), component.clone());
+                }
+            }
+            SceneNode::Timeline(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Track(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Sequence(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Chain(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Group(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Puppet(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Part(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Repeat(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Mask(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Precompose(node) => {
+                collect_parametric_components(&node.children, components)
+            }
+            SceneNode::Layer(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Camera(node) => collect_parametric_components(&node.children, components),
+            SceneNode::Character(node) => collect_parametric_components(&node.children, components),
+            _ => {}
+        }
+    }
+}
+
+fn lower_parametric_uses_in_nodes(
+    nodes: &mut [SceneNode],
+    components: &HashMap<String, ComponentNode>,
+) -> Result<(), GraphParseError> {
+    for node in nodes {
+        if let SceneNode::Use(use_node) = node {
+            let Some(component) = components.get(&use_node.ref_id) else {
+                if !use_node.params.is_empty() {
+                    return Err(GraphParseError {
+                        line: 0,
+                        message: format!(
+                            "Parameterized <Use ref=\"{}\"> references an unknown Component.",
+                            use_node.ref_id
+                        ),
+                    });
+                }
+                continue;
+            };
+            if component.params.is_empty()
+                && component.derived.is_empty()
+                && component.slots.is_empty()
+            {
+                if !use_node.params.is_empty() {
+                    return Err(GraphParseError {
+                        line: 0,
+                        message: format!(
+                            "Component '{}' declares no <Param> values.",
+                            component.id
+                        ),
+                    });
+                }
+                continue;
+            }
+            if !use_node.blend.trim().eq_ignore_ascii_case("normal") {
+                return Err(GraphParseError {
+                    line: 0,
+                    message: "Parameterized <Use> currently requires blend=\"normal\".".to_string(),
+                });
+            }
+            let mut bindings = HashMap::new();
+            for param in &component.params {
+                let normalized =
+                    validate_component_param_value(param, &param.default, &component.id)?;
+                bindings.insert(param.name.clone(), normalized);
+            }
+            for value in &use_node.params {
+                let Some(param) = component
+                    .params
+                    .iter()
+                    .find(|param| param.name == value.name)
+                else {
+                    return Err(GraphParseError {
+                        line: 0,
+                        message: format!(
+                            "Unknown parameter '{}' for Component '{}'.",
+                            value.name, component.id
+                        ),
+                    });
+                };
+                let normalized =
+                    validate_component_param_value(param, &value.value, &component.id)?;
+                bindings.insert(value.name.clone(), normalized);
+            }
+            if let Some(missing) = bindings.iter().find_map(|(name, value)| {
+                if value.trim().is_empty() {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            }) {
+                return Err(GraphParseError {
+                    line: 0,
+                    message: format!(
+                        "Component '{}' parameter '{}' has no default or Use value.",
+                        component.id, missing
+                    ),
+                });
+            }
+            // Derived values are resolved in declaration order so later values can depend on earlier ones.
+            for derived in &component.derived {
+                let value = substitute_component_binding_text(&derived.value, &bindings);
+                if value.contains("param(") || value.contains("derived(") {
+                    return Err(GraphParseError {
+                        line: 0,
+                        message: format!(
+                            "Component '{}' Derived '{}' references an unknown or later binding.",
+                            component.id, derived.name
+                        ),
+                    });
+                }
+                bindings.insert(derived.name.clone(), value);
+            }
+            let slot_names = component
+                .slots
+                .iter()
+                .map(|slot| slot.name.as_str())
+                .collect::<HashSet<_>>();
+            for fill in &use_node.slots {
+                if !slot_names.contains(fill.name.as_str()) {
+                    return Err(GraphParseError {
+                        line: 0,
+                        message: format!(
+                            "Unknown slot '{}' for Component '{}'.",
+                            fill.name, component.id
+                        ),
+                    });
+                }
+            }
+            let mut children = substitute_component_params(&component.children, &bindings)?;
+            replace_component_slots(&mut children, &use_node.slots);
+            lower_parametric_uses_in_nodes(&mut children, components)?;
+            let use_node = use_node.clone();
+
+            // A reusable PuppetWarp must remain beside the artwork named by
+            // `target`. An identity <Use> wrapper would otherwise hide it one
+            // Group level deeper, preventing target resolution. Flatten only
+            // this semantics-preserving special case; transformed Uses retain
+            // the ordinary component Group wrapper.
+            if use_has_identity_wrapper(&use_node) && children.len() == 1 {
+                if let SceneNode::Puppet(mut puppet) = children.remove(0) {
+                    if puppet.id.is_none() {
+                        puppet.id = use_node.id;
+                    }
+                    *node = SceneNode::Puppet(puppet);
+                    continue;
+                }
+            }
+
+            *node = SceneNode::Group(GroupNode {
+                id: use_node.id,
+                brush: None,
+                material: None,
+                x: use_node.x,
+                y: use_node.y,
+                rotation: use_node.rotation,
+                scale: use_node.scale,
+                scale_x: use_node.scale_x,
+                scale_y: use_node.scale_y,
+                skew_x: use_node.skew_x,
+                skew_y: use_node.skew_y,
+                transform_origin_x: use_node.transform_origin_x,
+                transform_origin_y: use_node.transform_origin_y,
+                deform_grid: None,
+                grid_from: None,
+                grid_to: None,
+                deform_amount: "0".to_string(),
+                mask: None,
+                mask_from: None,
+                mask_mode: "alpha".to_string(),
+                mask_feather: "0".to_string(),
+                mask_expansion: "0".to_string(),
+                effects: Vec::new(),
+                opacity: use_node.opacity,
+                children,
+            });
+            continue;
+        }
+
+        match node {
+            SceneNode::Defs(defs) => {
+                for mask in &mut defs.masks {
+                    lower_parametric_uses_in_nodes(&mut mask.children, components)?;
+                }
+                for precompose in &mut defs.precomposes {
+                    lower_parametric_uses_in_nodes(&mut precompose.children, components)?;
+                }
+            }
+            SceneNode::Timeline(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Track(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Sequence(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Chain(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Group(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Puppet(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Part(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Repeat(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Mask(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Precompose(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Layer(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Camera(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            SceneNode::Character(node) => {
+                lower_parametric_uses_in_nodes(&mut node.children, components)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn use_has_identity_wrapper(node: &UseNode) -> bool {
+    fn is_zero(value: &str) -> bool {
+        value
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|number| number.abs() <= f64::EPSILON)
+    }
+    fn is_one(value: &str) -> bool {
+        value
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|number| (number - 1.0).abs() <= f64::EPSILON)
+    }
+
+    is_zero(&node.x)
+        && is_zero(&node.y)
+        && is_zero(&node.rotation)
+        && is_one(&node.scale)
+        && is_one(&node.scale_x)
+        && is_one(&node.scale_y)
+        && is_zero(&node.skew_x)
+        && is_zero(&node.skew_y)
+        && is_zero(&node.transform_origin_x)
+        && is_zero(&node.transform_origin_y)
+        && is_one(&node.opacity)
+        && node.blend.trim().eq_ignore_ascii_case("normal")
+}
+
+fn substitute_component_params(
+    nodes: &[SceneNode],
+    bindings: &HashMap<String, String>,
+) -> Result<Vec<SceneNode>, GraphParseError> {
+    let mut value = serde_json::to_value(nodes).map_err(|error| GraphParseError {
+        line: 0,
+        message: format!("Could not serialize Component for parameter substitution: {error}"),
+    })?;
+    substitute_component_value(&mut value, bindings);
+    serde_json::from_value(value).map_err(|error| GraphParseError {
+        line: 0,
+        message: format!("Could not resolve Component parameters: {error}"),
+    })
+}
+
+fn substitute_component_value(value: &mut serde_json::Value, bindings: &HashMap<String, String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = substitute_component_binding_text(text, bindings);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                substitute_component_value(value, bindings);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                substitute_component_value(value, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn substitute_component_binding_text(text: &str, bindings: &HashMap<String, String>) -> String {
+    let mut resolved = text.to_string();
+    for (name, replacement) in bindings {
+        for function in ["param", "derived"] {
+            resolved = resolved.replace(&format!("{function}(\"{name}\")"), replacement);
+            resolved = resolved.replace(&format!("{function}('{name}')"), replacement);
+        }
+    }
+    resolved
+}
+
+fn validate_component_param_value(
+    param: &ComponentParamDef,
+    value: &str,
+    component_id: &str,
+) -> Result<String, GraphParseError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let valid = match param.value_type.as_str() {
+        "number" => value.parse::<f64>().is_ok(),
+        "color" => {
+            let hex = value.strip_prefix('#');
+            value == "none"
+                || value == "transparent"
+                || hex.is_some_and(|digits| {
+                    matches!(digits.len(), 3 | 4 | 6 | 8)
+                        && digits.chars().all(|digit| digit.is_ascii_hexdigit())
+                })
+        }
+        "path" => matches!(value.chars().next(), Some('M' | 'm')),
+        "boolean" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "false" | "1" | "0"
+        ),
+        "enum" => param.values.iter().any(|allowed| allowed == value),
+        "text" => true,
+        _ => false,
+    };
+    if !valid {
+        return Err(GraphParseError {
+            line: 0,
+            message: format!(
+                "Component '{component_id}' parameter '{}' expected {}; got '{value}'.",
+                param.name, param.value_type
+            ),
+        });
+    }
+    if param.value_type == "boolean" {
+        return Ok(
+            if matches!(value.to_ascii_lowercase().as_str(), "true" | "1") {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn replace_component_slots(nodes: &mut [SceneNode], fills: &[ComponentSlotValue]) {
+    for node in nodes {
+        match node {
+            SceneNode::Group(group) => {
+                if let Some(name) = group
+                    .id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("__motionloom_slot__"))
+                {
+                    if let Some(fill) = fills.iter().find(|fill| fill.name == name) {
+                        group.children = fill.children.clone();
+                    }
+                    // Placeholder ids are parser internals and must not collide across Uses.
+                    group.id = None;
+                }
+                replace_component_slots(&mut group.children, fills);
+            }
+            SceneNode::Puppet(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Part(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Repeat(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Mask(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Precompose(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Layer(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Camera(node) => replace_component_slots(&mut node.children, fills),
+            SceneNode::Character(node) => replace_component_slots(&mut node.children, fills),
+            _ => {}
+        }
+    }
 }
 
 fn parse_filter_block(lines: &[&str], start: usize) -> Result<(FilterDef, usize), GraphParseError> {
@@ -4410,18 +5707,67 @@ fn parse_scene_string_list(raw: &str) -> Vec<String> {
 
 fn parse_puppet_node(
     block: &str,
-    _line: usize,
+    line: usize,
     children: Vec<SceneNode>,
 ) -> Result<PuppetNode, GraphParseError> {
+    let target = attr_value(block, "target")
+        .or_else(|| attr_value(block, "targetId"))
+        .or_else(|| attr_value(block, "target_id"))
+        .map(|v| strip_wrappers(&v).to_string())
+        .filter(|v| !v.trim().is_empty());
+    let mut capture = attr_value(block, "capture")
+        .map(|v| strip_wrappers(&v).to_string())
+        .filter(|v| !v.trim().is_empty());
+    if let Some(selector) = target.as_deref().filter(|value| value.starts_with('@')) {
+        if !selector.eq_ignore_ascii_case("@layer") {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Unknown PuppetWarp target selector \"{selector}\". Use \"@layer\" or a Group id."
+                ),
+            });
+        }
+        if capture.is_none() {
+            capture = Some("before".to_string());
+        } else if !capture
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("before"))
+        {
+            return Err(GraphParseError {
+                line,
+                message: "PuppetWarp target=\"@layer\" requires capture=\"before\".".to_string(),
+            });
+        }
+    }
     Ok(PuppetNode {
         id: attr_value(block, "id").map(|v| strip_wrappers(&v).to_string()),
-        target: attr_value(block, "target")
-            .or_else(|| attr_value(block, "targetId"))
-            .or_else(|| attr_value(block, "target_id"))
-            .map(|v| strip_wrappers(&v).to_string())
-            .filter(|v| !v.trim().is_empty()),
+        target,
+        capture,
+        solver: scene_attr_or_default(block, &["solver"], "soft"),
         mesh: scene_attr_or_default(block, &["mesh"], "auto"),
         density: scene_attr_or_default(block, &["density"], "medium"),
+        bend: scene_attr_or_default(block, &["bend", "bendDirection", "bend_direction"], "auto"),
+        stretch: scene_attr_or_default(block, &["stretch"], "0"),
+        joint_softness: scene_attr_or_default(block, &["jointSoftness", "joint_softness"], "32"),
+        preserve_volume: scene_attr_or_default(
+            block,
+            &["preserveVolume", "preserve_volume"],
+            "true",
+        ),
+        preserve_outside: scene_attr_or_default(
+            block,
+            &["preserveOutside", "preserve_outside"],
+            "false",
+        ),
+        preserve_length: scene_attr_or_default(
+            block,
+            &["preserveLength", "preserve_length"],
+            "true",
+        ),
+        stiffness: scene_attr_or_default(block, &["stiffness"], "0.72"),
+        damping: scene_attr_or_default(block, &["damping"], "0.84"),
+        drag: scene_attr_or_default(block, &["drag"], "0.18"),
+        overlap: scene_attr_or_default(block, &["overlap"], "0.12"),
         x: scene_attr_or_default(block, &["x"], "0"),
         y: scene_attr_or_default(block, &["y"], "0"),
         rotation: scene_attr_or_default(block, &["rotation"], "0"),
@@ -4448,9 +5794,67 @@ fn parse_puppet_node(
     })
 }
 
+fn parse_limb_envelope_node(block: &str, line: usize) -> Result<LimbEnvelopeNode, GraphParseError> {
+    let d = required_attr_value(block, "d", line)?;
+    if !d.trim_end().ends_with(['Z', 'z']) {
+        return Err(GraphParseError {
+            line,
+            message: "<LimbEnvelope d=\"...\"> must be a closed path ending in Z.".to_string(),
+        });
+    }
+    Ok(LimbEnvelopeNode {
+        id: attr_value(block, "id").map(|value| strip_wrappers(&value).to_string()),
+        d,
+        alpha_clip: scene_attr_or_default(block, &["alphaClip", "alpha_clip"], "true"),
+        hand_from: attr_value(block, "handFrom")
+            .or_else(|| attr_value(block, "hand_from"))
+            .map(|value| strip_wrappers(&value).to_string())
+            .filter(|value| !value.trim().is_empty()),
+    })
+}
+
+fn parse_limb_region_node(block: &str, line: usize) -> Result<LimbRegionNode, GraphParseError> {
+    let d = required_attr_value(block, "d", line)?;
+    if !d.trim_end().ends_with(['Z', 'z']) {
+        return Err(GraphParseError {
+            line,
+            message: "<LimbRegion d=\"...\"> must be a closed path ending in Z.".to_string(),
+        });
+    }
+    let role = required_attr_value(block, "role", line)?;
+    let normalized_role = strip_wrappers(&role).trim().to_ascii_lowercase();
+    if !matches!(
+        normalized_role.as_str(),
+        "anchor"
+            | "upper"
+            | "shoulder"
+            | "joint"
+            | "elbow"
+            | "control"
+            | "lower"
+            | "forearm"
+            | "wrist"
+            | "hand"
+    ) {
+        return Err(GraphParseError {
+            line,
+            message: "<LimbRegion role=\"...\"> expected anchor, joint, or control.".to_string(),
+        });
+    }
+    Ok(LimbRegionNode {
+        id: attr_value(block, "id").map(|value| strip_wrappers(&value).to_string()),
+        role: normalized_role,
+        d,
+        alpha_clip: scene_attr_or_default(block, &["alphaClip", "alpha_clip"], "true"),
+    })
+}
+
 pub(crate) fn parse_pin_node(block: &str, _line: usize) -> Result<PinNode, GraphParseError> {
     Ok(PinNode {
         id: attr_value(block, "id").map(|v| strip_wrappers(&v).to_string()),
+        role: attr_value(block, "role")
+            .map(|v| strip_wrappers(&v).to_string())
+            .filter(|v| !v.trim().is_empty()),
         bind_to: attr_value(block, "bindTo")
             .or_else(|| attr_value(block, "bind_to"))
             .map(|v| strip_wrappers(&v).to_string())
@@ -4458,6 +5862,11 @@ pub(crate) fn parse_pin_node(block: &str, _line: usize) -> Result<PinNode, Graph
         vertex: attr_value(block, "vertex")
             .or_else(|| attr_value(block, "vertexId"))
             .or_else(|| attr_value(block, "vertex_id"))
+            .map(|v| strip_wrappers(&v).to_string())
+            .filter(|v| !v.trim().is_empty()),
+        parent: attr_value(block, "parent")
+            .or_else(|| attr_value(block, "parentId"))
+            .or_else(|| attr_value(block, "parent_id"))
             .map(|v| strip_wrappers(&v).to_string())
             .filter(|v| !v.trim().is_empty()),
         x: attr_value(block, "x").map(|v| strip_wrappers(&v).to_string()),
@@ -4470,6 +5879,8 @@ pub(crate) fn parse_pin_node(block: &str, _line: usize) -> Result<PinNode, Graph
             .map(|v| strip_wrappers(&v).to_string()),
         radius: scene_attr_or_default(block, &["radius", "r"], "120"),
         strength: scene_attr_or_default(block, &["strength", "weight"], "1"),
+        rotation: scene_attr_or_default(block, &["rotation", "rotate", "angle"], "0"),
+        scale: scene_attr_or_default(block, &["scale"], "1"),
         falloff: scene_attr_or_default(block, &["falloff"], "smooth"),
         fixed: scene_attr_or_default(block, &["fixed", "lock", "locked"], "false"),
     })
@@ -4494,6 +5905,17 @@ fn parse_vertex_node(block: &str, line: usize) -> Result<VertexNode, GraphParseE
         id: required_attr_value(block, "id", line)?,
         x: required_attr_value(block, "x", line)?,
         y: required_attr_value(block, "y", line)?,
+        sample_x: attr_value(block, "sampleX")
+            .or_else(|| attr_value(block, "sample_x"))
+            .map(|value| strip_wrappers(&value).to_string()),
+        sample_y: attr_value(block, "sampleY")
+            .or_else(|| attr_value(block, "sample_y"))
+            .map(|value| strip_wrappers(&value).to_string()),
+        bone: attr_value(block, "bone")
+            .or_else(|| attr_value(block, "bindTo"))
+            .or_else(|| attr_value(block, "bind_to"))
+            .map(|value| strip_wrappers(&value).to_string())
+            .filter(|value| !value.trim().is_empty()),
     })
 }
 
@@ -4646,6 +6068,298 @@ fn parse_repeat_node(
         opacity_step,
         children,
     })
+}
+
+fn lower_advanced_repeat(
+    block: &str,
+    repeat: RepeatNode,
+    distribution: &str,
+    mut variants: Vec<RepeatVariantDef>,
+    varies: Vec<RepeatVaryDef>,
+    variant_seed: Option<u32>,
+    line: usize,
+) -> Result<GroupNode, GraphParseError> {
+    let count = repeat
+        .count
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: "Advanced Repeat variation requires a literal integer count.".to_string(),
+        })?;
+    if count > 10_000 {
+        return Err(GraphParseError {
+            line,
+            message: "Advanced Repeat variation supports at most 10000 instances.".to_string(),
+        });
+    }
+
+    let bounds = parse_literal_float_array(block, "bounds", 4, line)?
+        .unwrap_or_else(|| vec![0.0, 0.0, 400.0, 240.0]);
+    let scale_range =
+        parse_literal_float_array(block, "scaleRange", 2, line)?.unwrap_or_else(|| vec![1.0, 1.0]);
+    let rotation_range = parse_literal_float_array(block, "rotationRange", 2, line)?
+        .unwrap_or_else(|| vec![0.0, 0.0]);
+    let opacity_range = parse_literal_float_array(block, "opacityRange", 2, line)?
+        .unwrap_or_else(|| vec![1.0, 1.0]);
+    let literal = |name: &str, value: &str| {
+        value.trim().parse::<f32>().map_err(|_| GraphParseError {
+            line,
+            message: format!("Advanced Repeat variation requires literal {name}; got '{value}'."),
+        })
+    };
+    let x_step = literal("xStep", &repeat.x_step)?;
+    let y_step = literal("yStep", &repeat.y_step)?;
+    let rotation_step = literal("rotationStep", &repeat.rotation_step)?;
+    let scale_step = literal("scaleStep", &repeat.scale_step)?;
+    let opacity_step = literal("opacityStep", &repeat.opacity_step)?;
+    let repeat_seed = attr_value(block, "seed")
+        .and_then(|value| strip_wrappers(&value).trim().parse::<u32>().ok())
+        .unwrap_or(1);
+    let mut placement_state = repeat_seed;
+    let mut variation_state = variant_seed.unwrap_or(repeat_seed);
+    let base_id = repeat
+        .id
+        .clone()
+        .unwrap_or_else(|| "scatter_repeat".to_string());
+    if variants.is_empty() {
+        variants.push(RepeatVariantDef {
+            weight: 1.0,
+            children: repeat.children.clone(),
+        });
+    }
+    let columns = literal_f32_attr(block, &["columns"], 1.0)
+        .round()
+        .clamp(1.0, 1024.0) as usize;
+    let mut children = Vec::with_capacity(count);
+    for index in 0..count {
+        let fraction = |state: &mut u32, range: &[f32]| {
+            range[0] + procedural_random(state) * (range[1] - range[0])
+        };
+        let (column, row) = (index % columns, index / columns);
+        let (mut x, mut y) = match distribution {
+            "scatter" => (
+                bounds[0]
+                    + procedural_random(&mut placement_state) * bounds[2]
+                    + x_step * index as f32,
+                bounds[1]
+                    + procedural_random(&mut placement_state) * bounds[3]
+                    + y_step * index as f32,
+            ),
+            "grid" => (x_step * column as f32, y_step * row as f32),
+            _ => (x_step * index as f32, y_step * index as f32),
+        };
+        let mut rotation = rotation_step * index as f32
+            + if distribution == "scatter" {
+                fraction(&mut placement_state, &rotation_range)
+            } else {
+                0.0
+            };
+        let mut scale = ((1.0 + scale_step * index as f32)
+            * if distribution == "scatter" {
+                fraction(&mut placement_state, &scale_range)
+            } else {
+                1.0
+            })
+        .clamp(0.001, 64.0);
+        let mut opacity = ((1.0 + opacity_step * index as f32)
+            * if distribution == "scatter" {
+                fraction(&mut placement_state, &opacity_range)
+            } else {
+                1.0
+            })
+        .clamp(0.0, 1.0);
+        let variant_index = weighted_repeat_variant_index(&variants, &mut variation_state);
+        let mut artwork = variants[variant_index].children.clone();
+        for vary in &varies {
+            let value = if let Some(range) = vary.range {
+                let value =
+                    range[0] + procedural_random(&mut variation_state) * (range[1] - range[0]);
+                value.to_string()
+            } else {
+                let choice = (procedural_random(&mut variation_state) * vary.values.len() as f32)
+                    .floor() as usize;
+                vary.values[choice.min(vary.values.len() - 1)].clone()
+            };
+            match vary.property.as_str() {
+                "x" => {
+                    x += value
+                        .parse::<f32>()
+                        .map_err(|_| vary_numeric_error(vary, line))?
+                }
+                "y" => {
+                    y += value
+                        .parse::<f32>()
+                        .map_err(|_| vary_numeric_error(vary, line))?
+                }
+                "rotation" => {
+                    rotation += value
+                        .parse::<f32>()
+                        .map_err(|_| vary_numeric_error(vary, line))?
+                }
+                "scale" => {
+                    scale *= value
+                        .parse::<f32>()
+                        .map_err(|_| vary_numeric_error(vary, line))?
+                }
+                "opacity" => {
+                    opacity *= value
+                        .parse::<f32>()
+                        .map_err(|_| vary_numeric_error(vary, line))?
+                }
+                property => apply_repeat_vary_property(&mut artwork, property, &value)?,
+            }
+        }
+        scale = scale.clamp(0.001, 64.0);
+        opacity = opacity.clamp(0.0, 1.0);
+        let item_tag = format!(
+            "<Group id=\"{base_id}__item_{index:04}\" x=\"{x}\" y=\"{y}\" rotation=\"{rotation}\" scale=\"{scale}\" opacity=\"{opacity}\">"
+        );
+        children.push(SceneNode::Group(parse_group_node(
+            &item_tag, line, artwork,
+        )?));
+    }
+
+    let outer_tag = format!(
+        "<Group id=\"{base_id}\" x=\"{}\" y=\"{}\" rotation=\"{}\" scale=\"{}\" opacity=\"{}\">",
+        repeat.x, repeat.y, repeat.rotation, repeat.scale, repeat.opacity
+    );
+    parse_group_node(&outer_tag, line, children)
+}
+
+fn weighted_repeat_variant_index(variants: &[RepeatVariantDef], state: &mut u32) -> usize {
+    if variants.len() == 1 {
+        return 0;
+    }
+    let total = variants.iter().map(|variant| variant.weight).sum::<f32>();
+    let mut choice = procedural_random(state) * total;
+    for (index, variant) in variants.iter().enumerate() {
+        if choice < variant.weight {
+            return index;
+        }
+        choice -= variant.weight;
+    }
+    variants.len() - 1
+}
+
+fn vary_numeric_error(vary: &RepeatVaryDef, line: usize) -> GraphParseError {
+    GraphParseError {
+        line,
+        message: format!(
+            "<Vary property=\"{}\"> requires numeric values.",
+            vary.property
+        ),
+    }
+}
+
+fn apply_repeat_vary_property(
+    nodes: &mut Vec<SceneNode>,
+    property: &str,
+    value: &str,
+) -> Result<(), GraphParseError> {
+    let mut json = serde_json::to_value(&*nodes).map_err(|error| GraphParseError {
+        line: 0,
+        message: format!("Could not serialize Repeat variant: {error}"),
+    })?;
+    let mut matches = 0;
+    apply_repeat_vary_json(&mut json, property, value, &mut matches);
+    if matches == 0 {
+        return Err(GraphParseError {
+            line: 0,
+            message: format!("<Vary property=\"{property}\"> matched no variant attributes."),
+        });
+    }
+    *nodes = serde_json::from_value(json).map_err(|error| GraphParseError {
+        line: 0,
+        message: format!("Could not resolve Repeat variation: {error}"),
+    })?;
+    Ok(())
+}
+
+fn apply_repeat_vary_json(
+    value: &mut serde_json::Value,
+    property: &str,
+    replacement: &str,
+    matches: &mut usize,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                apply_repeat_vary_json(value, property, replacement, matches);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (name, value) in values.iter_mut() {
+                let is_color_alias =
+                    property == "color" && matches!(name.as_str(), "color" | "fill");
+                if (name == property || is_color_alias) && value.is_string() {
+                    *value = serde_json::Value::String(replacement.to_string());
+                    *matches += 1;
+                } else {
+                    apply_repeat_vary_json(value, property, replacement, matches);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_literal_float_array(
+    block: &str,
+    name: &str,
+    expected_len: usize,
+    line: usize,
+) -> Result<Option<Vec<f32>>, GraphParseError> {
+    let Some(raw) = attr_value(block, name) else {
+        return Ok(None);
+    };
+    let body = strip_wrappers(&raw)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let values = split_scene_top_level_csv(body)
+        .into_iter()
+        .map(|value| {
+            value.trim().parse::<f32>().map_err(|_| GraphParseError {
+                line,
+                message: format!("{name} requires literal numeric values; got '{value}'."),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != expected_len {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "{name} requires {expected_len} numeric values; got {}.",
+                values.len()
+            ),
+        });
+    }
+    Ok(Some(values))
+}
+
+fn parse_literal_string_array(
+    block: &str,
+    name: &str,
+    line: usize,
+) -> Result<Option<Vec<String>>, GraphParseError> {
+    let Some(raw) = attr_value(block, name) else {
+        return Ok(None);
+    };
+    let body = strip_wrappers(&raw);
+    let body = body.trim().trim_start_matches('[').trim_end_matches(']');
+    let values = split_scene_top_level_csv(body)
+        .into_iter()
+        .map(|value| strip_wrappers(&value).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(GraphParseError {
+            line,
+            message: format!("{name} requires at least one literal value."),
+        });
+    }
+    Ok(Some(values))
 }
 
 fn parse_mask_node(

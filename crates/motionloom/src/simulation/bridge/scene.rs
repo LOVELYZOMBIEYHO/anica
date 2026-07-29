@@ -3,7 +3,7 @@
 // crates/motionloom/src/simulation/bridge/scene.rs
 
 use crate::dsl::GraphScript;
-use crate::scene::model::{CircleNode, DefsNode, GroupNode, SceneNode};
+use crate::scene::model::{CircleNode, DefsNode, GroupNode, PuppetNode, SceneNode};
 use crate::simulation::clock::SimulationClock;
 use crate::simulation::error::SimulationError;
 use crate::simulation::model::{
@@ -200,6 +200,23 @@ fn apply_curve_bindings(
 ) -> Result<(), SimulationError> {
     for node in nodes.iter_mut() {
         match node {
+            SceneNode::Puppet(puppet) => {
+                let Some(id) = puppet.id.as_deref() else {
+                    continue;
+                };
+                if !puppet.solver.eq_ignore_ascii_case("chain") {
+                    continue;
+                }
+                let Some(binding) = bindings.iter().find_map(|binding| match binding {
+                    SimulationBindingNode::SpringChain(binding) if binding.target == id => {
+                        Some(binding)
+                    }
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                apply_puppet_chain_binding(puppet, binding, clock);
+            }
             SceneNode::Polyline(curve) => {
                 let Some(id) = curve.id.as_deref() else {
                     continue;
@@ -277,6 +294,141 @@ fn apply_curve_bindings(
     }
     append_particles(nodes, clock);
     Ok(())
+}
+
+/// Resolves a SpringChain directly into chain PuppetPin targets.
+///
+/// The controller remains the authored goal while the intermediate pins use a
+/// deterministic Verlet solve, so random-access frame rendering stays stable.
+fn apply_puppet_chain_binding(
+    puppet: &mut PuppetNode,
+    binding: &crate::simulation::model::SpringChainNode,
+    clock: SimulationClock,
+) {
+    let ordered_indices = ordered_puppet_pin_indices(puppet);
+    if ordered_indices.len() < 2 {
+        return;
+    }
+    let source = ordered_indices
+        .iter()
+        .filter_map(|index| puppet.children.get(*index))
+        .filter_map(|node| match node {
+            SceneNode::Pin(pin) => Some([
+                pin.x
+                    .as_deref()
+                    .map(|value| sample_numeric(value, clock))
+                    .unwrap_or(0.0),
+                pin.y
+                    .as_deref()
+                    .map(|value| sample_numeric(value, clock))
+                    .unwrap_or(0.0),
+            ]),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if source.len() != ordered_indices.len() {
+        return;
+    }
+
+    let control_index = *ordered_indices.last().unwrap_or(&ordered_indices[0]);
+    let control = match puppet.children.get(control_index) {
+        Some(SceneNode::Pin(pin)) => pin.clone(),
+        _ => return,
+    };
+    let source_tip = *source.last().unwrap_or(&[0.0, 0.0]);
+    let mut state = crate::simulation::bodies::dynamic_curve::build_dynamic_curve(&source, "start");
+    let drag = sample_numeric(&puppet.drag, clock).clamp(0.0, 1.0);
+    let overlap = sample_numeric(&puppet.overlap, clock).clamp(0.0, 0.95);
+    let stiffness =
+        (binding.stiffness * sample_numeric(&puppet.stiffness, clock)).clamp(0.001, 1.0);
+    let damping =
+        ((binding.damping + sample_numeric(&puppet.damping, clock)) * 0.5).clamp(0.0, 0.999);
+    let dt = clock.fixed_dt();
+    for frame in 0..=clock.frame {
+        let frame_clock = SimulationClock {
+            fps: clock.fps,
+            frame,
+            duration_seconds: clock.duration_seconds,
+        };
+        let desired = [
+            control
+                .target_x
+                .as_deref()
+                .map(|value| sample_numeric(value, frame_clock))
+                .unwrap_or(source_tip[0]),
+            control
+                .target_y
+                .as_deref()
+                .map(|value| sample_numeric(value, frame_clock))
+                .unwrap_or(source_tip[1]),
+        ];
+        if let Some(tip) = state.particles.last_mut() {
+            let response = ((1.0 - overlap) * (0.35 + drag * 0.65)).clamp(0.02, 1.0);
+            tip.previous = tip.position;
+            tip.position[0] += (desired[0] - tip.position[0]) * response;
+            tip.position[1] += (desired[1] - tip.position[1]) * response;
+        }
+        crate::simulation::solvers::verlet::step(
+            &mut state,
+            |_| binding.gravity,
+            dt,
+            damping,
+            stiffness,
+            &[],
+            0.0,
+        );
+    }
+
+    for (chain_index, child_index) in ordered_indices.into_iter().enumerate() {
+        let Some(SceneNode::Pin(pin)) = puppet.children.get_mut(child_index) else {
+            continue;
+        };
+        let position = state.particles[chain_index].position;
+        pin.target_x = Some(format!("{:.4}", position[0]));
+        pin.target_y = Some(format!("{:.4}", position[1]));
+    }
+}
+
+fn ordered_puppet_pin_indices(puppet: &PuppetNode) -> Vec<usize> {
+    let pins = puppet
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| match node {
+            SceneNode::Pin(pin) => Some((index, pin)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some((root_index, root)) = pins.iter().find(|(_, pin)| {
+        pin.role
+            .as_deref()
+            .is_some_and(|role| matches!(role.to_ascii_lowercase().as_str(), "anchor" | "root"))
+            || pin.parent.is_none()
+    }) else {
+        return Vec::new();
+    };
+    let Some(mut current_id) = root.id.clone() else {
+        return Vec::new();
+    };
+    let mut ordered = vec![*root_index];
+    while let Some((index, pin)) = pins
+        .iter()
+        .find(|(_, pin)| pin.parent.as_deref() == Some(current_id.as_str()))
+    {
+        let Some(id) = pin.id.clone() else {
+            break;
+        };
+        if ordered.contains(index) {
+            return Vec::new();
+        }
+        ordered.push(*index);
+        current_id = id;
+    }
+    if ordered.len() == pins.len() {
+        ordered
+    } else {
+        Vec::new()
+    }
 }
 
 fn cache_clock(

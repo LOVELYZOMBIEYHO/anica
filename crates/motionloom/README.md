@@ -153,7 +153,9 @@ for Scene Camera and Layer3D labels, groups, property types, and animatability.
 | Compact numeric animation | `curve("time:value:ease, ...")` | Use for hand-authored numeric properties. |
 | UI/time keyframes | `<AnimationTarget>` + `<Key>` | Direct graph children targeting a node id and property. |
 | Editable path shape keys | `AnimationTarget property="d"` | Use path-string keys; do not use `curve(...)` for `Path.d`. |
-| Puppet deformation | `<PuppetWarp>` + `<PuppetPin>` | Target-based editor syntax; `<Puppet>` + `<Pin>` remains supported. |
+| Puppet deformation | `<PuppetWarp>` + `<PuppetPin>` | Target one Group, or opt into the current Layer with `target="@layer" capture="before"`. |
+| Exact limb boundary | `<LimbEnvelope>` | Closed Path-like area for `solver="bones"`; replaces scalar Limb Width topology. |
+| Role-specific limb areas | Three `<LimbRegion role="anchor|joint|control">` nodes | Draw shoulder/upper limb, bend seam, and lower limb/hand separately; each closed path receives an explicit rigid/blended bone binding. |
 | Manual topology | `<MeshTopology>` + `<Vertex>` + `<Triangle>` | Optional expert path when auto mesh is not enough. |
 | Character rigs | `<Skeleton>`, `<Action>`, `<Character>`, `<Part>`, `<ApplyAction>` | Bone-attached scene artwork. |
 | IK controls | `<IK root mid end ...>` or `<IK chain="..." ...>` | Two-bone and CCD-chain solvers. |
@@ -161,6 +163,22 @@ for Scene Camera and Layer3D labels, groups, property types, and animatability.
 | 2.5D scene cards | `<Layer3D>` | Flat card/panel depth and tilt, not true 3D mesh rendering. |
 | Moving masks | `<Mask follow="node:id">` | Follow/reveal style masks. |
 | Procedural face outline | `<FaceJaw>` | Parameterized jaw/face curve generation. |
+| Reusable scene systems | `<Component>`, `<Param>`, `<Derived>`, `<Slot>` | Typed inputs, calculated bindings, and replaceable child content. |
+| Deterministic variation | `<Repeat>`, `<Variants>`, `<Vary>` | Weighted artwork choice and seeded property variation. |
+| Automatic composition | `<Layout>` | Row, column, and grid placement with padding, alignment, justification, and spans. |
+
+### Component, Repeat Variation, and Layout
+
+Advanced authoring abstractions lower to ordinary scene nodes during parsing,
+so they share the existing CPU and WebGPU render paths. Components support
+`number`, `color`, `text`, `path`, `boolean`, and `enum` parameters, ordered
+`Derived` expressions, and named `Slot`/`Fill` content. Repeat supports seeded
+weighted `Variants` and `Vary` values or ranges. Layout supports row, column,
+and grid modes with explicit size, padding, independent gaps, alignment,
+justification, and `layoutSpan`.
+
+See `LLM_AUTHORING.md` and core scene examples `cs-000051` through `cs-000053`
+for complete syntax and validation rules.
 
 ### AnimationTarget
 
@@ -209,7 +227,110 @@ Use `MeshTopology` only for advanced cases that need explicit vertices,
 triangles, edges, or regions. Pins can attach to topology vertices with
 `vertex="vertex_id"`.
 
-For DSL-first editor workflows, place `PuppetWarp` beside the target Group and
+For a precise arm or leg, place one closed `LimbEnvelope` inside a bone warp.
+It is non-rendering: MotionLoom triangulates the path into a local bone mesh,
+retains transparent source pixels when `alphaClip="true"`, and preserves all
+artwork outside the envelope. `handFrom` names the wrist/ankle pin where the
+rigid end region begins. With `target="@layer"`, omitted `capture` defaults to
+`before`.
+
+```xml
+<PuppetWarp id="right_arm_rig" target="@layer"
+            solver="bones" preserveOutside="true">
+  <LimbEnvelope id="right_arm_area"
+                d="M 300 140 L 480 130 L 500 180 L 390 220 L 285 190 Z"
+                alphaClip="true" handFrom="wrist" />
+  <PuppetPin id="shoulder" role="anchor"
+             x="304" y="163" fixed="true" />
+  <PuppetPin id="elbow" role="joint" x="392" y="190" />
+  <PuppetPin id="wrist" role="control"
+             x="476" y="157" targetX="420" targetY="76" />
+</PuppetWarp>
+```
+
+For easier authoring and more deliberate joint seams, replace the single
+envelope with three closed local regions. The regions may overlap slightly:
+`anchor` follows the upper bone, `joint` blends both bones, and `control`
+follows the forearm/lower bone. Existing `LimbEnvelope` scripts remain valid.
+
+```xml
+<PuppetWarp id="right_arm_rig" target="@layer"
+            solver="bones" preserveOutside="true">
+  <LimbRegion id="shoulder_upper" role="anchor"
+              d="M 300 140 L 392 150 L 402 202 L 285 190 Z" />
+  <LimbRegion id="elbow_blend" role="joint"
+              d="M 375 158 L 420 154 L 430 208 L 386 218 Z" />
+  <LimbRegion id="forearm_hand" role="control"
+              d="M 405 148 L 500 130 L 512 180 L 418 210 Z" />
+  <PuppetPin id="shoulder" role="anchor"
+             x="304" y="163" fixed="true" />
+  <PuppetPin id="elbow" role="joint" x="402" y="185" />
+  <PuppetPin id="wrist" role="control"
+             x="476" y="157" targetX="420" targetY="76" />
+</PuppetWarp>
+```
+
+Puppet Warp has two target modes:
+
+- `target="GROUP_ID"` is the original isolated-part mode. It resolves one
+  semantic Group and preserves the existing Group workflow.
+- `target="@layer" capture="before"` is universal mode. The Puppet must be a
+  direct child of a Layer. It captures every earlier visual sibling exactly
+  once; later siblings remain undeformed overlays.
+
+Use universal mode when imported artwork has no useful semantic Group ids:
+
+```xml
+<Layer id="character_layer">
+  <Group id="imported_character">
+    <!-- Complete imported artwork. -->
+  </Group>
+
+  <PuppetWarp id="layer_warp"
+              target="@layer" capture="before"
+              mesh="alpha" solver="arap"
+              width="1200" height="900" density="16x16">
+    <PuppetPin id="shoulder" x="220" y="300"
+               targetX="220" targetY="300" fixed="true" />
+    <PuppetPin id="hand" x="455" y="455"
+               targetX="390" targetY="270" radius="160" />
+  </PuppetWarp>
+
+  <!-- This overlay is after the capture boundary, so it does not deform. -->
+  <Text value="DRAG THE HAND" x="900" y="820" />
+</Layer>
+```
+
+`capture="before"` is the only valid capture policy for `@layer`; omitting the
+attribute selects that policy automatically. This keeps source order
+deterministic and prevents the original artwork from being drawn a second
+time. Unknown `@...` selectors are rejected instead of silently falling back.
+
+For an After Effects-style surface workflow, first lower the visible alpha
+silhouette into an explicit `MeshTopology`, then add any number of ordinary
+position or bend pins. These pins are deliberately not semantic joints:
+
+```xml
+<PuppetWarp id="surface_warp" target="@layer" capture="before"
+            mesh="alpha" solver="arap" width="1200" height="900">
+  <MeshTopology id="surface_alpha_mesh">
+    <!-- Vertices and triangles generated from the visible alpha silhouette. -->
+  </MeshTopology>
+  <PuppetPin id="hold_pin" role="position"
+             x="220" y="300" targetX="220" targetY="300" />
+  <PuppetPin id="bend_pin" role="bend"
+             x="360" y="400" targetX="360" targetY="400"
+             rotation={curve("0:0, 1:28:ease_in_out, 2:0:ease_in_out")}
+             scale="1" />
+</PuppetWarp>
+```
+
+`role="position"` moves or holds a local area. `role="bend"` additionally
+rotates and scales the influenced vertices around its source point. Both roles
+may be repeated without limit. The `anchor/joint/control` role requirement only
+applies to `solver="bones"` limb IK.
+
+For isolated-part workflows, place `PuppetWarp` beside the target Group and
 bind pins to semantic descendant ids. Moving a pin writes `targetX/targetY`;
 the target artwork remains the single source of geometry:
 
@@ -228,6 +349,88 @@ the target artwork remains the single source of geometry:
 `PuppetWarp`/`PuppetPin` are aliases over the native Puppet renderer. A bound
 pin uses its target node's local Scene anchor as the rest position. Free pins
 can continue to use explicit `x/y`.
+
+For arms and legs, soft radial deformation can stretch or curve the artwork.
+Use the opt-in bone solver with exactly one anchor, joint, and control:
+
+```xml
+<PuppetWarp id="arm_warp" target="character"
+            solver="bones" bend="auto" stretch="0"
+            jointSoftness="32" preserveVolume="true"
+            preserveOutside="true" width="1200" height="900">
+  <MeshTopology id="arm_mesh">
+    <Vertex id="shoulder_v" x="220" y="300" bone="upper" />
+    <Vertex id="elbow_v" x="320" y="410" bone="joint" />
+    <Vertex id="wrist_v" x="455" y="455" bone="forearm" />
+    <!-- Add enough vertices and triangles to enclose the complete limb. -->
+  </MeshTopology>
+  <PuppetPin id="shoulder" role="anchor" vertex="shoulder_v"
+             x="220" y="300" fixed="true" />
+  <PuppetPin id="elbow" role="joint" vertex="elbow_v"
+             x="320" y="410" />
+  <PuppetPin id="wrist" role="control" vertex="wrist_v"
+             x="455" y="455" targetX="390" targetY="270" />
+</PuppetWarp>
+```
+
+`stretch="0"` clamps unreachable controls to the authored chain length.
+`bend="auto"` keeps the source elbow side. Explicit vertex
+`bone="upper|forearm|hand|joint"` assignments keep each region rigid;
+`bone="fixed"` keeps a seam vertex in its bind pose, and unassigned vertices
+use distance-based weights. `jointSoftness` controls blended vertices around
+the bend. For hard bends, duplicate the shoulder or joint seam and connect the
+copies with triangles. A seam vertex may set `sampleX` and `sampleY` to sample
+material from a safe interior skin or clothing point while its `x/y` still
+defines the deforming mesh position. This provides material-sampled joint skin
+completion without hard-coding a fill colour.
+
+`preserveOutside="true"` keeps source pixels outside the local topology and
+clears the old limb before drawing its posed triangles, which is useful when
+`target` is a complete imported character. It cannot reconstruct artwork that
+was never present behind an occluding limb; author a backfill layer when the
+pose reveals a large previously hidden torso region.
+
+For a serial tail, hair lock, rope, or tentacle, use the separate chain solver.
+It does not replace either ordinary surface pins or three-point limb IK:
+
+```xml
+<PuppetWarp id="tail_rig" target="tail_art" solver="chain"
+            preserveLength="true" stretch="0"
+            stiffness="0.72" damping="0.84" drag="0.18" overlap="0.12">
+  <MeshTopology id="tail_mesh">
+    <!-- Triangles enclosing the tail artwork. -->
+  </MeshTopology>
+  <PuppetPin id="tail_root" role="anchor"
+             x="150" y="180" targetX="150" targetY="180" fixed="true" />
+  <PuppetPin id="tail_1" role="chain" parent="tail_root"
+             x="220" y="170" targetX="220" targetY="170" />
+  <PuppetPin id="tail_2" role="chain" parent="tail_1"
+             x="285" y="145" targetX="285" targetY="145" />
+  <PuppetPin id="tail_tip" role="control" parent="tail_2"
+             x="345" y="110" targetX="365" targetY="82" />
+</PuppetWarp>
+<SpringChain target="tail_rig" segments="3" pin="start"
+             stiffness="0.72" damping="0.84" gravity={[0,18]} />
+```
+
+Every chain pin needs an explicit id. Each pin after the root names exactly one
+`parent`, producing one non-branching root-to-tip chain. The root must use
+`fixed="true"`. `preserveLength` and `stretch` control geometric length;
+`stiffness`, `damping`, `drag`, and `overlap` control follow-through. The same
+evaluated chain targets feed both CPU and WebGPU renderers.
+
+The three Puppet modes are intentionally stable:
+
+- `solver="soft"`: unlimited free Position and Bend pins on a surface.
+- `solver="bones"`: one Anchor, Joint, and Control for Two-Bone IK.
+- `solver="chain"`: parent-linked multi-segment FK-style posing with optional
+  `SpringChain` follow-through.
+
+Existing Puppet Warp scripts remain soft-deformation rigs because the default
+solver is `soft`. Bone Puppet is therefore an opt-in, non-breaking migration.
+Universal Layer Puppet is also opt-in; Group targets are not rewritten. See
+core examples `cs-000054` and `cs-000055`, plus showcases `s-000058` and
+`s-000063`.
 
 ### Character Sources
 

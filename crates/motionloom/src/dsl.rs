@@ -18,14 +18,16 @@ pub use crate::scene::dsl::{
     SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode,
 };
 use crate::scene::dsl::{
-    BrushParseContext, parse_action_block, parse_apply_action_node, parse_background_node,
-    parse_camera_block, parse_camera_node, parse_character_block, parse_circle_node,
-    parse_defs_block, parse_face_jaw_node, parse_group_block, parse_image_node, parse_line_node,
-    parse_mask_any, parse_mesh_topology_block, parse_model_profile_block, parse_part_block,
-    parse_path_node, parse_pin_node, parse_pixel_grid_block, parse_polyline_node,
-    parse_precompose_block, parse_puppet_block, parse_rect_node, parse_repeat_block,
-    parse_scene_root_block, parse_shadow_node, parse_skeleton_block, parse_svg_node,
-    parse_text_node, validate_scene_camera_structure, validate_scene_model_profile_refs,
+    BrushParseContext, lower_parametric_component_uses, parse_action_block,
+    parse_apply_action_node, parse_background_node, parse_camera_block, parse_camera_node,
+    parse_character_block, parse_circle_node, parse_defs_block, parse_face_jaw_node,
+    parse_group_block, parse_image_node, parse_layout_block, parse_line_node, parse_mask_any,
+    parse_mesh_topology_block, parse_model_profile_block, parse_part_block, parse_path_node,
+    parse_pin_node, parse_pixel_grid_block, parse_polyline_node, parse_precompose_block,
+    parse_puppet_block, parse_rect_node, parse_repeat_block, parse_scene_root_block,
+    parse_shadow_node, parse_skeleton_block, parse_svg_node, parse_text_node,
+    resolve_lowered_puppet_targets, validate_scene_camera_structure,
+    validate_scene_model_profile_refs,
 };
 use crate::scene::model::{SceneNode, SceneRootNode};
 pub use crate::scene::text::TextNode;
@@ -713,6 +715,13 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
             continue;
         }
 
+        if starts_open_tag(line, "Layout") {
+            let (layout, end_ix) = parse_layout_block(&lines, i, &brush_ctx)?;
+            scene_nodes.push(SceneNode::Group(layout));
+            i = end_ix + 1;
+            continue;
+        }
+
         if starts_open_tag(line, "Puppet") || starts_open_tag(line, "PuppetWarp") {
             let (puppet, end_ix) = parse_puppet_block(&lines, i, &brush_ctx)?;
             scene_nodes.push(SceneNode::Puppet(puppet));
@@ -743,7 +752,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
 
         if starts_open_tag(line, "Repeat") {
             let (repeat, end_ix) = parse_repeat_block(&lines, i, &brush_ctx)?;
-            scene_nodes.push(SceneNode::Repeat(repeat));
+            scene_nodes.push(repeat);
             i = end_ix + 1;
             continue;
         }
@@ -842,6 +851,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         line: graph_start_ix + 1,
         message: "Missing <Present from=\"...\" /> node.".to_string(),
     })?;
+
+    lower_parametric_component_uses(&mut scene_nodes, &mut scenes)?;
+    resolve_lowered_puppet_targets(&mut scene_nodes, &mut scenes)?;
 
     validate_graph(
         fps,
@@ -3265,6 +3277,661 @@ Font note: this is not a structured XML comment.
     }
 
     #[test]
+    fn graph_parser_lowers_parametric_component_use() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="parametric_component_scene">
+    <Defs>
+      <Component id="dot">
+        <Param name="radius" type="number" default="4" />
+        <Param name="paint" type="color" default="#ff0000" />
+        <Circle x="0" y="0" radius={param("radius")} color={param("paint")} />
+      </Component>
+    </Defs>
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Use id="large_dot" ref="dot" x="20" y="24"
+                 params={{ radius: "9", paint: "#00ff00" }} />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="parametric_component_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Defs(defs) = &graph.scenes[0].children[0] else {
+            panic!("expected defs");
+        };
+        assert_eq!(defs.components[0].params.len(), 2);
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[1] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        let SceneNode::Group(instance) = &layer.children[0] else {
+            panic!("parameterized Use should lower to Group");
+        };
+        assert_eq!(instance.id.as_deref(), Some("large_dot"));
+        assert_eq!(instance.x, "20");
+        let SceneNode::Circle(circle) = &instance.children[0] else {
+            panic!("expected substituted Circle");
+        };
+        assert_eq!(circle.radius, "9");
+        assert_eq!(circle.color, "#00ff00");
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_binds_target_for_lowered_puppet_component() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="puppet_component_scene">
+    <Defs>
+      <Component id="puppet_preset">
+        <Param name="targetId" type="text" />
+        <PuppetWarp target={param("targetId")} width="64" height="64">
+          <PuppetPin id="control" x="32" y="32" targetX="36" targetY="28" />
+        </PuppetWarp>
+      </Component>
+    </Defs>
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Group id="arm_art">
+              <Rect x="20" y="20" width="24" height="12" color="#ffffff" />
+            </Group>
+            <Use id="arm_puppet" ref="puppet_preset"
+                 params={{ targetId: "arm_art" }} />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="puppet_component_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[1] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        assert_eq!(layer.children.len(), 1);
+        let SceneNode::Puppet(puppet) = &layer.children[0] else {
+            panic!("identity Puppet Component should lower directly to Puppet");
+        };
+        assert_eq!(puppet.id.as_deref(), Some("arm_puppet"));
+        assert_eq!(puppet.target.as_deref(), Some("arm_art"));
+        assert!(matches!(
+            puppet.children.first(),
+            Some(SceneNode::Group(group)) if group.id.as_deref() == Some("arm_art")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_captures_preceding_layer_nodes_for_universal_puppet()
+    -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="universal_puppet_scene">
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer id="art_layer">
+            <Rect id="body" x="8" y="8" width="48" height="48" color="#ffffff" />
+            <PuppetWarp id="layer_puppet" target="@layer" capture="before"
+                        mesh="alpha" width="64" height="64">
+              <PuppetPin id="control" x="32" y="32" targetX="36" targetY="28" />
+            </PuppetWarp>
+            <Text id="overlay" x="32" y="60" value="UI" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="universal_puppet_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        assert_eq!(layer.children.len(), 2);
+        let SceneNode::Puppet(puppet) = &layer.children[0] else {
+            panic!("captured artwork should lower to one Puppet surface");
+        };
+        assert_eq!(puppet.target.as_deref(), Some("@layer"));
+        assert_eq!(puppet.capture.as_deref(), Some("before"));
+        assert!(matches!(
+            puppet.children.first(),
+            Some(SceneNode::Rect(rect)) if rect.id.as_deref() == Some("body")
+        ));
+        assert!(matches!(
+            layer.children.get(1),
+            Some(SceneNode::Text(text)) if text.id.as_deref() == Some("overlay")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_composes_multiple_universal_puppets_in_source_order()
+    -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="multi_limb_scene">
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer id="art_layer">
+            <Rect id="body" x="8" y="8" width="48" height="48" color="#ffffff" />
+            <PuppetWarp id="left_arm" target="@layer" capture="before"
+                        mesh="alpha" width="64" height="64">
+              <PuppetPin id="left_control" x="20" y="32" targetX="18" targetY="26" />
+            </PuppetWarp>
+            <PuppetWarp id="right_arm" target="@layer" capture="before"
+                        mesh="alpha" width="64" height="64">
+              <PuppetPin id="right_control" x="44" y="32" targetX="46" targetY="26" />
+            </PuppetWarp>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="multi_limb_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+
+        // Each later universal warp captures the previously lowered surface.
+        assert_eq!(layer.children.len(), 1);
+        let SceneNode::Puppet(right_arm) = &layer.children[0] else {
+            panic!("expected the last universal warp at the layer root");
+        };
+        assert_eq!(right_arm.id.as_deref(), Some("right_arm"));
+        let Some(SceneNode::Puppet(left_arm)) = right_arm.children.first() else {
+            panic!("expected the earlier universal warp inside the later warp");
+        };
+        assert_eq!(left_arm.id.as_deref(), Some("left_arm"));
+        assert!(matches!(
+            left_arm.children.first(),
+            Some(SceneNode::Rect(rect)) if rect.id.as_deref() == Some("body")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_defaults_universal_puppet_capture_to_before() {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="invalid_universal_puppet">
+    <Timeline>
+      <Track space="screen">
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="8" y="8" width="48" height="48" color="#ffffff" />
+            <PuppetWarp target="@layer">
+              <PuppetPin x="32" y="32" targetX="36" targetY="28" />
+            </PuppetWarp>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="invalid_universal_puppet" />
+</Graph>
+"##;
+        parse_graph_script(script).expect("target=@layer should default capture to before");
+    }
+
+    #[test]
+    fn graph_parser_rejects_invalid_universal_puppet_capture() {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="invalid_universal_puppet">
+    <Timeline>
+      <Track space="screen">
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="8" y="8" width="48" height="48" color="#ffffff" />
+            <PuppetWarp target="@layer" capture="after">
+              <PuppetPin x="32" y="32" targetX="36" targetY="28" />
+            </PuppetWarp>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="invalid_universal_puppet" />
+</Graph>
+"##;
+        let error =
+            parse_graph_script(script).expect_err("explicit capture modes other than before fail");
+        assert!(
+            error
+                .message
+                .contains("target=\"@layer\" requires capture=\"before\"")
+        );
+    }
+
+    #[test]
+    fn graph_parser_keeps_group_target_mode_unchanged() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="group_puppet_scene">
+    <Timeline>
+      <Track space="screen">
+        <Sequence duration="1s">
+          <Layer>
+            <Group id="hair">
+              <Rect x="8" y="8" width="48" height="24" color="#ffffff" />
+            </Group>
+            <PuppetWarp id="hair_puppet" target="hair" width="64" height="64">
+              <PuppetPin x="32" y="16" targetX="36" targetY="12" />
+            </PuppetWarp>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="group_puppet_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        assert_eq!(layer.children.len(), 1);
+        let SceneNode::Puppet(puppet) = &layer.children[0] else {
+            panic!("Group target should retain its existing lowering");
+        };
+        assert_eq!(puppet.target.as_deref(), Some("hair"));
+        assert_eq!(puppet.capture, None);
+        assert!(matches!(
+            puppet.children.first(),
+            Some(SceneNode::Group(group)) if group.id.as_deref() == Some("hair")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_lowers_seeded_scatter_repeat_deterministically() -> Result<(), GraphParseError>
+    {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[128,128]}>
+  <Scene id="scatter_scene">
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Repeat id="stars" count="6" distribution="scatter"
+                    bounds={[10,20,80,60]} seed="42"
+                    scaleRange={[0.5,1.5]} rotationRange={[-10,10]}
+                    opacityRange={[0.3,1]}>
+              <Circle x="0" y="0" radius="3" color="#ffffff" />
+            </Repeat>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scatter_scene" />
+</Graph>
+"##;
+        let first = parse_graph_script(script)?;
+        let second = parse_graph_script(script)?;
+        assert_eq!(first.scenes, second.scenes);
+        let SceneNode::Timeline(timeline) = &first.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        let SceneNode::Group(scatter) = &layer.children[0] else {
+            panic!("scatter Repeat should lower to Group");
+        };
+        assert_eq!(scatter.children.len(), 6);
+        let SceneNode::Group(first_item) = &scatter.children[0] else {
+            panic!("expected generated scatter item");
+        };
+        let SceneNode::Group(second_item) = &scatter.children[1] else {
+            panic!("expected generated scatter item");
+        };
+        assert_ne!(first_item.x, second_item.x);
+        assert_ne!(first_item.scale, second_item.scale);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_lowers_declarative_grid_layout() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[320,240]}>
+  <Scene id="layout_scene">
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Layout id="cards" mode="grid" x="20" y="30"
+                    columns="2" itemWidth="80" itemHeight="50" gap="10">
+              <Rect x="0" y="0" width="80" height="50" color="#ff0000" />
+              <Rect x="0" y="0" width="80" height="50" color="#00ff00" />
+              <Rect x="0" y="0" width="80" height="50" color="#0000ff" />
+            </Layout>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="layout_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        let SceneNode::Group(layout) = &layer.children[0] else {
+            panic!("Layout should lower to Group");
+        };
+        assert_eq!(layout.x, "20");
+        assert_eq!(layout.y, "30");
+        assert_eq!(layout.children.len(), 3);
+        let positions = layout
+            .children
+            .iter()
+            .map(|node| match node {
+                SceneNode::Group(item) => (item.x.as_str(), item.y.as_str()),
+                _ => panic!("expected layout item Group"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions, vec![("0", "0"), ("90", "0"), ("0", "60")]);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_lowers_advanced_component_bindings_and_slots() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[240,160]}>
+  <Scene id="advanced_component_scene">
+    <Defs>
+      <Component id="card">
+        <Param name="width" type="number" default="100" />
+        <Param name="visible" type="boolean" default="true" />
+        <Param name="tone" type="enum" values={["#22d3ee","#a3e635"]} default="#22d3ee" />
+        <Derived name="halfWidth" value={param("width") * 0.5} />
+        <Rect x={derived("halfWidth")} y="0" width={param("width")} height="60"
+              color={param("tone")} opacity={param("visible")} />
+        <Slot name="label">
+          <Text x="8" y="32" value="DEFAULT" fontSize="14" color="#ffffff" />
+        </Slot>
+      </Component>
+    </Defs>
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Use id="custom_card" ref="card" x="20" y="40"
+                 params={{ width: "80", visible: "false", tone: "#a3e635" }}>
+              <Fill slot="label">
+                <Text x="8" y="32" value="CUSTOM" fontSize="14" color="#ffffff" />
+              </Fill>
+            </Use>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="advanced_component_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[1] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        let SceneNode::Group(instance) = &layer.children[0] else {
+            panic!("expected lowered component Group");
+        };
+        let SceneNode::Rect(rect) = &instance.children[0] else {
+            panic!("expected component Rect");
+        };
+        assert_eq!(rect.x, "80 * 0.5");
+        assert_eq!(rect.width, "80");
+        assert_eq!(rect.color, "#a3e635");
+        assert_eq!(rect.opacity, "0");
+        let SceneNode::Group(slot) = &instance.children[1] else {
+            panic!("expected lowered Slot Group");
+        };
+        let SceneNode::Text(label) = &slot.children[0] else {
+            panic!("expected custom slot Text");
+        };
+        assert_eq!(label.value, "CUSTOM");
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_lowers_weighted_variants_and_property_variation_deterministically()
+    -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[320,120]}>
+  <Scene id="repeat_variants_scene">
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Repeat id="marks" count="24" x="20" y="60" xStep="12" seed="77">
+              <Variants choose="weighted" seed="91">
+                <Circle x="0" y="0" radius="5" color="#ffffff" weight="3" />
+                <Rect x="-5" y="-5" width="10" height="10" color="#ffffff" weight="1" />
+              </Variants>
+              <Vary property="color" values={["#22d3ee","#a3e635","#f472b6"]} />
+              <Vary property="scale" range={[0.6,1.4]} />
+            </Repeat>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="repeat_variants_scene" />
+</Graph>
+"##;
+        let first = parse_graph_script(script)?;
+        let second = parse_graph_script(script)?;
+        assert_eq!(first.scenes, second.scenes);
+        let SceneNode::Timeline(timeline) = &first.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        let SceneNode::Group(repeat) = &layer.children[0] else {
+            panic!("expected lowered Repeat Group");
+        };
+        assert_eq!(repeat.children.len(), 24);
+        let changed_variant_seed =
+            parse_graph_script(&script.replace("seed=\"91\"", "seed=\"92\""))?;
+        let SceneNode::Timeline(changed_timeline) = &changed_variant_seed.scenes[0].children[0]
+        else {
+            panic!("expected changed timeline");
+        };
+        let SceneNode::Track(changed_track) = &changed_timeline.children[0] else {
+            panic!("expected changed track");
+        };
+        let SceneNode::Sequence(changed_sequence) = &changed_track.children[0] else {
+            panic!("expected changed sequence");
+        };
+        let SceneNode::Layer(changed_layer) = &changed_sequence.children[0] else {
+            panic!("expected changed layer");
+        };
+        let SceneNode::Group(changed_repeat) = &changed_layer.children[0] else {
+            panic!("expected changed Repeat Group");
+        };
+        for (original, changed) in repeat.children.iter().zip(&changed_repeat.children) {
+            let (SceneNode::Group(original), SceneNode::Group(changed)) = (original, changed)
+            else {
+                panic!("expected Repeat item Groups");
+            };
+            assert_eq!(
+                (original.x.as_str(), original.y.as_str()),
+                (changed.x.as_str(), changed.y.as_str())
+            );
+        }
+        let mut circles = 0;
+        let mut rects = 0;
+        for item in &repeat.children {
+            let SceneNode::Group(item) = item else {
+                panic!("expected Repeat item Group");
+            };
+            assert_ne!(item.scale, "1");
+            match &item.children[0] {
+                SceneNode::Circle(circle) => {
+                    circles += 1;
+                    assert_ne!(circle.color, "#ffffff");
+                }
+                SceneNode::Rect(rect) => {
+                    rects += 1;
+                    assert_ne!(rect.color, "#ffffff");
+                }
+                _ => panic!("expected weighted Circle or Rect"),
+            }
+        }
+        assert!(circles > 0 && rects > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_lowers_layout_padding_alignment_justify_and_span() -> Result<(), GraphParseError>
+    {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[360,220]}>
+  <Scene id="advanced_layout_scene">
+    <Timeline>
+      <Track id="main" space="screen" z="0">
+        <Sequence duration="1s">
+          <Layer>
+            <Layout id="cards" mode="grid" width="300" height="160" columns="3"
+                    itemWidth="40" itemHeight="30" padding={[10,20]}
+                    columnGap="10" rowGap="8" justify="spaceBetween" align="center">
+              <Group layoutSpan="2">
+                <Rect x="0" y="0" width="40" height="30" color="#22d3ee" />
+              </Group>
+              <Rect x="0" y="0" width="40" height="30" color="#a3e635" />
+              <Rect x="0" y="0" width="40" height="30" color="#f472b6" />
+            </Layout>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="advanced_layout_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected layer");
+        };
+        let SceneNode::Group(layout) = &layer.children[0] else {
+            panic!("expected lowered Layout Group");
+        };
+        let positions = layout
+            .children
+            .iter()
+            .map(|node| match node {
+                SceneNode::Group(item) => (item.x.as_str(), item.y.as_str()),
+                _ => panic!("expected Layout item Group"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions, vec![("20", "46"), ("240", "46"), ("20", "84")]);
+        Ok(())
+    }
+
+    #[test]
     fn graph_parser_rejects_removed_symbol_defs() {
         let script = r##"
 <Graph fps={30} duration="1s" size={[64,64]}>
@@ -4175,6 +4842,134 @@ Font note: this is not a structured XML comment.
             })
             .expect("bound pin");
         assert_eq!(pin.bind_to.as_deref(), Some("left_hand"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_accepts_bone_puppet_solver_and_pin_roles() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="2s" size={[640,360]}>
+  <Scene id="bone_puppet_scene">
+    <Timeline>
+      <Track>
+        <Sequence from="0s" duration="2s">
+          <Layer>
+            <Group id="arm">
+              <Path d="M 100 100 L 300 220" fill="none" stroke="#ffffff" strokeWidth="40" />
+            </Group>
+            <PuppetWarp id="arm_rig" target="arm" solver="bones"
+                        bend="auto" stretch="0" jointSoftness="24"
+                        preserveVolume="true" width="640" height="360">
+              <PuppetPin id="shoulder" role="anchor" x="100" y="100"
+                         targetX="100" targetY="100" fixed="true" />
+              <PuppetPin id="elbow" role="joint" x="200" y="160"
+                         targetX="200" targetY="160" />
+              <PuppetPin id="wrist" role="control" x="300" y="220"
+                         targetX="280" targetY="120" />
+            </PuppetWarp>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="bone_puppet_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected Timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected Track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected Sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected Layer");
+        };
+        let SceneNode::Puppet(puppet) = &layer.children[0] else {
+            panic!("expected targeted PuppetWarp");
+        };
+        assert_eq!(puppet.solver, "bones");
+        assert_eq!(puppet.bend, "auto");
+        assert_eq!(puppet.joint_softness, "24");
+        let roles = puppet
+            .children
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Pin(pin) => pin.role.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["anchor", "joint", "control"]);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_accepts_chain_puppet_controls() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="2s" size={[640,360]}>
+  <Scene id="chain_puppet_scene">
+    <Timeline>
+      <Track>
+        <Sequence from="0s" duration="2s">
+          <Layer>
+            <Group id="tail">
+              <Path d="M 100 100 C 180 120 240 160 300 220"
+                    fill="none" stroke="#ffffff" strokeWidth="40" />
+            </Group>
+            <PuppetWarp id="tail_rig" target="tail" solver="chain"
+                        preserveLength="true" stiffness="0.72" damping="0.84"
+                        drag="0.18" overlap="0.12" width="640" height="360">
+              <PuppetPin id="tail_root" role="anchor" x="100" y="100"
+                         targetX="100" targetY="100" fixed="true" />
+              <PuppetPin id="tail_mid" role="chain" parent="tail_root"
+                         x="200" y="150" targetX="200" targetY="150" />
+              <PuppetPin id="tail_tip" role="control" parent="tail_mid"
+                         x="300" y="220" targetX="280" targetY="120" />
+            </PuppetWarp>
+            <SpringChain target="tail_rig" segments="2" pin="both"
+                         stiffness="0.8" damping="0.2" gravity={[0,16]} />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="chain_puppet_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script)?;
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected Timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected Track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected Sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("expected Layer");
+        };
+        let SceneNode::Puppet(puppet) = &layer.children[0] else {
+            panic!("expected targeted PuppetWarp");
+        };
+        assert_eq!(puppet.solver, "chain");
+        assert_eq!(puppet.preserve_length, "true");
+        assert_eq!(puppet.stiffness, "0.72");
+        assert_eq!(puppet.damping, "0.84");
+        assert_eq!(puppet.drag, "0.18");
+        assert_eq!(puppet.overlap, "0.12");
+        let parents = puppet
+            .children
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Pin(pin) => Some(pin.parent.as_deref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parents, vec![None, Some("tail_root"), Some("tail_mid")]);
         Ok(())
     }
 

@@ -121,6 +121,8 @@ fn scene_node_is_rich(node: &SceneNode) -> bool {
         SceneNode::Part(part) => part.children.iter().any(scene_node_is_rich),
         SceneNode::Repeat(repeat) => repeat.children.iter().any(scene_node_is_rich),
         SceneNode::Pin(_)
+        | SceneNode::LimbEnvelope(_)
+        | SceneNode::LimbRegion(_)
         | SceneNode::MeshTopology(_)
         | SceneNode::Vertex(_)
         | SceneNode::Triangle(_)

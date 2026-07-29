@@ -2268,10 +2268,11 @@ impl WgpuBgraEffectContext {
         }))
         .map_err(|_| "No suitable WGPU adapter found".to_string())?;
 
+        let required_limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("anica-wgpu-bgra-effects-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits,
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))

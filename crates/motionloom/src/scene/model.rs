@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/scene/model.rs
+
 use serde::{Deserialize, Serialize};
 
 use crate::scene::dsl::{ImageNode, SvgNode};
@@ -99,6 +103,8 @@ pub enum SceneNode {
     Character(CharacterNode),
     Puppet(PuppetNode),
     Pin(PinNode),
+    LimbEnvelope(LimbEnvelopeNode),
+    LimbRegion(LimbRegionNode),
     MeshTopology(MeshTopologyNode),
     Vertex(VertexNode),
     Triangle(TriangleNode),
@@ -291,6 +297,49 @@ fn default_texture_relief() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct ComponentNode {
     pub id: String,
+    #[serde(default)]
+    pub params: Vec<ComponentParamDef>,
+    #[serde(default)]
+    pub derived: Vec<ComponentDerivedDef>,
+    #[serde(default)]
+    pub slots: Vec<ComponentSlotDef>,
+    pub children: Vec<SceneNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentParamDef {
+    pub name: String,
+    pub value_type: String,
+    pub default: String,
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentDerivedDef {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentSlotDef {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentParamValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentSlotValue {
+    pub name: String,
     pub children: Vec<SceneNode>,
 }
 
@@ -829,10 +878,34 @@ pub struct PuppetNode {
     pub id: Option<String>,
     #[serde(default)]
     pub target: Option<String>,
+    #[serde(default)]
+    pub capture: Option<String>,
+    #[serde(default = "default_scene_puppet_solver")]
+    pub solver: String,
     #[serde(default = "default_scene_puppet_mesh")]
     pub mesh: String,
     #[serde(default = "default_scene_puppet_density")]
     pub density: String,
+    #[serde(default = "default_scene_puppet_bend")]
+    pub bend: String,
+    #[serde(default = "default_scene_zero")]
+    pub stretch: String,
+    #[serde(default = "default_scene_puppet_joint_softness")]
+    pub joint_softness: String,
+    #[serde(default = "default_scene_true")]
+    pub preserve_volume: String,
+    #[serde(default = "default_scene_false")]
+    pub preserve_outside: String,
+    #[serde(default = "default_scene_true")]
+    pub preserve_length: String,
+    #[serde(default = "default_scene_chain_stiffness")]
+    pub stiffness: String,
+    #[serde(default = "default_scene_chain_damping")]
+    pub damping: String,
+    #[serde(default = "default_scene_chain_drag")]
+    pub drag: String,
+    #[serde(default = "default_scene_chain_overlap")]
+    pub overlap: String,
     pub x: String,
     pub y: String,
     pub rotation: String,
@@ -864,9 +937,14 @@ pub struct PuppetNode {
 pub struct PinNode {
     pub id: Option<String>,
     #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
     pub bind_to: Option<String>,
     #[serde(default)]
     pub vertex: Option<String>,
+    /// Explicit parent id keeps chain topology stable when pins are reordered.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub x: Option<String>,
     pub y: Option<String>,
     pub target_x: Option<String>,
@@ -875,10 +953,47 @@ pub struct PinNode {
     pub radius: String,
     #[serde(default = "default_scene_one")]
     pub strength: String,
+    /// Local clockwise rotation in degrees. This is primarily used by
+    /// role="bend" pins, but remains valid on any soft-solver pin.
+    #[serde(default = "default_scene_zero")]
+    pub rotation: String,
+    /// Local uniform scale around the pin source.
+    #[serde(default = "default_scene_one")]
+    pub scale: String,
     #[serde(default = "default_scene_pin_falloff")]
     pub falloff: String,
     #[serde(default = "default_scene_false")]
     pub fixed: String,
+}
+
+/// A closed, non-rendering path that limits a bone rig to an exact limb area.
+///
+/// The runtime triangulates this path when no explicit MeshTopology is present.
+/// `alpha_clip` keeps transparent source pixels transparent, while `hand_from`
+/// names the pin where the rigid end-effector region begins.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimbEnvelopeNode {
+    pub id: Option<String>,
+    pub d: String,
+    #[serde(default = "default_scene_true")]
+    pub alpha_clip: String,
+    #[serde(default)]
+    pub hand_from: Option<String>,
+}
+
+/// One exact influence area within a bone-rigged limb.
+///
+/// `role="anchor"` binds the area to the upper bone, `role="joint"` blends
+/// both bones at the bend, and `role="control"` binds it to the lower bone.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimbRegionNode {
+    pub id: Option<String>,
+    pub role: String,
+    pub d: String,
+    #[serde(default = "default_scene_true")]
+    pub alpha_clip: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -896,6 +1011,12 @@ pub struct VertexNode {
     pub id: String,
     pub x: String,
     pub y: String,
+    #[serde(default)]
+    pub sample_x: Option<String>,
+    #[serde(default)]
+    pub sample_y: Option<String>,
+    #[serde(default)]
+    pub bone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -933,8 +1054,36 @@ fn default_scene_puppet_mesh() -> String {
     "auto".to_string()
 }
 
+fn default_scene_puppet_solver() -> String {
+    "soft".to_string()
+}
+
 fn default_scene_puppet_density() -> String {
     "medium".to_string()
+}
+
+fn default_scene_puppet_bend() -> String {
+    "auto".to_string()
+}
+
+fn default_scene_puppet_joint_softness() -> String {
+    "32".to_string()
+}
+
+fn default_scene_chain_stiffness() -> String {
+    "0.72".to_string()
+}
+
+fn default_scene_chain_damping() -> String {
+    "0.84".to_string()
+}
+
+fn default_scene_chain_drag() -> String {
+    "0.18".to_string()
+}
+
+fn default_scene_chain_overlap() -> String {
+    "0.12".to_string()
 }
 
 fn default_scene_puppet_width() -> String {
@@ -951,6 +1100,10 @@ fn default_scene_pin_radius() -> String {
 
 fn default_scene_pin_falloff() -> String {
     "smooth".to_string()
+}
+
+fn default_scene_true() -> String {
+    "true".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1042,6 +1195,10 @@ pub struct UseNode {
     pub opacity: String,
     #[serde(default = "default_scene_blend")]
     pub blend: String,
+    #[serde(default)]
+    pub params: Vec<ComponentParamValue>,
+    #[serde(default)]
+    pub slots: Vec<ComponentSlotValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

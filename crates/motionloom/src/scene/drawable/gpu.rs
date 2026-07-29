@@ -222,6 +222,12 @@ fn describe_scene_node_for_gpu(node: &SceneNode) -> String {
         SceneNode::Group(group) => format!("Group{}", id_suffix(group.id.as_deref())),
         SceneNode::Puppet(puppet) => format!("Puppet{}", id_suffix(puppet.id.as_deref())),
         SceneNode::Pin(pin) => format!("Pin{}", id_suffix(pin.id.as_deref())),
+        SceneNode::LimbEnvelope(envelope) => {
+            format!("LimbEnvelope{}", id_suffix(envelope.id.as_deref()))
+        }
+        SceneNode::LimbRegion(region) => {
+            format!("LimbRegion{}", id_suffix(region.id.as_deref()))
+        }
         SceneNode::MeshTopology(topology) => {
             format!("MeshTopology{}", id_suffix(topology.id.as_deref()))
         }
