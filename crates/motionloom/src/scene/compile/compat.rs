@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/scene/compile/compat.rs
+
 use crate::dsl::GraphScript;
 use crate::scene::model::SceneNode;
 
@@ -61,7 +65,11 @@ pub(crate) fn scene_nodes_require_cpu_scene_compositing(nodes: &[SceneNode]) -> 
         }
         SceneNode::Chain(chain) => scene_nodes_require_cpu_scene_compositing(&chain.children),
         SceneNode::Group(group) => {
-            group.mask.is_some()
+            // A 3D island becomes a texture layer, so the shape-only fast path
+            // must not discard its compiler-only Camera3D and Model nodes.
+            group.composite.as_ref().is_some_and(|composite| {
+                composite.space.eq_ignore_ascii_case("3d") && !composite.nodes_3d.is_empty()
+            }) || group.mask.is_some()
                 || group.mask_from.is_some()
                 || scene_nodes_require_cpu_scene_compositing(&group.children)
         }
@@ -130,5 +138,39 @@ fn scene_node_is_rich(node: &SceneNode) -> bool {
         | SceneNode::Region(_) => false,
         SceneNode::Simulation(_) => false,
         SceneNode::Camera(_) | SceneNode::Character(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scene_nodes_for_present, scene_nodes_require_cpu_scene_compositing};
+    use crate::dsl::parse_graph_script;
+
+    #[test]
+    fn scene_3d_composite_bypasses_shape_only_fast_path() {
+        let graph = parse_graph_script(
+            r#"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ModelAsset id="phone" src="phone.glb" />
+  </Assets>
+  <Scene id="stage">
+    <Timeline>
+      <Track id="model" space="3d">
+        <Sequence from="0s" duration="1s" out="hold">
+          <CompositeGroup id="phone_island" space="3d" depth="true">
+            <Camera3D position={[0,0,6]} target={[0,0,0]} />
+            <Model asset="phone" scale="1" />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="stage" />
+</Graph>"#,
+        )
+        .expect("3D scene graph");
+        let nodes = scene_nodes_for_present(&graph).expect("presented scene");
+
+        assert!(scene_nodes_require_cpu_scene_compositing(nodes));
     }
 }
