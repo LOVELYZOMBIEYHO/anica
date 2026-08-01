@@ -196,7 +196,8 @@ fn apply_process_pass(
         Some(ProcessEffect::ToneMap)
         | Some(ProcessEffect::LightSweep)
         | Some(ProcessEffect::TextureOverlay)
-        | Some(ProcessEffect::MagnifyLens) => {
+        | Some(ProcessEffect::MagnifyLens)
+        | Some(ProcessEffect::SpectralEnergy) => {
             // CPU renderer does not implement these effects yet; pass through unchanged.
             image
         }

@@ -46,8 +46,8 @@
 //!
 //! - [`api`] is the recommended stable integration surface.
 //! - [`prelude`] contains a small convenience import set.
-//! - [`experimental`] exposes advanced editor, world, GLB, and timeline helpers
-//!   that are useful but may change before the main API.
+//! - [`experimental`] exposes advanced editor, legacy GLB compatibility, and
+//!   timeline helpers that are useful but may change before the main API.
 //!
 //! # Export paths
 //!
@@ -107,6 +107,7 @@ mod export;
 pub mod preview;
 pub mod preview_protocol;
 mod process;
+mod render_graph;
 mod root;
 mod scene;
 pub mod simulation;
@@ -125,15 +126,20 @@ pub use compat::{
     GpuCompatibilityTarget, ScenePreviewPath, inspect_gpu_compatibility,
 };
 pub use export::{EncodeError, VideoEncoder, VideoFrame, create_encoder};
+pub use render_graph::{
+    RenderEffectScope, RenderPassDag, RenderPassDagEdge, RenderPassDagKind, RenderPassDagNode,
+    RenderPassSpace, compile_render_pass_dag,
+};
 
 pub use common::keyframe::ScalarKeyframe;
 pub use dsl::{
     ActionBoneNode, ActionNode, ActionPoseNode, AnimationKeyNode, AnimationTargetNode,
-    ApplyActionNode, BackgroundNode, GraphScript, ImageNode, ModelProfileBoneAxisMapNode,
-    ModelProfileBoneAxisNode, ModelProfileNode, ModelProfileRetargetMapNode,
-    ModelProfileRetargetNode, SkeletonBoneNode, SkeletonConstraintNode, SkeletonControlNode,
-    SkeletonGuideNode, SkeletonLandmarkNode, SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode,
-    SkeletonRegionNode, SvgNode, is_graph_script, parse_graph_script,
+    ApplyActionNode, BackgroundNode, GraphAssetKind, GraphAssetNode, GraphScript, ImageNode,
+    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
+    ModelProfileRetargetMapNode, ModelProfileRetargetNode, ProcessDefinitionNode, SkeletonBoneNode,
+    SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode, SkeletonLandmarkNode,
+    SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode,
+    is_graph_script, parse_graph_script,
 };
 pub use error::{GraphParseError, MotionLoomError, RootGraphError, RuntimeCompileError};
 pub use preview::{

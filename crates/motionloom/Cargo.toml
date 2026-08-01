@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-description = "MotionLoom DSL parser and renderer for video effects, scene graphs, motion graphics, and world graphs."
+description = "MotionLoom DSL parser and renderer for video effects, unified scene graphs, motion graphics, and Scene-based 3D."
 repository = "https://github.com/LOVELYZOMBIEYHO/anica"
 homepage = "https://github.com/LOVELYZOMBIEYHO/anica"
 documentation = "https://docs.rs/motionloom"
@@ -20,6 +20,7 @@ serde_json = "1.0.133"
 exmex = "0.20"
 thiserror = "2.0.17"
 base64 = "0.22.1"
+draco-gltf = { version = "0.2.0", default-features = false, features = ["read", "draco-decode"] }
 cosmic-text = { version = "0.14.2", features = ["swash"] }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 resvg = { version = "0.45.1", default-features = false, features = ["text"] }

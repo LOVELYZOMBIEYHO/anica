@@ -576,6 +576,14 @@ impl ProcessWebGpuRenderer {
                 process_param_f32(pass, &["zoom"], time_norm, time_sec, 1.85),
                 process_param_f32(pass, &["distortion"], time_norm, time_sec, 0.18),
             ),
+            Some(crate::process::effect_kind::ProcessEffect::SpectralEnergy) => (
+                process_param_f32(pass, &["active", "mix"], time_norm, time_sec, 1.0)
+                    .clamp(0.0, 1.0),
+                process_param_f32(pass, &["intensity"], time_norm, time_sec, 1.0).max(0.0),
+                process_param_f32(pass, &["density", "grain"], time_norm, time_sec, 1.0).max(0.05),
+                process_param_f32(pass, &["drift", "motion"], time_norm, time_sec, 0.0),
+                process_param_f32(pass, &["seed"], time_norm, time_sec, 67.0),
+            ),
             _ => (
                 process_param_f32(pass, &["hue", "h"], time_norm, time_sec, 0.0),
                 process_param_f32(pass, &["saturation", "sat", "s"], time_norm, time_sec, 0.0),
@@ -962,6 +970,7 @@ fn process_effect_ids(pass: &PassNode) -> Result<Vec<u32>, ProcessWebGpuRenderEr
         Some(crate::process::effect_kind::ProcessEffect::MagnifyLens) => Ok(vec![9]),
         Some(crate::process::effect_kind::ProcessEffect::Brightness) => Ok(vec![11]),
         Some(crate::process::effect_kind::ProcessEffect::Opacity) => Ok(vec![12]),
+        Some(crate::process::effect_kind::ProcessEffect::SpectralEnergy) => Ok(vec![20]),
         None => Err(ProcessWebGpuRenderError::UnsupportedEffect(
             pass.effect.clone(),
         )),
@@ -1308,6 +1317,60 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     } else if params.effect_id > 11.5 && params.effect_id < 12.5 {
         // Opacity: hue is alpha multiplier.
         out_alpha = base.a * clamp(params.hue, 0.0, 1.0);
+    } else if params.effect_id > 19.5 && params.effect_id < 20.5 {
+        // Spectral energy field. This remains an ordinary Process Effect:
+        // hue=active mix, saturation=intensity, lightness=density,
+        // alpha=drift and sigma=seed.
+        let effect_mix = clamp(params.hue, 0.0, 1.0);
+        let intensity = max(params.saturation, 0.0);
+        let density = max(params.lightness, 0.05);
+        let drift = params.alpha;
+        let seed = params.sigma;
+        let aspect = params.width / max(params.height, 1.0);
+        let p = vec2<f32>(uv.x * aspect, uv.y);
+
+        let upper_curve = 0.30 + 0.16 * sin(uv.x * 5.7 + drift * 0.7);
+        let middle_curve = 0.52 + 0.075 * sin(uv.x * 8.4 - 0.9 + drift);
+        let lower_curve = 0.73 + 0.12 * sin(uv.x * 4.8 + 1.7 - drift * 0.5);
+        let cyan_upper = exp(-pow(abs(uv.y - upper_curve) / 0.19, 2.0));
+        let cyan_lower = exp(-pow(abs(uv.y - lower_curve) / 0.25, 2.0));
+        let magenta_mid = exp(-pow(abs(uv.y - middle_curve) / 0.105, 2.0));
+        let dark_cut = smoothstep(0.22, 0.78, 1.0 - uv.x)
+            + 0.55 * smoothstep(0.72, 0.28, abs(uv.x - 0.72));
+
+        let flow_noise = ml_process_fbm(
+            p * vec2<f32>(3.1, 5.7) * density
+                + vec2<f32>(seed * 0.017 + drift, seed * 0.011)
+        );
+        let fine_noise = ml_process_hash21(
+            floor(uv * vec2<f32>(params.width, params.height) * density)
+                + vec2<f32>(seed, seed * 1.91)
+        );
+        let sparkle = pow(fine_noise, 3.6);
+        let granular = 0.18 + flow_noise * 0.82 + sparkle * 1.45;
+
+        let cyan = vec3<f32>(0.00, 0.78, 1.00);
+        let ice = vec3<f32>(0.30, 0.96, 1.00);
+        let magenta = vec3<f32>(1.00, 0.00, 0.52);
+        let blue = vec3<f32>(0.00, 0.22, 0.62);
+        var field = vec3<f32>(0.002, 0.009, 0.018);
+        field = field
+            + (cyan_upper * cyan + cyan_lower * ice) * granular
+            + magenta_mid * magenta * (0.45 + granular * 0.95)
+            + (cyan_upper + cyan_lower) * blue * 0.32;
+        field = field * mix(0.78, 1.08, clamp(dark_cut, 0.0, 1.0)) * intensity;
+        field = min(field, vec3<f32>(1.35));
+
+        // Keep authored foreground graphics (white title and colored mark)
+        // crisp while replacing only the dark scene plate.
+        let foreground = smoothstep(0.10, 0.34, max(base_rgb.r, max(base_rgb.g, base_rgb.b)));
+        let composed = mix(field, base_rgb, foreground);
+        rgb = mix(base_rgb, composed, effect_mix);
+        // The Scene input may contain transparent pixels even though this
+        // procedural Process effect creates a full-frame energy plate. Give
+        // the generated pixels coverage while the effect is active, otherwise
+        // valid RGB is discarded by the canvas compositor as transparent.
+        out_alpha = mix(base_alpha, 1.0, effect_mix);
     } else if params.effect_id > 7.5 && params.effect_id < 8.5 {
         // Texture overlay: hue=kind, saturation=scale, lightness=strength, alpha=contrast, sigma=seed.
         let kind = i32(round(params.hue));

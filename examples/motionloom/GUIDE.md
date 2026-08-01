@@ -91,9 +91,12 @@ Use these for character assembly, face/hair/vector trace experiments, stick figu
 - `scene/characters/characters3/stickman_jump_walk_handshake.motionloom`
   - Simple action sequence reference: jump, walk, handshake.
 
-### World GLB Experiments
+### Legacy World GLB Experiments
 
-Use these for unified `<World>` experiments that combine static backgrounds with GLB actors, camera control, retarget maps, and reusable humanoid actions.
+These files document the retired `<World>` syntax for migration and renderer
+compatibility testing only. Do not copy them into new DSL. New GLB work belongs
+inside a `<Scene>` with a `space="3d"` track, `CompositeGroup`, `Camera3D`, and
+`Model`.
 
 - `world/scenes/glb_camera_static_bg_level1.motionloom`
   - Static forest background plus one GLB actor and orbit camera.

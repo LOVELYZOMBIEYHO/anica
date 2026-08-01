@@ -310,7 +310,7 @@ src/
 crates/
   video-engine/             FFmpeg playback and frame decoding
   gpui-video-renderer/      GPUI rendering bridge for video preview
-  motionloom/               Compositing and world DSL runtime
+  motionloom/               Unified Scene, compositing, Process, and render-DAG runtime
   gpu-effect-export-engine/ GPU-effect export helpers
   ai-subtitle-engine/       Cloud/Local ONNX Whisper subtitle generation
 

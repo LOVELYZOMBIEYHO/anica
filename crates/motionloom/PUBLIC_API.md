@@ -434,8 +434,10 @@ Low-level kernel resolution helpers such as `default_kernel_for_effect` and
 `resolve_pass_kernel` are also kept for compatibility. Prefer the process
 catalog APIs for effect discovery.
 
-World graph APIs are currently experimental and mainly used by Anica internal
-tools and design/debug surfaces.
+Rust types and functions whose names contain `World` are legacy compatibility
+APIs for Anica internal tools and design/debug surfaces. They are not a current
+DSL authoring surface: `<World>` is invalid. New integrations should parse a
+unified `<Scene>` and place true-3D content in a `space="3d"` track.
 
 ## Recommended API Choice
 

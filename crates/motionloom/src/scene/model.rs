@@ -65,7 +65,33 @@ fn default_scene_out_hold() -> String {
 pub struct SceneRootNode {
     pub id: String,
     pub size: Option<(u32, u32)>,
+    /// Process-backed effects applied after every Track in this Scene has been
+    /// composited. This deliberately references the existing Process pipeline
+    /// instead of creating a second effect language.
+    #[serde(default)]
+    pub effects: Vec<SceneEffectRef>,
+    /// Final Scene-local effects. Kept separate from `effects` so the compiler
+    /// can preserve an explicit post-composite scope in the render-pass DAG.
+    #[serde(default)]
+    pub post_effects: Vec<SceneEffectRef>,
     pub children: Vec<SceneNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEffectRef {
+    pub process: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub params: Vec<SceneEffectParam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEffectParam {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -129,8 +155,14 @@ pub struct SceneTrackNode {
     #[serde(default = "default_scene_track_space")]
     pub space: String,
     pub z: i32,
+    /// Stable 2D/3D compositing order. When omitted, legacy `z` remains the
+    /// ordering key so existing showcases render unchanged.
+    #[serde(default)]
+    pub composite_order: Option<i32>,
     #[serde(default = "default_scene_zero")]
     pub z_depth: String,
+    #[serde(default)]
+    pub effects: Vec<SceneEffectRef>,
     pub children: Vec<SceneNode>,
 }
 
@@ -868,8 +900,94 @@ pub struct GroupNode {
     pub mask_expansion: String,
     #[serde(default)]
     pub effects: Vec<String>,
+    /// Generic Process-backed effects scoped to this Group/CompositeGroup.
+    #[serde(default)]
+    pub process_effects: Vec<SceneEffectRef>,
+    /// Present only when this Group was authored as `<CompositeGroup>`.
+    #[serde(default)]
+    pub composite: Option<CompositeGroupConfig>,
     pub opacity: String,
     pub children: Vec<SceneNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositeGroupConfig {
+    #[serde(default = "default_scene_track_space")]
+    pub space: String,
+    #[serde(default)]
+    pub composite_order: Option<i32>,
+    #[serde(default)]
+    pub depth: bool,
+    #[serde(default = "default_scene_composite_format")]
+    pub format: String,
+    /// True-3D declarations are retained as typed compiler data. They lower to
+    /// a 3D render island in the unified render-pass DAG.
+    #[serde(default)]
+    pub nodes_3d: Vec<Scene3DNode>,
+}
+
+fn default_scene_composite_format() -> String {
+    "rgba8unorm".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Scene3DNode {
+    Camera(SceneCamera3DNode),
+    EnvironmentLight(SceneEnvironmentLightNode),
+    Model(SceneModel3DNode),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneCamera3DNode {
+    pub id: Option<String>,
+    pub position: String,
+    pub target: String,
+    pub fov: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEnvironmentLightNode {
+    pub id: Option<String>,
+    pub asset: String,
+    pub intensity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneModel3DNode {
+    pub id: Option<String>,
+    pub asset: String,
+    pub position: String,
+    #[serde(default)]
+    pub position_x: Option<String>,
+    #[serde(default)]
+    pub position_y: Option<String>,
+    #[serde(default)]
+    pub position_z: Option<String>,
+    pub rotation: String,
+    #[serde(default)]
+    pub rotation_x: Option<String>,
+    #[serde(default)]
+    pub rotation_y: Option<String>,
+    #[serde(default)]
+    pub rotation_z: Option<String>,
+    pub scale: String,
+    #[serde(default)]
+    pub material_bindings: Vec<SceneMaterialBindingNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneMaterialBindingNode {
+    pub material: String,
+    #[serde(default)]
+    pub definition: Option<String>,
+    #[serde(default)]
+    pub texture: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1240,6 +1358,10 @@ pub struct SceneLayerNode {
     pub blend: String,
     #[serde(default)]
     pub effect: Option<String>,
+    #[serde(default)]
+    pub process_effects: Vec<SceneEffectRef>,
+    #[serde(default)]
+    pub space: Option<String>,
     #[serde(default = "default_scene_source_time")]
     pub source_time: String,
     #[serde(default)]

@@ -1,7 +1,7 @@
 # MotionLoom
 
 MotionLoom is the DSL parser and renderer crate used by Anica for video effects,
-scene graphs, motion graphics, and world graphs.
+unified 2D/2.5D/3D scene graphs, and motion graphics.
 
 It is designed to be used as a Rust library. Anica can expose MotionLoom through
 application tools such as `anica.motionloom/render_scene`, while this crate
@@ -29,9 +29,9 @@ New Rust integrations should start with `motionloom::api` or
 
 - `motionloom::api` is the recommended stable integration surface.
 - `motionloom::prelude` contains a small convenience import set for common use.
-- `motionloom::experimental` exposes advanced editor, world, GLB, text layout,
-  and timeline helpers. These APIs are public, but their stability is lower than
-  `motionloom::api`.
+- `motionloom::experimental` exposes advanced editor, legacy GLB compatibility,
+  text layout, and timeline helpers. These APIs are public, but their stability
+  is lower than `motionloom::api`.
 - The crate root keeps broader re-exports for short-term compatibility with
   existing applications. Prefer `motionloom::api` in new code.
 
@@ -54,22 +54,12 @@ Checks whether a string looks like a MotionLoom graph script.
 Parses a scene/effect/composition graph. Use this for `<Scene>`, `<Tex>`,
 `<Pass>`, `<Layer>`, `<Precompose>`, `<Mask>`, and most motion graphics DSL.
 
-`is_world_graph_script(input: &str) -> bool`
-
-Checks whether a string should be handled by the world graph parser.
-
-`parse_world_graph_script(input: &str) -> Result<WorldGraph, GraphParseError>`
-
-Parses a `<World>` graph. Use this for GLB actors, camera/world
-world, directional sprites, retarget maps, and skeletal actions.
-
 ## Present Rule
 
 Every MotionLoom graph must contain exactly one `<Present ... />` node.
 
 `<Present ... />` must be a direct child of `<Graph>` and must be the final node
-before `</Graph>`. It cannot be nested inside `<Scene>`, `<World>`, or
-`<Process>`.
+before `</Graph>`. It cannot be nested inside `<Scene>` or `<Process>`.
 
 For process graphs, use root-level present from the process id:
 
@@ -80,6 +70,69 @@ For process graphs, use root-level present from the process id:
 
 <Present from="FinalProcess" />
 ```
+
+## Unified Scene Architecture
+
+All renderable content belongs to `<Scene>`. The former `<World>` DSL tag is
+removed. `world` remains a coordinate-space value, so existing
+`space="world"` Scene content keeps its meaning.
+
+The parser lowers Scene content and existing Process passes into one validated
+Render Pass DAG:
+
+- `compositeOrder` defines Track or CompositeGroup order. Existing Track `z`
+  remains the fallback, preserving old showcases.
+- `space="screen|world|3d"` describes the coordinate space without introducing
+  a second root render domain.
+- `<CompositeGroup>` creates an explicit offscreen pass. A 3D group may contain
+  `Camera3D`, `EnvironmentLight`, `Model`, and `MaterialBinding` metadata.
+- `<Assets><ModelAsset ... /></Assets>` accepts binary `.glb` and JSON `.gltf`
+  2.0 models. Draco-compressed GLB geometry is decoded by the runtime. Put the
+  model in a `space="3d"` CompositeGroup; it is rendered as a transparent
+  Scene pass and then composited by the same ordered DAG as 2D content.
+- `texture="scene:phone_ui"` or `texture="@scene:phone_ui"` adds a
+  Scene-to-texture dependency. Unknown references and dependency cycles fail at
+  compile time.
+- `<Effects>` applies reusable Process definitions to its containing Scene,
+  Track, Layer, Group, or CompositeGroup scope. `<PostEffects>` is the final
+  Scene scope.
+- Root `<Process>` continues to represent the final texture/effect pipeline
+  used by MotionLoom and Anica. Its existing Input, Tex, Pass, and Output
+  semantics are unchanged.
+
+Scene-local effects reference a Process instead of hard-coding an effect tag:
+
+```xml
+<Process id="fx_blur">
+  <Input id="effect_input" type="video" />
+  <Tex id="effect_src" fmt="rgba16f" from="input:effect_input" />
+  <Tex id="effect_out" fmt="rgba16f" size={[1920,1080]} />
+  <Pass id="blur_pass" kind="compute" effect="gaussian_5tap_blur"
+        in={["effect_src"]} out={["effect_out"]}
+        params={{ radius: "8" }} />
+</Process>
+
+<Scene id="title_scene">
+  <Timeline>
+    <Track id="title" space="screen" compositeOrder="100">
+      <Sequence duration="4s">
+        <Layer>
+          <Text value="MOTIONLOOM" x="960" y="540" fontSize="112" />
+        </Layer>
+      </Sequence>
+    </Track>
+  </Timeline>
+  <PostEffects>
+    <Effect process="fx_blur">
+      <Param name="radius" value="16" />
+    </Effect>
+  </PostEffects>
+</Scene>
+```
+
+`compile_render_pass_dag(&graph)` exposes the compiled ordering, scopes,
+formats, Scene dependencies, Process passes, and Present output for host
+inspection and future pass scheduling.
 
 ## Scene Rendering
 
@@ -135,7 +188,7 @@ Export support:
 Process graphs that use external timeline inputs such as
 `<Input id="clip0" from="input:clip0" />` are intended for host applications
 such as Layer FX. Standalone MotionLoom export cannot render those process-only
-graphs unless the process wraps a self-contained `<Scene>` or `<World>` source.
+graphs unless the process wraps a self-contained `<Scene>` source.
 
 Scene `zDepth` uses camera-space depth: negative is closer, positive is farther.
 
@@ -666,36 +719,6 @@ The window title reports frame index, render time, blit/present time, tick rate,
 target size, surface format, quality mode, and script path. `--print-stats`
 prints rows such as `quality=... target=... render_ms=...` for benchmark notes.
 
-## World Rendering
-
-`render_world_frame(graph: &WorldGraph, frame: u32, asset_root)`
-
-Renders one world frame using the compatibility world renderer.
-
-`WorldFrameRenderer::new()`
-
-Creates a reusable world renderer with image, GLB mesh, and GPU caches.
-
-`WorldFrameRenderer::render_frame(graph, frame, asset_root)`
-
-Renders an world frame on the CPU/debug path.
-
-`WorldFrameRenderer::render_frame_gpu(graph, frame, asset_root)`
-
-Renders an world frame using the GPU actor path where available.
-
-`WorldFrameRenderer::render_frame_gpu_with_ground_grid(...)`
-
-Renders GPU world with a ground grid overlay for viewport/debug use.
-
-`render_world_graph_to_video_with_progress(ffmpeg_bin, graph, asset_root, output_path, profile, progress_every_frames, callback)`
-
-Renders an world graph to video through ffmpeg and reports progress.
-
-World graphs also support PNG sequence export through
-`render_world_graph_to_png_sequence_with_progress`. In that mode `output_dir`
-is an output directory and FFmpeg is not used.
-
 ## Runtime Evaluation
 
 `compile_runtime_program(graph: GraphScript) -> Result<RuntimeProgram, RuntimeCompileError>`
@@ -822,25 +845,58 @@ Returns embedded WGSL source for a known process kernel.
 
 Checks whether a kernel name is built into the crate.
 
-## GLB Helpers
+## glTF / GLB Helpers
 
 `load_glb_metadata(path)` and `parse_glb_metadata(path, bytes)`
 
-Load or parse lightweight GLB metadata such as nodes, meshes, joints, and
-materials.
+Load or parse lightweight glTF 2.0 metadata such as nodes, meshes, joints, and
+materials. The existing function names remain for source compatibility, but
+the parser detects both binary GLB and JSON glTF input.
 
 `load_glb_mesh_data(path)` and `parse_glb_mesh_data(path, bytes)`
 
-Load or parse GLB mesh data for world rendering and diagnostics.
+Load or parse glTF/GLB mesh data for Scene 3D rendering and diagnostics.
+Self-contained JSON glTF data URIs are supported everywhere. External `.bin`
+and image URIs are supported by the native file loader; the MotionLoom browser
+host fetches and packages those dependencies before passing the model to WASM.
+Packaged GLB remains the recommended web delivery format. Draco-compressed GLB
+primitives are decoded before upload to WGPU.
+
+Unified Scene example:
+
+```xml
+<Graph fps={30} duration="4s" size={[1280,720]}>
+  <Assets>
+    <ModelAsset id="phone" src="assets/iphone.glb" decoder="draco" />
+  </Assets>
+
+  <Scene id="product">
+    <Timeline>
+      <Track id="phone_pass" compositeOrder="20">
+        <Sequence from="0s" duration="4s">
+          <CompositeGroup id="phone_3d" space="3d" depth="true">
+            <Camera3D position={[0,0,6]} target={[0,0,0]} fov="35" />
+            <Model asset="phone"
+                   rotationY={curve("0:-25:linear, 4:25:ease_in_out")} />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+
+  <Present from="product" />
+</Graph>
+```
 
 `diagnose_world_glb_gpu_plan(mesh)`
 
-Builds a diagnostic report for whether a GLB mesh is suitable for the GPU
-world path.
+Builds a diagnostic report for whether a GLB mesh is suitable for the GPU 3D
+path. The function name is retained for compatibility.
 
 `diagnose_world_graph_actor_gpu_frame(graph, actor_id, frame, asset_root)`
 
-Diagnoses one actor in an world graph at a specific frame.
+Diagnoses one actor through the legacy world compatibility path at a specific
+frame. This is not a current DSL authoring API.
 
 ## Minimal Scene Example
 
@@ -862,28 +918,6 @@ let graph = parse_graph_script(script)?;
 let frame = pollster::block_on(render_scene_graph_frame(&graph, 0, SceneRenderProfile::Gpu))
     .or_else(|_| pollster::block_on(render_scene_graph_frame(&graph, 0, SceneRenderProfile::Cpu)))?;
 frame.save("motionloom_frame.png")?;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-## Minimal World Example
-
-```rust
-use motionloom::{WorldFrameRenderer, parse_world_graph_script};
-
-let script = r##"
-<Graph fps={30} duration="1s" size={[320,180]}>
-  <World id="world">
-    <Background color="#ffffff" />
-    <Camera yaw="0" pitch="0" zoom="1" />
-  </World>
-  <Present from="world" />
-</Graph>
-"##;
-
-let graph = parse_world_graph_script(script)?;
-let mut renderer = WorldFrameRenderer::new();
-let frame = renderer.render_frame(&graph, 0, ".")?;
-frame.save("motionloom_world_frame.png")?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -909,8 +943,10 @@ definitions and benchmark methodology.
 
 ## Notes
 
-Scene graph APIs are for 2D scene/motion graphics/effect graphs. World graph
-APIs are for world/camera/actor/directional-character rendering.
+Scene graph APIs are the authoring surface for 2D, 2.5D, true-3D island
+metadata, motion graphics, and effect graphs. The old Rust world module remains
+temporarily for binary/source compatibility, but `<World>` is no longer valid
+MotionLoom DSL.
 
 GPU rendering requires a working `wgpu` backend on the host machine. For tools
 that need robust fallback behavior, try `SceneRenderProfile::Gpu` first and fall

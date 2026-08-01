@@ -21,6 +21,7 @@ use crate::dsl::GraphScript;
 use crate::scene::backend::gpu::shaders::{
     WGPU_BATCH_SHAPE_SHADER, WGPU_BLOOM_SHADER, WGPU_DOWNSAMPLE_SHADER, WGPU_LIGHT_SWEEP_SHADER,
     WGPU_MATTE_TEXTURE_SHADER, WGPU_POST_SHADER, WGPU_PUPPET_DEFORM_SHADER, WGPU_SCENE_SHADER,
+    WGPU_SPECTRAL_ENERGY_SHADER,
 };
 use crate::scene::composition::{SceneMagnifyLensParams, SceneTextureOverlayParams};
 use crate::scene::drawable::{
@@ -102,6 +103,8 @@ pub(crate) struct WgpuSceneCompositor {
     post_bind_group_layout: wgpu::BindGroupLayout,
     post_pipeline: wgpu::ComputePipeline,
     light_sweep_pipeline: wgpu::ComputePipeline,
+    spectral_energy_bind_group_layout: wgpu::BindGroupLayout,
+    spectral_energy_pipeline: wgpu::ComputePipeline,
     downsample_bind_group_layout: wgpu::BindGroupLayout,
     downsample_pipeline: wgpu::ComputePipeline,
     bloom_bind_group_layout: wgpu::BindGroupLayout,
@@ -762,6 +765,10 @@ impl WgpuSceneCompositor {
             label: Some("anica-motionloom-scene-light-sweep-gpu-shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WGPU_LIGHT_SWEEP_SHADER)),
         });
+        let spectral_energy_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("anica-motionloom-scene-spectral-energy-gpu-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WGPU_SPECTRAL_ENERGY_SHADER)),
+        });
         let downsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("anica-motionloom-scene-downsample-gpu-shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WGPU_DOWNSAMPLE_SHADER)),
@@ -1196,6 +1203,57 @@ impl WgpuSceneCompositor {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let spectral_energy_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("anica-motionloom-scene-spectral-energy-gpu-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let spectral_energy_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("anica-motionloom-scene-spectral-energy-gpu-pipeline-layout"),
+                bind_group_layouts: &[&spectral_energy_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let spectral_energy_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("anica-motionloom-scene-spectral-energy-gpu-pipeline"),
+                layout: Some(&spectral_energy_pipeline_layout),
+                module: &spectral_energy_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let downsample_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("anica-motionloom-scene-downsample-gpu-pipeline-layout"),
@@ -1368,6 +1426,8 @@ impl WgpuSceneCompositor {
             post_bind_group_layout,
             post_pipeline,
             light_sweep_pipeline,
+            spectral_energy_bind_group_layout,
+            spectral_energy_pipeline,
             downsample_bind_group_layout,
             downsample_pipeline,
             bloom_bind_group_layout,
@@ -3094,6 +3154,62 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_gpu_spectral_energy_texture(
+        &mut self,
+        input: &GpuSceneNativeTexture,
+        mode: f32,
+        active: f32,
+        intensity: f32,
+        density: f32,
+        drift: f32,
+        seed: f32,
+        time_sec: f32,
+    ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+        let width = input.width.max(1);
+        let height = input.height.max(1);
+        let values = [
+            width as f32,
+            height as f32,
+            active.clamp(0.0, 1.0),
+            intensity.clamp(0.0, 8.0),
+            density.clamp(0.05, 8.0),
+            drift,
+            seed,
+            time_sec,
+            mode,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        let mut uniform = [0u8; 48];
+        for (index, value) in values.into_iter().enumerate() {
+            let offset = index * 4;
+            uniform[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut encoder = self.frame_encoder("anica-motionloom-scene-spectral-energy-gpu-encoder");
+        let uniform_buffer = self.make_post_uniform_buffer(&uniform);
+        let dst = std::sync::Arc::new(Self::make_canvas_texture(&self.device, width, height));
+        let mut keepalive = WgpuDispatchKeepalive::default();
+        self.dispatch_spectral_energy_pass(
+            &mut encoder,
+            &input.texture,
+            &dst,
+            &uniform_buffer,
+            width,
+            height,
+            &mut keepalive,
+        );
+        self.submit_encoder_with_keepalive(encoder, keepalive);
+        drop(uniform_buffer);
+        Ok(GpuSceneNativeTexture {
+            texture: dst,
+            width,
+            height,
+            _keepalive_textures: vec![input.texture.clone()],
+        })
+    }
+
     pub(crate) fn apply_gpu_texture_overlay_texture(
         &mut self,
         input: &GpuSceneNativeTexture,
@@ -4231,6 +4347,49 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.light_sweep_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(16).max(1), height.div_ceil(16).max(1), 1);
+        drop(pass);
+        keepalive.texture_views.extend([base_view, out_view]);
+        keepalive.bind_groups.push(bind_group);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_spectral_energy_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        base_texture: &wgpu::Texture,
+        out_texture: &wgpu::Texture,
+        uniform_buffer: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        keepalive: &mut WgpuDispatchKeepalive,
+    ) {
+        let base_view = base_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let out_view = out_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("anica-motionloom-scene-spectral-energy-gpu-bg"),
+            layout: &self.spectral_energy_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&out_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("anica-motionloom-scene-spectral-energy-gpu-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.spectral_energy_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(width.div_ceil(16).max(1), height.div_ceil(16).max(1), 1);
         drop(pass);

@@ -142,10 +142,12 @@ fn set_graph_group_attr(graph: &mut GraphScript, group_id: &str, attr: &str, val
 pub fn motionloom_parse_summary(script: &str) -> Result<String, JsValue> {
     if is_graph_script(script) {
         let graph = parse_graph_script(script).map_err(|err| js_error(err.to_string()))?;
+        let frame_count =
+            ((graph.duration_ms as f64 / 1000.0) * graph.fps.max(1.0) as f64).round() as u64;
         return Ok(format!(
-            "scene graph: {} scene node(s), {} frame(s)",
-            graph.scene_nodes.len(),
-            graph.duration_ms
+            "scene graph: {} scene(s), {} frame(s)",
+            graph.scenes.len(),
+            frame_count
         ));
     }
     if is_world_graph_script(script) {
@@ -326,7 +328,9 @@ fn parse_scene_profile_with_fallback(
     }
 }
 
-/// Render one frame of a world graph script to an RGBA byte buffer.
+/// Render one frame through the legacy world compatibility path.
+///
+/// New DSL must use `<Scene>`; `<World>` is no longer a valid authoring tag.
 ///
 /// This convenience function uses the default path-based asset resolver.
 /// To supply in-memory assets use `WasmWorldRenderer`.
@@ -613,7 +617,9 @@ impl WasmSceneRenderer {
     }
 }
 
-/// WASM-facing wrapper around a parsed world graph with renderer-owned assets.
+/// WASM-facing wrapper for the legacy world compatibility renderer.
+///
+/// New DSL must use `<Scene>`; `<World>` is no longer a valid authoring tag.
 #[wasm_bindgen]
 pub struct WasmWorldRenderer {
     graph: crate::world::WorldGraph,

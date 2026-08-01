@@ -50,6 +50,9 @@ pub struct GraphScript {
     pub size: (u32, u32),
     #[serde(default)]
     pub render_size: Option<(u32, u32)>,
+    /// External files shared by every Scene and Process in the Graph.
+    #[serde(default)]
+    pub assets: Vec<GraphAssetNode>,
     pub inputs: Vec<InputNode>,
     pub textures: Vec<TexNode>,
     pub buffers: Vec<BufferNode>,
@@ -77,11 +80,50 @@ pub struct GraphScript {
     pub animation_targets: Vec<AnimationTargetNode>,
     #[serde(default)]
     pub layers: Vec<LayerNode>,
+    /// Process boundary metadata. The original flattened Process resources and
+    /// passes remain untouched; this index lets Scene effect scopes safely
+    /// reference an existing Process by id.
+    #[serde(default)]
+    pub processes: Vec<ProcessDefinitionNode>,
     #[serde(default)]
     pub world_sources: Vec<WorldSourceNode>,
     pub passes: Vec<PassNode>,
     pub outputs: Vec<OutputNode>,
     pub present: PresentNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphAssetNode {
+    pub id: String,
+    pub kind: GraphAssetKind,
+    pub src: String,
+    #[serde(default)]
+    pub decoder: Option<String>,
+    #[serde(default)]
+    pub color_space: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GraphAssetKind {
+    Video,
+    Image,
+    Model,
+    Audio,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessDefinitionNode {
+    pub id: String,
+    pub output: String,
+    #[serde(default)]
+    pub input_ids: Vec<String>,
+    #[serde(default)]
+    pub texture_ids: Vec<String>,
+    #[serde(default)]
+    pub pass_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -127,12 +169,13 @@ impl GraphScript {
 
     pub fn summary(&self) -> String {
         format!(
-            "Graph parsed: fps={:.2}, apply={:?}, duration={}ms, size={}x{}, input={}, tex={}, buffer={}, scene={}, scene_node={}, model_profile={}, skeleton={}, action={}, apply_action={}, animation_target={}, layer={}, world={}, pass={}, output={}, present={}",
+            "Graph parsed: fps={:.2}, apply={:?}, duration={}ms, size={}x{}, asset={}, input={}, tex={}, buffer={}, scene={}, scene_node={}, model_profile={}, skeleton={}, action={}, apply_action={}, animation_target={}, layer={}, process={}, world={}, pass={}, output={}, present={}",
             self.fps,
             self.apply,
             self.duration_ms,
             self.size.0,
             self.size.1,
+            self.assets.len(),
             self.inputs.len(),
             self.textures.len(),
             self.buffers.len(),
@@ -144,6 +187,7 @@ impl GraphScript {
             self.apply_actions.len(),
             self.animation_targets.len(),
             self.layers.len(),
+            self.processes.len(),
             self.world_sources.len(),
             self.passes.len(),
             self.outputs.len(),
@@ -489,6 +533,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     };
 
     let mut inputs = Vec::<InputNode>::new();
+    let mut assets = Vec::<GraphAssetNode>::new();
     let mut textures = Vec::<TexNode>::new();
     let mut buffers = Vec::<BufferNode>::new();
     let mut backgrounds = Vec::<BackgroundNode>::new();
@@ -503,7 +548,8 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut apply_actions = Vec::<ApplyActionNode>::new();
     let mut animation_targets = Vec::<AnimationTargetNode>::new();
     let mut layers = Vec::<LayerNode>::new();
-    let mut world_sources = Vec::<WorldSourceNode>::new();
+    let mut processes = Vec::<ProcessDefinitionNode>::new();
+    let world_sources = Vec::<WorldSourceNode>::new();
     let mut outputs = Vec::<OutputNode>::new();
     let mut process_outputs = Vec::<OutputNode>::new();
     let mut passes = Vec::<PassNode>::new();
@@ -525,6 +571,13 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         if line.starts_with("<Input") {
             let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
             inputs.push(parse_input_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+
+        if starts_open_tag(line, "Assets") {
+            let (mut parsed_assets, end_ix) = parse_assets_block(&lines, i)?;
+            assets.append(&mut parsed_assets);
             i = end_ix + 1;
             continue;
         }
@@ -558,20 +611,19 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         }
 
         if starts_open_tag(line, "Process") {
-            let (process_output, process_body_start_ix) = parse_process_resource_alias(&lines, i)?;
+            let (process_output, process_definition, process_body_start_ix) =
+                parse_process_resource_alias(&lines, i)?;
             process_outputs.push(process_output);
+            processes.push(process_definition);
             i = process_body_start_ix;
             continue;
         }
 
         if starts_open_tag(line, "World") {
-            let (open_tag, open_end_ix) = collect_tag_block(&lines, i, '>', false)?;
-            let close_ix = find_matching_close_tag(&lines, open_end_ix + 1, "World")?;
-            world_sources.push(WorldSourceNode {
-                id: strip_wrappers(&required_attr_value(&open_tag, "id", i + 1)?).to_string(),
+            return Err(GraphParseError {
+                line: i + 1,
+                message: "<World> has been removed from MotionLoom DSL. Put 3D content in <Scene><Timeline><Track><Sequence><CompositeGroup space=\"3d\">...</CompositeGroup> and keep space=\"world\" only as a coordinate-space value.".to_string(),
             });
-            i = close_ix + 1;
-            continue;
         }
 
         if starts_open_tag(line, "ModelProfile") {
@@ -880,7 +932,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         graph_start_ix + 1,
     )?;
 
-    Ok(GraphScript {
+    let graph = GraphScript {
         raw_script: Some(input.to_string()),
         id,
         version,
@@ -890,6 +942,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         duration_explicit,
         size,
         render_size,
+        assets,
         inputs,
         textures,
         buffers,
@@ -905,11 +958,14 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         apply_actions,
         animation_targets,
         layers,
+        processes,
         world_sources,
         passes,
         outputs,
         present,
-    })
+    };
+    crate::render_graph::compile_render_pass_dag(&graph)?;
+    Ok(graph)
 }
 
 fn parse_animation_target_block(
@@ -1325,7 +1381,7 @@ fn validate_graph(
 fn parse_process_resource_alias(
     lines: &[&str],
     start: usize,
-) -> Result<(OutputNode, usize), GraphParseError> {
+) -> Result<(OutputNode, ProcessDefinitionNode, usize), GraphParseError> {
     let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     if is_self_closing_tag(&open_tag) {
         return Err(GraphParseError {
@@ -1337,6 +1393,13 @@ fn parse_process_resource_alias(
     let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
     let body = lines[open_end_ix + 1..close_ix].join("\n");
     let from = infer_process_output_resource(&open_tag, &body, start + 1)?;
+    let definition = ProcessDefinitionNode {
+        id: id.clone(),
+        output: from.clone(),
+        input_ids: collect_tag_attr_values(&body, "Input", "id")?,
+        texture_ids: collect_tag_attr_values(&body, "Tex", "id")?,
+        pass_ids: collect_tag_attr_values(&body, "Pass", "id")?,
+    };
     Ok((
         OutputNode {
             id,
@@ -1348,8 +1411,103 @@ fn parse_process_resource_alias(
             alpha: None,
             is_process_implicit: true,
         },
+        definition,
         open_end_ix + 1,
     ))
+}
+
+fn parse_assets_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(Vec<GraphAssetNode>, usize), GraphParseError> {
+    let (_open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Assets")?;
+    let mut assets = Vec::new();
+    let mut i = open_end_ix + 1;
+    while i < close_ix {
+        let line = lines[i].trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('{')
+            || line.starts_with("<!--")
+        {
+            i += 1;
+            continue;
+        }
+        let (kind, tag_name) = if starts_open_tag(line, "VideoAsset") {
+            (GraphAssetKind::Video, "VideoAsset")
+        } else if starts_open_tag(line, "ImageAsset") {
+            (GraphAssetKind::Image, "ImageAsset")
+        } else if starts_open_tag(line, "ModelAsset") {
+            (GraphAssetKind::Model, "ModelAsset")
+        } else if starts_open_tag(line, "AudioAsset") {
+            (GraphAssetKind::Audio, "AudioAsset")
+        } else {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: format!(
+                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, or <AudioAsset>, got: {line}"
+                ),
+            });
+        };
+        let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+        if !starts_open_tag(tag.trim(), tag_name) {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: format!("Invalid <{tag_name}> asset tag."),
+            });
+        }
+        assets.push(GraphAssetNode {
+            id: strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string(),
+            kind,
+            src: strip_wrappers(&required_attr_value(&tag, "src", i + 1)?).to_string(),
+            decoder: attr_value(&tag, "decoder").map(|v| strip_wrappers(&v).to_string()),
+            color_space: attr_value(&tag, "colorSpace")
+                .or_else(|| attr_value(&tag, "color_space"))
+                .map(|v| strip_wrappers(&v).to_string()),
+        });
+        i = end_ix + 1;
+    }
+    let mut ids = HashSet::new();
+    for asset in &assets {
+        if asset.id.trim().is_empty() || asset.src.trim().is_empty() {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: "Asset id and src must not be empty.".to_string(),
+            });
+        }
+        if !ids.insert(asset.id.clone()) {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!("Duplicate Asset id: {}", asset.id),
+            });
+        }
+    }
+    Ok((assets, close_ix))
+}
+
+fn collect_tag_attr_values(
+    input: &str,
+    tag_name: &str,
+    attr: &str,
+) -> Result<Vec<String>, GraphParseError> {
+    let mut cursor = 0usize;
+    let mut values = Vec::new();
+    while let Some(start) = find_open_tag_byte(input, tag_name, cursor) {
+        let tag_end = find_tag_end_byte(input, start).ok_or_else(|| GraphParseError {
+            line: line_of_byte(input, start),
+            message: format!("Unclosed <{tag_name} ... /> tag."),
+        })?;
+        let tag = &input[start..=tag_end];
+        if let Some(raw) = attr_value(tag, attr) {
+            let value = strip_wrappers(&raw).to_string();
+            if !value.is_empty() {
+                values.push(value);
+            }
+        }
+        cursor = tag_end + 1;
+    }
+    Ok(values)
 }
 
 fn infer_process_output_resource(

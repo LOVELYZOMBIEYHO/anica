@@ -50,6 +50,13 @@ pub(crate) fn load_rgba_image_source(
     }
 
     if is_remote_image_source(src) {
+        // Browser hosts preload remote assets and register their bytes under
+        // the original DSL URL. Consult that renderer-owned resolver before
+        // attempting a platform fetch; WASM deliberately has no synchronous
+        // network loader of its own.
+        if let Ok(crate::asset::AssetSource::Bytes(bytes)) = resolver.resolve(src) {
+            return decode_image_bytes(src, &bytes);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let bytes = fetch_remote_asset_bytes(src)?;
@@ -143,6 +150,12 @@ pub(crate) fn load_svg_source(
     let (bytes, resources_dir) = if is_svg_data_uri(src) {
         (decode_svg_data_uri(src)?, None)
     } else if is_remote_image_source(src) {
+        // Match raster-image handling: a WASM host can fetch asynchronously,
+        // then expose the bytes through the renderer's MemoryAssetResolver.
+        // The URL remains the stable DSL key.
+        if let Ok(crate::asset::AssetSource::Bytes(bytes)) = resolver.resolve(src) {
+            return render_svg_bytes(src, &bytes, None);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             (fetch_remote_asset_bytes(src)?, None)
@@ -499,5 +512,38 @@ fn format_ureq_error(err: ureq::Error) -> String {
             format!("HTTP {code} {}", response.status_text())
         }
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_rgba_image_source, load_svg_source};
+    use crate::asset::MemoryAssetResolver;
+    use base64::Engine;
+
+    #[test]
+    fn remote_raster_url_uses_prefetched_resolver_bytes() {
+        let src = "https://example.test/pixel.png";
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            )
+            .expect("valid PNG fixture");
+        let resolver = MemoryAssetResolver::new().with_asset(src.to_string(), bytes);
+
+        let image = load_rgba_image_source(src, &resolver).expect("prefetched PNG should decode");
+
+        assert_eq!((image.width(), image.height()), (1, 1));
+    }
+
+    #[test]
+    fn remote_svg_url_uses_prefetched_resolver_bytes() {
+        let src = "https://example.test/mark.svg";
+        let bytes = br##"<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><rect width="3" height="2" fill="#00ffcc"/></svg>"##.to_vec();
+        let resolver = MemoryAssetResolver::new().with_asset(src.to_string(), bytes);
+
+        let image = load_svg_source(src, &resolver).expect("prefetched SVG should render");
+
+        assert_eq!((image.width(), image.height()), (3, 2));
     }
 }

@@ -10,3 +10,4 @@ pub(crate) const WGPU_POST_SHADER: &str = include_str!("post.wgsl");
 pub(crate) const WGPU_BLOOM_SHADER: &str = include_str!("bloom.wgsl");
 pub(crate) const WGPU_DOWNSAMPLE_SHADER: &str = include_str!("downsample.wgsl");
 pub(crate) const WGPU_LIGHT_SWEEP_SHADER: &str = include_str!("light_sweep.wgsl");
+pub(crate) const WGPU_SPECTRAL_ENERGY_SHADER: &str = include_str!("spectral_energy.wgsl");

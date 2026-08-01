@@ -19,8 +19,8 @@ use std::sync::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 
-use crate::dsl::GraphScript;
-use crate::process::model::PassNode;
+use crate::dsl::{GraphAssetKind, GraphScript, ProcessDefinitionNode};
+use crate::process::model::{PassNode, PassParam};
 use crate::process::runtime::{CompiledTimeExpr, eval_time_expr, parse_curve_ease};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -80,10 +80,11 @@ use crate::scene::drawable::{
 };
 use crate::scene::dsl::{ImageNode, SvgNode};
 use crate::scene::model::{
-    CameraNode, CharacterNode, CircleNode, DefsNode, EllipseNode, FaceJawNode, FilterDef, FontDef,
-    GradientDef, GroupNode, LineNode, MaskNode, MaterialDef, NoiseDef, PaletteNode, PartNode,
-    PathNode, PixelGridNode, PolylineNode, PrecomposeNode, PuppetNode, RectNode, RepeatNode,
-    SceneLayerNode, SceneNode, TextureDef, UseNode,
+    CameraNode, CharacterNode, CircleNode, CompositeGroupConfig, DefsNode, EllipseNode,
+    FaceJawNode, FilterDef, FontDef, GradientDef, GroupNode, LineNode, MaskNode, MaterialDef,
+    NoiseDef, PaletteNode, PartNode, PathNode, PixelGridNode, PolylineNode, PrecomposeNode,
+    PuppetNode, RectNode, RepeatNode, Scene3DNode, SceneEffectRef, SceneLayerNode, SceneNode,
+    SceneTrackNode, TextureDef, UseNode,
 };
 pub use crate::scene::resource::{clear_scene_asset_roots, set_scene_asset_roots};
 use crate::scene::resource::{
@@ -93,6 +94,22 @@ use crate::scene::resource::{
     collect_graph_texture_defs, default_world_asset_root, load_extra_fonts, load_rgba_image_source,
     load_svg_source, resolve_local_scene_asset_path,
 };
+
+fn scene_track_composite_order(track: &SceneTrackNode) -> i32 {
+    track.composite_order.unwrap_or(track.z)
+}
+
+fn scene_effect_resource<'a>(
+    resources: &'a HashMap<String, GraphTextureSource>,
+    id: &str,
+) -> Option<&'a GraphTextureSource> {
+    resources.get(id).or_else(|| {
+        id.strip_prefix("input:")
+            .or_else(|| id.strip_prefix("scene:"))
+            .and_then(|plain| resources.get(plain))
+    })
+}
+
 use crate::scene::spatial::{
     Affine2, CameraRect, EvaluatedDeformGrid, active_scene_camera_from_tracks, affine_is_identity,
     camera_transform, camera_viewport, camera_world_bounds, clamp_nonzero_signed_scale,
@@ -656,7 +673,11 @@ use crate::scene::text::{
 use crate::scene::timeline::{
     eval_repeat_count, scene_layer_source_time, scene_sequence_local_time,
 };
-use crate::world::{WorldFrameRenderer, parse_world_graph_script};
+use crate::world::{
+    WorldActor, WorldBackground, WorldBackgroundFit, WorldCamera, WorldCameraControl,
+    WorldCameraProjection, WorldFrameRenderer, WorldGraph, WorldMaterial, WorldMaterialStyle,
+    WorldNode, WorldPathStyle, WorldPresent, parse_world_graph_script,
+};
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use image::{Rgba, RgbaImage, imageops::FilterType};
 
@@ -1453,6 +1474,8 @@ struct SceneFrameRenderer {
     gpu_text_raster_cache: HashMap<u64, CachedGpuTextRaster>,
     gpu_layer3d_texture_cache: HashMap<u64, CachedGpuLayer3dTexture>,
     prepared_graph_signature: u64,
+    prepared_graph_fps: f32,
+    prepared_graph_duration_ms: u64,
     gpu_path_cache_hits: usize,
     gpu_path_cache_misses: usize,
     gradient_defs: HashMap<String, GradientDef>,
@@ -1468,6 +1491,8 @@ struct SceneFrameRenderer {
     scene_precompose_defs: HashMap<String, PrecomposeNode>,
     scene_precomposes: HashMap<String, RgbaImage>,
     scene_masks: HashMap<String, MaskNode>,
+    model_asset_sources: HashMap<String, String>,
+    image_asset_sources: HashMap<String, String>,
     gpu_pick_ids: HashMap<String, u32>,
     world_renderer: WorldFrameRenderer,
     gpu_compositor: Option<WgpuSceneCompositor>,
@@ -2122,6 +2147,8 @@ fn collect_scene_node_defs_from_nodes(nodes: &[SceneNode], out: &mut HashMap<Str
                             mask_feather: "0".to_string(),
                             mask_expansion: "0".to_string(),
                             effects: Vec::new(),
+                            process_effects: Vec::new(),
+                            composite: None,
                             opacity: "1".to_string(),
                             children: component.children.clone(),
                         }),
@@ -2229,6 +2256,7 @@ impl SceneFrameRenderer {
     ) -> Self {
         let mut font_system = FontSystem::new();
         load_extra_fonts(&mut font_system);
+        let world_asset_resolver = asset_resolver.clone();
         Self {
             profile,
             asset_resolver,
@@ -2245,6 +2273,8 @@ impl SceneFrameRenderer {
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
             prepared_graph_signature: 0,
+            prepared_graph_fps: 30.0,
+            prepared_graph_duration_ms: 1_000,
             gpu_path_cache_hits: 0,
             gpu_path_cache_misses: 0,
             gradient_defs: HashMap::new(),
@@ -2260,8 +2290,10 @@ impl SceneFrameRenderer {
             scene_precompose_defs: HashMap::new(),
             scene_precomposes: HashMap::new(),
             scene_masks: HashMap::new(),
+            model_asset_sources: HashMap::new(),
+            image_asset_sources: HashMap::new(),
             gpu_pick_ids: HashMap::new(),
-            world_renderer: WorldFrameRenderer::with_resolver(Arc::new(PathAssetResolver)),
+            world_renderer: WorldFrameRenderer::with_resolver(world_asset_resolver),
             gpu_compositor: None,
             #[cfg(not(target_arch = "wasm32"))]
             last_cpu_frame_profile: SceneCpuFrameProfile::default(),
@@ -2281,6 +2313,7 @@ impl SceneFrameRenderer {
     ) -> Self {
         let mut font_system = FontSystem::new();
         load_extra_fonts(&mut font_system);
+        let world_asset_resolver = asset_resolver.clone();
         Self {
             profile,
             asset_resolver,
@@ -2297,6 +2330,8 @@ impl SceneFrameRenderer {
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
             prepared_graph_signature: 0,
+            prepared_graph_fps: 30.0,
+            prepared_graph_duration_ms: 1_000,
             gpu_path_cache_hits: 0,
             gpu_path_cache_misses: 0,
             gradient_defs: HashMap::new(),
@@ -2312,8 +2347,10 @@ impl SceneFrameRenderer {
             scene_precompose_defs: HashMap::new(),
             scene_precomposes: HashMap::new(),
             scene_masks: HashMap::new(),
+            model_asset_sources: HashMap::new(),
+            image_asset_sources: HashMap::new(),
             gpu_pick_ids: HashMap::new(),
-            world_renderer: WorldFrameRenderer::with_resolver(Arc::new(PathAssetResolver)),
+            world_renderer: WorldFrameRenderer::with_resolver(world_asset_resolver),
             gpu_compositor: None,
             last_cpu_frame_profile: SceneCpuFrameProfile::default(),
             external_device_queue: Some((device, queue)),
@@ -2878,6 +2915,8 @@ impl SceneFrameRenderer {
     }
 
     fn prepare_frame_caches(&mut self, graph: &GraphScript) {
+        self.prepared_graph_fps = graph.fps.max(1.0);
+        self.prepared_graph_duration_ms = graph.duration_ms.max(1);
         // Action evaluation may reuse the same allocation for different
         // frame-local Graph clones, so pointer identity alone is not a valid
         // retained-scene revision. Always verify the content signature.
@@ -2908,6 +2947,21 @@ impl SceneFrameRenderer {
         self.scene_precompose_defs.clear();
         self.scene_precomposes.clear();
         self.scene_masks.clear();
+        self.model_asset_sources.clear();
+        self.image_asset_sources.clear();
+        for asset in &graph.assets {
+            match asset.kind {
+                GraphAssetKind::Model => {
+                    self.model_asset_sources
+                        .insert(asset.id.clone(), asset.src.clone());
+                }
+                GraphAssetKind::Image => {
+                    self.image_asset_sources
+                        .insert(asset.id.clone(), asset.src.clone());
+                }
+                GraphAssetKind::Video | GraphAssetKind::Audio => {}
+            }
+        }
         collect_graph_gradient_defs(graph, &mut self.gradient_defs);
         collect_graph_palette_defs(graph, &mut self.palette_defs);
         collect_graph_font_defs(graph, &mut self.font_defs);
@@ -3191,7 +3245,7 @@ impl SceneFrameRenderer {
         if !graph.world_sources.is_empty() {
             let raw_script = graph.raw_script.as_deref().ok_or_else(|| {
                 MotionLoomSceneRenderError::WorldSource {
-                    message: "unified graph is missing raw DSL needed to render <World> sources"
+                    message: "unified graph is missing raw DSL required by a legacy world source"
                         .to_string(),
                 }
             })?;
@@ -3290,6 +3344,26 @@ impl SceneFrameRenderer {
                 )?;
                 GraphTextureSource::Cpu(image)
             };
+            let scene_source = self
+                .apply_scene_effect_refs(
+                    scene_source,
+                    &scene.effects,
+                    graph,
+                    scene_output_size,
+                    time_norm,
+                    time_sec,
+                )
+                .await?;
+            let scene_source = self
+                .apply_scene_effect_refs(
+                    scene_source,
+                    &scene.post_effects,
+                    graph,
+                    scene_output_size,
+                    time_norm,
+                    time_sec,
+                )
+                .await?;
             resources.insert(scene.id.clone(), scene_source.clone());
             resources.insert(format!("scene:{}", scene.id), scene_source.clone());
             resources.entry("scene".to_string()).or_insert(scene_source);
@@ -3410,6 +3484,138 @@ impl SceneFrameRenderer {
                 ))
             });
         Ok(source)
+    }
+
+    async fn apply_scene_effect_refs(
+        &mut self,
+        mut source: GraphTextureSource,
+        effects: &[SceneEffectRef],
+        graph: &GraphScript,
+        output_size: (u32, u32),
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<GraphTextureSource, MotionLoomSceneRenderError> {
+        for effect in effects {
+            let process = graph
+                .processes
+                .iter()
+                .find(|process| process.id == effect.process)
+                .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                    message: format!(
+                        "Scene Effect references unknown Process \"{}\".",
+                        effect.process
+                    ),
+                })?;
+            source = self
+                .apply_process_definition_to_scene_source(
+                    source,
+                    process,
+                    effect,
+                    graph,
+                    output_size,
+                    time_norm,
+                    time_sec,
+                )
+                .await?;
+        }
+        Ok(source)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_process_definition_to_scene_source(
+        &mut self,
+        source: GraphTextureSource,
+        process: &ProcessDefinitionNode,
+        effect: &SceneEffectRef,
+        graph: &GraphScript,
+        output_size: (u32, u32),
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<GraphTextureSource, MotionLoomSceneRenderError> {
+        let mut local = HashMap::<String, GraphTextureSource>::new();
+        local.insert("scene".to_string(), source.clone());
+        for input_id in &process.input_ids {
+            local.insert(input_id.clone(), source.clone());
+            local.insert(format!("input:{input_id}"), source.clone());
+        }
+
+        for tex_id in &process.texture_ids {
+            let Some(tex) = graph.textures.iter().find(|tex| tex.id == *tex_id) else {
+                continue;
+            };
+            let resolved = tex
+                .from
+                .as_deref()
+                .and_then(|from| scene_effect_resource(&local, from))
+                .cloned()
+                .or_else(|| {
+                    tex.input
+                        .as_deref()
+                        .and_then(|input| scene_effect_resource(&local, input))
+                        .cloned()
+                })
+                .unwrap_or_else(|| {
+                    let size = tex.size.unwrap_or(output_size);
+                    GraphTextureSource::Cpu(RgbaImage::from_pixel(
+                        size.0.max(1),
+                        size.1.max(1),
+                        Rgba([0, 0, 0, 0]),
+                    ))
+                });
+            local.insert(tex.id.clone(), resolved);
+        }
+
+        for pass_id in &process.pass_ids {
+            let Some(base_pass) = graph.passes.iter().find(|pass| pass.id == *pass_id) else {
+                continue;
+            };
+            let mut pass = base_pass.clone();
+            for override_param in &effect.params {
+                if let Some(existing) = pass
+                    .params
+                    .iter_mut()
+                    .find(|param| param.key == override_param.name)
+                {
+                    existing.value = override_param.value.clone();
+                } else {
+                    pass.params.push(PassParam {
+                        key: override_param.name.clone(),
+                        value: override_param.value.clone(),
+                    });
+                }
+            }
+            let inputs = pass
+                .inputs
+                .iter()
+                .filter_map(|input| scene_effect_resource(&local, input.resource_id()).cloned())
+                .collect::<Vec<_>>();
+            if inputs.is_empty() {
+                return Err(MotionLoomSceneRenderError::GpuRender {
+                    message: format!(
+                        "Scene Effect Process \"{}\" pass \"{}\" has no resolved input.",
+                        process.id, pass.id
+                    ),
+                });
+            }
+            let mut output = self
+                .apply_scene_post_pass_multi(&inputs, &pass, time_norm, time_sec)
+                .await?;
+            output = self
+                .apply_process_pass_mask(output, inputs.first(), &pass, &local, time_norm, time_sec)
+                .await?;
+            for output_ref in &pass.outputs {
+                local.insert(output_ref.resource_id().to_string(), output.clone());
+            }
+        }
+
+        scene_effect_resource(&local, &process.output)
+            .cloned()
+            .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                message: format!(
+                    "Scene Effect Process \"{}\" did not produce output \"{}\".",
+                    process.id, process.output
+                ),
+            })
     }
 
     fn insert_cpu_input_resources(
@@ -5418,6 +5624,162 @@ impl SceneFrameRenderer {
         Ok(())
     }
 
+    /// Lower a typed Scene `<CompositeGroup space="3d">` into the mature GLB
+    /// renderer, then return that transparent 3D island as a regular Scene
+    /// texture. The island is composited by the same Scene pass ordering as
+    /// every 2D Layer, so this bridge does not reintroduce a public `<World>`
+    /// render family.
+    async fn render_scene_3d_composite(
+        &mut self,
+        composite: &CompositeGroupConfig,
+        frame: u32,
+        fps: f32,
+        duration_ms: u64,
+        canvas_size: (u32, u32),
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<RgbaImage, MotionLoomSceneRenderError> {
+        let mut camera = WorldCamera::default();
+        let mut actors = Vec::new();
+
+        for node in &composite.nodes_3d {
+            match node {
+                Scene3DNode::Camera(node) => {
+                    let position =
+                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 6.0])?;
+                    let target =
+                        eval_scene_vec3(&node.target, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    let dx = position[0] - target[0];
+                    let dy = position[1] - target[1];
+                    let dz = position[2] - target[2];
+                    let horizontal = (dx * dx + dz * dz).sqrt();
+                    let distance = (horizontal * horizontal + dy * dy).sqrt().max(0.05);
+                    let yaw = dx.atan2(dz).to_degrees();
+                    let pitch = dy.atan2(horizontal.max(0.0001)).to_degrees();
+                    camera = WorldCamera {
+                        id: node.id.clone(),
+                        control: WorldCameraControl::Orbit,
+                        projection: WorldCameraProjection::Perspective,
+                        target: None,
+                        x: "0".to_string(),
+                        y: "0".to_string(),
+                        z: "0".to_string(),
+                        target_x: target[0].to_string(),
+                        target_y: target[1].to_string(),
+                        target_z: target[2].to_string(),
+                        yaw: yaw.to_string(),
+                        pitch: pitch.to_string(),
+                        roll: "0".to_string(),
+                        distance: distance.to_string(),
+                        zoom: "1".to_string(),
+                        fov: eval_scene_number(&node.fov, time_norm, time_sec)?.to_string(),
+                        orthographic_scale: None,
+                    };
+                }
+                Scene3DNode::EnvironmentLight(_) => {
+                    // GLB embedded materials already use the established World
+                    // lighting shader. The typed light remains in compiler data
+                    // for the dedicated IBL pass added by the material bridge.
+                }
+                Scene3DNode::Model(node) => {
+                    let src = self
+                        .model_asset_sources
+                        .get(&node.asset)
+                        .cloned()
+                        .unwrap_or_else(|| node.asset.clone());
+                    let mut position =
+                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    if let Some(value) = &node.position_x {
+                        position[0] = eval_scene_number(value, time_norm, time_sec)?;
+                    }
+                    if let Some(value) = &node.position_y {
+                        position[1] = eval_scene_number(value, time_norm, time_sec)?;
+                    }
+                    if let Some(value) = &node.position_z {
+                        position[2] = eval_scene_number(value, time_norm, time_sec)?;
+                    }
+                    let mut rotation =
+                        eval_scene_vec3(&node.rotation, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    if let Some(value) = &node.rotation_x {
+                        rotation[0] = eval_scene_number(value, time_norm, time_sec)?;
+                    }
+                    if let Some(value) = &node.rotation_y {
+                        rotation[1] = eval_scene_number(value, time_norm, time_sec)?;
+                    }
+                    if let Some(value) = &node.rotation_z {
+                        rotation[2] = eval_scene_number(value, time_norm, time_sec)?;
+                    }
+                    actors.push(WorldActor {
+                        id: node
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("model_{}", actors.len())),
+                        model: src,
+                        path_style: WorldPathStyle::Relative,
+                        hide_meshes: Vec::new(),
+                        hide_materials: Vec::new(),
+                        profile: None,
+                        rig: None,
+                        retarget: None,
+                        x: position[0].to_string(),
+                        y: position[1].to_string(),
+                        z: position[2].to_string(),
+                        yaw: rotation[1].to_string(),
+                        pitch: rotation[0].to_string(),
+                        roll: rotation[2].to_string(),
+                        scale: eval_scene_number(&node.scale, time_norm, time_sec)?.to_string(),
+                        opacity: "1".to_string(),
+                        material: Some(WorldMaterial {
+                            style: WorldMaterialStyle::Pbr,
+                            outline: false,
+                            outline_width: "0".to_string(),
+                        }),
+                        play: None,
+                    });
+                }
+            }
+        }
+
+        let world_id = "__scene_3d_island".to_string();
+        let world_graph = WorldGraph {
+            id: Some(world_id.clone()),
+            version: Some("scene-3d-bridge-v1".to_string()),
+            fps,
+            duration_ms,
+            duration_explicit: true,
+            size: canvas_size,
+            render_size: Some(canvas_size),
+            model_profiles: Vec::new(),
+            worlds: vec![WorldNode {
+                id: world_id.clone(),
+                background: Some(WorldBackground {
+                    id: None,
+                    src: None,
+                    fit: WorldBackgroundFit::Stretch,
+                    color: "#00000000".to_string(),
+                    opacity: "1".to_string(),
+                }),
+                camera,
+                actors,
+                directional_characters: Vec::new(),
+            }],
+            retargets: Vec::new(),
+            actions: Vec::new(),
+            apply_actions: Vec::new(),
+            present: WorldPresent { from: world_id },
+        };
+        self.world_renderer
+            .render_frame_gpu(
+                &world_graph,
+                frame,
+                crate::scene::resource::default_world_asset_root(),
+            )
+            .await
+            .map_err(|err| MotionLoomSceneRenderError::GpuRender {
+                message: format!("Scene 3D island render failed: {err}"),
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn collect_gpu_scene_native_commands_with_depth<'a>(
         &'a mut self,
@@ -5482,7 +5844,7 @@ impl SceneFrameRenderer {
                                 _ => None,
                             })
                             .collect::<Vec<_>>();
-                        tracks.sort_by_key(|track| track.z);
+                        tracks.sort_by_key(|track| scene_track_composite_order(track));
                         let active_camera = active_scene_camera_from_tracks(
                             &tracks,
                             canvas_size.0,
@@ -5501,9 +5863,13 @@ impl SceneFrameRenderer {
                                     let b_depth =
                                         scene_depth_track_sort_key(&b.z_depth, time_norm, time_sec)
                                             .unwrap_or(0.0);
-                                    b_depth.total_cmp(&a_depth).then_with(|| a.z.cmp(&b.z))
+                                    b_depth.total_cmp(&a_depth).then_with(|| {
+                                        scene_track_composite_order(a)
+                                            .cmp(&scene_track_composite_order(b))
+                                    })
                                 }
-                                _ => a.z.cmp(&b.z),
+                                _ => scene_track_composite_order(a)
+                                    .cmp(&scene_track_composite_order(b)),
                             }
                         });
                         for track in tracks {
@@ -6290,6 +6656,57 @@ impl SceneFrameRenderer {
                         let group_deform = eval_group_deform_grid(group, time_norm, time_sec)?;
                         if group.mask.is_some() && group.mask_from.is_some() {
                             *unsupported = true;
+                            continue;
+                        }
+                        if let Some(composite) = group.composite.as_ref()
+                            && composite.space.eq_ignore_ascii_case("3d")
+                            && !composite.nodes_3d.is_empty()
+                        {
+                            let fps = self.prepared_graph_fps.max(1.0);
+                            let frame = (time_sec * fps).round().max(0.0) as u32;
+                            let image = self
+                                .render_scene_3d_composite(
+                                    composite,
+                                    frame,
+                                    fps,
+                                    self.prepared_graph_duration_ms,
+                                    canvas_size,
+                                    time_norm,
+                                    time_sec,
+                                )
+                                .await?;
+                            texture_layers.push(GpuSceneTextureLayer {
+                                source: GpuSceneTextureSource::Cpu(image),
+                                transform: group_transform,
+                                projected_quad: None,
+                                opacity,
+                                blend: SceneBlendMode::Normal,
+                                pick_id: group_pick_id,
+                                matte: None,
+                                primitive_index: primitives.len(),
+                            });
+
+                            // Camera/Model/Light tags are compiler-only nodes,
+                            // while ordinary children remain legal overlays in
+                            // the same CompositeGroup and keep their authored
+                            // order after the 3D island.
+                            if !group.children.is_empty() {
+                                self.collect_gpu_scene_native_commands(
+                                    &group.children,
+                                    group_transform,
+                                    deform,
+                                    opacity,
+                                    time_norm,
+                                    time_sec,
+                                    canvas_size,
+                                    assets,
+                                    primitives,
+                                    texture_layers,
+                                    text_requests,
+                                    unsupported,
+                                )
+                                .await?;
+                            }
                             continue;
                         }
                         if group.mask.is_some()
@@ -7320,6 +7737,14 @@ impl SceneFrameRenderer {
                 .apply_scene_brightness_pass(input, pass, time_norm, time_sec)
                 .await;
         }
+        if matches!(
+            crate::process::effect_kind::resolve_process_effect(&pass.effect),
+            Some(crate::process::effect_kind::ProcessEffect::SpectralEnergy)
+        ) {
+            return self
+                .apply_scene_spectral_energy_pass(input, pass, time_norm, time_sec)
+                .await;
+        }
         let effect = pass.effect.to_ascii_lowercase();
         if effect == "opacity" || effect == "composite.opacity" {
             let opacity = pass_param_expr(pass, "opacity")
@@ -7522,6 +7947,78 @@ impl SceneFrameRenderer {
         )))
     }
 
+    async fn apply_scene_spectral_energy_pass(
+        &mut self,
+        input: &GraphTextureSource,
+        pass: &PassNode,
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<GraphTextureSource, MotionLoomSceneRenderError> {
+        let mode = pass
+            .mode
+            .as_deref()
+            .or_else(|| pass_param_expr(pass, "mode"))
+            .map(|value| {
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_ascii_lowercase()
+            })
+            .map(|value| match value.as_str() {
+                "granular" | "granular_light_field" | "light_field" => 1.0,
+                _ => 0.0,
+            })
+            .unwrap_or(0.0);
+        let active = pass_param_expr(pass, "active")
+            .or_else(|| pass_param_expr(pass, "mix"))
+            .map(|expr| eval_scene_number(expr, time_norm, time_sec))
+            .transpose()?
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let intensity = pass_param_expr(pass, "intensity")
+            .map(|expr| eval_scene_number(expr, time_norm, time_sec))
+            .transpose()?
+            .unwrap_or(1.0)
+            .max(0.0);
+        let density = pass_param_expr(pass, "density")
+            .or_else(|| pass_param_expr(pass, "grain"))
+            .map(|expr| eval_scene_number(expr, time_norm, time_sec))
+            .transpose()?
+            .unwrap_or(1.0)
+            .max(0.05);
+        let drift = pass_param_expr(pass, "drift")
+            .or_else(|| pass_param_expr(pass, "motion"))
+            .map(|expr| eval_scene_number(expr, time_norm, time_sec))
+            .transpose()?
+            .unwrap_or(0.0);
+        let seed = pass_param_expr(pass, "seed")
+            .map(|expr| eval_scene_number(expr, time_norm, time_sec))
+            .transpose()?
+            .unwrap_or(67.0);
+
+        if self.profile.uses_gpu_compositor()
+            && let GraphTextureSource::Gpu(texture) = input
+        {
+            self.ensure_gpu_compositor_size(texture.width.max(1), texture.height.max(1))
+                .await?;
+            let compositor = self.gpu_compositor.as_mut().ok_or_else(|| {
+                MotionLoomSceneRenderError::GpuRender {
+                    message: "GPU compositor was not initialized".to_string(),
+                }
+            })?;
+            return Ok(GraphTextureSource::Gpu(
+                compositor.apply_gpu_spectral_energy_texture(
+                    texture, mode, active, intensity, density, drift, seed, time_sec,
+                )?,
+            ));
+        }
+
+        // Compatibility Render intentionally keeps the authored Scene intact;
+        // this procedural look is a WebGPU effect.
+        Ok(input.clone())
+    }
+
     async fn apply_scene_light_sweep_pass(
         &mut self,
         input: &GraphTextureSource,
@@ -7721,7 +8218,7 @@ impl SceneFrameRenderer {
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    tracks.sort_by_key(|track| track.z);
+                    tracks.sort_by_key(|track| scene_track_composite_order(track));
                     let active_camera = active_scene_camera_from_tracks(
                         &tracks,
                         canvas.width(),
@@ -7740,9 +8237,14 @@ impl SceneFrameRenderer {
                                 let b_depth =
                                     scene_depth_track_sort_key(&b.z_depth, time_norm, time_sec)
                                         .unwrap_or(0.0);
-                                b_depth.total_cmp(&a_depth).then_with(|| a.z.cmp(&b.z))
+                                b_depth.total_cmp(&a_depth).then_with(|| {
+                                    scene_track_composite_order(a)
+                                        .cmp(&scene_track_composite_order(b))
+                                })
                             }
-                            _ => a.z.cmp(&b.z),
+                            _ => {
+                                scene_track_composite_order(a).cmp(&scene_track_composite_order(b))
+                            }
                         }
                     });
                     for track in tracks {
@@ -9213,7 +9715,7 @@ impl SceneFrameRenderer {
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    tracks.sort_by_key(|track| track.z);
+                    tracks.sort_by_key(|track| scene_track_composite_order(track));
                     let active_camera = active_scene_camera_from_tracks(
                         &tracks,
                         canvas.width(),
@@ -11158,6 +11660,60 @@ impl SceneFrameRenderer {
     }
 }
 
+fn eval_scene_vec3(
+    expr: &str,
+    time_norm: f32,
+    time_sec: f32,
+    default: [f32; 3],
+) -> Result<[f32; 3], MotionLoomSceneRenderError> {
+    let trimmed = expr
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+
+    let mut values = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote = None;
+    for (index, ch) in trimmed.char_indices() {
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                values.push(trimmed[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    values.push(trimmed[start..].trim());
+    if values.len() != 3 {
+        return Err(MotionLoomSceneRenderError::InvalidExpression {
+            expr: expr.to_string(),
+            message: "expected a three-component vector such as [0,0,6]".to_string(),
+        });
+    }
+    Ok([
+        eval_scene_number(values[0], time_norm, time_sec)?,
+        eval_scene_number(values[1], time_norm, time_sec)?,
+        eval_scene_number(values[2], time_norm, time_sec)?,
+    ])
+}
+
 pub(crate) fn eval_scene_number(
     expr: &str,
     time_norm: f32,
@@ -11481,7 +12037,7 @@ fn collect_gpu_scene_commands_with_depth(
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                tracks.sort_by_key(|track| track.z);
+                tracks.sort_by_key(|track| scene_track_composite_order(track));
                 let active_camera = active_scene_camera_from_tracks(
                     &tracks,
                     canvas_size.0,
@@ -11500,9 +12056,11 @@ fn collect_gpu_scene_commands_with_depth(
                             let b_depth =
                                 scene_depth_track_sort_key(&b.z_depth, time_norm, time_sec)
                                     .unwrap_or(0.0);
-                            b_depth.total_cmp(&a_depth).then_with(|| a.z.cmp(&b.z))
+                            b_depth.total_cmp(&a_depth).then_with(|| {
+                                scene_track_composite_order(a).cmp(&scene_track_composite_order(b))
+                            })
                         }
-                        _ => a.z.cmp(&b.z),
+                        _ => scene_track_composite_order(a).cmp(&scene_track_composite_order(b)),
                     }
                 });
                 for track in tracks {
@@ -17767,6 +18325,53 @@ mod tests {
         assert!(
             right[0] > left[0] + 90 && right[3] > 240,
             "expected right pixel to receive masked brightness, got left={left:?} right={right:?}"
+        );
+    }
+
+    #[test]
+    fn scene_renderer_applies_referenced_process_effect_and_param_override() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[32,24]}>
+  <Background color="#00000000" />
+  <Process id="fx_brightness">
+    <Input id="effect_input" type="video" />
+    <Tex id="effect_src" fmt="rgba16f" from="input:effect_input" />
+    <Tex id="effect_out" fmt="rgba16f" size={[32,24]} />
+    <Pass id="brightness_pass" kind="compute"
+          effect="brightness"
+          in={["effect_src"]} out={["effect_out"]}
+          params={{ brightness: "0.0" }} />
+  </Process>
+  <Scene id="graded_scene">
+    <Timeline>
+      <Track id="main" space="screen">
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="32" height="24" color="#202020" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+    <Effects>
+      <Effect process="fx_brightness">
+        <Param name="brightness" value="0.5" />
+      </Effect>
+    </Effects>
+  </Scene>
+  <Present from="graded_scene" />
+</Graph>
+"##,
+        )
+        .expect("scene Process reference should parse");
+
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+        let rendered = pollster::block_on(renderer.render_frame(&graph, 0))
+            .expect("scene Process reference should render");
+        let pixel = rendered.get_pixel(12, 12);
+        assert!(
+            pixel[0] > 120 && pixel[1] > 120 && pixel[2] > 120,
+            "expected Scene Effect Param to override brightness, got {pixel:?}"
         );
     }
 

@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use draco_gltf::{
+    ComponentType as DracoComponentType, MeshIndex as DracoMeshIndex, PackedAttribute,
+    PackedGeometry, PrimitiveIndex as DracoPrimitiveIndex, PrimitiveMode as DracoPrimitiveMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -202,7 +207,7 @@ pub fn load_glb_mesh_data_from_bytes(
 }
 
 pub fn parse_glb_metadata(path: &Path, bytes: &[u8]) -> Result<GlbMetadata, GlbLoadError> {
-    let chunks = parse_glb_chunks(path, bytes)?;
+    let chunks = parse_gltf_or_glb_chunks(path, bytes)?;
     let skin_count = array_len(chunks.json.get("skins"));
     Ok(GlbMetadata {
         path: path.to_path_buf(),
@@ -223,7 +228,25 @@ pub fn parse_glb_metadata(path: &Path, bytes: &[u8]) -> Result<GlbMetadata, GlbL
 }
 
 pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, GlbLoadError> {
-    let chunks = parse_glb_chunks(path, bytes)?;
+    let chunks = parse_gltf_or_glb_chunks(path, bytes)?;
+    let draco_import = chunks
+        .json
+        .get("extensionsRequired")
+        .and_then(Value::as_array)
+        .is_some_and(|extensions| {
+            extensions
+                .iter()
+                .any(|extension| extension.as_str() == Some("KHR_draco_mesh_compression"))
+        })
+        .then(|| {
+            draco_gltf::import_slice(bytes, path.parent()).map_err(|error| {
+                invalid_err(
+                    path,
+                    &format!("failed to read Draco glTF geometry: {error}"),
+                )
+            })
+        })
+        .transpose()?;
     let textures = read_textures(&chunks, path)?;
     let materials = read_materials(&chunks);
     let nodes = read_nodes(&chunks);
@@ -257,9 +280,47 @@ pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, Glb
             continue;
         };
         let mesh_node = mesh_node_lookup.get(&mesh_index).copied();
-        for primitive in primitives {
+        for (primitive_index, primitive) in primitives.iter().enumerate() {
             let mode = primitive.get("mode").and_then(Value::as_u64).unwrap_or(4);
             if mode != 4 {
+                continue;
+            }
+            if primitive
+                .get("extensions")
+                .and_then(|extensions| extensions.get("KHR_draco_mesh_compression"))
+                .is_some()
+            {
+                let import = draco_import.as_ref().ok_or_else(|| {
+                    invalid_err(path, "Draco primitive found without a Draco decoder")
+                })?;
+                let geometry = import
+                    .read_primitive(DracoPrimitiveIndex::new(
+                        DracoMeshIndex(mesh_index),
+                        primitive_index,
+                    ))
+                    .map_err(|error| {
+                        invalid_err(
+                            path,
+                            &format!(
+                                "failed to decode Draco mesh {mesh_index} primitive {primitive_index}: {error}"
+                            ),
+                        )
+                    })?;
+                append_packed_primitive(
+                    path,
+                    &geometry,
+                    primitive,
+                    mesh_index,
+                    mesh_node,
+                    &mut positions,
+                    &mut normals,
+                    &mut texcoords,
+                    &mut colors,
+                    &mut joints,
+                    &mut weights,
+                    &mut indices,
+                    &mut triangles,
+                )?;
                 continue;
             }
             let Some(position_index) = primitive
@@ -370,11 +431,360 @@ pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, Glb
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_packed_primitive(
+    path: &Path,
+    geometry: &PackedGeometry,
+    primitive: &Value,
+    mesh_index: usize,
+    mesh_node: Option<usize>,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<Option<[f32; 3]>>,
+    texcoords: &mut Vec<Option<[f32; 2]>>,
+    colors: &mut Vec<Option<[f32; 4]>>,
+    joints: &mut Vec<Option<[u16; 4]>>,
+    weights: &mut Vec<Option<[f32; 4]>>,
+    indices: &mut Vec<u32>,
+    triangles: &mut Vec<GlbTriangle>,
+) -> Result<(), GlbLoadError> {
+    if geometry.mode() != DracoPrimitiveMode::Triangles {
+        return Ok(());
+    }
+    let position_attribute = packed_attribute(geometry, "POSITION")
+        .ok_or_else(|| invalid_err(path, "decoded Draco primitive is missing POSITION"))?;
+    let primitive_positions = packed_f32_rows::<3>(path, position_attribute)?;
+    let primitive_normals = packed_attribute(geometry, "NORMAL")
+        .map(|attribute| packed_f32_rows::<3>(path, attribute))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(normalize3)
+        .collect::<Vec<_>>();
+    let primitive_texcoords = packed_attribute(geometry, "TEXCOORD_0")
+        .map(|attribute| packed_f32_rows::<2>(path, attribute))
+        .transpose()?
+        .unwrap_or_default();
+    let primitive_colors = packed_attribute(geometry, "COLOR_0")
+        .map(|attribute| packed_colors(path, attribute))
+        .transpose()?
+        .unwrap_or_default();
+    let primitive_joints = packed_attribute(geometry, "JOINTS_0")
+        .map(|attribute| packed_u16_rows::<4>(path, attribute))
+        .transpose()?
+        .unwrap_or_default();
+    let primitive_weights = packed_attribute(geometry, "WEIGHTS_0")
+        .map(|attribute| packed_f32_rows::<4>(path, attribute))
+        .transpose()?
+        .unwrap_or_default();
+
+    let base = positions.len() as u32;
+    let primitive_len = primitive_positions.len();
+    positions.extend(primitive_positions);
+    for idx in 0..primitive_len {
+        normals.push(primitive_normals.get(idx).copied());
+        texcoords.push(primitive_texcoords.get(idx).copied());
+        colors.push(primitive_colors.get(idx).copied());
+        joints.push(primitive_joints.get(idx).copied());
+        weights.push(primitive_weights.get(idx).copied());
+    }
+
+    let primitive_indices = geometry
+        .indices()
+        .map(|packed| packed_indices(path, packed))
+        .transpose()?
+        .unwrap_or_else(|| (0..primitive_len as u32).collect())
+        .into_iter()
+        .map(|index| base + index)
+        .collect::<Vec<_>>();
+    let material = primitive
+        .get("material")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    for chunk in primitive_indices.chunks(3) {
+        if let [a, b, c] = *chunk {
+            indices.extend([a, b, c]);
+            triangles.push(GlbTriangle {
+                indices: [a, b, c],
+                material,
+                mesh: Some(mesh_index),
+                mesh_node,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn packed_attribute<'a>(
+    geometry: &'a PackedGeometry,
+    semantic: &str,
+) -> Option<&'a PackedAttribute> {
+    geometry
+        .attributes()
+        .iter()
+        .find(|attribute| attribute.semantic() == semantic)
+}
+
+fn packed_f32_rows<const N: usize>(
+    path: &Path,
+    attribute: &PackedAttribute,
+) -> Result<Vec<[f32; N]>, GlbLoadError> {
+    if usize::from(attribute.components()) != N {
+        return invalid(
+            path,
+            &format!(
+                "decoded Draco {} has {} components; expected {N}",
+                attribute.semantic(),
+                attribute.components()
+            ),
+        );
+    }
+    let stride = attribute.component_type().byte_width() * N;
+    let mut rows = Vec::with_capacity(attribute.count());
+    for row in 0..attribute.count() {
+        let mut values = [0.0; N];
+        for (component, value) in values.iter_mut().enumerate() {
+            *value = packed_component_f32(
+                path,
+                attribute,
+                row * stride + component * attribute.component_type().byte_width(),
+            )?;
+        }
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
+fn packed_u16_rows<const N: usize>(
+    path: &Path,
+    attribute: &PackedAttribute,
+) -> Result<Vec<[u16; N]>, GlbLoadError> {
+    if usize::from(attribute.components()) != N {
+        return invalid(
+            path,
+            &format!(
+                "decoded Draco {} has {} components; expected {N}",
+                attribute.semantic(),
+                attribute.components()
+            ),
+        );
+    }
+    let stride = attribute.component_type().byte_width() * N;
+    let mut rows = Vec::with_capacity(attribute.count());
+    for row in 0..attribute.count() {
+        let mut values = [0; N];
+        for (component, value) in values.iter_mut().enumerate() {
+            *value = packed_component_u64(
+                path,
+                attribute.component_type(),
+                attribute.bytes(),
+                row * stride + component * attribute.component_type().byte_width(),
+            )?
+            .min(u16::MAX as u64) as u16;
+        }
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
+fn packed_colors(path: &Path, attribute: &PackedAttribute) -> Result<Vec<[f32; 4]>, GlbLoadError> {
+    let components = usize::from(attribute.components());
+    if components != 3 && components != 4 {
+        return invalid(path, "decoded Draco COLOR_0 must be VEC3 or VEC4");
+    }
+    let stride = attribute.component_type().byte_width() * components;
+    let mut rows = Vec::with_capacity(attribute.count());
+    for row in 0..attribute.count() {
+        let mut values = [1.0; 4];
+        for (component, value) in values.iter_mut().enumerate().take(components) {
+            *value = packed_component_f32(
+                path,
+                attribute,
+                row * stride + component * attribute.component_type().byte_width(),
+            )?;
+        }
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
+fn packed_indices(
+    path: &Path,
+    indices: &draco_gltf::PackedIndices,
+) -> Result<Vec<u32>, GlbLoadError> {
+    let width = indices.component_type().byte_width();
+    let mut out = Vec::with_capacity(indices.count());
+    for index in 0..indices.count() {
+        out.push(
+            packed_component_u64(
+                path,
+                indices.component_type(),
+                indices.bytes(),
+                index * width,
+            )?
+            .min(u32::MAX as u64) as u32,
+        );
+    }
+    Ok(out)
+}
+
+fn packed_component_f32(
+    path: &Path,
+    attribute: &PackedAttribute,
+    offset: usize,
+) -> Result<f32, GlbLoadError> {
+    let bytes = attribute.bytes();
+    let component_type = attribute.component_type();
+    let normalized = attribute.normalized();
+    let value = match component_type {
+        DracoComponentType::F32 => read_f32(bytes, offset)
+            .ok_or_else(|| invalid_err(path, "truncated packed f32 Draco attribute"))?,
+        DracoComponentType::U8 => {
+            let value = *bytes
+                .get(offset)
+                .ok_or_else(|| invalid_err(path, "truncated packed u8 Draco attribute"))?
+                as f32;
+            if normalized { value / 255.0 } else { value }
+        }
+        DracoComponentType::I8 => {
+            let value = *bytes
+                .get(offset)
+                .ok_or_else(|| invalid_err(path, "truncated packed i8 Draco attribute"))?
+                as i8 as f32;
+            if normalized {
+                (value / 127.0).max(-1.0)
+            } else {
+                value
+            }
+        }
+        DracoComponentType::U16 => {
+            let value = read_u16(bytes, offset)
+                .ok_or_else(|| invalid_err(path, "truncated packed u16 Draco attribute"))?
+                as f32;
+            if normalized { value / 65535.0 } else { value }
+        }
+        DracoComponentType::I16 => {
+            let value = read_i16(bytes, offset)
+                .ok_or_else(|| invalid_err(path, "truncated packed i16 Draco attribute"))?
+                as f32;
+            if normalized {
+                (value / 32767.0).max(-1.0)
+            } else {
+                value
+            }
+        }
+        DracoComponentType::U32 => read_u32(bytes, offset)
+            .ok_or_else(|| invalid_err(path, "truncated packed u32 Draco attribute"))?
+            as f32,
+        other => {
+            return invalid(
+                path,
+                &format!("unsupported decoded Draco component type {other:?}"),
+            );
+        }
+    };
+    Ok(value)
+}
+
+fn packed_component_u64(
+    path: &Path,
+    component_type: DracoComponentType,
+    bytes: &[u8],
+    offset: usize,
+) -> Result<u64, GlbLoadError> {
+    let value = match component_type {
+        DracoComponentType::U8 => *bytes
+            .get(offset)
+            .ok_or_else(|| invalid_err(path, "truncated packed u8 Draco integer"))?
+            as u64,
+        DracoComponentType::U16 => read_u16(bytes, offset)
+            .ok_or_else(|| invalid_err(path, "truncated packed u16 Draco integer"))?
+            as u64,
+        DracoComponentType::U32 => read_u32(bytes, offset)
+            .ok_or_else(|| invalid_err(path, "truncated packed u32 Draco integer"))?
+            as u64,
+        other => {
+            return invalid(
+                path,
+                &format!("unsupported decoded Draco integer type {other:?}"),
+            );
+        }
+    };
+    Ok(value)
+}
+
 fn read_file(path: &Path) -> Result<Vec<u8>, GlbLoadError> {
     std::fs::read(path).map_err(|source| GlbLoadError::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn parse_gltf_or_glb_chunks(path: &Path, bytes: &[u8]) -> Result<GlbChunks, GlbLoadError> {
+    if bytes.starts_with(GLB_MAGIC) {
+        return parse_glb_chunks(path, bytes);
+    }
+    parse_gltf_json_chunks(path, bytes)
+}
+
+fn parse_gltf_json_chunks(path: &Path, bytes: &[u8]) -> Result<GlbChunks, GlbLoadError> {
+    let json: Value = serde_json::from_slice(bytes).map_err(|source| GlbLoadError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let version = json
+        .get("asset")
+        .and_then(|asset| asset.get("version"))
+        .and_then(Value::as_str)
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .unwrap_or(2);
+    if version != 2 {
+        return invalid(path, &format!("expected glTF version 2, got {version}"));
+    }
+    let buffers = json
+        .get("buffers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if buffers.len() > 1 {
+        return invalid(
+            path,
+            "text glTF currently supports one binary buffer; use GLB for multi-buffer assets",
+        );
+    }
+    let bin = if let Some(buffer) = buffers.first() {
+        let uri = buffer.get("uri").and_then(Value::as_str).ok_or_else(|| {
+            invalid_err(
+                path,
+                "text glTF buffer is missing uri; use a data URI, external .bin, or GLB",
+            )
+        })?;
+        read_gltf_uri(path, uri)?
+    } else {
+        Vec::new()
+    };
+    Ok(GlbChunks {
+        version,
+        json_len: bytes.len(),
+        bin_len: bin.len(),
+        json,
+        bin,
+    })
+}
+
+fn read_gltf_uri(path: &Path, uri: &str) -> Result<Vec<u8>, GlbLoadError> {
+    if let Some((header, payload)) = uri.split_once(',')
+        && header.starts_with("data:")
+    {
+        if header.ends_with(";base64") {
+            return base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .map_err(|err| invalid_err(path, &format!("invalid base64 data URI: {err}")));
+        }
+        return Ok(payload.as_bytes().to_vec());
+    }
+    let asset_path = path.parent().unwrap_or_else(|| Path::new(".")).join(uri);
+    read_file(&asset_path)
 }
 
 fn parse_glb_chunks(path: &Path, bytes: &[u8]) -> Result<GlbChunks, GlbLoadError> {
@@ -480,14 +890,7 @@ fn read_image_node(
         ensure_range(path, view.byte_offset, byte_length, chunks.bin.len())?;
         chunks.bin[view.byte_offset..view.byte_offset + byte_length].to_vec()
     } else if let Some(uri) = image_node.get("uri").and_then(Value::as_str) {
-        if uri.starts_with("data:") {
-            return Ok(None);
-        }
-        let image_path = path.parent().unwrap_or_else(|| Path::new(".")).join(uri);
-        std::fs::read(&image_path).map_err(|source| GlbLoadError::Io {
-            path: image_path,
-            source,
-        })?
+        read_gltf_uri(path, uri)?
     } else {
         return Ok(None);
     };
@@ -1110,6 +1513,11 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
+fn read_i16(bytes: &[u8], offset: usize) -> Option<i16> {
+    let slice = bytes.get(offset..offset + 2)?;
+    Some(i16::from_le_bytes([slice[0], slice[1]]))
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let slice = bytes.get(offset..offset + 4)?;
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
@@ -1177,9 +1585,12 @@ fn invalid_err(path: &Path, message: &str) -> GlbLoadError {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use serde_json::json;
 
-    use super::{GlbChunks, load_glb_mesh_data, load_glb_metadata, read_materials};
+    use super::{
+        GlbChunks, load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data, read_materials,
+    };
 
     #[test]
     fn loads_example_glb_metadata_when_present() {
@@ -1210,6 +1621,81 @@ mod tests {
         assert_eq!(mesh.positions.len(), mesh.weights.len());
         assert!(!mesh.materials.is_empty());
         assert!(mesh.bounds_max[1] > mesh.bounds_min[1]);
+    }
+
+    #[test]
+    fn loads_draco_iphone_glb_mesh_data_when_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../motionloom-example/assets/sample_assets/glb/iphone.glb");
+        if !path.exists() {
+            return;
+        }
+        let mesh = load_glb_mesh_data(&path).expect("Draco iPhone GLB mesh data");
+        assert!(!mesh.positions.is_empty());
+        assert!(mesh.indices.len() >= 3);
+        assert_eq!(mesh.positions.len(), mesh.texcoords.len());
+        assert_eq!(mesh.positions.len(), mesh.normals.len());
+        assert!(!mesh.materials.is_empty());
+        assert!(mesh.bounds_max[1] > mesh.bounds_min[1]);
+    }
+
+    #[test]
+    fn loads_self_contained_json_gltf_mesh_data() {
+        let mut buffer = Vec::new();
+        for value in [
+            -1.0f32, -1.0, 0.0, //
+            1.0, -1.0, 0.0, //
+            0.0, 1.0, 0.0,
+        ] {
+            buffer.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in [0u16, 1, 2] {
+            buffer.extend_from_slice(&index.to_le_bytes());
+        }
+        let document = json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{
+                "primitives": [{
+                    "attributes": { "POSITION": 0 },
+                    "indices": 1
+                }]
+            }],
+            "buffers": [{
+                "byteLength": buffer.len(),
+                "uri": format!(
+                    "data:application/octet-stream;base64,{}",
+                    BASE64_STANDARD.encode(&buffer)
+                )
+            }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+                { "buffer": 0, "byteOffset": 36, "byteLength": 6 }
+            ],
+            "accessors": [
+                {
+                    "bufferView": 0,
+                    "componentType": 5126,
+                    "count": 3,
+                    "type": "VEC3"
+                },
+                {
+                    "bufferView": 1,
+                    "componentType": 5123,
+                    "count": 3,
+                    "type": "SCALAR"
+                }
+            ]
+        });
+        let bytes = serde_json::to_vec(&document).expect("serialize embedded glTF");
+        let mesh =
+            parse_glb_mesh_data(std::path::Path::new("triangle.gltf"), &bytes).expect("JSON glTF");
+        assert_eq!(mesh.positions.len(), 3);
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+        assert_eq!(mesh.bounds_min, [-1.0, -1.0, 0.0]);
+        assert_eq!(mesh.bounds_max, [1.0, 1.0, 0.0]);
     }
 
     #[test]

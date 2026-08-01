@@ -3,16 +3,18 @@
 Use this guide when generating or editing MotionLoom DSL. Prefer valid,
 predictable, editable, and renderable output over the shortest possible script.
 
-## Choose One Graph Family
+## Choose the Authoring Root
 
-- **Scene graph**: vector graphics, text, animation, characters, cameras, masks,
-  rigs, and composition.
+- **Scene graph**: all renderable 2D, 2.5D, and true-3D content, including
+  vector graphics, text, animation, characters, cameras, masks, rigs, models,
+  and composition.
 - **Process graph**: media input, textures, compute effects, and multi-pass image
   processing.
-- **World graph**: 3D/world content where the documented world components are
-  required.
-- Do not mix graph families unless the composition genuinely requires it and a
-  documented example demonstrates the connection.
+- `<World>` has been removed from the DSL. Never generate a `<World>` node or a
+  `from="world:..."` resource reference. Put 3D content in a `<Scene>` using a
+  `space="3d"` track and `CompositeGroup`, `Camera3D`, and `Model`.
+- Scene and Process resources may coexist when a composition needs
+  post-processing; keep their texture dependencies explicit.
 
 ## Canonical Scene Structure
 
@@ -43,6 +45,36 @@ directly below `<Scene>`.
 `Graph -> Scene -> Timeline -> Track -> Sequence -> Layer` is the canonical
 authoring grammar. Keeping one structure makes scripts easier for parsers, UI
 editors, humans, and other LLMs to modify safely.
+
+For true 3D, keep the same Scene timeline and place the 3D island inside its
+own track:
+
+```xml
+<Graph fps={30} duration="4s" size={[1280,720]}>
+  <Assets>
+    <ModelAsset id="product_model" src="assets/product.glb" />
+  </Assets>
+
+  <Scene id="product_scene">
+    <Timeline>
+      <Track id="product_3d" space="3d" compositeOrder="20">
+        <Sequence from="0s" duration="4s" out="hold">
+          <CompositeGroup id="product_island" space="3d" depth="true">
+            <Camera3D position={[0,0,6]} target={[0,0,0]} fov="35" />
+            <Model asset="product_model"
+                   rotationY={curve("0:-25:linear, 4:25:ease_in_out")} />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+
+  <Present from="product_scene" />
+</Graph>
+```
+
+`Track space="world"` remains a valid 2D Scene coordinate mode. The word
+`world` in that attribute does not imply that a `<World>` DSL element exists.
 
 ## Canonical Process Structure
 
@@ -262,7 +294,8 @@ Use `Layout` when children share a regular row, column, or grid structure:
 
 ## Reliable Generation Workflow
 
-1. Classify the request as Scene, Process, or World.
+1. Classify the request as Scene, Process, or Scene plus Process. Use Scene for
+   every visual composition, including true 3D.
 2. Find the nearest working example in `motionloom-example/core`.
 3. Copy its structural skeleton, not its decorative content.
 4. Add stable semantic IDs before animation or references.

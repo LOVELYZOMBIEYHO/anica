@@ -92,11 +92,17 @@ pub fn inspect_root_graph(script: &str) -> Result<RootGraphShell, GraphParseErro
             message: "Missing </Graph> close tag.".to_string(),
         });
     }
+    if contains_open_tag(graph_body, "World") {
+        return Err(GraphParseError {
+            line: 1,
+            message: "<World> has been removed from MotionLoom DSL. Put renderable 3D content inside <Scene> using <CompositeGroup space=\"3d\">; space=\"world\" remains available as a coordinate-space value.".to_string(),
+        });
+    }
 
     Ok(RootGraphShell {
         has_process: graph_body.contains("<Process"),
         has_scene: graph_body.contains("<Scene"),
-        has_world: graph_body.contains("<World"),
+        has_world: false,
     })
 }
 
@@ -183,7 +189,7 @@ where
         if process_graph_needs_external_input(&graph) {
             return Err(MotionLoomError::UnsupportedDocument {
                 message:
-                    "Process-only graphs with input:clip0 need a source clip. Use the timeline Layer FX export path, or wrap the effect around a <Scene>/<World> source for MotionLoom Page render."
+                    "Process-only graphs with input:clip0 need a source clip. Use the timeline Layer FX export path, or wrap the effect around a <Scene> source for MotionLoom Page render."
                         .to_string(),
             });
         }
@@ -282,7 +288,7 @@ where
         if process_graph_needs_external_input(&graph) {
             return Err(MotionLoomError::UnsupportedDocument {
                 message:
-                    "Process-only graphs with input:clip0 need a source clip. Use the timeline Layer FX export path, or wrap the effect around a <Scene>/<World> source for MotionLoom Page render."
+                    "Process-only graphs with input:clip0 need a source clip. Use the timeline Layer FX export path, or wrap the effect around a <Scene> source for MotionLoom Page render."
                         .to_string(),
             });
         }
@@ -426,6 +432,39 @@ mod tests {
 "#;
         let err = parse_motionloom_document(script).expect_err("legacy shorthand should fail");
         assert!(err.message.contains("Root-level process nodes"));
+    }
+
+    #[test]
+    fn root_dispatcher_rejects_removed_world_tag_but_keeps_world_space_name() {
+        let removed_world = r#"
+<Graph fps={30} duration="1s" size={[1920,1080]}>
+  <World id="legacy_world" />
+  <Present from="legacy_world" />
+</Graph>
+"#;
+        let err =
+            parse_motionloom_document(removed_world).expect_err("World tag should be removed");
+        assert!(err.message.contains("<World> has been removed"));
+
+        let world_space = r##"
+<Graph fps={30} duration="1s" size={[256,256]}>
+  <Scene id="scene0">
+    <Timeline>
+      <Track id="main" space="world">
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="256" height="256" color="#ffffff" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scene0" />
+</Graph>
+"##;
+        let doc = parse_motionloom_document(world_space)
+            .expect("world remains a valid Scene coordinate-space name");
+        assert!(matches!(doc, MotionLoomDocument::Scene(_)));
     }
 
     #[test]

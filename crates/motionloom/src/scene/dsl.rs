@@ -651,9 +651,19 @@ pub(crate) fn parse_scene_root_block(
         .map(|v| parse_size(v, start + 1, "size"))
         .transpose()?;
     let mut child_ctx = brush_ctx.clone();
-    let mut children = parse_scene_root_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let (mut children, effects, post_effects) =
+        parse_scene_root_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
     resolve_puppet_targets(&mut children)?;
-    Ok((SceneRootNode { id, size, children }, close_ix))
+    Ok((
+        SceneRootNode {
+            id,
+            size,
+            effects,
+            post_effects,
+            children,
+        },
+        close_ix,
+    ))
 }
 
 // PuppetWarp is authored beside its target so the DSL remains easy to edit.
@@ -878,8 +888,10 @@ fn parse_scene_root_nodes(
     start: usize,
     end: usize,
     brush_ctx: &mut BrushParseContext,
-) -> Result<Vec<SceneNode>, GraphParseError> {
+) -> Result<(Vec<SceneNode>, Vec<SceneEffectRef>, Vec<SceneEffectRef>), GraphParseError> {
     let mut nodes = Vec::<SceneNode>::new();
+    let mut effects = Vec::<SceneEffectRef>::new();
+    let mut post_effects = Vec::<SceneEffectRef>::new();
     let mut i = start;
     while i < end {
         let line = lines[i].trim();
@@ -903,14 +915,106 @@ fn parse_scene_root_nodes(
             i = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "Effects") {
+            let (mut parsed, end_ix) = parse_scene_effects_block(lines, i, "Effects")?;
+            effects.append(&mut parsed);
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "PostEffects") {
+            let (mut parsed, end_ix) = parse_scene_effects_block(lines, i, "PostEffects")?;
+            post_effects.append(&mut parsed);
+            i = end_ix + 1;
+            continue;
+        }
         return Err(GraphParseError {
             line: i + 1,
             message: format!(
-                "<Scene> root only accepts <Defs> and <Timeline>. Visual nodes must be wrapped in <Timeline><Track><Sequence>..., got: {line}"
+                "<Scene> root only accepts <Defs> and <Timeline> visual structure, plus optional <Effects> and <PostEffects>. Visual nodes must be wrapped in <Timeline><Track><Sequence>..., got: {line}"
             ),
         });
     }
-    Ok(nodes)
+    Ok((nodes, effects, post_effects))
+}
+
+fn parse_scene_effects_block(
+    lines: &[&str],
+    start: usize,
+    tag_name: &str,
+) -> Result<(Vec<SceneEffectRef>, usize), GraphParseError> {
+    let (_open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, tag_name)?;
+    let mut effects = Vec::new();
+    let mut i = open_end_ix + 1;
+    while i < close_ix {
+        let line = lines[i].trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('{')
+            || line.starts_with("<!--")
+        {
+            i += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "Effect") {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: format!("<{tag_name}> only accepts <Effect process=\"...\"> children."),
+            });
+        }
+        let (effect_tag, effect_open_end) = collect_tag_block(lines, i, '>', false)?;
+        let process =
+            strip_wrappers(&required_attr_value(&effect_tag, "process", i + 1)?).to_string();
+        if process.trim().is_empty() {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: "Scene Effect process must not be empty.".to_string(),
+            });
+        }
+        let id = attr_value(&effect_tag, "id").map(|v| strip_wrappers(&v).to_string());
+        let mut params = Vec::new();
+        let effect_end = if is_self_closing_tag(&effect_tag) {
+            effect_open_end
+        } else {
+            let end_ix = find_matching_close_tag(lines, effect_open_end + 1, "Effect")?;
+            let mut p = effect_open_end + 1;
+            while p < end_ix {
+                let param_line = lines[p].trim();
+                if param_line.is_empty()
+                    || param_line.starts_with("//")
+                    || param_line.starts_with('{')
+                    || param_line.starts_with("<!--")
+                {
+                    p += 1;
+                    continue;
+                }
+                if !starts_open_tag(param_line, "Param") {
+                    return Err(GraphParseError {
+                        line: p + 1,
+                        message:
+                            "<Effect> only accepts self-closing <Param name=\"...\" value=\"...\" /> children."
+                                .to_string(),
+                    });
+                }
+                let (param_tag, param_end) = collect_self_closing_block(lines, p)?;
+                params.push(SceneEffectParam {
+                    name: strip_wrappers(&required_attr_value(&param_tag, "name", p + 1)?)
+                        .to_string(),
+                    value: strip_wrappers(&required_attr_value(&param_tag, "value", p + 1)?)
+                        .to_string(),
+                });
+                p = param_end + 1;
+            }
+            end_ix
+        };
+        effects.push(SceneEffectRef {
+            process,
+            id,
+            params,
+        });
+        i = effect_end + 1;
+    }
+    Ok((effects, close_ix))
 }
 
 pub(crate) fn parse_model_profile_block(
@@ -1620,12 +1724,12 @@ fn parse_track_block(
         .map(|v| strip_wrappers(&v).to_ascii_lowercase())
         .filter(|v| !v.trim().is_empty());
     if let Some(role) = role.as_deref()
-        && role != "camera"
+        && !matches!(role, "camera" | "lighting")
     {
         return Err(GraphParseError {
             line: start + 1,
             message: format!(
-                "Invalid Track role=\"{role}\". Expected role=\"camera\" or omit role."
+                "Invalid Track role=\"{role}\". Expected camera, lighting, or omit role."
             ),
         });
     }
@@ -1635,16 +1739,14 @@ fn parse_track_block(
     if role.as_deref() == Some("camera") && space_attr.is_some() {
         return Err(GraphParseError {
             line: start + 1,
-            message: "<Track role=\"camera\"> must not set space. Use space=\"world\" or space=\"screen\" only on visual tracks.".to_string(),
+            message: "A camera Track must not set space; Camera3D owns its view space.".to_string(),
         });
     }
     let space = space_attr.unwrap_or_else(|| "world".to_string());
-    if !matches!(space.as_str(), "world" | "screen") {
+    if !matches!(space.as_str(), "world" | "screen" | "3d") {
         return Err(GraphParseError {
             line: start + 1,
-            message: format!(
-                "Invalid Track space=\"{space}\". Expected space=\"world\" or space=\"screen\"."
-            ),
+            message: format!("Invalid Track space=\"{space}\". Expected screen, world, or 3d."),
         });
     }
     let z = attr_value(&open_tag, "z")
@@ -1657,18 +1759,31 @@ fn parse_track_block(
         })
         .transpose()?
         .unwrap_or(0);
+    let composite_order = attr_value(&open_tag, "compositeOrder")
+        .or_else(|| attr_value(&open_tag, "composite_order"))
+        .map(|v| {
+            let text = strip_wrappers(&v);
+            text.parse::<i32>().map_err(|_| GraphParseError {
+                line: start + 1,
+                message: format!("Invalid Track compositeOrder value: {text}"),
+            })
+        })
+        .transpose()?;
     let z_depth = attr_value(&open_tag, "zDepth")
         .or_else(|| attr_value(&open_tag, "z_depth"))
         .map(|v| strip_wrappers(&v).to_string())
         .unwrap_or_else(|| "0".to_string());
-    let children = parse_timeline_item_nodes(lines, open_end_ix + 1, close_ix, brush_ctx)?;
+    let (children, effects) =
+        parse_timeline_item_nodes(lines, open_end_ix + 1, close_ix, brush_ctx)?;
     Ok((
         SceneTrackNode {
             id,
             role,
             space,
             z,
+            composite_order,
             z_depth,
+            effects,
             children,
         },
         close_ix,
@@ -1680,8 +1795,9 @@ fn parse_timeline_item_nodes(
     start: usize,
     end: usize,
     brush_ctx: &mut BrushParseContext,
-) -> Result<Vec<SceneNode>, GraphParseError> {
+) -> Result<(Vec<SceneNode>, Vec<SceneEffectRef>), GraphParseError> {
     let mut nodes = Vec::<SceneNode>::new();
+    let mut effects = Vec::<SceneEffectRef>::new();
     let mut i = start;
     while i < end {
         let line = lines[i].trim();
@@ -1701,12 +1817,20 @@ fn parse_timeline_item_nodes(
             i = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "Effects") {
+            let (mut parsed, end_ix) = parse_scene_effects_block(lines, i, "Effects")?;
+            effects.append(&mut parsed);
+            i = end_ix + 1;
+            continue;
+        }
         return Err(GraphParseError {
             line: i + 1,
-            message: format!("<Track> only accepts <Sequence> or <Chain> children, got: {line}"),
+            message: format!(
+                "<Track> only accepts <Sequence>, <Chain>, or <Effects> children, got: {line}"
+            ),
         });
     }
-    Ok(nodes)
+    Ok((nodes, effects))
 }
 
 fn parse_sequence_block(
@@ -1741,7 +1865,7 @@ fn parse_sequence_block(
         });
     }
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     Ok((
         SceneSequenceNode {
             id,
@@ -1816,8 +1940,168 @@ pub(crate) fn parse_group_block(
     let brush = attr_value(&open_tag, "brush").map(|v| strip_wrappers(&v).to_string());
     brush_ctx.validate_brush_ref(brush.as_deref(), start + 1)?;
     let mut child_ctx = brush_ctx.with_inherited_brush(brush);
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
-    Ok((parse_group_node(&open_tag, start + 1, children)?, close_ix))
+    let mut process_effects = Vec::new();
+    let children = parse_scene_nodes(
+        lines,
+        open_end_ix + 1,
+        close_ix,
+        &mut child_ctx,
+        Some(&mut process_effects),
+    )?;
+    let mut group = parse_group_node(&open_tag, start + 1, children)?;
+    group.process_effects = process_effects;
+    Ok((group, close_ix))
+}
+
+fn parse_composite_group_block(
+    lines: &[&str],
+    start: usize,
+    brush_ctx: &BrushParseContext,
+) -> Result<(GroupNode, usize), GraphParseError> {
+    let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "CompositeGroup")?;
+    let space = attr_value(&open_tag, "space")
+        .map(|v| strip_wrappers(&v).to_ascii_lowercase())
+        .unwrap_or_else(|| "screen".to_string());
+    if !matches!(space.as_str(), "screen" | "world" | "3d") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "Invalid <CompositeGroup space=\"{space}\">. Expected screen, world, or 3d."
+            ),
+        });
+    }
+    let composite_order = attr_value(&open_tag, "compositeOrder")
+        .or_else(|| attr_value(&open_tag, "composite_order"))
+        .map(|value| {
+            strip_wrappers(&value)
+                .parse::<i32>()
+                .map_err(|_| GraphParseError {
+                    line: start + 1,
+                    message: format!(
+                        "Invalid <CompositeGroup compositeOrder=\"{}\">. Expected an integer.",
+                        strip_wrappers(&value)
+                    ),
+                })
+        })
+        .transpose()?;
+    let depth = attr_value(&open_tag, "depth")
+        .map(|value| matches!(strip_wrappers(&value), "true" | "1"))
+        .unwrap_or(space == "3d");
+    let format = attr_value(&open_tag, "format")
+        .map(|v| strip_wrappers(&v).to_ascii_lowercase())
+        .unwrap_or_else(|| "rgba8unorm".to_string());
+    if !matches!(
+        format.as_str(),
+        "rgba8unorm" | "rgba8unorm-srgb" | "rgba16f" | "rgba32f"
+    ) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "Invalid <CompositeGroup format=\"{format}\">. Expected rgba8unorm, rgba8unorm-srgb, rgba16f, or rgba32f."
+            ),
+        });
+    }
+
+    let mut child_ctx = brush_ctx.clone();
+    let mut process_effects = Vec::new();
+    let children = parse_scene_nodes(
+        lines,
+        open_end_ix + 1,
+        close_ix,
+        &mut child_ctx,
+        Some(&mut process_effects),
+    )?;
+    let mut nodes_3d = Vec::new();
+    let mut i = open_end_ix + 1;
+    while i < close_ix {
+        let line = lines[i].trim();
+        if starts_open_tag(line, "Camera3D") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::Camera(SceneCamera3DNode {
+                id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
+                position: scene_attr_or_default(&tag, &["position"], "[0,0,6]"),
+                target: scene_attr_or_default(&tag, &["target"], "[0,0,0]"),
+                fov: scene_attr_or_default(&tag, &["fov"], "35"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "EnvironmentLight") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::EnvironmentLight(SceneEnvironmentLightNode {
+                id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
+                asset: strip_wrappers(&required_attr_value(&tag, "asset", i + 1)?).to_string(),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Model") || starts_open_tag(line, "ModelLayer") {
+            let tag_name = if starts_open_tag(line, "ModelLayer") {
+                "ModelLayer"
+            } else {
+                "Model"
+            };
+            let (tag, tag_end_ix) = collect_tag_block(lines, i, '>', false)?;
+            let model_close_ix = if is_self_closing_tag(&tag) {
+                tag_end_ix
+            } else {
+                find_matching_close_tag(lines, tag_end_ix + 1, tag_name)?
+            };
+            let mut material_bindings = Vec::new();
+            let mut j = tag_end_ix + 1;
+            while j < model_close_ix {
+                if starts_open_tag(lines[j].trim(), "MaterialBinding") {
+                    let (binding, binding_end_ix) = collect_self_closing_block(lines, j)?;
+                    material_bindings.push(SceneMaterialBindingNode {
+                        material: strip_wrappers(&required_attr_value(
+                            &binding,
+                            "material",
+                            j + 1,
+                        )?)
+                        .to_string(),
+                        definition: attr_value(&binding, "definition")
+                            .map(|v| strip_wrappers(&v).to_string()),
+                        texture: attr_value(&binding, "texture")
+                            .map(|v| strip_wrappers(&v).to_string()),
+                    });
+                    j = binding_end_ix + 1;
+                    continue;
+                }
+                j += 1;
+            }
+            nodes_3d.push(Scene3DNode::Model(SceneModel3DNode {
+                id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
+                asset: strip_wrappers(&required_attr_value(&tag, "asset", i + 1)?).to_string(),
+                position: scene_attr_or_default(&tag, &["position"], "[0,0,0]"),
+                position_x: attr_value(&tag, "positionX").map(|v| strip_wrappers(&v).to_string()),
+                position_y: attr_value(&tag, "positionY").map(|v| strip_wrappers(&v).to_string()),
+                position_z: attr_value(&tag, "positionZ").map(|v| strip_wrappers(&v).to_string()),
+                rotation: scene_attr_or_default(&tag, &["rotation"], "[0,0,0]"),
+                rotation_x: attr_value(&tag, "rotationX").map(|v| strip_wrappers(&v).to_string()),
+                rotation_y: attr_value(&tag, "rotationY").map(|v| strip_wrappers(&v).to_string()),
+                rotation_z: attr_value(&tag, "rotationZ").map(|v| strip_wrappers(&v).to_string()),
+                scale: scene_attr_or_default(&tag, &["scale"], "1"),
+                material_bindings,
+            }));
+            i = model_close_ix + 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    let synthetic_group_tag = open_tag.replacen("<CompositeGroup", "<Group", 1);
+    let mut group = parse_group_node(&synthetic_group_tag, start + 1, children)?;
+    group.process_effects = process_effects;
+    group.composite = Some(CompositeGroupConfig {
+        space,
+        composite_order,
+        depth,
+        format,
+        nodes_3d,
+    });
+    Ok((group, close_ix))
 }
 
 pub(crate) fn parse_puppet_block(
@@ -1839,7 +2123,7 @@ pub(crate) fn parse_puppet_block(
     };
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, tag_name)?;
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     Ok((parse_puppet_node(&open_tag, start + 1, children)?, close_ix))
 }
 
@@ -1908,7 +2192,7 @@ pub(crate) fn parse_part_block(
     let brush = attr_value(&open_tag, "brush").map(|v| strip_wrappers(&v).to_string());
     brush_ctx.validate_brush_ref(brush.as_deref(), start + 1)?;
     let mut child_ctx = brush_ctx.with_inherited_brush(brush);
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     Ok((parse_part_node(&open_tag, start + 1, children)?, close_ix))
 }
 
@@ -1920,7 +2204,7 @@ pub(crate) fn parse_layout_block(
     let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Layout")?;
     let mut child_ctx = brush_ctx.clone();
-    let raw_children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let raw_children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     let spans = parse_layout_child_spans(lines, open_end_ix + 1, close_ix)?;
     if spans.len() != raw_children.len() {
         return Err(GraphParseError {
@@ -2327,7 +2611,7 @@ fn parse_repeat_contents(
                     });
                 }
                 let mut child_ctx = brush_ctx.clone();
-                let parsed = parse_scene_nodes(lines, j, variant_end + 1, &mut child_ctx)?;
+                let parsed = parse_scene_nodes(lines, j, variant_end + 1, &mut child_ctx, None)?;
                 if parsed.len() != 1 {
                     return Err(GraphParseError {
                         line: j + 1,
@@ -2376,7 +2660,13 @@ fn parse_repeat_contents(
         }
         let (_, _, child_end) = scene_element_bounds(lines, i, end)?;
         let mut child_ctx = brush_ctx.clone();
-        children.extend(parse_scene_nodes(lines, i, child_end + 1, &mut child_ctx)?);
+        children.extend(parse_scene_nodes(
+            lines,
+            i,
+            child_end + 1,
+            &mut child_ctx,
+            None,
+        )?);
         i = child_end + 1;
     }
     if !variants.is_empty() && !children.is_empty() {
@@ -2433,7 +2723,7 @@ pub(crate) fn parse_mask_any(
     }
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Mask")?;
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     Ok((parse_mask_node(&open_tag, start + 1, children)?, close_ix))
 }
 
@@ -2476,7 +2766,7 @@ pub(crate) fn parse_precompose_block(
         .map(|value| parse_size(value, start + 1, "size"))
         .transpose()?;
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     Ok((
         PrecomposeNode {
             id,
@@ -2562,7 +2852,8 @@ fn parse_use_any(
             });
         }
         let mut child_ctx = brush_ctx.clone();
-        let children = parse_scene_nodes(lines, fill_open_end + 1, fill_close, &mut child_ctx)?;
+        let children =
+            parse_scene_nodes(lines, fill_open_end + 1, fill_close, &mut child_ctx, None)?;
         use_node.slots.push(ComponentSlotValue { name, children });
         i = fill_close + 1;
     }
@@ -2674,7 +2965,7 @@ pub(crate) fn parse_character_block(
     }
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Character")?;
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
+    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx, None)?;
     Ok((
         parse_character_node(&open_tag, start + 1, children)?,
         close_ix,
@@ -2686,6 +2977,7 @@ fn parse_scene_nodes(
     start: usize,
     end: usize,
     brush_ctx: &mut BrushParseContext,
+    mut scope_effects: Option<&mut Vec<SceneEffectRef>>,
 ) -> Result<Vec<SceneNode>, GraphParseError> {
     let mut nodes = Vec::<SceneNode>::new();
     let mut i = start;
@@ -2704,6 +2996,20 @@ fn parse_scene_nodes(
         if starts_open_tag(line, "Timeline") {
             let (timeline, end_ix) = parse_timeline_block(lines, i, brush_ctx)?;
             nodes.push(SceneNode::Timeline(timeline));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Effects") {
+            let (mut parsed, end_ix) = parse_scene_effects_block(lines, i, "Effects")?;
+            let Some(effect_sink) = scope_effects.as_deref_mut() else {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message:
+                        "<Effects> is only valid directly inside Scene, Track, Layer, Group, or CompositeGroup."
+                            .to_string(),
+                });
+            };
+            effect_sink.append(&mut parsed);
             i = end_ix + 1;
             continue;
         }
@@ -2828,6 +3134,12 @@ fn parse_scene_nodes(
         }
         if starts_open_tag(line, "Group") {
             let (group, end_ix) = parse_group_block(lines, i, brush_ctx)?;
+            nodes.push(SceneNode::Group(group));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "CompositeGroup") {
+            let (group, end_ix) = parse_composite_group_block(lines, i, brush_ctx)?;
             nodes.push(SceneNode::Group(group));
             i = end_ix + 1;
             continue;
@@ -3925,7 +4237,7 @@ fn parse_component_block(
     }
     let mut child_ctx = brush_ctx.clone();
     let child_refs = child_lines.iter().map(String::as_str).collect::<Vec<_>>();
-    let children = parse_scene_nodes(&child_refs, 0, child_refs.len(), &mut child_ctx)?;
+    let children = parse_scene_nodes(&child_refs, 0, child_refs.len(), &mut child_ctx, None)?;
     Ok((
         ComponentNode {
             id,
@@ -4137,6 +4449,8 @@ fn lower_parametric_uses_in_nodes(
                 mask_feather: "0".to_string(),
                 mask_expansion: "0".to_string(),
                 effects: Vec::new(),
+                process_effects: Vec::new(),
+                composite: None,
                 opacity: use_node.opacity,
                 children,
             });
@@ -5688,6 +6002,8 @@ fn parse_group_node(
         mask_feather,
         mask_expansion,
         effects,
+        process_effects: Vec::new(),
+        composite: None,
         opacity,
         children,
     })
@@ -6426,11 +6742,17 @@ fn parse_scene_layer_block(
     let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, tag_name)?;
     let mut child_ctx = brush_ctx.clone();
-    let children = parse_scene_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
-    Ok((
-        parse_scene_layer_node(&open_tag, start + 1, children, false, is_3d)?,
+    let mut process_effects = Vec::new();
+    let children = parse_scene_nodes(
+        lines,
+        open_end_ix + 1,
         close_ix,
-    ))
+        &mut child_ctx,
+        Some(&mut process_effects),
+    )?;
+    let mut layer = parse_scene_layer_node(&open_tag, start + 1, children, false, is_3d)?;
+    layer.process_effects = process_effects;
+    Ok((layer, close_ix))
 }
 
 fn parse_scene_layer_node(
@@ -6522,6 +6844,19 @@ fn parse_scene_layer_node(
         .or_else(|| attr_value(block, "filter"))
         .map(|v| strip_wrappers(&v).to_string())
         .filter(|v| !v.trim().is_empty());
+    let space = attr_value(block, "space")
+        .map(|v| strip_wrappers(&v).to_ascii_lowercase())
+        .filter(|v| !v.trim().is_empty());
+    if let Some(space) = space.as_deref() {
+        if !matches!(space, "screen" | "world" | "3d") {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Invalid Scene Layer space=\"{space}\". Expected screen, world, or 3d."
+                ),
+            });
+        }
+    }
     let source_time = attr_value(block, "sourceTime")
         .or_else(|| attr_value(block, "source_time"))
         .map(|v| strip_wrappers(&v).to_string())
@@ -6606,6 +6941,8 @@ fn parse_scene_layer_node(
         opacity,
         blend,
         effect,
+        process_effects: Vec::new(),
+        space,
         source_time,
         time_offset_ms,
         playback_rate,
@@ -6632,7 +6969,7 @@ pub(crate) fn parse_camera_node(
     if attr_value(block, "mode").is_some() {
         return Err(GraphParseError {
             line,
-            message: "<Scene> Camera is the 2D Scene Camera; remove mode=\"...\". Use <World><Camera> for 3D/world cameras.".to_string(),
+            message: "<Scene> Camera is the legacy 2D Scene Camera; remove mode=\"...\". Use <Camera3D> inside <CompositeGroup space=\"3d\"> for a true 3D camera.".to_string(),
         });
     }
     let x = attr_value(block, "x")
