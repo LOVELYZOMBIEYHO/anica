@@ -182,9 +182,43 @@ impl WgpuPresentationContext {
 }
 
 impl WgpuSceneCompositor {
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn device_queue(&self) -> (Arc<wgpu::Device>, wgpu::Queue) {
         (self.device.clone(), self.queue.clone())
+    }
+
+    pub(crate) fn resize(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(), MotionLoomSceneRenderError> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        let max_texture_dimension_2d = self.device.limits().max_texture_dimension_2d;
+        if width > max_texture_dimension_2d || height > max_texture_dimension_2d {
+            return Err(MotionLoomSceneRenderError::GpuRender {
+                message: format!(
+                    "requested scene render size {width}x{height} exceeds GPU max 2D texture dimension {max_texture_dimension_2d}"
+                ),
+            });
+        }
+
+        // Resize only canvas-dependent allocations. Keeping the same device is
+        // required because cached GLB and text textures belong to that device.
+        self.width = width;
+        self.height = height;
+        self.tex_a = Self::make_canvas_texture(&self.device, width, height);
+        self.tex_b = Self::make_canvas_texture(&self.device, width, height);
+        self.padded_bytes_per_row = align_to_256(width.saturating_mul(4));
+        self.readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("anica-motionloom-scene-gpu-readback"),
+            size: (self.padded_bytes_per_row as u64 * height as u64).max(4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(())
     }
 
     fn submit_encoder(&mut self, encoder: wgpu::CommandEncoder) {

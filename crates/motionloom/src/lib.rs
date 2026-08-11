@@ -99,6 +99,7 @@
 //! ```
 
 mod asset;
+mod authoring;
 mod common;
 mod compat;
 mod dsl;
@@ -121,6 +122,13 @@ pub mod prelude;
 pub mod wasm_api;
 
 pub use asset::{AssetResolver, AssetSource, MemoryAssetResolver, PathAssetResolver};
+pub use authoring::{
+    AuthoringDiagnostic, AuthoringDiagnosticSeverity, AuthoringStatus, AuthoringSuggestion,
+    AuthoringSummary, EffectiveGraphSummary, MotionLoomAuthoringReport, MotionLoomShowcaseSchema,
+    ShowcaseAttributeSchema, ShowcaseTagSchema, analyze_motionloom_script,
+    analyze_motionloom_script_for_target, motionloom_analyze_script_for_target_json,
+    motionloom_analyze_script_json, motionloom_showcase_schema_json,
+};
 pub use compat::{
     GpuCompatibilityIssue, GpuCompatibilityReport, GpuCompatibilitySeverity,
     GpuCompatibilityTarget, ScenePreviewPath, inspect_gpu_compatibility,
@@ -143,8 +151,8 @@ pub use dsl::{
 };
 pub use error::{GraphParseError, MotionLoomError, RootGraphError, RuntimeCompileError};
 pub use preview::{
-    WgpuPreviewEngine, WgpuPreviewEngineError, WgpuPreviewFrame, WgpuPreviewGraphCache,
-    WgpuPreviewQuality,
+    WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewEngineError, WgpuPreviewFrame,
+    WgpuPreviewGraphCache, WgpuPreviewPreloadReport, WgpuPreviewQuality,
 };
 pub use preview_protocol::{
     PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,
@@ -190,6 +198,12 @@ pub use root::{
     render_motionloom_document_to_video_with_progress,
     render_motionloom_document_to_video_with_progress_and_cancel,
 };
+pub use scene::animation::{
+    ANIMATION_PROPERTY_DESCRIPTORS, AnimationCapabilityReport, AnimationDiagnostic,
+    AnimationDiagnosticSeverity, AnimationInterpolation, AnimationPropertyDescriptor,
+    AnimationValueType, animation_properties_for_node_kind, animation_property_descriptor,
+    animation_property_schema_json, inspect_animation_targets,
+};
 pub use scene::domain::{
     ProportionProfile, SkeletonDiagnostic, SkeletonDiagnosticSeverity, SkeletonOverlayPrimitive,
     SkeletonPosePreset, SkeletonValidationReport, auto_correct_skeleton, build_skeleton_overlay,
@@ -198,8 +212,10 @@ pub use scene::domain::{
 };
 pub use scene::editor_keyframes::{
     AnimationKeyframeEditError, EditableAnimationKey, EditableAnimationTarget,
-    EditableAnimationTimeline, extract_editable_animation_timeline,
-    replace_editable_animation_targets, upsert_editable_animation_target,
+    EditableAnimationTimeline, animation_target_inline_curve_expression, editable_animation_target,
+    extract_editable_animation_timeline, promote_inline_curve_to_animation_target,
+    remove_editable_animation_target, replace_editable_animation_targets,
+    upsert_editable_animation_target,
 };
 pub use scene::model::{
     BrushDef, CameraNode, CharacterNode, CircleNode, ComponentDerivedDef, ComponentNode,
@@ -214,12 +230,12 @@ pub use scene::model::{
 #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
 pub use scene::render::DmabufPlane;
 pub use scene::render::{
-    MotionLoomSceneRenderError, SceneGpuTexture, ScenePlatformPreviewSurface, ScenePreviewBackend,
-    ScenePreviewPixelFormat, ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderError,
-    SceneRenderProfile, SceneRenderProgress, SceneRenderer, clear_scene_asset_roots,
-    next_scene_output_path, next_scene_output_path_for_profile, render_scene_graph_frame,
-    render_scene_graph_frame_with_cpu_inputs, render_scene_graph_frame_with_resolver,
-    render_scene_graph_to_png_sequence_with_progress,
+    GpuFrameTexture, MotionLoomSceneRenderError, SceneGpuTexture, ScenePlatformPreviewSurface,
+    ScenePreviewBackend, ScenePreviewPixelFormat, ScenePreviewSurface, ScenePreviewSurfaceOptions,
+    SceneRenderError, SceneRenderProfile, SceneRenderProgress, SceneRenderer,
+    clear_scene_asset_roots, next_scene_output_path, next_scene_output_path_for_profile,
+    render_scene_graph_frame, render_scene_graph_frame_with_cpu_inputs,
+    render_scene_graph_frame_with_resolver, render_scene_graph_to_png_sequence_with_progress,
     render_scene_graph_to_png_sequence_with_progress_and_cancel, render_scene_graph_to_video,
     render_scene_graph_to_video_with_progress,
     render_scene_graph_to_video_with_progress_and_cancel, set_scene_asset_roots,
@@ -234,16 +250,23 @@ pub use scene::text::{
 };
 pub use world::error::{MotionLoomWorldError, WorldAssetError, WorldError, WorldParseError};
 pub use world::{
-    CharacterDesignGpuViewport, CharacterDesignViewportFrame, GlbLoadError, GlbMeshData,
-    GlbMetadata, GlbNodeData, WorldAction, WorldActionBone, WorldActionPose, WorldActor,
+    BodyBasisProposal, BoneAxisProposal, CharacterDesignGpuViewport, CharacterDesignViewportFrame,
+    EnvironmentAnchorProposal, EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic,
+    EnvironmentSurfaceProposal, GlbEnvironmentInspectionReport, GlbLoadError, GlbMeshData,
+    GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HumanoidBoneProposal, JointAlternative,
+    ModelInspectionDiagnostic, ModelInspectionError, RestPoseProposal, Scene3DFrameProfile,
+    SemanticAxisProposal, WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor,
     WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
     WorldCamera, WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldFrameRenderer,
     WorldGpuDiagnostics, WorldGraph, WorldMaterial, WorldMaterialStyle, WorldModelProfile,
     WorldNode, WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget, WorldRenderError,
     WorldRenderProgress, WorldRetarget, WorldRetargetMap, WorldSpritePlayback, WorldTime,
-    diagnose_world_glb_gpu_plan, diagnose_world_graph_actor_gpu_frame, is_world_graph_script,
-    load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data, parse_glb_metadata,
-    parse_world_graph_script, render_world_frame, render_world_graph_to_png_sequence_with_progress,
+    diagnose_world_glb_gpu_plan, diagnose_world_graph_actor_gpu_frame,
+    inspect_glb_environment_bytes, inspect_glb_environment_json, inspect_glb_environment_path,
+    inspect_glb_skeleton_bytes, inspect_glb_skeleton_json, inspect_glb_skeleton_path,
+    is_world_graph_script, load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data,
+    parse_glb_metadata, parse_world_graph_script, render_world_frame,
+    render_world_graph_to_png_sequence_with_progress,
     render_world_graph_to_png_sequence_with_progress_and_cancel,
     render_world_graph_to_video_with_progress,
 };

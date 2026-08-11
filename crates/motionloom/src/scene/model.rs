@@ -921,6 +921,9 @@ pub struct CompositeGroupConfig {
     pub depth: bool,
     #[serde(default = "default_scene_composite_format")]
     pub format: String,
+    /// Optional id of the Camera3D selected by a discrete AnimationTarget.
+    #[serde(default)]
+    pub active_camera: Option<String>,
     /// True-3D declarations are retained as typed compiler data. They lower to
     /// a 3D render island in the unified render-pass DAG.
     #[serde(default)]
@@ -937,6 +940,83 @@ pub enum Scene3DNode {
     Camera(SceneCamera3DNode),
     EnvironmentLight(SceneEnvironmentLightNode),
     Model(SceneModel3DNode),
+    Anchor(SceneAnchor3DNode),
+    Debug(SceneEnvironmentDebugNode),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEnvironmentDebugNode {
+    #[serde(default = "default_scene_bool_true")]
+    pub axes: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub bounds: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub surfaces: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub anchors: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub action_path: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub cameras: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneAnchor3DNode {
+    pub id: String,
+    pub relative_to: String,
+    pub offset: String,
+    pub space: String,
+    /// Optional named GLB node used as the anchor origin. `offset` is applied
+    /// after the node transform so portable environment markers do not need
+    /// hard-coded world coordinates.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Optional semantic surface owned by `relative_to`. When present, `uv`
+    /// selects a stable point inside that surface's asset-space bounds.
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub uv: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneSurface3DNode {
+    pub id: String,
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default = "default_scene_surface_kind")]
+    pub kind: String,
+    /// Explicit local-space fallback height. Named GLB nodes take precedence.
+    #[serde(default = "default_scene_zero")]
+    pub height: String,
+    #[serde(default = "default_scene_surface_normal")]
+    pub normal: String,
+    /// `scene` preserves the original height-only behavior. `asset` means the
+    /// measurements came from GLB inspection and must pass through the same
+    /// normalization transform as the environment mesh.
+    #[serde(default = "default_scene_surface_space")]
+    pub space: String,
+    #[serde(default)]
+    pub centroid: Option<String>,
+    #[serde(default)]
+    pub bounds_min: Option<String>,
+    #[serde(default)]
+    pub bounds_max: Option<String>,
+}
+
+fn default_scene_surface_kind() -> String {
+    "ground".to_string()
+}
+
+fn default_scene_surface_normal() -> String {
+    "[0,1,0]".to_string()
+}
+
+fn default_scene_surface_space() -> String {
+    "scene".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -946,6 +1026,12 @@ pub struct SceneCamera3DNode {
     pub position: String,
     pub target: String,
     pub fov: String,
+    #[serde(default = "default_scene_surface_normal")]
+    pub up: String,
+    #[serde(default = "default_scene_zero")]
+    pub roll: String,
+    #[serde(default)]
+    pub horizon_lock: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -961,6 +1047,15 @@ pub struct SceneEnvironmentLightNode {
 pub struct SceneModel3DNode {
     pub id: Option<String>,
     pub asset: String,
+    /// Optional canonical humanoid profile used to resolve Action bone ids.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Optional explicit rig id retained for compatibility with the 3D backend.
+    #[serde(default)]
+    pub rig: Option<String>,
+    /// Optional retarget id retained for advanced host-generated graphs.
+    #[serde(default)]
+    pub retarget: Option<String>,
     pub position: String,
     #[serde(default)]
     pub position_x: Option<String>,
@@ -976,8 +1071,103 @@ pub struct SceneModel3DNode {
     #[serde(default)]
     pub rotation_z: Option<String>,
     pub scale: String,
+    /// True when this Model was authored as `<Environment>`. It still lowers
+    /// through the same GLB/PBR renderer as Model; this flag only carries
+    /// environment semantics for authoring, grounding and inspection.
+    #[serde(default)]
+    pub environment: bool,
+    #[serde(default)]
+    pub r#static: bool,
+    #[serde(default)]
+    pub collision: Option<String>,
+    /// Coordinate declaration for environment assets. Defaults match glTF.
+    #[serde(default = "default_scene_environment_up")]
+    pub up: String,
+    #[serde(default = "default_scene_environment_forward")]
+    pub forward: String,
+    #[serde(default = "default_scene_one")]
+    pub unit_scale: String,
+    #[serde(default = "default_scene_environment_scale_mode")]
+    pub scale_mode: String,
+    #[serde(default = "default_scene_bool_true")]
+    pub cast_shadow: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub receive_shadow: bool,
+    #[serde(default)]
+    pub surfaces: Vec<SceneSurface3DNode>,
+    #[serde(default = "default_scene_model_exposure")]
+    pub exposure: String,
     #[serde(default)]
     pub material_bindings: Vec<SceneMaterialBindingNode>,
+    /// Embedded GLB animation playback. This remains optional for rig-only assets.
+    #[serde(default)]
+    pub play: Option<SceneModelPlayNode>,
+    /// Additional clip layers blended after `play`. The singular field keeps
+    /// existing serialized graphs and one-clip DSL behavior unchanged.
+    #[serde(default)]
+    pub plays: Vec<SceneModelPlayNode>,
+    /// Per-frame editor overrides synthesized from bones.* AnimationTarget paths.
+    #[serde(default)]
+    pub bone_overrides: Vec<SceneModelBoneOverrideNode>,
+}
+
+fn default_scene_model_exposure() -> String {
+    "1".to_string()
+}
+
+fn default_scene_environment_up() -> String {
+    "+Y".to_string()
+}
+
+fn default_scene_environment_forward() -> String {
+    "+Z".to_string()
+}
+
+fn default_scene_environment_scale_mode() -> String {
+    "normalize_height".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneModelPlayNode {
+    #[serde(default)]
+    pub clip: Option<String>,
+    #[serde(default = "default_scene_bool_true")]
+    pub r#loop: bool,
+    #[serde(default = "default_scene_one")]
+    pub speed: String,
+    #[serde(default = "default_scene_one")]
+    pub weight: String,
+    #[serde(default = "default_scene_zero")]
+    pub blend_in: String,
+    #[serde(default = "default_scene_zero")]
+    pub blend_out: String,
+    #[serde(default)]
+    pub mask: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneModelBoneOverrideNode {
+    pub bone: String,
+    #[serde(default)]
+    pub x: Option<String>,
+    #[serde(default)]
+    pub y: Option<String>,
+    #[serde(default)]
+    pub z: Option<String>,
+    #[serde(default)]
+    pub rotation_x: Option<String>,
+    #[serde(default)]
+    pub rotation_y: Option<String>,
+    #[serde(default)]
+    pub rotation_z: Option<String>,
+    #[serde(default)]
+    pub scale: Option<String>,
+}
+
+fn default_scene_bool_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

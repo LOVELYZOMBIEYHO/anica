@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod backend;
 pub mod compile;
 pub mod composition;

@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/world/dsl.rs
+
 use std::collections::HashSet;
 
 use crate::dsl::{graph_root_start, validate_graph_present_placement};
@@ -147,6 +151,8 @@ pub fn parse_world_graph_script(script: &str) -> Result<WorldGraph, GraphParseEr
         retargets,
         actions,
         apply_actions,
+        animation_assets: Vec::new(),
+        constraints: Vec::new(),
         present,
     })
 }
@@ -422,6 +428,9 @@ fn parse_camera_node(block: &str) -> Result<WorldCamera, GraphParseError> {
     camera.yaw = attr_value(block, "yaw").unwrap_or(camera.yaw);
     camera.pitch = attr_value(block, "pitch").unwrap_or(camera.pitch);
     camera.roll = attr_value(block, "roll").unwrap_or(camera.roll);
+    camera.up_x = attr_value(block, "upX").unwrap_or(camera.up_x);
+    camera.up_y = attr_value(block, "upY").unwrap_or(camera.up_y);
+    camera.up_z = attr_value(block, "upZ").unwrap_or(camera.up_z);
     camera.distance = attr_value(block, "distance").unwrap_or(camera.distance);
     camera.zoom = attr_value(block, "zoom").unwrap_or(camera.zoom);
     camera.fov = attr_value(block, "fov").unwrap_or(camera.fov);
@@ -435,10 +444,15 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
         .first()
         .map(|node| parse_material_node(node))
         .transpose()?;
-    let play = collect_self_closing_blocks(inner, "Play")?
-        .first()
+    let mut parsed_plays = collect_self_closing_blocks(inner, "Play")?
+        .iter()
         .map(|node| parse_play_node(node))
-        .transpose()?;
+        .collect::<Result<Vec<_>, _>>()?;
+    let play = if parsed_plays.is_empty() {
+        None
+    } else {
+        Some(parsed_plays.remove(0))
+    };
     Ok(WorldActor {
         id: required_attr_value(open, "id", line)?,
         model: required_attr_value(open, "model", line)?,
@@ -458,6 +472,7 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
         opacity: attr_value(open, "opacity").unwrap_or_else(|| "1".to_string()),
         material,
         play,
+        plays: parsed_plays,
     })
 }
 
@@ -622,6 +637,7 @@ fn parse_action_block(block: &str) -> Result<WorldAction, GraphParseError> {
         intent: attr_value(open, "intent"),
         duration_ms,
         poses,
+        iks: Vec::new(),
     })
 }
 
@@ -685,6 +701,25 @@ fn parse_apply_action_node(block: &str) -> Result<WorldApplyAction, GraphParseEr
             .transpose()?
             .unwrap_or(false),
         weight: attr_value(block, "weight").unwrap_or_else(|| "1".to_string()),
+        speed: attr_value(block, "speed").unwrap_or_else(|| "1".to_string()),
+        blend_in: attr_value(block, "blendIn").unwrap_or_else(|| "0".to_string()),
+        blend_out: attr_value(block, "blendOut").unwrap_or_else(|| "0".to_string()),
+        mode: attr_value(block, "mode").unwrap_or_else(|| "override".to_string()),
+        mask: attr_value(block, "mask")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        duration_ms: None,
+        root_motion: None,
+        destination: None,
+        face: None,
+        sync_group: None,
+        sync_marker: None,
     })
 }
 
@@ -700,6 +735,7 @@ fn parse_material_node(block: &str) -> Result<WorldMaterial, GraphParseError> {
             .transpose()?
             .unwrap_or(true),
         outline_width: attr_value(block, "outlineWidth").unwrap_or_else(|| "2".to_string()),
+        exposure: attr_value(block, "exposure").unwrap_or_else(|| "1".to_string()),
     })
 }
 
@@ -712,6 +748,18 @@ fn parse_play_node(block: &str) -> Result<WorldPlay, GraphParseError> {
             .transpose()?
             .unwrap_or(true),
         speed: attr_value(block, "speed").unwrap_or_else(|| "1".to_string()),
+        weight: attr_value(block, "weight").unwrap_or_else(|| "1".to_string()),
+        blend_in: attr_value(block, "blendIn").unwrap_or_else(|| "0".to_string()),
+        blend_out: attr_value(block, "blendOut").unwrap_or_else(|| "0".to_string()),
+        mask: attr_value(block, "mask")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 

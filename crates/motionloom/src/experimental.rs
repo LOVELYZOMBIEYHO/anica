@@ -19,6 +19,7 @@ pub use crate::{
     render_world_graph_to_video_with_progress,
 };
 
+pub use crate::scene::model::{Scene3DNode, SceneModel3DNode, SceneNode};
 pub use crate::world::gltf_loader::{load_glb_mesh_data_from_bytes, load_glb_metadata_from_bytes};
 
 pub mod clip {
@@ -43,7 +44,9 @@ pub mod keyframe {
 pub mod editor {
     pub use crate::scene::editor_keyframes::{
         AnimationKeyframeEditError, EditableAnimationKey, EditableAnimationTarget,
-        EditableAnimationTimeline, extract_editable_animation_timeline,
+        EditableAnimationTimeline, animation_target_inline_curve_expression,
+        editable_animation_target, extract_editable_animation_timeline,
+        promote_inline_curve_to_animation_target, remove_editable_animation_target,
         replace_editable_animation_targets, upsert_editable_animation_target,
     };
 }

@@ -72,3 +72,10 @@ short_description = "An agentic AI video editor that automates the editing proce
 long_description = """
 An experimental video editor built with Rust and GPUI.
 """
+
+# MotionLoom's retained scene traversal, text preparation, and WGPU command
+# encoding are intentionally exercised through `cargo run` during authoring.
+# Keep that developer command interactive even as the renderer grows; other
+# workspace crates retain Cargo's normal fast-compiling dev profile.
+[profile.dev.package.motionloom]
+opt-level = 3

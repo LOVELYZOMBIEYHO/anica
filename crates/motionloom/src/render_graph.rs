@@ -363,7 +363,7 @@ impl<'a> DagBuilder<'a> {
                         GraphAssetKind::Image,
                         "EnvironmentLight",
                     )?,
-                    Scene3DNode::Camera(_) => {}
+                    Scene3DNode::Camera(_) | Scene3DNode::Anchor(_) | Scene3DNode::Debug(_) => {}
                 }
             }
         }

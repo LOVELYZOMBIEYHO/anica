@@ -21,13 +21,18 @@ use std::time::{Duration, Instant};
 
 use crate::dsl::{GraphAssetKind, GraphScript, ProcessDefinitionNode};
 use crate::process::model::{PassNode, PassParam};
-use crate::process::runtime::{CompiledTimeExpr, eval_time_expr, parse_curve_ease};
+use crate::process::runtime::{
+    CompiledTimeExpr, apply_curve_ease, eval_time_expr, parse_curve_ease,
+};
+use crate::scene::animation::{
+    AnimationValueType, animation_property_descriptor, parse_bone_property_path, parse_vector3,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::scene::backend::encoding::scene_encoder_args;
 
 pub use super::preview_surface::*;
-use crate::asset::{AssetResolver, PathAssetResolver};
+use crate::asset::{AssetResolver, AssetSource, PathAssetResolver};
 pub use crate::scene::backend::encoding::{
     SceneRenderProfile, SceneRenderProgress, next_scene_output_path,
     next_scene_output_path_for_profile,
@@ -45,15 +50,14 @@ use crate::scene::composition::{
     SceneTextureOverlayParams, TextureOverlayKind, apply_alpha_mask, apply_alpha_mask_with_invert,
     apply_box_blur_pass, apply_color_core_pass, apply_deform_grid, apply_hsla_pass,
     apply_image_texture_overlay_pass, apply_layer_effects, apply_over_pass,
-    apply_scene_filter_step, apply_scene_post_pass, blend_pixel, build_scene_bloom_prefilter,
-    composite_layer, composite_layer_affine, composite_layer_affine_blend,
-    composite_layer_affine_blend_clipped, composite_layer_affine_clipped,
-    composite_layer_projected_quad_blend_clipped, composite_scene_bloom,
-    composite_transformed_layer, composite_transformed_layer_anchored, draw_rgba_image,
-    is_color_key_alpha_effect, pass_param_expr, scene_post_bloom_params, scene_post_blur_passes,
-    scene_post_brightness_amount, scene_post_glow_stack_params, scene_post_light_sweep_params,
-    scene_post_magnify_lens_params, scene_post_texture_overlay_params, scene_post_tone_map_params,
-    shape_alpha_mask,
+    apply_scene_filter_step, apply_scene_post_pass, build_scene_bloom_prefilter, composite_layer,
+    composite_layer_affine, composite_layer_affine_blend, composite_layer_affine_blend_clipped,
+    composite_layer_affine_clipped, composite_layer_projected_quad_blend_clipped,
+    composite_scene_bloom, composite_transformed_layer, composite_transformed_layer_anchored,
+    draw_rgba_image, is_color_key_alpha_effect, pass_param_expr, scene_post_bloom_params,
+    scene_post_blur_passes, scene_post_brightness_amount, scene_post_glow_stack_params,
+    scene_post_light_sweep_params, scene_post_magnify_lens_params,
+    scene_post_texture_overlay_params, scene_post_tone_map_params, shape_alpha_mask,
 };
 use crate::scene::domain::apply_action_graph_at_time;
 
@@ -84,7 +88,7 @@ use crate::scene::model::{
     FaceJawNode, FilterDef, FontDef, GradientDef, GroupNode, LineNode, MaskNode, MaterialDef,
     NoiseDef, PaletteNode, PartNode, PathNode, PixelGridNode, PolylineNode, PrecomposeNode,
     PuppetNode, RectNode, RepeatNode, Scene3DNode, SceneEffectRef, SceneLayerNode, SceneNode,
-    SceneTrackNode, TextureDef, UseNode,
+    SceneRootNode, SceneTrackNode, TextureDef, UseNode,
 };
 pub use crate::scene::resource::{clear_scene_asset_roots, set_scene_asset_roots};
 use crate::scene::resource::{
@@ -110,6 +114,92 @@ fn scene_effect_resource<'a>(
     })
 }
 
+#[derive(Default)]
+struct GlobalProcessLiveness {
+    resources: HashSet<String>,
+    passes: HashSet<String>,
+    pass_outputs: HashSet<String>,
+}
+
+/// Backward liveness for the flattened global Process DAG.
+///
+/// Scene-scoped `<Effect process="...">` evaluates its Process in a local
+/// resource map. The parser also retains those passes in the flattened graph
+/// for compatibility; executing every flattened pass again doubled effects
+/// and allocated dead full-frame textures. Only resources that can reach the
+/// top-level Present are live in this global traversal.
+fn global_process_liveness(graph: &GraphScript) -> GlobalProcessLiveness {
+    let mut live = GlobalProcessLiveness::default();
+    live.resources.insert(graph.present.from.clone());
+    if let Some(plain) = graph
+        .present
+        .from
+        .strip_prefix("scene:")
+        .or_else(|| graph.present.from.strip_prefix("input:"))
+    {
+        live.resources.insert(plain.to_string());
+    }
+    for pass in &graph.passes {
+        live.pass_outputs.extend(
+            pass.outputs
+                .iter()
+                .map(|output| output.resource_id().to_string()),
+        );
+    }
+
+    loop {
+        let before_resources = live.resources.len();
+        let before_passes = live.passes.len();
+        // A top-level Present may name a Process boundary rather than its
+        // concrete output texture. Preserve that boundary alias before walking
+        // texture/pass dependencies.
+        for process in &graph.processes {
+            if live.resources.contains(&process.id) {
+                live.resources.insert(process.output.clone());
+            }
+        }
+        for output in &graph.outputs {
+            if live.resources.contains(&output.id)
+                && let Some(from) = output.from.as_deref()
+            {
+                live.resources.insert(from.to_string());
+            }
+        }
+        for texture in &graph.textures {
+            if !live.resources.contains(&texture.id) {
+                continue;
+            }
+            if let Some(from) = texture.from.as_deref() {
+                live.resources.insert(from.to_string());
+            }
+            if let Some(input) = texture.input.as_deref() {
+                live.resources.insert(input.to_string());
+            }
+        }
+        for pass in &graph.passes {
+            if pass
+                .outputs
+                .iter()
+                .any(|output| live.resources.contains(output.resource_id()))
+            {
+                live.passes.insert(pass.id.clone());
+                live.resources.extend(
+                    pass.inputs
+                        .iter()
+                        .map(|input| input.resource_id().to_string()),
+                );
+                if let Some(mask) = pass.mask.as_deref() {
+                    live.resources.insert(mask.to_string());
+                }
+            }
+        }
+        if before_resources == live.resources.len() && before_passes == live.passes.len() {
+            break;
+        }
+    }
+    live
+}
+
 use crate::scene::spatial::{
     Affine2, CameraRect, EvaluatedDeformGrid, active_scene_camera_from_tracks, affine_is_identity,
     camera_transform, camera_viewport, camera_world_bounds, clamp_nonzero_signed_scale,
@@ -125,7 +215,7 @@ use crate::scene::text::TextNode;
 
 fn apply_animation_targets_at_frame(
     graph: &GraphScript,
-    _frame: u32,
+    frame: u32,
 ) -> Result<Option<GraphScript>, MotionLoomSceneRenderError> {
     if graph.animation_targets.is_empty() {
         return Ok(None);
@@ -134,7 +224,18 @@ fn apply_animation_targets_at_frame(
     let mut graph = graph.clone();
     let fps = graph.fps.max(1.0);
     for target in graph.animation_targets.clone() {
-        let value = animation_target_expression(&target.keys, fps, &target.property)?;
+        let descriptor = animation_property_descriptor(&target.property).ok_or_else(|| {
+            MotionLoomSceneRenderError::InvalidExpression {
+                expr: target.property.clone(),
+                message: "AnimationTarget property is not registered".to_string(),
+            }
+        })?;
+        let value = match descriptor.value_type {
+            _ if animation_target_requires_frame_sampling(&graph, &target) => {
+                sample_dynamic_animation_value(&target, frame as f32 / fps)?
+            }
+            _ => animation_target_expression(&target.keys, fps, &target.property)?,
+        };
         apply_animation_property_to_graph(&mut graph, &target.node, &target.property, value);
     }
     Ok(Some(graph))
@@ -148,8 +249,17 @@ fn animation_target_expression(
     if keys.is_empty() {
         return Ok("0".to_string());
     }
-    if property == "d" {
+    let descriptor = animation_property_descriptor(property).ok_or_else(|| {
+        MotionLoomSceneRenderError::InvalidExpression {
+            expr: property.to_string(),
+            message: "AnimationTarget property is not registered".to_string(),
+        }
+    })?;
+    if descriptor.value_type == AnimationValueType::Path {
         return Ok(path_morph_expr_from_animation_keys(keys, fps));
+    }
+    if descriptor.value_type == AnimationValueType::Vector3 {
+        return vector3_expr_from_animation_keys(keys);
     }
     if keys.len() == 1 {
         keys[0].value.parse::<f32>().map_err(|_| {
@@ -188,6 +298,176 @@ fn animation_target_expression(
         ));
     }
     Ok(format!("curve(\"{}\")", points.join(", ")))
+}
+
+fn vector3_expr_from_animation_keys(
+    keys: &[crate::dsl::AnimationKeyNode],
+) -> Result<String, MotionLoomSceneRenderError> {
+    let parsed = keys
+        .iter()
+        .map(|key| {
+            parse_vector3(&key.value).ok_or_else(|| MotionLoomSceneRenderError::InvalidExpression {
+                expr: key.value.clone(),
+                message: "AnimationTarget vector key requires [x,y,z]".to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.len() == 1 {
+        return Ok(format!(
+            "[{},{},{}]",
+            format_float_for_animation(parsed[0][0]),
+            format_float_for_animation(parsed[0][1]),
+            format_float_for_animation(parsed[0][2])
+        ));
+    }
+    let component = |axis: usize| {
+        let points = keys
+            .iter()
+            .zip(parsed.iter())
+            .enumerate()
+            .map(|(index, (key, value))| {
+                let ease = keys.get(index + 1).unwrap_or(key).ease.as_str();
+                format!(
+                    "{}:{}:{}",
+                    format_float_for_animation(key.seconds),
+                    format_float_for_animation(value[axis]),
+                    ease
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("curve(\"{points}\")")
+    };
+    Ok(format!(
+        "[{},{},{}]",
+        component(0),
+        component(1),
+        component(2)
+    ))
+}
+
+fn sample_dynamic_animation_value(
+    target: &crate::dsl::AnimationTargetNode,
+    time_sec: f32,
+) -> Result<String, MotionLoomSceneRenderError> {
+    let keys = &target.keys;
+    let Some(first) = keys.first() else {
+        return Ok(String::new());
+    };
+    if time_sec <= first.seconds || keys.len() == 1 {
+        return Ok(first.value.clone());
+    }
+    let Some(last) = keys.last() else {
+        return Ok(first.value.clone());
+    };
+    if time_sec >= last.seconds {
+        return Ok(last.value.clone());
+    }
+    let next_index = keys
+        .iter()
+        .position(|key| key.seconds >= time_sec)
+        .unwrap_or(keys.len() - 1);
+    let previous = &keys[next_index.saturating_sub(1)];
+    let next = &keys[next_index];
+    let descriptor = animation_property_descriptor(&target.property).ok_or_else(|| {
+        MotionLoomSceneRenderError::InvalidExpression {
+            expr: target.property.clone(),
+            message: "AnimationTarget property is not registered".to_string(),
+        }
+    })?;
+    if descriptor.value_type == AnimationValueType::Number {
+        let expression = animation_target_expression(&target.keys, 1.0, &target.property)?;
+        return eval_time_expr(&expression, 0.0, time_sec)
+            .map(format_float_for_animation)
+            .map_err(|message| MotionLoomSceneRenderError::InvalidExpression {
+                expr: expression,
+                message,
+            });
+    }
+    if descriptor.value_type == AnimationValueType::Discrete {
+        return Ok(previous.value.clone());
+    }
+    let duration = (next.seconds - previous.seconds).max(f32::EPSILON);
+    let easing = parse_curve_ease(&next.ease).map_err(|message| {
+        MotionLoomSceneRenderError::InvalidExpression {
+            expr: next.ease.clone(),
+            message,
+        }
+    })?;
+    let t = apply_curve_ease((time_sec - previous.seconds) / duration, easing);
+    let from = parse_color(&previous.value)?;
+    let to = parse_color(&next.value)?;
+    let mixed = std::array::from_fn::<_, 4, _>(|index| {
+        (from[index] as f32 + (to[index] as f32 - from[index] as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    });
+    // Emit canonical RGBA hex so every CPU/GPU paint path receives the same
+    // channel order as a statically authored color.
+    if mixed[3] == 255 {
+        Ok(format!("#{:02X}{:02X}{:02X}", mixed[0], mixed[1], mixed[2]))
+    } else {
+        Ok(format!(
+            "#{:02X}{:02X}{:02X}{:02X}",
+            mixed[0], mixed[1], mixed[2], mixed[3]
+        ))
+    }
+}
+
+fn animation_target_requires_frame_sampling(
+    graph: &GraphScript,
+    target: &crate::dsl::AnimationTargetNode,
+) -> bool {
+    if animation_property_descriptor(&target.property).is_some_and(|descriptor| {
+        matches!(
+            descriptor.value_type,
+            AnimationValueType::Color | AnimationValueType::Discrete
+        )
+    }) {
+        return true;
+    }
+    graph
+        .scenes
+        .iter()
+        .any(|scene| scene_nodes_contain_simulation_id(&scene.children, &target.node))
+        || scene_nodes_contain_simulation_id(&graph.scene_nodes, &target.node)
+}
+
+fn scene_nodes_contain_simulation_id(nodes: &[SceneNode], node_id: &str) -> bool {
+    nodes.iter().any(|node| match node {
+        SceneNode::Simulation(binding) => simulation_binding_id(binding) == Some(node_id),
+        SceneNode::Timeline(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Track(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Sequence(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Chain(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Group(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Part(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Repeat(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Mask(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Precompose(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Layer(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Camera(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Character(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        SceneNode::Puppet(node) => scene_nodes_contain_simulation_id(&node.children, node_id),
+        _ => false,
+    })
+}
+
+fn simulation_binding_id(
+    binding: &crate::simulation::model::SimulationBindingNode,
+) -> Option<&str> {
+    use crate::simulation::model::SimulationBindingNode;
+    match binding {
+        SimulationBindingNode::SpringChain(node) => node.id.as_deref(),
+        SimulationBindingNode::DynamicCurve(node) => node.id.as_deref(),
+        SimulationBindingNode::DistanceConstraint(node) => node.id.as_deref(),
+        SimulationBindingNode::Hinge(node) => node.id.as_deref(),
+        SimulationBindingNode::RigidBody2D(node) => Some(&node.id),
+        SimulationBindingNode::ParticleEmitter(node) => Some(&node.id),
+        SimulationBindingNode::Cloth(node) => Some(&node.id),
+        SimulationBindingNode::HairStrandField(node) => Some(&node.id),
+        SimulationBindingNode::CacheBake(node) => Some(&node.id),
+    }
 }
 
 fn path_morph_expr_from_animation_keys(keys: &[crate::dsl::AnimationKeyNode], _fps: f32) -> String {
@@ -230,6 +510,9 @@ fn apply_animation_property_to_graph(
     value: String,
 ) {
     for scene in &mut graph.scenes {
+        if scene.id == node_id && property == "activeCamera" {
+            set_scene_active_camera(&mut scene.children, &value);
+        }
         apply_animation_property_to_nodes(&mut scene.children, node_id, property, &value);
     }
     apply_animation_property_to_nodes(&mut graph.scene_nodes, node_id, property, &value);
@@ -242,11 +525,69 @@ fn apply_animation_property_to_graph(
     for svg in &mut graph.svgs {
         apply_animation_property_to_svg(svg, node_id, property, &value);
     }
+    for background in &mut graph.backgrounds {
+        if background.id.as_deref() == Some(node_id) && property == "color" {
+            background.color = value.clone();
+        }
+    }
+    for pass in &mut graph.passes {
+        if pass.id != node_id {
+            continue;
+        }
+        if let Some(param_name) = property.strip_prefix("params.") {
+            if let Some(param) = pass.params.iter_mut().find(|param| param.key == param_name) {
+                param.value = value.clone();
+            } else {
+                pass.params.push(PassParam {
+                    key: param_name.to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+    }
     for skeleton in &mut graph.skeletons {
         for bone in &mut skeleton.bones {
-            if bone.id == node_id && property == "rotation" {
-                bone.rotation = value.clone();
+            if bone.id == node_id {
+                match property {
+                    "x" => bone.x = value.clone(),
+                    "y" => bone.y = value.clone(),
+                    "rotation" => bone.rotation = value.clone(),
+                    "scale" => bone.scale = value.clone(),
+                    "length" => bone.length = Some(value.clone()),
+                    _ => {}
+                }
             }
+        }
+    }
+}
+
+fn set_scene_active_camera(nodes: &mut [SceneNode], camera_id: &str) {
+    for node in nodes {
+        match node {
+            SceneNode::Timeline(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Track(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Sequence(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Chain(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Group(node) => {
+                if let Some(composite) = node.composite.as_mut()
+                    && composite.nodes_3d.iter().any(|node| {
+                        matches!(node, Scene3DNode::Camera(camera)
+                            if camera.id.as_deref() == Some(camera_id))
+                    })
+                {
+                    composite.active_camera = Some(camera_id.to_string());
+                }
+                set_scene_active_camera(&mut node.children, camera_id);
+            }
+            SceneNode::Layer(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Character(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Puppet(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Part(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Repeat(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Mask(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Precompose(node) => set_scene_active_camera(&mut node.children, camera_id),
+            SceneNode::Camera(node) => set_scene_active_camera(&mut node.children, camera_id),
+            _ => {}
         }
     }
 }
@@ -263,6 +604,9 @@ fn apply_animation_property_to_nodes(
                 apply_animation_property_to_nodes(&mut timeline.children, node_id, property, value);
             }
             SceneNode::Track(track) => {
+                if track.id.as_deref() == Some(node_id) && property == "zDepth" {
+                    track.z_depth = value.to_string();
+                }
                 apply_animation_property_to_nodes(&mut track.children, node_id, property, value);
             }
             SceneNode::Sequence(sequence) => {
@@ -296,6 +640,20 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if rect.id.as_deref() == Some(node_id) {
+                    match property {
+                        "width" => rect.width = value.to_string(),
+                        "height" => rect.height = value.to_string(),
+                        "radius" => rect.radius = value.to_string(),
+                        "color" | "fill" => rect.color = value.to_string(),
+                        "stroke" => rect.stroke = Some(value.to_string()),
+                        "strokeWidth" => rect.stroke_width = value.to_string(),
+                        "textureOpacity" => rect.texture_opacity = value.to_string(),
+                        "textureScale" => rect.texture_scale = value.to_string(),
+                        "textureMask" => rect.texture_mask = value.to_string(),
+                        _ => {}
+                    }
+                }
             }
             SceneNode::Circle(circle) => {
                 apply_animation_property_to_transform(
@@ -315,6 +673,18 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if circle.id.as_deref() == Some(node_id) {
+                    match property {
+                        "radius" => circle.radius = value.to_string(),
+                        "color" | "fill" => circle.color = value.to_string(),
+                        "stroke" => circle.stroke = Some(value.to_string()),
+                        "strokeWidth" => circle.stroke_width = value.to_string(),
+                        "textureOpacity" => circle.texture_opacity = value.to_string(),
+                        "textureScale" => circle.texture_scale = value.to_string(),
+                        "textureMask" => circle.texture_mask = value.to_string(),
+                        _ => {}
+                    }
+                }
             }
             SceneNode::Ellipse(ellipse) => {
                 apply_animation_property_to_transform(
@@ -334,6 +704,16 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if ellipse.id.as_deref() == Some(node_id) {
+                    match property {
+                        "radiusX" => ellipse.radius_x = value.to_string(),
+                        "radiusY" => ellipse.radius_y = value.to_string(),
+                        "color" | "fill" => ellipse.color = value.to_string(),
+                        "stroke" => ellipse.stroke = Some(value.to_string()),
+                        "strokeWidth" => ellipse.stroke_width = value.to_string(),
+                        _ => {}
+                    }
+                }
             }
             SceneNode::Line(line) => {
                 apply_animation_property_to_transform(
@@ -353,6 +733,15 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if line.id.as_deref() == Some(node_id) {
+                    match property {
+                        "width" | "strokeWidth" => line.width = value.to_string(),
+                        "color" | "stroke" => line.color = value.to_string(),
+                        "taperStart" => line.taper_start = value.to_string(),
+                        "taperEnd" => line.taper_end = value.to_string(),
+                        _ => {}
+                    }
+                }
             }
             SceneNode::Polyline(polyline) => {
                 apply_animation_property_to_transform(
@@ -372,11 +761,36 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if polyline.id.as_deref() == Some(node_id) {
+                    match property {
+                        "stroke" | "color" => polyline.stroke = value.to_string(),
+                        "strokeWidth" => polyline.stroke_width = value.to_string(),
+                        "trimStart" => polyline.trim_start = value.to_string(),
+                        "trimEnd" => polyline.trim_end = value.to_string(),
+                        "taperStart" => polyline.taper_start = value.to_string(),
+                        "taperEnd" => polyline.taper_end = value.to_string(),
+                        _ => {}
+                    }
+                }
             }
             SceneNode::Path(path) => {
-                if path.id.as_deref() == Some(node_id) && property == "d" {
-                    path.d = value.to_string();
-                } else {
+                if path.id.as_deref() == Some(node_id) {
+                    match property {
+                        "d" => path.d = value.to_string(),
+                        "fill" | "color" => path.fill = Some(value.to_string()),
+                        "stroke" => path.stroke = value.to_string(),
+                        "strokeWidth" => path.stroke_width = value.to_string(),
+                        "trimStart" => path.trim_start = value.to_string(),
+                        "trimEnd" => path.trim_end = value.to_string(),
+                        "taperStart" => path.taper_start = value.to_string(),
+                        "taperEnd" => path.taper_end = value.to_string(),
+                        "textureOpacity" => path.texture_opacity = value.to_string(),
+                        "textureScale" => path.texture_scale = value.to_string(),
+                        "textureMask" => path.texture_mask = value.to_string(),
+                        _ => {}
+                    }
+                }
+                if property != "d" {
                     apply_animation_property_to_transform(
                         path.id.as_deref(),
                         &mut path.x,
@@ -414,20 +828,97 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if group.id.as_deref() == Some(node_id) {
+                    match property {
+                        "deformAmount" => group.deform_amount = value.to_string(),
+                        "maskFeather" => group.mask_feather = value.to_string(),
+                        "maskExpansion" => group.mask_expansion = value.to_string(),
+                        _ => {}
+                    }
+                    if let Some(composite) = group.composite.as_mut() {
+                        apply_animation_property_to_3d_nodes(
+                            &mut composite.nodes_3d,
+                            node_id,
+                            property,
+                            value,
+                        );
+                    }
+                } else if let Some(composite) = group.composite.as_mut() {
+                    apply_animation_property_to_3d_nodes(
+                        &mut composite.nodes_3d,
+                        node_id,
+                        property,
+                        value,
+                    );
+                }
                 apply_animation_property_to_nodes(&mut group.children, node_id, property, value);
             }
             SceneNode::Part(part) => {
+                if part.id.as_deref() == Some(node_id) {
+                    match property {
+                        "x" => part.x = value.to_string(),
+                        "y" => part.y = value.to_string(),
+                        "rotation" => part.rotation = value.to_string(),
+                        "scale" => part.scale = value.to_string(),
+                        "opacity" => part.opacity = value.to_string(),
+                        "anchorX" => part.anchor_x = value.to_string(),
+                        "anchorY" => part.anchor_y = value.to_string(),
+                        _ => {}
+                    }
+                }
                 apply_animation_property_to_nodes(&mut part.children, node_id, property, value);
             }
             SceneNode::Repeat(repeat) => {
+                if repeat.id.as_deref() == Some(node_id) {
+                    match property {
+                        "x" => repeat.x = value.to_string(),
+                        "y" => repeat.y = value.to_string(),
+                        "rotation" => repeat.rotation = value.to_string(),
+                        "scale" => repeat.scale = value.to_string(),
+                        "opacity" => repeat.opacity = value.to_string(),
+                        _ => {}
+                    }
+                }
                 apply_animation_property_to_nodes(&mut repeat.children, node_id, property, value);
             }
             SceneNode::Mask(mask) => {
+                if mask.id.as_deref() == Some(node_id) {
+                    match property {
+                        "x" => mask.x = value.to_string(),
+                        "y" => mask.y = value.to_string(),
+                        "width" => mask.width = value.to_string(),
+                        "height" => mask.height = value.to_string(),
+                        "radius" => mask.radius = value.to_string(),
+                        "d" => mask.d = Some(value.to_string()),
+                        "feather" => mask.feather = value.to_string(),
+                        "opacity" => mask.opacity = value.to_string(),
+                        _ => {}
+                    }
+                }
                 apply_animation_property_to_nodes(&mut mask.children, node_id, property, value);
             }
             SceneNode::Precompose(precompose) => {
                 apply_animation_property_to_nodes(
                     &mut precompose.children,
+                    node_id,
+                    property,
+                    value,
+                );
+            }
+            SceneNode::Use(use_node) => {
+                apply_animation_property_to_transform(
+                    use_node.id.as_deref(),
+                    &mut use_node.x,
+                    &mut use_node.y,
+                    Some(&mut use_node.rotation),
+                    &mut use_node.scale,
+                    Some(&mut use_node.scale_x),
+                    Some(&mut use_node.scale_y),
+                    Some(&mut use_node.skew_x),
+                    Some(&mut use_node.skew_y),
+                    Some(&mut use_node.transform_origin_x),
+                    Some(&mut use_node.transform_origin_y),
+                    &mut use_node.opacity,
                     node_id,
                     property,
                     value,
@@ -451,6 +942,19 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if layer.id.as_deref() == Some(node_id) {
+                    match property {
+                        "z" => layer.z = value.to_string(),
+                        "zDepth" => layer.z_depth = Some(value.to_string()),
+                        "rotationX" => layer.rotation_x = value.to_string(),
+                        "rotationY" => layer.rotation_y = value.to_string(),
+                        "perspective" => layer.perspective = value.to_string(),
+                        "playbackRate" => layer.playback_rate = value.to_string(),
+                        "maskFeather" => layer.mask_feather = value.to_string(),
+                        "maskExpansion" => layer.mask_expansion = value.to_string(),
+                        _ => {}
+                    }
+                }
                 apply_animation_property_to_nodes(&mut layer.children, node_id, property, value);
             }
             SceneNode::Character(character) => {
@@ -496,6 +1000,19 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if puppet.id.as_deref() == Some(node_id) {
+                    match property {
+                        "width" => puppet.width = value.to_string(),
+                        "height" => puppet.height = value.to_string(),
+                        "amount" => puppet.amount = value.to_string(),
+                        "jointSoftness" => puppet.joint_softness = value.to_string(),
+                        "stiffness" => puppet.stiffness = value.to_string(),
+                        "damping" => puppet.damping = value.to_string(),
+                        "drag" => puppet.drag = value.to_string(),
+                        "overlap" => puppet.overlap = value.to_string(),
+                        _ => {}
+                    }
+                }
                 apply_animation_property_to_nodes(&mut puppet.children, node_id, property, value);
             }
             SceneNode::Pin(pin) => {
@@ -503,6 +1020,12 @@ fn apply_animation_property_to_nodes(
                     match property {
                         "x" => pin.target_x = Some(value.to_string()),
                         "y" => pin.target_y = Some(value.to_string()),
+                        "targetX" => pin.target_x = Some(value.to_string()),
+                        "targetY" => pin.target_y = Some(value.to_string()),
+                        "radius" => pin.radius = value.to_string(),
+                        "strength" => pin.strength = value.to_string(),
+                        "rotation" => pin.rotation = value.to_string(),
+                        "scale" => pin.scale = value.to_string(),
                         _ => {}
                     }
                 }
@@ -525,7 +1048,172 @@ fn apply_animation_property_to_nodes(
                     property,
                     value,
                 );
+                if face.id.as_deref() == Some(node_id) {
+                    match property {
+                        "width" => face.width = value.to_string(),
+                        "height" => face.height = value.to_string(),
+                        "stroke" => face.stroke = value.to_string(),
+                        "fill" | "color" => face.fill = Some(value.to_string()),
+                        "strokeWidth" => face.stroke_width = value.to_string(),
+                        "trimStart" => face.trim_start = value.to_string(),
+                        "trimEnd" => face.trim_end = value.to_string(),
+                        "taperStart" => face.taper_start = value.to_string(),
+                        "taperEnd" => face.taper_end = value.to_string(),
+                        _ => {}
+                    }
+                }
             }
+            SceneNode::Shadow(shadow) => {
+                if shadow.id.as_deref() == Some(node_id) {
+                    match property {
+                        "x" => shadow.x = value.to_string(),
+                        "y" => shadow.y = value.to_string(),
+                        "blur" => shadow.blur = value.to_string(),
+                        "color" => shadow.color = value.to_string(),
+                        "opacity" => shadow.opacity = value.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            SceneNode::Camera(camera) => {
+                if camera.id.as_deref() == Some(node_id) {
+                    match property {
+                        "x" => camera.x = value.to_string(),
+                        "y" => camera.y = value.to_string(),
+                        "targetX" => camera.target_x = Some(value.to_string()),
+                        "targetY" => camera.target_y = Some(value.to_string()),
+                        "anchorX" => camera.anchor_x = value.to_string(),
+                        "anchorY" => camera.anchor_y = value.to_string(),
+                        "offsetX" => camera.offset_x = value.to_string(),
+                        "offsetY" => camera.offset_y = value.to_string(),
+                        "shakeX" => camera.shake_x = value.to_string(),
+                        "shakeY" => camera.shake_y = value.to_string(),
+                        "zoom" => camera.zoom = value.to_string(),
+                        "rotation" => camera.rotation = value.to_string(),
+                        "opacity" => camera.opacity = value.to_string(),
+                        _ => {}
+                    }
+                }
+                apply_animation_property_to_nodes(&mut camera.children, node_id, property, value);
+            }
+            SceneNode::Simulation(binding) => {
+                if simulation_binding_id(binding) != Some(node_id) {
+                    continue;
+                }
+                let Ok(number) = value.parse::<f32>() else {
+                    continue;
+                };
+                use crate::simulation::model::SimulationBindingNode;
+                match binding {
+                    SimulationBindingNode::SpringChain(node) => match property {
+                        "stiffness" => node.stiffness = number,
+                        "damping" => node.damping = number,
+                        _ => {}
+                    },
+                    SimulationBindingNode::DistanceConstraint(node) => {
+                        if property == "stiffness" {
+                            node.stiffness = number;
+                        }
+                    }
+                    SimulationBindingNode::Hinge(node) => {
+                        if property == "stiffness" {
+                            node.stiffness = number;
+                        }
+                    }
+                    SimulationBindingNode::Cloth(node) => match property {
+                        "stiffness" => node.stiffness = number,
+                        "damping" => node.damping = number,
+                        "amount" => node.amplitude = number,
+                        _ => {}
+                    },
+                    SimulationBindingNode::HairStrandField(node) => match property {
+                        "stiffness" => node.stiffness = number,
+                        "damping" => node.damping = number,
+                        _ => {}
+                    },
+                    SimulationBindingNode::ParticleEmitter(node) => match property {
+                        "x" => node.x = number,
+                        "y" => node.y = number,
+                        "radius" => node.radius = number,
+                        "amount" | "rate" => node.rate = number,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_animation_property_to_3d_nodes(
+    nodes: &mut [Scene3DNode],
+    node_id: &str,
+    property: &str,
+    value: &str,
+) {
+    for node in nodes {
+        match node {
+            Scene3DNode::Camera(camera) if camera.id.as_deref() == Some(node_id) => {
+                match property {
+                    "position" => camera.position = value.to_string(),
+                    "target" => camera.target = value.to_string(),
+                    "fov" => camera.fov = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::EnvironmentLight(light) if light.id.as_deref() == Some(node_id) => {
+                if property == "intensity" {
+                    light.intensity = value.to_string();
+                }
+            }
+            Scene3DNode::Model(model) if model.id.as_deref() == Some(node_id) => match property {
+                "position" => model.position = value.to_string(),
+                "positionX" => model.position_x = Some(value.to_string()),
+                "positionY" => model.position_y = Some(value.to_string()),
+                "positionZ" => model.position_z = Some(value.to_string()),
+                "rotation" => model.rotation = value.to_string(),
+                "rotationX" => model.rotation_x = Some(value.to_string()),
+                "rotationY" => model.rotation_y = Some(value.to_string()),
+                "rotationZ" => model.rotation_z = Some(value.to_string()),
+                "scale" => model.scale = value.to_string(),
+                "exposure" => model.exposure = value.to_string(),
+                _ => {
+                    if let Some((bone, component)) = parse_bone_property_path(property) {
+                        let index = model
+                            .bone_overrides
+                            .iter()
+                            .position(|entry| entry.bone == bone)
+                            .unwrap_or_else(|| {
+                                model.bone_overrides.push(
+                                    crate::scene::model::SceneModelBoneOverrideNode {
+                                        bone: bone.to_string(),
+                                        x: None,
+                                        y: None,
+                                        z: None,
+                                        rotation_x: None,
+                                        rotation_y: None,
+                                        rotation_z: None,
+                                        scale: None,
+                                    },
+                                );
+                                model.bone_overrides.len() - 1
+                            });
+                        let entry = &mut model.bone_overrides[index];
+                        match component {
+                            "x" => entry.x = Some(value.to_string()),
+                            "y" => entry.y = Some(value.to_string()),
+                            "z" => entry.z = Some(value.to_string()),
+                            "rotationX" => entry.rotation_x = Some(value.to_string()),
+                            "rotationY" => entry.rotation_y = Some(value.to_string()),
+                            "rotationZ" | "rotation" => entry.rotation_z = Some(value.to_string()),
+                            "scale" => entry.scale = Some(value.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+            },
+            Scene3DNode::Anchor(_) => {}
             _ => {}
         }
     }
@@ -619,6 +1307,25 @@ fn apply_animation_property_to_text(
         property,
         value,
     );
+    if text.id.as_deref() == Some(node_id) {
+        match property {
+            "value" => text.value = value.to_string(),
+            "fontSize" => text.font_size = value.to_string(),
+            "tracking" => text.tracking = Some(value.to_string()),
+            "lineHeight" => text.line_height = Some(value.to_string()),
+            "blur" => text.blur = Some(value.to_string()),
+            "softEdge" => text.soft_edge = Some(value.to_string()),
+            "color" | "fill" => text.color = value.to_string(),
+            "stroke" => text.stroke = Some(value.to_string()),
+            "strokeWidth" => text.stroke_width = Some(value.to_string()),
+            "boxPaddingX" => text.box_padding_x = Some(value.to_string()),
+            "boxPaddingY" => text.box_padding_y = Some(value.to_string()),
+            "boxRadius" => text.box_radius = Some(value.to_string()),
+            "visibleChars" => text.visible_chars = Some(value.to_string()),
+            "width" => text.width = Some(value.to_string()),
+            _ => {}
+        }
+    }
 }
 
 fn apply_animation_property_to_image(
@@ -666,17 +1373,20 @@ fn apply_animation_property_to_svg(svg: &mut SvgNode, node_id: &str, property: &
     );
 }
 use crate::scene::text::{
-    TextAnimatorRasterParams, TextRasterizedLayer, apply_text_layer_effects,
-    draw_text_buffer_with_animators, prepare_text_layout_for_value, soften_text_alpha_edges,
-    stroke_layer_from_alpha, text_bounds, text_layer_effect_spec,
+    TextAnimatorRasterParams, TextRasterParams, TextRasterizedLayer, apply_text_layer_effects,
+    draw_text_buffer_scaled, draw_text_buffer_with_animators, prepare_text_layout_for_value,
+    soften_text_alpha_edges, stroke_layer_from_alpha, text_bounds, text_layer_effect_spec,
 };
 use crate::scene::timeline::{
     eval_repeat_count, scene_layer_source_time, scene_sequence_local_time,
 };
+use crate::world::render::Scene3DRenderer;
 use crate::world::{
-    WorldActor, WorldBackground, WorldBackgroundFit, WorldCamera, WorldCameraControl,
-    WorldCameraProjection, WorldFrameRenderer, WorldGraph, WorldMaterial, WorldMaterialStyle,
-    WorldNode, WorldPathStyle, WorldPresent, parse_world_graph_script,
+    WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldAnimationAsset,
+    WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
+    WorldCamera, WorldCameraControl, WorldCameraProjection, WorldConstraint, WorldGraph,
+    WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay,
+    WorldPresent, WorldProfileRetarget, WorldRetargetMap, parse_world_graph_script,
 };
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use image::{Rgba, RgbaImage, imageops::FilterType};
@@ -771,7 +1481,7 @@ where
         let fps = graph.fps.max(1.0);
         let duration_sec = (graph.duration_ms as f32 / 1000.0).max(1.0 / fps);
         let total_frames = ((duration_sec * fps).round() as u32).max(1);
-        let encoder_args = scene_encoder_args(profile);
+        let encoder_args = scene_encoder_args(profile, w, h, fps);
         let mut renderer = SceneFrameRenderer::new_for_profile(profile).await;
         progress_callback(SceneRenderProgress {
             rendered_frames: 0,
@@ -1128,6 +1838,13 @@ impl SceneRenderer {
         self.inner.last_cpu_frame_profile
     }
 
+    /// CPU preparation and submission timings for the most recent true-3D
+    /// island. This complements `last_gpu_frame_ms()` and remains zeroed for
+    /// scenes that did not render a 3D CompositeGroup.
+    pub fn last_3d_frame_profile(&self) -> crate::world::Scene3DFrameProfile {
+        self.inner.scene_3d_renderer.last_frame_profile()
+    }
+
     /// Whether the active native adapter exposes WebGPU timestamp queries.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn gpu_timestamp_supported(&self) -> bool {
@@ -1473,9 +2190,18 @@ struct SceneFrameRenderer {
         HashMap<RetainedGpuShapeSceneKey, CachedRetainedGpuTransformScene>,
     gpu_text_raster_cache: HashMap<u64, CachedGpuTextRaster>,
     gpu_layer3d_texture_cache: HashMap<u64, CachedGpuLayer3dTexture>,
+    scene_material_texture_cache: HashMap<u64, Arc<crate::world::render::GpuWorldTexture>>,
+    animation_source_signature: u64,
+    compiled_animation_graph: Option<Arc<GraphScript>>,
+    compiled_animation_has_dynamic_channels: bool,
     prepared_graph_signature: u64,
     prepared_graph_fps: f32,
     prepared_graph_duration_ms: u64,
+    prepared_scene_model_profiles: Vec<crate::scene::dsl::ModelProfileNode>,
+    prepared_scene_actions: Vec<crate::scene::dsl::ActionNode>,
+    prepared_scene_apply_actions: Vec<crate::scene::dsl::ApplyActionNode>,
+    prepared_scene_animation_assets: Vec<crate::dsl::GraphAssetNode>,
+    prepared_scene_constraints: Vec<crate::dsl::SceneConstraintNode>,
     gpu_path_cache_hits: usize,
     gpu_path_cache_misses: usize,
     gradient_defs: HashMap<String, GradientDef>,
@@ -1491,10 +2217,25 @@ struct SceneFrameRenderer {
     scene_precompose_defs: HashMap<String, PrecomposeNode>,
     scene_precomposes: HashMap<String, RgbaImage>,
     scene_masks: HashMap<String, MaskNode>,
+    scene_material_sources: HashMap<String, SceneRootNode>,
     model_asset_sources: HashMap<String, String>,
     image_asset_sources: HashMap<String, String>,
+    /// Named local-space GLB node positions used by Environment anchors and
+    /// surfaces. One inspection per asset is retained across preview frames.
+    environment_node_cache: HashMap<String, HashMap<String, [f32; 3]>>,
+    /// Renderer-space bounds (after GLB node transforms) used to normalize
+    /// semantic nodes exactly like the 3D actor shader normalizes geometry.
+    environment_bounds_cache: HashMap<String, Option<([f32; 3], [f32; 3])>>,
+    /// Walkable transformed GLB triangles. This is the reusable spatial input
+    /// for raycast grounding; it is decoded once rather than once per frame.
+    environment_triangle_cache:
+        HashMap<String, Arc<[crate::world::model_inspection::EnvironmentWalkableTriangle]>>,
+    /// Scene-space spatial grids derived from the immutable triangle cache.
+    /// A key includes the complete Environment transform, so static stages do
+    /// not clone or re-transform thousands of triangles on every frame.
+    environment_spatial_cache: HashMap<EnvironmentSpatialKey, Arc<EnvironmentTriangleSpatialIndex>>,
     gpu_pick_ids: HashMap<String, u32>,
-    world_renderer: WorldFrameRenderer,
+    scene_3d_renderer: Scene3DRenderer,
     gpu_compositor: Option<WgpuSceneCompositor>,
     #[cfg(not(target_arch = "wasm32"))]
     last_cpu_frame_profile: SceneCpuFrameProfile,
@@ -1771,6 +2512,132 @@ struct CachedRetainedGpuTransformScene {
     path_count: usize,
 }
 
+fn scene_model_profile_to_world(
+    profile: &crate::scene::dsl::ModelProfileNode,
+) -> WorldModelProfile {
+    WorldModelProfile {
+        id: profile.id.clone(),
+        model: profile.model.clone().unwrap_or_default(),
+        preset: profile.preset.clone(),
+        retarget: profile
+            .retarget
+            .as_ref()
+            .map(|retarget| WorldProfileRetarget {
+                preset: retarget.preset.clone(),
+                maps: retarget
+                    .maps
+                    .iter()
+                    .map(|map| WorldRetargetMap {
+                        from: map.from.clone(),
+                        to: map.to.clone(),
+                    })
+                    .collect(),
+            }),
+        bone_axis_map: profile
+            .bone_axis_map
+            .as_ref()
+            .map(|axis_map| WorldBoneAxisMap {
+                axes: axis_map
+                    .axes
+                    .iter()
+                    .map(|axis| WorldBoneAxis {
+                        bone: axis.bone.clone(),
+                        forward: axis.forward.clone(),
+                        side: axis.side.clone(),
+                        twist: axis.twist.clone(),
+                        bend: axis.bend.clone(),
+                        turn: axis.turn.clone(),
+                        rest_forward: axis.rest_forward.clone(),
+                        rest_side: axis.rest_side.clone(),
+                        rest_twist: axis.rest_twist.clone(),
+                        rest_bend: axis.rest_bend.clone(),
+                        rest_turn: axis.rest_turn.clone(),
+                    })
+                    .collect(),
+            }),
+    }
+}
+
+fn scene_action_to_world(action: &crate::scene::dsl::ActionNode) -> WorldAction {
+    WorldAction {
+        id: action.id.clone(),
+        skeleton: action
+            .skeleton
+            .clone()
+            .unwrap_or_else(|| "humanoid_v1".to_string()),
+        intent: None,
+        duration_ms: action.duration_ms,
+        poses: action
+            .poses
+            .iter()
+            .map(|pose| WorldActionPose {
+                t: pose.t,
+                label: None,
+                bones: pose
+                    .bones
+                    .iter()
+                    .map(|bone| WorldActionBone {
+                        id: bone.id.clone(),
+                        x: bone.x.clone(),
+                        y: bone.y.clone(),
+                        z: bone.z.clone(),
+                        rotation: bone.rotation.clone(),
+                        rotation_x: bone.rotation_x.clone(),
+                        rotation_y: bone.rotation_y.clone(),
+                        rotation_z: bone.rotation_z.clone(),
+                        forward: bone.forward.clone(),
+                        side: bone.side.clone(),
+                        twist: bone.twist.clone(),
+                        bend: bone.bend.clone(),
+                        turn: bone.turn.clone(),
+                        scale: bone.scale.clone(),
+                        opacity: bone.opacity.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        iks: action
+            .iks
+            .iter()
+            .map(|ik| WorldActionIk {
+                root: ik.root.clone(),
+                mid: ik.mid.clone(),
+                end: ik.end.clone(),
+                target_x: ik.target_x.clone(),
+                target_y: ik.target_y.clone(),
+                target_z: ik.target_z.clone(),
+                pole_x: ik.pole_x.clone(),
+                pole_y: ik.pole_y.clone(),
+                pole_z: ik.pole_z.clone(),
+                plane: ik.plane.clone(),
+                bend: ik.bend.clone(),
+                weight: ik.weight.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn scene_apply_action_to_world(apply: &crate::scene::dsl::ApplyActionNode) -> WorldApplyAction {
+    WorldApplyAction {
+        target: apply.target.clone(),
+        action: apply.action.clone(),
+        at_ms: apply.at_ms,
+        r#loop: apply.r#loop,
+        weight: apply.weight.clone(),
+        speed: apply.speed.clone(),
+        blend_in: apply.blend_in.clone(),
+        blend_out: apply.blend_out.clone(),
+        mode: apply.mode.clone(),
+        mask: apply.mask.clone(),
+        duration_ms: apply.duration_ms,
+        root_motion: apply.root_motion.clone(),
+        destination: apply.destination.clone(),
+        face: apply.face.clone(),
+        sync_group: apply.sync_group.clone(),
+        sync_marker: apply.sync_marker.clone(),
+    }
+}
+
 struct RetainedGpuTransformFrame {
     primitives: Arc<Vec<GpuScenePrimitive>>,
     text_requests: Vec<GpuSceneTextRequest>,
@@ -1901,6 +2768,85 @@ fn vector_overlay_nodes_are_static(nodes: &[SceneNode]) -> bool {
         && !debug.contains("noise(")
 }
 
+fn scene_material_texture_cache_key(
+    graph_signature: u64,
+    scene: &SceneRootNode,
+    texture_size: (u32, u32),
+) -> Option<u64> {
+    if !vector_overlay_nodes_are_static(&scene.children) {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    graph_signature.hash(&mut hasher);
+    scene.id.hash(&mut hasher);
+    texture_size.hash(&mut hasher);
+    format!("{:?}", scene.children).hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn collect_material_binding_scene_ids(nodes: &[SceneNode], out: &mut HashSet<String>) {
+    for node in nodes {
+        match node {
+            SceneNode::Group(group) => {
+                if let Some(composite) = group.composite.as_ref() {
+                    for node_3d in &composite.nodes_3d {
+                        let Scene3DNode::Model(model) = node_3d else {
+                            continue;
+                        };
+                        for binding in &model.material_bindings {
+                            let Some(texture) = binding.texture.as_deref() else {
+                                continue;
+                            };
+                            if let Some(scene_id) = texture
+                                .strip_prefix("@scene:")
+                                .or_else(|| texture.strip_prefix("scene:"))
+                            {
+                                out.insert(scene_id.to_string());
+                            }
+                        }
+                    }
+                }
+                collect_material_binding_scene_ids(&group.children, out);
+            }
+            SceneNode::Timeline(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Track(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Sequence(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Chain(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Part(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Repeat(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Mask(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Precompose(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Layer(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Camera(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Character(node) => collect_material_binding_scene_ids(&node.children, out),
+            SceneNode::Puppet(node) => collect_material_binding_scene_ids(&node.children, out),
+            _ => {}
+        }
+    }
+}
+
+fn graph_requires_scene_resource(graph: &GraphScript, scene_id: &str) -> bool {
+    let matches = |value: &str| {
+        value == scene_id
+            || value.strip_prefix("scene:") == Some(scene_id)
+            || value.strip_prefix("@scene:") == Some(scene_id)
+    };
+    matches(&graph.present.from)
+        || graph
+            .textures
+            .iter()
+            .any(|texture| texture.from.as_deref().is_some_and(matches))
+        || graph
+            .passes
+            .iter()
+            .flat_map(|pass| pass.inputs.iter())
+            .any(|input| matches(input.resource_id()))
+        || graph
+            .outputs
+            .iter()
+            .any(|output| output.from.as_deref().is_some_and(matches))
+}
+
 fn gpu_layer3d_texture_cache_key(
     graph_signature: u64,
     layer: &SceneLayerNode,
@@ -1960,12 +2906,14 @@ fn gpu_text_raster_cache_key(
     graph_signature: u64,
     text: &TextNode,
     canvas_size: (u32, u32),
+    raster_scale: f32,
 ) -> u64 {
     let mut content = text.clone();
     content.opacity = "1".to_string();
     let mut hasher = DefaultHasher::new();
     graph_signature.hash(&mut hasher);
     canvas_size.hash(&mut hasher);
+    raster_scale.to_bits().hash(&mut hasher);
     format!("{content:?}").hash(&mut hasher);
     hasher.finish()
 }
@@ -2240,6 +3188,688 @@ fn apply_gpu_pick_id_to_empty_commands(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn load_environment_node_positions(source: &str) -> HashMap<String, [f32; 3]> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return HashMap::new();
+    }
+    let resolved = resolve_local_scene_asset_path(source);
+    let Ok(mesh) = crate::world::load_glb_mesh_data(&resolved) else {
+        return HashMap::new();
+    };
+    let mut transforms = vec![None::<EnvironmentNodeTransform>; mesh.nodes.len()];
+    let mut visiting = vec![false; mesh.nodes.len()];
+    for index in 0..mesh.nodes.len() {
+        compute_environment_node_transform(index, &mesh.nodes, &mut transforms, &mut visiting);
+    }
+    mesh.nodes
+        .iter()
+        .filter_map(|node| {
+            Some((
+                node.name.clone()?,
+                transforms.get(node.index)?.as_ref()?.translation,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_environment_node_positions(_source: &str) -> HashMap<String, [f32; 3]> {
+    // Browser-hosted GLBs are resolved asynchronously by the renderer. Authors
+    // can always include an explicit Anchor offset/Surface height fallback;
+    // host-side inspection can then write the proposed values into the DSL.
+    HashMap::new()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_environment_bounds(source: &str) -> Option<([f32; 3], [f32; 3])> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return None;
+    }
+    let resolved = resolve_local_scene_asset_path(source);
+    let report = crate::world::inspect_glb_environment_path(resolved).ok()?;
+    Some((report.bounds_min, report.bounds_max))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_environment_bounds(_source: &str) -> Option<([f32; 3], [f32; 3])> {
+    // Browser hosts can run motionloom_inspect_glb_environment_json while
+    // preloading the asset. Explicit offsets remain valid without inspection.
+    None
+}
+
+fn load_environment_triangles(
+    source: &str,
+    resolver: &dyn AssetResolver,
+) -> Vec<crate::world::model_inspection::EnvironmentWalkableTriangle> {
+    let parsed = match resolver.resolve(source) {
+        Ok(AssetSource::Bytes(bytes)) => {
+            crate::world::parse_glb_mesh_data(std::path::Path::new(source), &bytes).ok()
+        }
+        Ok(AssetSource::Path(path)) => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                resolve_local_scene_asset_path(path.to_string_lossy().as_ref())
+            };
+            crate::world::load_glb_mesh_data(path).ok()
+        }
+        Ok(AssetSource::Url(_)) | Err(_) => None,
+    };
+    parsed
+        .as_ref()
+        .map(crate::world::model_inspection::environment_collision_triangles)
+        .unwrap_or_default()
+}
+
+const ENVIRONMENT_SPATIAL_GRID_SIZE: usize = 48;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct EnvironmentSpatialKey {
+    source: String,
+    position: [u32; 3],
+    rotation: [u32; 3],
+    scale: u32,
+    bounds: Option<[u32; 6]>,
+}
+
+impl EnvironmentSpatialKey {
+    fn new(
+        source: &str,
+        bounds: Option<([f32; 3], [f32; 3])>,
+        position: [f32; 3],
+        rotation: [f32; 3],
+        scale: f32,
+    ) -> Self {
+        Self {
+            source: source.to_string(),
+            position: position.map(f32::to_bits),
+            rotation: rotation.map(f32::to_bits),
+            scale: scale.to_bits(),
+            bounds: bounds.map(|(min, max)| {
+                [
+                    min[0].to_bits(),
+                    min[1].to_bits(),
+                    min[2].to_bits(),
+                    max[0].to_bits(),
+                    max[1].to_bits(),
+                    max[2].to_bits(),
+                ]
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SceneEnvironmentTriangle {
+    points: [[f32; 3]; 3],
+    normal: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HumanoidCollisionSphere {
+    center: [f32; 3],
+    radius: f32,
+}
+
+#[derive(Debug)]
+struct EnvironmentTriangleSpatialIndex {
+    triangles: Arc<[SceneEnvironmentTriangle]>,
+    min_x: f32,
+    min_z: f32,
+    cell_width: f32,
+    cell_depth: f32,
+    cells: Vec<Vec<u32>>,
+}
+
+impl EnvironmentTriangleSpatialIndex {
+    fn build(
+        triangles: &[crate::world::model_inspection::EnvironmentWalkableTriangle],
+        environment_bounds: Option<([f32; 3], [f32; 3])>,
+        model_position: [f32; 3],
+        model_rotation: [f32; 3],
+        model_scale: f32,
+    ) -> Self {
+        let triangles = triangles
+            .iter()
+            .map(|triangle| SceneEnvironmentTriangle {
+                points: triangle.points.map(|point| {
+                    environment_asset_point_to_scene(
+                        point,
+                        environment_bounds,
+                        model_position,
+                        model_rotation,
+                        model_scale,
+                    )
+                }),
+                normal: rotate_scene_surface_normal(triangle.normal, model_rotation),
+            })
+            .collect::<Vec<_>>();
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_z = f32::INFINITY;
+        let mut max_z = f32::NEG_INFINITY;
+        for triangle in &triangles {
+            for point in triangle.points {
+                min_x = min_x.min(point[0]);
+                max_x = max_x.max(point[0]);
+                min_z = min_z.min(point[2]);
+                max_z = max_z.max(point[2]);
+            }
+        }
+        if !min_x.is_finite() {
+            min_x = 0.0;
+            max_x = 1.0;
+            min_z = 0.0;
+            max_z = 1.0;
+        }
+        let cell_width = ((max_x - min_x) / ENVIRONMENT_SPATIAL_GRID_SIZE as f32).max(1.0e-4);
+        let cell_depth = ((max_z - min_z) / ENVIRONMENT_SPATIAL_GRID_SIZE as f32).max(1.0e-4);
+        let mut cells = vec![Vec::<u32>::new(); ENVIRONMENT_SPATIAL_GRID_SIZE.pow(2)];
+        for (triangle_index, triangle) in triangles.iter().enumerate() {
+            let tri_min_x = triangle
+                .points
+                .iter()
+                .map(|point| point[0])
+                .fold(f32::INFINITY, f32::min);
+            let tri_max_x = triangle
+                .points
+                .iter()
+                .map(|point| point[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let tri_min_z = triangle
+                .points
+                .iter()
+                .map(|point| point[2])
+                .fold(f32::INFINITY, f32::min);
+            let tri_max_z = triangle
+                .points
+                .iter()
+                .map(|point| point[2])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let x0 = spatial_cell(tri_min_x, min_x, cell_width);
+            let x1 = spatial_cell(tri_max_x, min_x, cell_width);
+            let z0 = spatial_cell(tri_min_z, min_z, cell_depth);
+            let z1 = spatial_cell(tri_max_z, min_z, cell_depth);
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    cells[z * ENVIRONMENT_SPATIAL_GRID_SIZE + x].push(triangle_index as u32);
+                }
+            }
+        }
+        Self {
+            triangles: Arc::from(triangles),
+            min_x,
+            min_z,
+            cell_width,
+            cell_depth,
+            cells,
+        }
+    }
+
+    fn candidates(&self, x: f32, z: f32) -> impl Iterator<Item = &SceneEnvironmentTriangle> {
+        let cell_x = spatial_cell(x, self.min_x, self.cell_width);
+        let cell_z = spatial_cell(z, self.min_z, self.cell_depth);
+        self.cells[cell_z * ENVIRONMENT_SPATIAL_GRID_SIZE + cell_x]
+            .iter()
+            .filter_map(|index| self.triangles.get(*index as usize))
+    }
+
+    /// Query every grid cell touched by a collision sphere. Triangle indices
+    /// are de-duplicated because large triangles may occupy several cells.
+    fn candidates_in_radius(&self, x: f32, z: f32, radius: f32) -> Vec<&SceneEnvironmentTriangle> {
+        let x0 = spatial_cell(x - radius, self.min_x, self.cell_width);
+        let x1 = spatial_cell(x + radius, self.min_x, self.cell_width);
+        let z0 = spatial_cell(z - radius, self.min_z, self.cell_depth);
+        let z1 = spatial_cell(z + radius, self.min_z, self.cell_depth);
+        let mut indices = Vec::<u32>::new();
+        for cell_z in z0..=z1 {
+            for cell_x in x0..=x1 {
+                indices.extend_from_slice(
+                    &self.cells[cell_z * ENVIRONMENT_SPATIAL_GRID_SIZE + cell_x],
+                );
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .filter_map(|index| self.triangles.get(index as usize))
+            .collect()
+    }
+}
+
+fn spatial_cell(value: f32, min: f32, size: f32) -> usize {
+    ((((value - min) / size).floor() as isize).clamp(0, ENVIRONMENT_SPATIAL_GRID_SIZE as isize - 1))
+        as usize
+}
+
+fn raycast_environment_height(
+    spatial_index: &EnvironmentTriangleSpatialIndex,
+    x: f32,
+    z: f32,
+    surface: Option<&ResolvedSceneSurface>,
+) -> Option<f32> {
+    if let Some(surface) = surface
+        && (x < surface.bounds_min[0] - 0.02
+            || x > surface.bounds_max[0] + 0.02
+            || z < surface.bounds_min[2] - 0.02
+            || z > surface.bounds_max[2] + 0.02)
+    {
+        return None;
+    }
+    let mut hit = None::<f32>;
+    for triangle in spatial_index.candidates(x, z) {
+        let triangle_normal = triangle.normal;
+        if surface.is_some_and(|surface| {
+            triangle_normal[0] * surface.normal[0]
+                + triangle_normal[1] * surface.normal[1]
+                + triangle_normal[2] * surface.normal[2]
+                < 0.45
+        }) {
+            continue;
+        }
+        let points = triangle.points;
+        let x0 = points[0][0];
+        let z0 = points[0][2];
+        let x1 = points[1][0];
+        let z1 = points[1][2];
+        let x2 = points[2][0];
+        let z2 = points[2][2];
+        let denominator = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
+        if denominator.abs() <= 1.0e-7 {
+            continue;
+        }
+        let a = ((z1 - z2) * (x - x2) + (x2 - x1) * (z - z2)) / denominator;
+        let b = ((z2 - z0) * (x - x2) + (x0 - x2) * (z - z2)) / denominator;
+        let c = 1.0 - a - b;
+        if a >= -0.0001 && b >= -0.0001 && c >= -0.0001 {
+            let y = a * points[0][1] + b * points[1][1] + c * points[2][1];
+            if surface.is_none_or(|surface| {
+                (y - surface.height).abs()
+                    <= (surface.bounds_max[1] - surface.bounds_min[1])
+                        .abs()
+                        .max(0.08)
+            }) && hit.is_none_or(|current| y > current)
+            {
+                hit = Some(y);
+            }
+        }
+    }
+    hit
+}
+
+fn closest_point_on_triangle(point: [f32; 3], triangle: [[f32; 3]; 3]) -> [f32; 3] {
+    let [a, b, c] = triangle;
+    let ab = sub_scene_vec3(b, a);
+    let ac = sub_scene_vec3(c, a);
+    let ap = sub_scene_vec3(point, a);
+    let d1 = dot_scene_vec3(ab, ap);
+    let d2 = dot_scene_vec3(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = sub_scene_vec3(point, b);
+    let d3 = dot_scene_vec3(ab, bp);
+    let d4 = dot_scene_vec3(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return add_scene_vec3(a, scale_scene_vec3(ab, v));
+    }
+    let cp = sub_scene_vec3(point, c);
+    let d5 = dot_scene_vec3(ab, cp);
+    let d6 = dot_scene_vec3(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return add_scene_vec3(a, scale_scene_vec3(ac, w));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let edge = sub_scene_vec3(c, b);
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return add_scene_vec3(b, scale_scene_vec3(edge, w));
+    }
+    let denominator = (va + vb + vc).max(1.0e-8);
+    let v = vb / denominator;
+    let w = vc / denominator;
+    add_scene_vec3(
+        a,
+        add_scene_vec3(scale_scene_vec3(ab, v), scale_scene_vec3(ac, w)),
+    )
+}
+
+fn add_scene_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|axis| a[axis] + b[axis])
+}
+
+fn sub_scene_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|axis| a[axis] - b[axis])
+}
+
+fn scale_scene_vec3(value: [f32; 3], scale: f32) -> [f32; 3] {
+    value.map(|component| component * scale)
+}
+
+fn dot_scene_vec3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn length_scene_vec3(value: [f32; 3]) -> f32 {
+    dot_scene_vec3(value, value).sqrt()
+}
+
+fn humanoid_collision_spheres(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+) -> Vec<HumanoidCollisionSphere> {
+    let scale = frame.actor_scale.max(0.05);
+    let capsules = [
+        ("hips", "chest", 0.15),
+        ("chest", "head", 0.13),
+        ("upper_arm_l", "forearm_l", 0.075),
+        ("forearm_l", "hand_l", 0.06),
+        ("upper_arm_r", "forearm_r", 0.075),
+        ("forearm_r", "hand_r", 0.06),
+        ("upper_leg_l", "lower_leg_l", 0.10),
+        ("lower_leg_l", "foot_l", 0.075),
+        ("upper_leg_r", "lower_leg_r", 0.10),
+        ("lower_leg_r", "foot_r", 0.075),
+    ];
+    let mut spheres = Vec::with_capacity(capsules.len() * 3);
+    for (start, end, radius_scale) in capsules {
+        let (Some(start), Some(end)) = (frame.joints.get(start), frame.joints.get(end)) else {
+            continue;
+        };
+        for t in [0.12_f32, 0.5, 0.88] {
+            spheres.push(HumanoidCollisionSphere {
+                center: std::array::from_fn(|axis| start[axis] + (end[axis] - start[axis]) * t),
+                radius: (scale * radius_scale).max(0.015),
+            });
+        }
+    }
+    if spheres.is_empty() {
+        let root = frame.joints.get("hips").copied().unwrap_or([0.0; 3]);
+        for (height, radius) in [(0.22, 0.13), (0.48, 0.16), (0.74, 0.11)] {
+            spheres.push(HumanoidCollisionSphere {
+                center: [root[0], root[1] + scale * height, root[2]],
+                radius: scale * radius,
+            });
+        }
+    }
+    spheres
+}
+
+fn sphere_environment_push(
+    spatial_index: &EnvironmentTriangleSpatialIndex,
+    center: [f32; 3],
+    radius: f32,
+) -> Option<[f32; 3]> {
+    let mut best = None::<([f32; 3], f32)>;
+    for triangle in spatial_index.candidates_in_radius(center[0], center[2], radius) {
+        let closest = closest_point_on_triangle(center, triangle.points);
+        let delta = sub_scene_vec3(center, closest);
+        let distance = length_scene_vec3(delta);
+        if distance >= radius {
+            continue;
+        }
+        let direction = if triangle.normal[1] >= 0.55 {
+            // Walkable geometry is one-sided for a character controller: a
+            // pose slightly below the deck must be lifted, never pushed into it.
+            triangle.normal
+        } else if distance > 1.0e-6 {
+            scale_scene_vec3(delta, 1.0 / distance)
+        } else {
+            triangle.normal
+        };
+        let signed = dot_scene_vec3(delta, direction);
+        let penetration = (radius - signed).max(radius - distance).max(0.0);
+        if best.is_none_or(|(_, current)| penetration > current) {
+            best = Some((scale_scene_vec3(direction, penetration), penetration));
+        }
+    }
+    best.map(|(push, _)| push)
+}
+
+/// Resolve an animated humanoid against retained environment meshes using a
+/// fixed iteration count. The bounded solve is deterministic across preview,
+/// export and random-access frame rendering.
+fn resolve_humanoid_kinematic_translation(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+) -> [f32; 3] {
+    let spheres = humanoid_collision_spheres(frame);
+    let mut correction = [0.0_f32; 3];
+    for _ in 0..8 {
+        let mut best = None::<([f32; 3], f32)>;
+        for sphere in &spheres {
+            let center = add_scene_vec3(sphere.center, correction);
+            for environment in environments {
+                let Some(push) =
+                    sphere_environment_push(environment, center, sphere.radius + 0.008)
+                else {
+                    continue;
+                };
+                let length = length_scene_vec3(push);
+                if best.is_none_or(|(_, current)| length > current) {
+                    best = Some((push, length));
+                }
+            }
+        }
+        let Some((push, length)) = best else {
+            break;
+        };
+        if length <= 1.0e-5 {
+            break;
+        }
+        correction = add_scene_vec3(correction, push);
+        let max_correction = frame.actor_scale.max(0.05) * 0.65;
+        let correction_length = length_scene_vec3(correction);
+        if correction_length > max_correction {
+            correction = scale_scene_vec3(correction, max_correction / correction_length);
+            break;
+        }
+    }
+    correction
+}
+
+fn humanoid_effector_contact_target(
+    point: [f32; 3],
+    radius: f32,
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+) -> Option<[f32; 3]> {
+    let mut best = None::<([f32; 3], f32)>;
+    for environment in environments {
+        let Some(push) = sphere_environment_push(environment, point, radius) else {
+            continue;
+        };
+        let length = length_scene_vec3(push);
+        if best.is_none_or(|(_, current)| length > current) {
+            best = Some((add_scene_vec3(point, push), length));
+        }
+    }
+    best.map(|(target, _)| target)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct EnvironmentNodeTransform {
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_environment_node_transform(
+    index: usize,
+    nodes: &[crate::world::GlbNodeData],
+    out: &mut [Option<EnvironmentNodeTransform>],
+    visiting: &mut [bool],
+) -> EnvironmentNodeTransform {
+    if let Some(value) = out.get(index).and_then(|value| *value) {
+        return value;
+    }
+    if visiting.get(index).copied().unwrap_or(false) {
+        return EnvironmentNodeTransform {
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        };
+    }
+    if let Some(slot) = visiting.get_mut(index) {
+        *slot = true;
+    }
+    let node = &nodes[index];
+    let mut local = EnvironmentNodeTransform {
+        translation: node.translation,
+        rotation: node.rotation,
+        scale: node.scale,
+    };
+    if let Some(matrix) = node.matrix {
+        local.translation = [matrix[12], matrix[13], matrix[14]];
+        local.scale = [
+            (matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]).sqrt(),
+            (matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]).sqrt(),
+            (matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]).sqrt(),
+        ];
+    }
+    let global = if let Some(parent) = node.parent {
+        let parent = compute_environment_node_transform(parent, nodes, out, visiting);
+        let scaled = [
+            local.translation[0] * parent.scale[0],
+            local.translation[1] * parent.scale[1],
+            local.translation[2] * parent.scale[2],
+        ];
+        let rotated = rotate_vec3_by_quaternion(scaled, parent.rotation);
+        EnvironmentNodeTransform {
+            translation: [
+                parent.translation[0] + rotated[0],
+                parent.translation[1] + rotated[1],
+                parent.translation[2] + rotated[2],
+            ],
+            rotation: quaternion_mul(parent.rotation, local.rotation),
+            scale: [
+                parent.scale[0] * local.scale[0],
+                parent.scale[1] * local.scale[1],
+                parent.scale[2] * local.scale[2],
+            ],
+        }
+    } else {
+        local
+    };
+    if let Some(slot) = out.get_mut(index) {
+        *slot = Some(global);
+    }
+    if let Some(slot) = visiting.get_mut(index) {
+        *slot = false;
+    }
+    global
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn quaternion_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rotate_vec3_by_quaternion(value: [f32; 3], q: [f32; 4]) -> [f32; 3] {
+    let u = [q[0], q[1], q[2]];
+    let s = q[3];
+    let dot_uv = u[0] * value[0] + u[1] * value[1] + u[2] * value[2];
+    let dot_uu = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
+    let cross = [
+        u[1] * value[2] - u[2] * value[1],
+        u[2] * value[0] - u[0] * value[2],
+        u[0] * value[1] - u[1] * value[0],
+    ];
+    [
+        2.0 * dot_uv * u[0] + (s * s - dot_uu) * value[0] + 2.0 * s * cross[0],
+        2.0 * dot_uv * u[1] + (s * s - dot_uu) * value[1] + 2.0 * s * cross[1],
+        2.0 * dot_uv * u[2] + (s * s - dot_uu) * value[2] + 2.0 * s * cross[2],
+    ]
+}
+
+fn resolve_scene_3d_reference(
+    value: &str,
+    anchors: &HashMap<String, [f32; 3]>,
+    models: &HashMap<String, [f32; 3]>,
+) -> Option<[f32; 3]> {
+    let id = value.trim().strip_prefix('@')?;
+    anchors.get(id).copied().or_else(|| models.get(id).copied())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedSceneSurface {
+    height: f32,
+    centroid: [f32; 3],
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    normal: [f32; 3],
+}
+
+fn environment_asset_point_to_scene(
+    point: [f32; 3],
+    bounds: Option<([f32; 3], [f32; 3])>,
+    model_position: [f32; 3],
+    model_rotation: [f32; 3],
+    model_scale: f32,
+) -> [f32; 3] {
+    let mut local = if let Some((min, max)) = bounds {
+        let height = (max[1] - min[1]).abs().max(0.001);
+        let center_x = (min[0] + max[0]) * 0.5;
+        let center_z = (min[2] + max[2]) * 0.5;
+        [
+            (point[0] - center_x) * model_scale / height,
+            (point[1] - min[1]) * model_scale / height,
+            (point[2] - center_z) * model_scale / height,
+        ]
+    } else {
+        [
+            point[0] * model_scale,
+            point[1] * model_scale,
+            point[2] * model_scale,
+        ]
+    };
+    let yaw = model_rotation[1].to_radians();
+    let x = local[0] * yaw.cos() + local[2] * yaw.sin();
+    let z = -local[0] * yaw.sin() + local[2] * yaw.cos();
+    local[0] = x;
+    local[2] = z;
+    [
+        model_position[0] + local[0],
+        model_position[1] + local[1],
+        model_position[2] + local[2],
+    ]
+}
+
+fn rotate_scene_surface_normal(normal: [f32; 3], rotation: [f32; 3]) -> [f32; 3] {
+    let yaw = rotation[1].to_radians();
+    let rotated = [
+        normal[0] * yaw.cos() + normal[2] * yaw.sin(),
+        normal[1],
+        -normal[0] * yaw.sin() + normal[2] * yaw.cos(),
+    ];
+    let length = (rotated[0] * rotated[0] + rotated[1] * rotated[1] + rotated[2] * rotated[2])
+        .sqrt()
+        .max(0.0001);
+    [
+        rotated[0] / length,
+        rotated[1] / length,
+        rotated[2] / length,
+    ]
+}
+
 impl SceneFrameRenderer {
     #[allow(dead_code)]
     async fn new() -> Self {
@@ -2272,9 +3902,18 @@ impl SceneFrameRenderer {
             retained_gpu_transform_scenes: HashMap::new(),
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
+            scene_material_texture_cache: HashMap::new(),
+            animation_source_signature: 0,
+            compiled_animation_graph: None,
+            compiled_animation_has_dynamic_channels: false,
             prepared_graph_signature: 0,
             prepared_graph_fps: 30.0,
             prepared_graph_duration_ms: 1_000,
+            prepared_scene_model_profiles: Vec::new(),
+            prepared_scene_actions: Vec::new(),
+            prepared_scene_apply_actions: Vec::new(),
+            prepared_scene_animation_assets: Vec::new(),
+            prepared_scene_constraints: Vec::new(),
             gpu_path_cache_hits: 0,
             gpu_path_cache_misses: 0,
             gradient_defs: HashMap::new(),
@@ -2290,10 +3929,15 @@ impl SceneFrameRenderer {
             scene_precompose_defs: HashMap::new(),
             scene_precomposes: HashMap::new(),
             scene_masks: HashMap::new(),
+            scene_material_sources: HashMap::new(),
             model_asset_sources: HashMap::new(),
             image_asset_sources: HashMap::new(),
+            environment_node_cache: HashMap::new(),
+            environment_bounds_cache: HashMap::new(),
+            environment_triangle_cache: HashMap::new(),
+            environment_spatial_cache: HashMap::new(),
             gpu_pick_ids: HashMap::new(),
-            world_renderer: WorldFrameRenderer::with_resolver(world_asset_resolver),
+            scene_3d_renderer: Scene3DRenderer::with_resolver(world_asset_resolver),
             gpu_compositor: None,
             #[cfg(not(target_arch = "wasm32"))]
             last_cpu_frame_profile: SceneCpuFrameProfile::default(),
@@ -2302,6 +3946,61 @@ impl SceneFrameRenderer {
             #[cfg(target_os = "windows")]
             windows_d3d11: None,
         }
+    }
+
+    fn environment_node_positions(&mut self, source: &str) -> &HashMap<String, [f32; 3]> {
+        self.environment_node_cache
+            .entry(source.to_string())
+            .or_insert_with(|| load_environment_node_positions(source))
+    }
+
+    fn environment_bounds(&mut self, source: &str) -> Option<([f32; 3], [f32; 3])> {
+        *self
+            .environment_bounds_cache
+            .entry(source.to_string())
+            .or_insert_with(|| load_environment_bounds(source))
+    }
+
+    fn environment_triangles(
+        &mut self,
+        source: &str,
+    ) -> Arc<[crate::world::model_inspection::EnvironmentWalkableTriangle]> {
+        let resolver = Arc::clone(&self.asset_resolver);
+        self.environment_triangle_cache
+            .entry(source.to_string())
+            .or_insert_with(|| Arc::from(load_environment_triangles(source, resolver.as_ref())))
+            .clone()
+    }
+
+    fn environment_spatial_index(
+        &mut self,
+        source: &str,
+        environment_bounds: Option<([f32; 3], [f32; 3])>,
+        model_position: [f32; 3],
+        model_rotation: [f32; 3],
+        model_scale: f32,
+    ) -> Arc<EnvironmentTriangleSpatialIndex> {
+        let key = EnvironmentSpatialKey::new(
+            source,
+            environment_bounds,
+            model_position,
+            model_rotation,
+            model_scale,
+        );
+        if let Some(index) = self.environment_spatial_cache.get(&key) {
+            return Arc::clone(index);
+        }
+        let triangles = self.environment_triangles(source);
+        let index = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            triangles.as_ref(),
+            environment_bounds,
+            model_position,
+            model_rotation,
+            model_scale,
+        ));
+        self.environment_spatial_cache
+            .insert(key, Arc::clone(&index));
+        index
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2329,9 +4028,18 @@ impl SceneFrameRenderer {
             retained_gpu_transform_scenes: HashMap::new(),
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
+            scene_material_texture_cache: HashMap::new(),
+            animation_source_signature: 0,
+            compiled_animation_graph: None,
+            compiled_animation_has_dynamic_channels: false,
             prepared_graph_signature: 0,
             prepared_graph_fps: 30.0,
             prepared_graph_duration_ms: 1_000,
+            prepared_scene_model_profiles: Vec::new(),
+            prepared_scene_actions: Vec::new(),
+            prepared_scene_apply_actions: Vec::new(),
+            prepared_scene_animation_assets: Vec::new(),
+            prepared_scene_constraints: Vec::new(),
             gpu_path_cache_hits: 0,
             gpu_path_cache_misses: 0,
             gradient_defs: HashMap::new(),
@@ -2347,10 +4055,15 @@ impl SceneFrameRenderer {
             scene_precompose_defs: HashMap::new(),
             scene_precomposes: HashMap::new(),
             scene_masks: HashMap::new(),
+            scene_material_sources: HashMap::new(),
             model_asset_sources: HashMap::new(),
             image_asset_sources: HashMap::new(),
+            environment_node_cache: HashMap::new(),
+            environment_bounds_cache: HashMap::new(),
+            environment_triangle_cache: HashMap::new(),
+            environment_spatial_cache: HashMap::new(),
             gpu_pick_ids: HashMap::new(),
-            world_renderer: WorldFrameRenderer::with_resolver(world_asset_resolver),
+            scene_3d_renderer: Scene3DRenderer::with_resolver(world_asset_resolver),
             gpu_compositor: None,
             last_cpu_frame_profile: SceneCpuFrameProfile::default(),
             external_device_queue: Some((device, queue)),
@@ -2367,6 +4080,57 @@ impl SceneFrameRenderer {
         self.render_frame_with_cpu_inputs(graph, frame, None).await
     }
 
+    fn compiled_animation_graph_for_frame(
+        &mut self,
+        graph: &GraphScript,
+        frame: u32,
+    ) -> Result<Option<Arc<GraphScript>>, MotionLoomSceneRenderError> {
+        if graph.animation_targets.is_empty() {
+            return Ok(None);
+        }
+        let mut hasher = DefaultHasher::new();
+        if let Some(raw_script) = graph.raw_script.as_deref() {
+            raw_script.hash(&mut hasher);
+        } else {
+            format!("{graph:?}").hash(&mut hasher);
+        }
+        let source_signature = hasher.finish();
+        if self.animation_source_signature != source_signature
+            || self.compiled_animation_graph.is_none()
+        {
+            // Numeric, vector, and path channels compile into time expressions
+            // once. Dynamic color/text channels are updated from this cached base.
+            let compiled = apply_animation_targets_at_frame(graph, 0)?
+                .expect("non-empty AnimationTarget list compiles a graph");
+            self.compiled_animation_has_dynamic_channels = graph
+                .animation_targets
+                .iter()
+                .any(|target| animation_target_requires_frame_sampling(graph, target));
+            self.animation_source_signature = source_signature;
+            self.compiled_animation_graph = Some(Arc::new(compiled));
+        }
+
+        let cached = Arc::clone(
+            self.compiled_animation_graph
+                .as_ref()
+                .expect("compiled animation graph is cached"),
+        );
+        if !self.compiled_animation_has_dynamic_channels || frame == 0 {
+            return Ok(Some(cached));
+        }
+
+        let mut resolved = (*cached).clone();
+        let time_sec = frame as f32 / graph.fps.max(1.0);
+        for target in &graph.animation_targets {
+            if !animation_target_requires_frame_sampling(graph, target) {
+                continue;
+            }
+            let value = sample_dynamic_animation_value(target, time_sec)?;
+            apply_animation_property_to_graph(&mut resolved, &target.node, &target.property, value);
+        }
+        Ok(Some(Arc::new(resolved)))
+    }
+
     async fn render_frame_with_cpu_inputs(
         &mut self,
         graph: &GraphScript,
@@ -2377,8 +4141,8 @@ impl SceneFrameRenderer {
         let duration_sec = (graph.duration_ms as f32 / 1000.0).max(1.0 / fps);
         let time_sec = frame as f32 / fps;
         let time_norm = (time_sec / duration_sec).clamp(0.0, 1.0);
-        let animated_graph = apply_animation_targets_at_frame(graph, frame)?;
-        let graph = animated_graph.as_ref().unwrap_or(graph);
+        let animated_graph = self.compiled_animation_graph_for_frame(graph, frame)?;
+        let graph = animated_graph.as_deref().unwrap_or(graph);
         let simulated_graph =
             crate::simulation::bridge::scene::apply_scene_simulation_at_frame(graph, frame)?;
         let graph = simulated_graph.as_ref().unwrap_or(graph);
@@ -2438,8 +4202,8 @@ impl SceneFrameRenderer {
         let time_norm = (time_sec / duration_sec).clamp(0.0, 1.0);
         #[cfg(not(target_arch = "wasm32"))]
         let expression_started = Instant::now();
-        let animated_graph = apply_animation_targets_at_frame(graph, frame)?;
-        let graph = animated_graph.as_ref().unwrap_or(graph);
+        let animated_graph = self.compiled_animation_graph_for_frame(graph, frame)?;
+        let graph = animated_graph.as_deref().unwrap_or(graph);
         let simulated_graph =
             crate::simulation::bridge::scene::apply_scene_simulation_at_frame(graph, frame)?;
         let graph = simulated_graph.as_ref().unwrap_or(graph);
@@ -2550,8 +4314,8 @@ impl SceneFrameRenderer {
         let duration_sec = (graph.duration_ms as f32 / 1000.0).max(1.0 / fps);
         let time_sec = frame as f32 / fps;
         let time_norm = (time_sec / duration_sec).clamp(0.0, 1.0);
-        let animated_graph = apply_animation_targets_at_frame(graph, frame)?;
-        let graph = animated_graph.as_ref().unwrap_or(graph);
+        let animated_graph = self.compiled_animation_graph_for_frame(graph, frame)?;
+        let graph = animated_graph.as_deref().unwrap_or(graph);
         let simulated_graph =
             crate::simulation::bridge::scene::apply_scene_simulation_at_frame(graph, frame)?;
         let graph = simulated_graph.as_ref().unwrap_or(graph);
@@ -2689,8 +4453,8 @@ impl SceneFrameRenderer {
         let duration_sec = (graph.duration_ms as f32 / 1000.0).max(1.0 / fps);
         let time_sec = frame as f32 / fps;
         let time_norm = (time_sec / duration_sec).clamp(0.0, 1.0);
-        let animated_graph = apply_animation_targets_at_frame(graph, frame)?;
-        let graph = animated_graph.as_ref().unwrap_or(graph);
+        let animated_graph = self.compiled_animation_graph_for_frame(graph, frame)?;
+        let graph = animated_graph.as_deref().unwrap_or(graph);
         let simulated_graph =
             crate::simulation::bridge::scene::apply_scene_simulation_at_frame(graph, frame)?;
         let graph = simulated_graph.as_ref().unwrap_or(graph);
@@ -2928,10 +4692,26 @@ impl SceneFrameRenderer {
         }
         let graph_signature = hasher.finish();
         if self.prepared_graph_signature != graph_signature {
+            // These declarations belong to the authoring graph rather than a
+            // frame. Keep their lowered inputs retained across playback. A
+            // frame-local animated Graph clone carries the same raw source and
+            // only mutates evaluated node values, so cloning the full action
+            // pool and profile registry on every frame is unnecessary.
+            self.prepared_scene_model_profiles = graph.model_profiles.clone();
+            self.prepared_scene_actions = graph.actions.clone();
+            self.prepared_scene_apply_actions = graph.apply_actions.clone();
+            self.prepared_scene_animation_assets = graph
+                .assets
+                .iter()
+                .filter(|asset| asset.kind == GraphAssetKind::Animation)
+                .cloned()
+                .collect();
+            self.prepared_scene_constraints = graph.scene_constraints.clone();
             self.retained_gpu_shape_scenes.clear();
             self.retained_gpu_transform_scenes.clear();
             self.gpu_text_raster_cache.clear();
             self.gpu_layer3d_texture_cache.clear();
+            self.scene_material_texture_cache.clear();
             self.prepared_graph_signature = graph_signature;
         }
         self.gradient_defs.clear();
@@ -2947,6 +4727,7 @@ impl SceneFrameRenderer {
         self.scene_precompose_defs.clear();
         self.scene_precomposes.clear();
         self.scene_masks.clear();
+        self.scene_material_sources.clear();
         self.model_asset_sources.clear();
         self.image_asset_sources.clear();
         for asset in &graph.assets {
@@ -2959,8 +4740,12 @@ impl SceneFrameRenderer {
                     self.image_asset_sources
                         .insert(asset.id.clone(), asset.src.clone());
                 }
-                GraphAssetKind::Video | GraphAssetKind::Audio => {}
+                GraphAssetKind::Video | GraphAssetKind::Audio | GraphAssetKind::Animation => {}
             }
+        }
+        for scene in &graph.scenes {
+            self.scene_material_sources
+                .insert(scene.id.clone(), scene.clone());
         }
         collect_graph_gradient_defs(graph, &mut self.gradient_defs);
         collect_graph_palette_defs(graph, &mut self.palette_defs);
@@ -3030,8 +4815,8 @@ impl SceneFrameRenderer {
         let duration_sec = (graph.duration_ms as f32 / 1000.0).max(1.0 / fps);
         let time_sec = frame as f32 / fps;
         let time_norm = (time_sec / duration_sec).clamp(0.0, 1.0);
-        let animated_graph = apply_animation_targets_at_frame(graph, frame)?;
-        let graph = animated_graph.as_ref().unwrap_or(graph);
+        let animated_graph = self.compiled_animation_graph_for_frame(graph, frame)?;
+        let graph = animated_graph.as_deref().unwrap_or(graph);
         let simulated_graph =
             crate::simulation::bridge::scene::apply_scene_simulation_at_frame(graph, frame)?;
         let graph = simulated_graph.as_ref().unwrap_or(graph);
@@ -3051,6 +4836,26 @@ impl SceneFrameRenderer {
         self.scene_precompose_defs.clear();
         self.scene_precomposes.clear();
         self.scene_masks.clear();
+        self.scene_material_sources.clear();
+        self.model_asset_sources.clear();
+        self.image_asset_sources.clear();
+        for asset in &graph.assets {
+            match asset.kind {
+                GraphAssetKind::Model => {
+                    self.model_asset_sources
+                        .insert(asset.id.clone(), asset.src.clone());
+                }
+                GraphAssetKind::Image => {
+                    self.image_asset_sources
+                        .insert(asset.id.clone(), asset.src.clone());
+                }
+                GraphAssetKind::Video | GraphAssetKind::Audio | GraphAssetKind::Animation => {}
+            }
+        }
+        for scene in &graph.scenes {
+            self.scene_material_sources
+                .insert(scene.id.clone(), scene.clone());
+        }
         collect_graph_gradient_defs(graph, &mut self.gradient_defs);
         collect_graph_palette_defs(graph, &mut self.palette_defs);
         collect_graph_font_defs(graph, &mut self.font_defs);
@@ -3241,6 +5046,7 @@ impl SceneFrameRenderer {
         if let Some(cpu_inputs) = cpu_inputs {
             Self::insert_cpu_input_resources(&mut resources, graph, cpu_inputs);
         }
+        let global_process_liveness = global_process_liveness(graph);
 
         if !graph.world_sources.is_empty() {
             let raw_script = graph.raw_script.as_deref().ok_or_else(|| {
@@ -3261,7 +5067,7 @@ impl SceneFrameRenderer {
                 world_graph.present.from = world_source.id.clone();
                 world_graph.render_size = Some(output_size);
                 let image = self
-                    .world_renderer
+                    .scene_3d_renderer
                     .render_frame_gpu(&world_graph, world_frame, &world_asset_root)
                     .await
                     .map_err(|err| MotionLoomSceneRenderError::WorldSource {
@@ -3306,7 +5112,19 @@ impl SceneFrameRenderer {
             resources.insert("scene".to_string(), source);
         }
 
+        let mut material_binding_scene_ids = HashSet::new();
         for scene in &graph.scenes {
+            collect_material_binding_scene_ids(&scene.children, &mut material_binding_scene_ids);
+        }
+        for scene in &graph.scenes {
+            // A Scene used only as a MaterialBinding source is a texture subgraph,
+            // not another full-frame output. Rendering it here used to resize the
+            // compositor and disturb retained text textures in the presented Scene.
+            if material_binding_scene_ids.contains(&scene.id)
+                && !graph_requires_scene_resource(graph, &scene.id)
+            {
+                continue;
+            }
             let scene_size = scene.size.unwrap_or(graph.size);
             let (scene_output_size, scene_logical_size, scene_transform) = if scene.size.is_some() {
                 (scene_size, scene_size, Affine2::identity())
@@ -3369,7 +5187,11 @@ impl SceneFrameRenderer {
             resources.entry("scene".to_string()).or_insert(scene_source);
         }
 
-        for tex in &graph.textures {
+        for tex in graph
+            .textures
+            .iter()
+            .filter(|tex| global_process_liveness.resources.contains(&tex.id))
+        {
             let source = if let (Some(layer_id), Some(input_id)) =
                 (tex.from.as_deref(), tex.input.as_deref())
             {
@@ -3405,6 +5227,11 @@ impl SceneFrameRenderer {
                         Rgba([0, 0, 0, 0]),
                     ))
                 })
+            } else if global_process_liveness.pass_outputs.contains(&tex.id) {
+                // GPU pass outputs are created by the pass itself. Allocating a
+                // full-size transparent CPU image here used to add one 8 MiB
+                // clear per 1080p output before it was immediately replaced.
+                continue;
             } else {
                 let size = tex.size.unwrap_or(graph.size);
                 GraphTextureSource::Cpu(RgbaImage::from_pixel(
@@ -3416,7 +5243,11 @@ impl SceneFrameRenderer {
             resources.insert(tex.id.clone(), source);
         }
 
-        for pass in &graph.passes {
+        for pass in graph
+            .passes
+            .iter()
+            .filter(|pass| global_process_liveness.passes.contains(&pass.id))
+        {
             let inputs = pass
                 .inputs
                 .iter()
@@ -3446,7 +5277,9 @@ impl SceneFrameRenderer {
         // Layer Tex nodes can depend on Pass outputs declared later in the DSL.
         // Re-resolve them after passes so <Tex from="layer" input="comp" /> uses
         // the final upstream resource instead of a transparent placeholder.
-        for tex in graph.textures.iter().filter(|tex| tex.input.is_some()) {
+        for tex in graph.textures.iter().filter(|tex| {
+            tex.input.is_some() && global_process_liveness.resources.contains(&tex.id)
+        }) {
             if let (Some(layer_id), Some(input_id)) = (tex.from.as_deref(), tex.input.as_deref())
                 && let Some(layer) = graph.layers.iter().find(|layer| layer.id == layer_id)
                 && let Some(base) = resources.get(input_id).cloned()
@@ -3538,6 +5371,13 @@ impl SceneFrameRenderer {
             local.insert(input_id.clone(), source.clone());
             local.insert(format!("input:{input_id}"), source.clone());
         }
+        let pass_outputs = process
+            .pass_ids
+            .iter()
+            .filter_map(|pass_id| graph.passes.iter().find(|pass| pass.id == *pass_id))
+            .flat_map(|pass| pass.outputs.iter())
+            .map(|output| output.resource_id().to_string())
+            .collect::<HashSet<_>>();
 
         for tex_id in &process.texture_ids {
             let Some(tex) = graph.textures.iter().find(|tex| tex.id == *tex_id) else {
@@ -3554,14 +5394,22 @@ impl SceneFrameRenderer {
                         .and_then(|input| scene_effect_resource(&local, input))
                         .cloned()
                 })
-                .unwrap_or_else(|| {
-                    let size = tex.size.unwrap_or(output_size);
-                    GraphTextureSource::Cpu(RgbaImage::from_pixel(
-                        size.0.max(1),
-                        size.1.max(1),
-                        Rgba([0, 0, 0, 0]),
-                    ))
+                .or_else(|| {
+                    // A pass output has no meaningful value before that pass
+                    // runs. Keep it absent instead of allocating a transparent
+                    // CPU image that a GPU output immediately replaces.
+                    (!pass_outputs.contains(&tex.id)).then(|| {
+                        let size = tex.size.unwrap_or(output_size);
+                        GraphTextureSource::Cpu(RgbaImage::from_pixel(
+                            size.0.max(1),
+                            size.1.max(1),
+                            Rgba([0, 0, 0, 0]),
+                        ))
+                    })
                 });
+            let Some(resolved) = resolved else {
+                continue;
+            };
             local.insert(tex.id.clone(), resolved);
         }
 
@@ -4217,20 +6065,14 @@ impl SceneFrameRenderer {
         width: u32,
         height: u32,
     ) -> Result<(), MotionLoomSceneRenderError> {
-        let needs_new_compositor = self
-            .gpu_compositor
-            .as_ref()
-            .map(|compositor| compositor.width != width || compositor.height != height)
-            .unwrap_or(true);
-        if needs_new_compositor {
+        let width = width.max(1);
+        let height = height.max(1);
+        if let Some(compositor) = self.gpu_compositor.as_mut() {
+            compositor.resize(width, height)?;
+        } else {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                if let Some((device, queue)) = self
-                    .gpu_compositor
-                    .as_ref()
-                    .map(|compositor| compositor.device_queue())
-                    .or_else(|| self.external_device_queue.clone())
-                {
+                if let Some((device, queue)) = self.external_device_queue.clone() {
                     self.gpu_compositor = Some(
                         WgpuSceneCompositor::new_with_device(
                             device,
@@ -4255,6 +6097,7 @@ impl SceneFrameRenderer {
                 );
             }
         }
+        self.sync_scene_3d_gpu_context();
         Ok(())
     }
 
@@ -5638,17 +7481,326 @@ impl SceneFrameRenderer {
         canvas_size: (u32, u32),
         time_norm: f32,
         time_sec: f32,
-    ) -> Result<RgbaImage, MotionLoomSceneRenderError> {
+    ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+        self.ensure_gpu_compositor_size(canvas_size.0.max(1), canvas_size.1.max(1))
+            .await?;
         let mut camera = WorldCamera::default();
         let mut actors = Vec::new();
+        let mut material_overrides = Vec::new();
+        let mut world_model_profiles = self
+            .prepared_scene_model_profiles
+            .iter()
+            .filter(|profile| profile.kind.eq_ignore_ascii_case("3d"))
+            .map(scene_model_profile_to_world)
+            .collect::<Vec<_>>();
+        let mut world_actions = self
+            .prepared_scene_actions
+            .iter()
+            .filter(|action| action.source.is_none())
+            .map(scene_action_to_world)
+            .collect::<Vec<_>>();
+        let mut world_apply_actions = self
+            .prepared_scene_apply_actions
+            .iter()
+            .map(scene_apply_action_to_world)
+            .collect::<Vec<_>>();
+
+        // Resolve model-relative anchors before lowering actors so node order
+        // never changes an authored placement.
+        let mut model_positions = HashMap::<String, [f32; 3]>::new();
+        let mut model_rotations = HashMap::<String, [f32; 3]>::new();
+        let mut model_scales = HashMap::<String, f32>::new();
+        let mut model_node_positions = HashMap::<String, HashMap<String, [f32; 3]>>::new();
+        let mut model_environment_bounds = HashMap::<String, Option<([f32; 3], [f32; 3])>>::new();
+        let mut model_environment_triangles =
+            HashMap::<String, Arc<EnvironmentTriangleSpatialIndex>>::new();
+        for node in &composite.nodes_3d {
+            if let Scene3DNode::Model(model) = node
+                && let Some(id) = model.id.as_ref()
+            {
+                let position = if model.position.trim().starts_with('@') {
+                    [0.0, 0.0, 0.0]
+                } else {
+                    eval_scene_vec3(&model.position, time_norm, time_sec, [0.0, 0.0, 0.0])?
+                };
+                let rotation =
+                    eval_scene_vec3(&model.rotation, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                model_positions.insert(id.clone(), position);
+                model_rotations.insert(id.clone(), rotation);
+                let authored_scale = eval_scene_number(&model.scale, time_norm, time_sec)?;
+                let unit_scale = if model.environment {
+                    eval_scene_number(&model.unit_scale, time_norm, time_sec)?
+                } else {
+                    1.0
+                };
+                let effective_scale = authored_scale * unit_scale;
+                model_scales.insert(id.clone(), effective_scale);
+                if model.environment {
+                    let source = self
+                        .model_asset_sources
+                        .get(&model.asset)
+                        .cloned()
+                        .unwrap_or_else(|| model.asset.clone());
+                    let environment_bounds = self.environment_bounds(&source);
+                    model_environment_bounds.insert(id.clone(), environment_bounds);
+                    model_node_positions
+                        .insert(id.clone(), self.environment_node_positions(&source).clone());
+                    model_environment_triangles.insert(
+                        id.clone(),
+                        self.environment_spatial_index(
+                            &source,
+                            environment_bounds,
+                            position,
+                            rotation,
+                            effective_scale,
+                        ),
+                    );
+                }
+            }
+        }
+        let mut surfaces = HashMap::<String, ResolvedSceneSurface>::new();
+        let mut surface_models = HashMap::<String, String>::new();
+        for node in &composite.nodes_3d {
+            let Scene3DNode::Model(model) = node else {
+                continue;
+            };
+            let Some(model_id) = model.id.as_deref() else {
+                continue;
+            };
+            let model_position = model_positions.get(model_id).copied().unwrap_or([0.0; 3]);
+            let model_rotation = model_rotations.get(model_id).copied().unwrap_or([0.0; 3]);
+            let model_scale = model_scales.get(model_id).copied().unwrap_or(1.0);
+            let environment_bounds = model_environment_bounds
+                .get(model_id)
+                .and_then(|bounds| *bounds);
+            for surface in &model.surfaces {
+                let authored_normal =
+                    eval_scene_vec3(&surface.normal, time_norm, time_sec, [0.0, 1.0, 0.0])?;
+                let resolved = if surface.space == "asset" {
+                    let raw_centroid = if let Some(value) = surface.centroid.as_deref() {
+                        eval_scene_vec3(value, time_norm, time_sec, [0.0, 0.0, 0.0])?
+                    } else {
+                        [
+                            0.0,
+                            eval_scene_number(&surface.height, time_norm, time_sec)?,
+                            0.0,
+                        ]
+                    };
+                    let raw_min = if let Some(value) = surface.bounds_min.as_deref() {
+                        eval_scene_vec3(value, time_norm, time_sec, raw_centroid)?
+                    } else {
+                        raw_centroid
+                    };
+                    let raw_max = if let Some(value) = surface.bounds_max.as_deref() {
+                        eval_scene_vec3(value, time_norm, time_sec, raw_centroid)?
+                    } else {
+                        raw_centroid
+                    };
+                    let centroid = environment_asset_point_to_scene(
+                        raw_centroid,
+                        environment_bounds,
+                        model_position,
+                        model_rotation,
+                        model_scale,
+                    );
+                    let corners = [
+                        [raw_min[0], raw_min[1], raw_min[2]],
+                        [raw_min[0], raw_min[1], raw_max[2]],
+                        [raw_max[0], raw_max[1], raw_min[2]],
+                        [raw_max[0], raw_max[1], raw_max[2]],
+                    ];
+                    let mut world_min = [f32::INFINITY; 3];
+                    let mut world_max = [f32::NEG_INFINITY; 3];
+                    for corner in corners {
+                        let world = environment_asset_point_to_scene(
+                            corner,
+                            environment_bounds,
+                            model_position,
+                            model_rotation,
+                            model_scale,
+                        );
+                        for axis in 0..3 {
+                            world_min[axis] = world_min[axis].min(world[axis]);
+                            world_max[axis] = world_max[axis].max(world[axis]);
+                        }
+                    }
+                    ResolvedSceneSurface {
+                        height: centroid[1],
+                        centroid,
+                        bounds_min: world_min,
+                        bounds_max: world_max,
+                        normal: rotate_scene_surface_normal(authored_normal, model_rotation),
+                    }
+                } else {
+                    let node_height = surface.node.as_deref().and_then(|name| {
+                        model_node_positions
+                            .get(model_id)
+                            .and_then(|nodes| nodes.get(name))
+                            .map(|position| {
+                                environment_asset_point_to_scene(
+                                    *position,
+                                    environment_bounds,
+                                    model_position,
+                                    model_rotation,
+                                    model_scale,
+                                )[1]
+                            })
+                    });
+                    let height = node_height.unwrap_or(
+                        model_position[1]
+                            + eval_scene_number(&surface.height, time_norm, time_sec)?,
+                    );
+                    let centroid = surface
+                        .centroid
+                        .as_deref()
+                        .map(|value| {
+                            eval_scene_vec3(value, time_norm, time_sec, [0.0, height, 0.0])
+                        })
+                        .transpose()?
+                        .unwrap_or([model_position[0], height, model_position[2]]);
+                    let bounds_min = surface
+                        .bounds_min
+                        .as_deref()
+                        .map(|value| eval_scene_vec3(value, time_norm, time_sec, centroid))
+                        .transpose()?
+                        .unwrap_or(centroid);
+                    let bounds_max = surface
+                        .bounds_max
+                        .as_deref()
+                        .map(|value| eval_scene_vec3(value, time_norm, time_sec, centroid))
+                        .transpose()?
+                        .unwrap_or(centroid);
+                    ResolvedSceneSurface {
+                        height,
+                        centroid,
+                        bounds_min,
+                        bounds_max,
+                        normal: authored_normal,
+                    }
+                };
+                surfaces.insert(surface.id.clone(), resolved);
+                surface_models.insert(surface.id.clone(), model_id.to_string());
+            }
+        }
+        let mut anchors = HashMap::<String, [f32; 3]>::new();
+        for node in &composite.nodes_3d {
+            let Scene3DNode::Anchor(anchor) = node else {
+                continue;
+            };
+            let mut base = model_positions
+                .get(&anchor.relative_to)
+                .copied()
+                .or_else(|| anchors.get(&anchor.relative_to).copied())
+                .unwrap_or([0.0, 0.0, 0.0]);
+            if let Some(surface) = anchor
+                .surface
+                .as_deref()
+                .and_then(|surface_id| surfaces.get(surface_id))
+            {
+                base = surface.centroid;
+                if let Some(uv) = anchor.uv.as_deref() {
+                    let uv = eval_scene_vec2(uv, time_norm, time_sec, [0.5, 0.5])?;
+                    base[0] = surface.bounds_min[0]
+                        + (surface.bounds_max[0] - surface.bounds_min[0]) * uv[0].clamp(0.0, 1.0);
+                    base[2] = surface.bounds_min[2]
+                        + (surface.bounds_max[2] - surface.bounds_min[2]) * uv[1].clamp(0.0, 1.0);
+                    base[1] = surface.height;
+                }
+            }
+            let mut offset = eval_scene_vec3(&anchor.offset, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+            let relative_model_scale = model_scales
+                .get(&anchor.relative_to)
+                .copied()
+                .unwrap_or(1.0);
+            if let Some(node_name) = anchor.node.as_deref()
+                && let Some(node_position) = model_node_positions
+                    .get(&anchor.relative_to)
+                    .and_then(|nodes| nodes.get(node_name))
+            {
+                let normalized = model_environment_bounds
+                    .get(&anchor.relative_to)
+                    .and_then(|bounds| *bounds)
+                    .map(|(min, max)| {
+                        let height = (max[1] - min[1]).abs().max(0.001);
+                        let center_x = (min[0] + max[0]) * 0.5;
+                        let center_z = (min[2] + max[2]) * 0.5;
+                        [
+                            (node_position[0] - center_x) * relative_model_scale / height,
+                            (node_position[1] - min[1]) * relative_model_scale / height,
+                            (node_position[2] - center_z) * relative_model_scale / height,
+                        ]
+                    })
+                    .unwrap_or(*node_position);
+                for axis in 0..3 {
+                    offset[axis] += normalized[axis];
+                }
+            }
+            if anchor.space == "local" {
+                let yaw = model_rotations
+                    .get(&anchor.relative_to)
+                    .map_or(0.0, |rotation| rotation[1])
+                    .to_radians();
+                let x = offset[0] * yaw.cos() + offset[2] * yaw.sin();
+                let z = -offset[0] * yaw.sin() + offset[2] * yaw.cos();
+                offset[0] = x;
+                offset[2] = z;
+            }
+            anchors.insert(
+                anchor.id.clone(),
+                [
+                    base[0] + offset[0],
+                    base[1] + offset[1],
+                    base[2] + offset[2],
+                ],
+            );
+        }
+        for node in &composite.nodes_3d {
+            if let Scene3DNode::Model(model) = node
+                && let Some(id) = model.id.as_ref()
+                && let Some(anchor_id) = model.position.trim().strip_prefix('@')
+                && let Some(position) = anchors.get(anchor_id).copied()
+            {
+                model_positions.insert(id.clone(), position);
+            }
+        }
+
+        let environment_light_intensity = composite
+            .nodes_3d
+            .iter()
+            .filter_map(|node| match node {
+                Scene3DNode::EnvironmentLight(light) => {
+                    eval_scene_number(&light.intensity, time_norm, time_sec).ok()
+                }
+                _ => None,
+            })
+            .next()
+            .unwrap_or(1.0)
+            .max(0.0);
 
         for node in &composite.nodes_3d {
             match node {
                 Scene3DNode::Camera(node) => {
-                    let position =
-                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 6.0])?;
-                    let target =
-                        eval_scene_vec3(&node.target, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    if composite
+                        .active_camera
+                        .as_deref()
+                        .is_some_and(|active| node.id.as_deref() != Some(active))
+                    {
+                        continue;
+                    }
+                    let position = if let Some(value) =
+                        resolve_scene_3d_reference(&node.position, &anchors, &model_positions)
+                    {
+                        value
+                    } else {
+                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 6.0])?
+                    };
+                    let target = if let Some(value) =
+                        resolve_scene_3d_reference(&node.target, &anchors, &model_positions)
+                    {
+                        value
+                    } else {
+                        eval_scene_vec3(&node.target, time_norm, time_sec, [0.0, 0.0, 0.0])?
+                    };
                     let dx = position[0] - target[0];
                     let dy = position[1] - target[1];
                     let dz = position[2] - target[2];
@@ -5656,6 +7808,11 @@ impl SceneFrameRenderer {
                     let distance = (horizontal * horizontal + dy * dy).sqrt().max(0.05);
                     let yaw = dx.atan2(dz).to_degrees();
                     let pitch = dy.atan2(horizontal.max(0.0001)).to_degrees();
+                    let authored_up = if node.horizon_lock {
+                        [0.0, 1.0, 0.0]
+                    } else {
+                        eval_scene_vec3(&node.up, time_norm, time_sec, [0.0, 1.0, 0.0])?
+                    };
                     camera = WorldCamera {
                         id: node.id.clone(),
                         control: WorldCameraControl::Orbit,
@@ -5669,7 +7826,10 @@ impl SceneFrameRenderer {
                         target_z: target[2].to_string(),
                         yaw: yaw.to_string(),
                         pitch: pitch.to_string(),
-                        roll: "0".to_string(),
+                        roll: eval_scene_number(&node.roll, time_norm, time_sec)?.to_string(),
+                        up_x: authored_up[0].to_string(),
+                        up_y: authored_up[1].to_string(),
+                        up_z: authored_up[2].to_string(),
                         distance: distance.to_string(),
                         zoom: "1".to_string(),
                         fov: eval_scene_number(&node.fov, time_norm, time_sec)?.to_string(),
@@ -5682,13 +7842,37 @@ impl SceneFrameRenderer {
                     // for the dedicated IBL pass added by the material bridge.
                 }
                 Scene3DNode::Model(node) => {
-                    let src = self
+                    let actor_id = node
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("model_{}", actors.len()));
+                    let authored_src = self
                         .model_asset_sources
                         .get(&node.asset)
                         .cloned()
                         .unwrap_or_else(|| node.asset.clone());
-                    let mut position =
-                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    // Scene-authored model and environment paths are relative
+                    // to the MotionLoom document, not to the legacy World
+                    // renderer's sample-asset directory. Resolve them before
+                    // crossing the internal Scene3D bridge. HTTP(S) sources
+                    // remain unchanged because canonicalization simply fails
+                    // and falls back to the original URL string.
+                    let src = {
+                        let resolved = resolve_local_scene_asset_path(&authored_src);
+                        std::fs::canonicalize(&resolved)
+                            .unwrap_or(resolved)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    let mut position = node
+                        .id
+                        .as_ref()
+                        .and_then(|id| model_positions.get(id).copied())
+                        .unwrap_or(if node.position.trim().starts_with('@') {
+                            [0.0, 0.0, 0.0]
+                        } else {
+                            eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 0.0])?
+                        });
                     if let Some(value) = &node.position_x {
                         position[0] = eval_scene_number(value, time_norm, time_sec)?;
                     }
@@ -5709,39 +7893,365 @@ impl SceneFrameRenderer {
                     if let Some(value) = &node.rotation_z {
                         rotation[2] = eval_scene_number(value, time_norm, time_sec)?;
                     }
+                    let active_apply = self.prepared_scene_apply_actions.iter().find(|apply| {
+                        let start = apply.at_ms as f32 / 1000.0;
+                        let duration = apply.duration_ms.unwrap_or(duration_ms) as f32 / 1000.0;
+                        apply.target == actor_id
+                            && time_sec >= start
+                            && (apply.r#loop || time_sec <= start + duration.max(0.0))
+                    });
+                    if let Some(apply) = active_apply.filter(|apply| {
+                        apply.target == actor_id
+                            && apply.root_motion.as_deref() == Some("match_target")
+                            && (apply.destination.is_some()
+                                || apply.takeoff.is_some()
+                                || apply.contact.is_some()
+                                || apply.landing.is_some())
+                    }) {
+                        let start_sec = apply.at_ms as f32 / 1000.0;
+                        let action = self
+                            .prepared_scene_actions
+                            .iter()
+                            .find(|action| action.id == apply.action);
+                        let duration_sec = apply
+                            .duration_ms
+                            .or_else(|| {
+                                action.map(|action| action.duration_ms).filter(|ms| *ms > 0)
+                            })
+                            .unwrap_or(duration_ms)
+                            as f32
+                            / 1000.0;
+                        let local_sec = (time_sec - start_sec).clamp(0.0, duration_sec.max(0.0));
+                        let marker_time = |role: &str, fallback: f32| {
+                            action
+                                .and_then(|action| {
+                                    action.markers.iter().find(|marker| {
+                                        marker.id.eq_ignore_ascii_case(role)
+                                            || marker.role.as_deref().is_some_and(|value| {
+                                                value.eq_ignore_ascii_case(role)
+                                            })
+                                    })
+                                })
+                                .map(|marker| marker.time_ms as f32 / 1000.0)
+                                .unwrap_or(fallback)
+                                .clamp(0.0, duration_sec.max(0.0))
+                        };
+                        let takeoff_t = marker_time("takeoff", 0.0);
+                        let contact_t = marker_time("contact", duration_sec * 0.5);
+                        let landing_t = marker_time("landing", duration_sec);
+                        let takeoff = apply
+                            .takeoff
+                            .as_deref()
+                            .and_then(|id| anchors.get(id).copied())
+                            .unwrap_or(position);
+                        let contact = apply
+                            .contact
+                            .as_deref()
+                            .and_then(|id| anchors.get(id).copied());
+                        let landing = apply
+                            .landing
+                            .as_deref()
+                            .or(apply.destination.as_deref())
+                            .and_then(|id| anchors.get(id).copied())
+                            .or(contact)
+                            .unwrap_or(takeoff);
+                        let interpolate = |from: [f32; 3], to: [f32; 3], t: f32| {
+                            std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * t)
+                        };
+                        position = if local_sec <= takeoff_t && takeoff_t > f32::EPSILON {
+                            interpolate(position, takeoff, local_sec / takeoff_t)
+                        } else if let Some(contact) = contact
+                            && local_sec <= contact_t
+                            && contact_t > takeoff_t
+                        {
+                            interpolate(
+                                takeoff,
+                                contact,
+                                (local_sec - takeoff_t) / (contact_t - takeoff_t),
+                            )
+                        } else if let Some(contact) = contact
+                            && landing_t > contact_t
+                        {
+                            interpolate(
+                                contact,
+                                landing,
+                                ((local_sec - contact_t) / (landing_t - contact_t)).clamp(0.0, 1.0),
+                            )
+                        } else {
+                            let progress = if duration_sec <= f32::EPSILON {
+                                1.0
+                            } else {
+                                (local_sec / duration_sec).clamp(0.0, 1.0)
+                            };
+                            interpolate(position, landing, progress)
+                        };
+                    }
+                    if let Some((ground_height, ground_offset)) = active_apply.and_then(|apply| {
+                        let ground = apply.ground.as_deref()?;
+                        let surface = surfaces.get(ground)?;
+                        let mut height = surface.height;
+                        if let Some(environment_id) = surface_models.get(ground)
+                            && let Some(triangles) = model_environment_triangles.get(environment_id)
+                        {
+                            height = raycast_environment_height(
+                                triangles,
+                                position[0],
+                                position[2],
+                                Some(surface),
+                            )
+                            .unwrap_or(height);
+                        }
+                        let offset =
+                            eval_scene_number(&apply.ground_offset, time_norm, time_sec).ok()?;
+                        Some((height, offset))
+                    }) {
+                        let airborne = active_apply.is_some_and(|apply| {
+                            (apply.takeoff.is_some() && apply.landing.is_some())
+                                && position[1] > ground_height + ground_offset + 0.001
+                        });
+                        if !airborne {
+                            position[1] = ground_height + ground_offset;
+                        }
+                    }
+                    if let Some(face_id) = self
+                        .prepared_scene_apply_actions
+                        .iter()
+                        .find(|apply| apply.target == actor_id && apply.face.is_some())
+                        .and_then(|apply| apply.face.as_deref())
+                        && let Some(target) = model_positions
+                            .get(face_id)
+                            .copied()
+                            .or_else(|| anchors.get(face_id).copied())
+                    {
+                        rotation[1] = (target[0] - position[0])
+                            .atan2(target[2] - position[2])
+                            .to_degrees();
+                    }
+                    for binding in &node.material_bindings {
+                        let Some(texture) = binding.texture.as_deref() else {
+                            continue;
+                        };
+                        let Some(scene_id) = texture
+                            .strip_prefix("@scene:")
+                            .or_else(|| texture.strip_prefix("scene:"))
+                        else {
+                            continue;
+                        };
+                        let source_scene = self
+                            .scene_material_sources
+                            .get(scene_id)
+                            .cloned()
+                            .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                                message: format!(
+                                    "MaterialBinding on model '{actor_id}' references unknown Scene '{scene_id}'"
+                                ),
+                        })?;
+                        let texture_size = source_scene.size.unwrap_or(canvas_size);
+                        let cache_key = scene_material_texture_cache_key(
+                            self.prepared_graph_signature,
+                            &source_scene,
+                            texture_size,
+                        );
+                        let texture = if let Some(texture) = cache_key
+                            .and_then(|key| self.scene_material_texture_cache.get(&key))
+                            .cloned()
+                        {
+                            texture
+                        } else {
+                            let image = self.render_cpu_scene_nodes_scaled(
+                                &source_scene.children,
+                                texture_size,
+                                texture_size,
+                                time_norm,
+                                time_sec,
+                                [0, 0, 0, 0],
+                            )?;
+                            let texture =
+                                crate::world::render::gpu_world_texture_from_rgba_image(&image);
+                            if let Some(cache_key) = cache_key {
+                                self.scene_material_texture_cache
+                                    .insert(cache_key, Arc::clone(&texture));
+                            }
+                            texture
+                        };
+                        material_overrides.push(
+                            crate::world::render::WorldMaterialTextureOverride {
+                                actor_id: actor_id.clone(),
+                                material: binding.material.clone(),
+                                texture,
+                            },
+                        );
+                    }
+                    let inferred_profile = node.profile.clone().or_else(|| {
+                        world_model_profiles
+                            .iter()
+                            .find(|profile| {
+                                profile.model == actor_id
+                                    || profile.model == node.asset
+                                    || profile.model == src
+                            })
+                            .map(|profile| profile.id.clone())
+                    });
+
+                    // AnimationTarget bones.* channels are lowered to a tiny
+                    // frame-evaluated Action so the established GPU skinning
+                    // path remains the only source of bone matrices.
+                    if !node.bone_overrides.is_empty() {
+                        let action_id = format!("__scene_animation_target_{actor_id}");
+                        let skeleton = inferred_profile
+                            .as_deref()
+                            .and_then(|id| {
+                                world_model_profiles.iter().find(|profile| profile.id == id)
+                            })
+                            .map(|profile| profile.preset.clone())
+                            .unwrap_or_else(|| "humanoid_v1".to_string());
+                        world_actions.push(WorldAction {
+                            id: action_id.clone(),
+                            skeleton,
+                            intent: Some("animation_target".to_string()),
+                            duration_ms: duration_ms.max(1),
+                            poses: vec![WorldActionPose {
+                                t: 0.0,
+                                label: Some("editor_override".to_string()),
+                                bones: node
+                                    .bone_overrides
+                                    .iter()
+                                    .map(|bone| WorldActionBone {
+                                        id: bone.bone.clone(),
+                                        x: bone.x.clone(),
+                                        y: bone.y.clone(),
+                                        z: bone.z.clone(),
+                                        rotation: None,
+                                        rotation_x: bone.rotation_x.clone(),
+                                        rotation_y: bone.rotation_y.clone(),
+                                        rotation_z: bone.rotation_z.clone(),
+                                        forward: None,
+                                        side: None,
+                                        twist: None,
+                                        bend: None,
+                                        turn: None,
+                                        scale: bone.scale.clone(),
+                                        opacity: None,
+                                    })
+                                    .collect(),
+                            }],
+                            iks: Vec::new(),
+                        });
+                        world_apply_actions.push(WorldApplyAction {
+                            target: actor_id.clone(),
+                            action: action_id,
+                            at_ms: 0,
+                            r#loop: false,
+                            weight: "1".to_string(),
+                            speed: "1".to_string(),
+                            blend_in: "0".to_string(),
+                            blend_out: "0".to_string(),
+                            mode: "override".to_string(),
+                            mask: Vec::new(),
+                            duration_ms: None,
+                            root_motion: None,
+                            destination: None,
+                            face: None,
+                            sync_group: None,
+                            sync_marker: None,
+                        });
+                    }
+
+                    let actor_scale = model_scales
+                        .get(&actor_id)
+                        .copied()
+                        .unwrap_or(eval_scene_number(&node.scale, time_norm, time_sec)?);
                     actors.push(WorldActor {
-                        id: node
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("model_{}", actors.len())),
+                        id: actor_id,
                         model: src,
                         path_style: WorldPathStyle::Relative,
                         hide_meshes: Vec::new(),
                         hide_materials: Vec::new(),
-                        profile: None,
-                        rig: None,
-                        retarget: None,
+                        profile: inferred_profile,
+                        rig: node.rig.clone(),
+                        retarget: node.retarget.clone(),
                         x: position[0].to_string(),
                         y: position[1].to_string(),
                         z: position[2].to_string(),
                         yaw: rotation[1].to_string(),
                         pitch: rotation[0].to_string(),
                         roll: rotation[2].to_string(),
-                        scale: eval_scene_number(&node.scale, time_norm, time_sec)?.to_string(),
+                        scale: actor_scale.to_string(),
                         opacity: "1".to_string(),
                         material: Some(WorldMaterial {
                             style: WorldMaterialStyle::Pbr,
                             outline: false,
                             outline_width: "0".to_string(),
+                            exposure: (eval_scene_number(&node.exposure, time_norm, time_sec)?
+                                * environment_light_intensity)
+                                .to_string(),
                         }),
-                        play: None,
+                        play: node.play.as_ref().map(|play| WorldPlay {
+                            clip: play.clip.clone(),
+                            r#loop: play.r#loop,
+                            speed: play.speed.clone(),
+                            weight: play.weight.clone(),
+                            blend_in: play.blend_in.clone(),
+                            blend_out: play.blend_out.clone(),
+                            mask: play.mask.clone(),
+                        }),
+                        plays: node
+                            .plays
+                            .iter()
+                            .map(|play| WorldPlay {
+                                clip: play.clip.clone(),
+                                r#loop: play.r#loop,
+                                speed: play.speed.clone(),
+                                weight: play.weight.clone(),
+                                blend_in: play.blend_in.clone(),
+                                blend_out: play.blend_out.clone(),
+                                mask: play.mask.clone(),
+                            })
+                            .collect(),
                     });
+                }
+                Scene3DNode::Anchor(_) => {}
+                Scene3DNode::Debug(debug) => {
+                    if frame == 0 {
+                        eprintln!(
+                            "MotionLoom EnvironmentDebug: axes={} bounds={} surfaces={} anchors={} actionPath={} cameras={} | {} surface(s), {} anchor(s)",
+                            debug.axes,
+                            debug.bounds,
+                            debug.surfaces,
+                            debug.anchors,
+                            debug.action_path,
+                            debug.cameras,
+                            surfaces.len(),
+                            anchors.len()
+                        );
+                        if debug.surfaces {
+                            let mut evidence = surfaces.iter().collect::<Vec<_>>();
+                            evidence.sort_by_key(|(id, _)| id.as_str());
+                            for (id, surface) in evidence {
+                                eprintln!(
+                                    "  surface {id}: y={:.4}, centroid={:?}, bounds={:?}..{:?}, normal={:?}",
+                                    surface.height,
+                                    surface.centroid,
+                                    surface.bounds_min,
+                                    surface.bounds_max,
+                                    surface.normal
+                                );
+                            }
+                        }
+                        if debug.anchors {
+                            let mut evidence = anchors.iter().collect::<Vec<_>>();
+                            evidence.sort_by_key(|(id, _)| id.as_str());
+                            for (id, position) in evidence {
+                                eprintln!("  anchor {id}: position={position:?}");
+                            }
+                        }
+                    }
                 }
             }
         }
 
         let world_id = "__scene_3d_island".to_string();
-        let world_graph = WorldGraph {
+        let mut world_graph = WorldGraph {
             id: Some(world_id.clone()),
             version: Some("scene-3d-bridge-v1".to_string()),
             fps,
@@ -5749,7 +8259,7 @@ impl SceneFrameRenderer {
             duration_explicit: true,
             size: canvas_size,
             render_size: Some(canvas_size),
-            model_profiles: Vec::new(),
+            model_profiles: std::mem::take(&mut world_model_profiles),
             worlds: vec![WorldNode {
                 id: world_id.clone(),
                 background: Some(WorldBackground {
@@ -5764,20 +8274,176 @@ impl SceneFrameRenderer {
                 directional_characters: Vec::new(),
             }],
             retargets: Vec::new(),
-            actions: Vec::new(),
-            apply_actions: Vec::new(),
+            actions: world_actions,
+            apply_actions: world_apply_actions,
+            animation_assets: self
+                .prepared_scene_actions
+                .iter()
+                .filter_map(|action| {
+                    let source = action.source.as_deref()?;
+                    let asset = self
+                        .prepared_scene_animation_assets
+                        .iter()
+                        .find(|asset| asset.id == source)?;
+                    Some(WorldAnimationAsset {
+                        // The renderer resolves ApplyAction by executable
+                        // Action id, never by raw AnimationAsset id.
+                        id: action.id.clone(),
+                        // Scene ModelAsset paths are resolved against the
+                        // authoring script root before entering the legacy 3D
+                        // bridge. AnimationAsset must follow the same rule;
+                        // otherwise a portable relative action path is looked
+                        // up under the crate's old world example directory.
+                        src: {
+                            let resolved = resolve_local_scene_asset_path(&asset.src);
+                            std::fs::canonicalize(&resolved)
+                                .unwrap_or(resolved)
+                                .to_string_lossy()
+                                .into_owned()
+                        },
+                        profile: action
+                            .source_profile
+                            .clone()
+                            .or_else(|| asset.profile.clone())
+                            .unwrap_or_else(|| "motionloom_humanoid_v1".to_string()),
+                        clip: action.clip.clone().or_else(|| asset.clip.clone()),
+                    })
+                })
+                .collect(),
+            constraints: self
+                .prepared_scene_constraints
+                .iter()
+                .map(|constraint| WorldConstraint {
+                    constraint_type: constraint.constraint_type.clone(),
+                    source: constraint.source.clone(),
+                    target: constraint.target.clone(),
+                    target_point: None,
+                    at_ms: constraint.at_ms,
+                    duration_ms: constraint.duration_ms,
+                    solver: constraint.solver.clone(),
+                    weight: constraint.weight.clone(),
+                })
+                .collect(),
             present: WorldPresent { from: world_id },
         };
-        self.world_renderer
-            .render_frame_gpu(
+        let collision_environments = model_environment_triangles
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let kinematic_actors = composite
+            .nodes_3d
+            .iter()
+            .filter_map(|node| {
+                let Scene3DNode::Model(model) = node else {
+                    return None;
+                };
+                let collision = model.collision.as_deref()?.to_ascii_lowercase();
+                matches!(
+                    collision.as_str(),
+                    "kinematic" | "character" | "character_controller"
+                )
+                .then(|| model.id.clone())
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        let world_asset_root = crate::scene::resource::default_world_asset_root();
+        for actor_id in kinematic_actors {
+            if collision_environments.is_empty() {
+                continue;
+            }
+            let sampled = self
+                .scene_3d_renderer
+                .sample_humanoid_frame(&world_graph, &actor_id, frame, &world_asset_root)
+                .map_err(|err| MotionLoomSceneRenderError::GpuRender {
+                    message: format!(
+                        "Scene 3D kinematic collider could not sample humanoid '{actor_id}': {err}"
+                    ),
+                })?;
+            let correction =
+                resolve_humanoid_kinematic_translation(&sampled, &collision_environments);
+            if length_scene_vec3(correction) > 1.0e-6
+                && let Some(actor) = world_graph
+                    .worlds
+                    .first_mut()
+                    .and_then(|world| world.actors.iter_mut().find(|actor| actor.id == actor_id))
+            {
+                let x = actor.x.parse::<f32>().unwrap_or(0.0) + correction[0];
+                let y = actor.y.parse::<f32>().unwrap_or(0.0) + correction[1];
+                let z = actor.z.parse::<f32>().unwrap_or(0.0) + correction[2];
+                actor.x = x.to_string();
+                actor.y = y.to_string();
+                actor.z = z.to_string();
+            }
+
+            // Re-sample after root correction, then keep hands and feet outside
+            // the environment with the established two-bone IK solver.
+            let corrected = self
+                .scene_3d_renderer
+                .sample_humanoid_frame(&world_graph, &actor_id, frame, &world_asset_root)
+                .map_err(|err| MotionLoomSceneRenderError::GpuRender {
+                    message: format!(
+                        "Scene 3D contact IK could not sample humanoid '{actor_id}': {err}"
+                    ),
+                })?;
+            let contact_ik_enabled = self.prepared_scene_apply_actions.iter().any(|apply| {
+                let start = apply.at_ms as f32 / 1000.0;
+                let duration = apply.duration_ms.unwrap_or(duration_ms) as f32 / 1000.0;
+                apply.target == actor_id
+                    && time_sec >= start
+                    && (apply.r#loop || time_sec <= start + duration.max(0.0))
+                    && apply
+                        .foot_lock
+                        .as_deref()
+                        .is_some_and(|value| matches!(value, "auto" | "true" | "on"))
+            });
+            if contact_ik_enabled {
+                for (bone, radius_scale) in [
+                    ("foot_l", 0.065_f32),
+                    ("foot_r", 0.065),
+                    ("hand_l", 0.05),
+                    ("hand_r", 0.05),
+                ] {
+                    let Some(point) = corrected.joints.get(bone).copied() else {
+                        continue;
+                    };
+                    let Some(target_point) = humanoid_effector_contact_target(
+                        point,
+                        (corrected.actor_scale * radius_scale).max(0.012),
+                        &collision_environments,
+                    ) else {
+                        continue;
+                    };
+                    world_graph.constraints.push(WorldConstraint {
+                        constraint_type: "position".to_string(),
+                        source: format!("{actor_id}.{bone}"),
+                        target: String::new(),
+                        target_point: Some(target_point),
+                        at_ms: 0,
+                        duration_ms,
+                        solver: "two_bone_ik".to_string(),
+                        weight: "0.92".to_string(),
+                    });
+                }
+            }
+        }
+        let frame = self
+            .scene_3d_renderer
+            .render_frame_to_gpu_texture_with_material_overrides(
                 &world_graph,
                 frame,
-                crate::scene::resource::default_world_asset_root(),
+                world_asset_root,
+                &material_overrides,
             )
             .await
             .map_err(|err| MotionLoomSceneRenderError::GpuRender {
                 message: format!("Scene 3D island render failed: {err}"),
-            })
+            })?;
+        Ok(GpuSceneNativeTexture {
+            texture: frame.texture,
+            width: frame.width,
+            height: frame.height,
+            _keepalive_textures: Vec::new(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6664,7 +9330,7 @@ impl SceneFrameRenderer {
                         {
                             let fps = self.prepared_graph_fps.max(1.0);
                             let frame = (time_sec * fps).round().max(0.0) as u32;
-                            let image = self
+                            let texture = self
                                 .render_scene_3d_composite(
                                     composite,
                                     frame,
@@ -6676,7 +9342,7 @@ impl SceneFrameRenderer {
                                 )
                                 .await?;
                             texture_layers.push(GpuSceneTextureLayer {
-                                source: GpuSceneTextureSource::Cpu(image),
+                                source: GpuSceneTextureSource::Gpu(texture),
                                 transform: group_transform,
                                 projected_quad: None,
                                 opacity,
@@ -7483,6 +10149,14 @@ impl SceneFrameRenderer {
         }
     }
 
+    /// Keep the embedded 3D renderer on the compositor device on native and WASM.
+    fn sync_scene_3d_gpu_context(&mut self) {
+        if let Some(compositor) = self.gpu_compositor.as_ref() {
+            let (device, queue) = compositor.device_queue();
+            self.scene_3d_renderer.set_gpu_context(device, queue);
+        }
+    }
+
     async fn apply_process_pass_mask(
         &mut self,
         output: GraphTextureSource,
@@ -7667,6 +10341,13 @@ impl SceneFrameRenderer {
         time_norm: f32,
         time_sec: f32,
     ) -> Result<GraphTextureSource, MotionLoomSceneRenderError> {
+        let active = pass_param_expr(pass, "active")
+            .map(|expr| eval_scene_number(expr, time_norm, time_sec))
+            .transpose()?
+            .unwrap_or(1.0);
+        if active <= 0.0001 {
+            return Ok(input.clone());
+        }
         if let Some(blur_passes) = scene_post_blur_passes(pass, time_norm, time_sec)?
             && self.profile.uses_gpu_compositor()
         {
@@ -8739,6 +11420,7 @@ impl SceneFrameRenderer {
                 );
             }
         }
+        self.sync_scene_3d_gpu_context();
         Ok(())
     }
 
@@ -11190,9 +13872,13 @@ impl SceneFrameRenderer {
         }
 
         let font_size = eval_scene_number(&text.font_size, time_norm, time_sec)?.clamp(1.0, 1024.0);
-        let render_scale =
-            eval_text_render_scale(&text.render_scale, font_size, time_norm, time_sec)?;
-        let raster_font_size = font_size * render_scale;
+        let local_transform = scene_text_local_transform(text, time_norm, time_sec)?;
+        let render_scale = eval_text_render_scale(
+            &text.render_scale,
+            affine_max_scale(transform.mul(local_transform)),
+            time_norm,
+            time_sec,
+        )?;
         let opacity = (eval_scene_number(&text.opacity, time_norm, time_sec)? * inherited_opacity)
             .clamp(0.0, 1.0);
         if opacity <= 0.0001 {
@@ -11209,12 +13895,10 @@ impl SceneFrameRenderer {
         } else {
             line_height_raw.max(1.0)
         };
-        let raster_line_height = line_height * render_scale;
         let width = text
             .layout_width_expr()
             .map(|expr| eval_scene_number(expr, time_norm, time_sec).map(|value| value.max(1.0)))
             .transpose()?;
-        let raster_width = width.map(|value| value * render_scale);
         let visible_value = if let Some(expr) = text.visible_chars.as_deref() {
             let count = eval_scene_number(expr, time_norm, time_sec)
                 .unwrap_or(text.value.chars().count() as f32)
@@ -11236,7 +13920,7 @@ impl SceneFrameRenderer {
                 })?,
             )
         };
-        let metrics = Metrics::new(raster_font_size, raster_line_height);
+        let metrics = Metrics::new(font_size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         let mut attrs = Attrs::new()
             .family(Family::SansSerif)
@@ -11277,12 +13961,10 @@ impl SceneFrameRenderer {
         #[cfg(not(target_arch = "wasm32"))]
         let shaping = Shaping::Advanced;
         buffer.set_text(&mut self.font_system, &visible_value, &attrs, shaping);
-        buffer.set_size(&mut self.font_system, raster_width, None);
+        buffer.set_size(&mut self.font_system, width, None);
         buffer.shape_until_scroll(&mut self.font_system, true);
 
-        let (raster_text_w, raster_text_h) = text_bounds(&buffer, raster_line_height);
-        let text_w = raster_text_w / render_scale;
-        let text_h = raster_text_h / render_scale;
+        let (text_w, text_h) = text_bounds(&buffer, line_height);
         let layout_w = width.unwrap_or(text_w);
         let box_style = eval_text_box_style(text, layout_w, text_h, time_norm, time_sec)?;
         let box_pad_x = box_style.map(|style| style.padding_x).unwrap_or(0.0);
@@ -11344,29 +14026,18 @@ impl SceneFrameRenderer {
                 },
             )?;
         } else {
-            buffer.draw(
+            draw_text_buffer_scaled(
+                &buffer,
                 &mut self.font_system,
                 &mut self.swash_cache,
+                &mut layer,
                 text_color,
-                |x, y, _w, _h, color| {
-                    if let Some(max_lines) = max_lines {
-                        let line_ix = ((y as f32) / raster_line_height).floor().max(0.0) as usize;
-                        if line_ix >= max_lines {
-                            return;
-                        }
-                    }
-                    let px = x + text_offset_x;
-                    let py = y + text_offset_y;
-                    if px < 0 || py < 0 {
-                        return;
-                    }
-                    let (px, py) = (px as u32, py as u32);
-                    if px >= layer.width() || py >= layer.height() {
-                        return;
-                    }
-                    let (sr, sg, sb, sa) = color.as_rgba_tuple();
-                    let sa = ((sa as f32) * combined_opacity).round().clamp(0.0, 255.0) as u8;
-                    blend_pixel(&mut layer, px, py, [sr, sg, sb, sa]);
+                TextRasterParams {
+                    offset_x: text_offset_x,
+                    offset_y: text_offset_y,
+                    raster_scale: render_scale,
+                    opacity: combined_opacity,
+                    max_lines,
                 },
             );
         }
@@ -11380,7 +14051,7 @@ impl SceneFrameRenderer {
                 x_base - box_pad_x - pad as f32 / render_scale,
                 y_base - box_pad_y - pad as f32 / render_scale,
             ))
-            .mul(scene_text_local_transform(text, time_norm, time_sec)?)
+            .mul(local_transform)
             .mul(Affine2::scale(1.0 / render_scale));
         Ok(Some(TextRasterizedLayer {
             image: layer,
@@ -11436,9 +14107,8 @@ impl SceneFrameRenderer {
         }
 
         // Static text content is retained independently from its parent Group
-        // transform. This is especially important for renderScale="4x": moving
-        // a title should update one texture-layer matrix, not rerun shaping,
-        // supersampled rasterization, and RGBA upload every frame.
+        // translation. Auto raster density is part of the cache key, so moving
+        // a title reuses its texture while output-scale changes can rebuild it.
         if text_raster_content_is_static(text)
             && !text_layer_effect_spec(text, context.time_norm, context.time_sec)?.has_effects()
         {
@@ -11449,8 +14119,20 @@ impl SceneFrameRenderer {
             if layer_opacity <= 0.0001 {
                 return Ok(Vec::new());
             }
-            let cache_key =
-                gpu_text_raster_cache_key(self.prepared_graph_signature, text, context.canvas_size);
+            let local_transform =
+                scene_text_local_transform(text, context.time_norm, context.time_sec)?;
+            let raster_scale = eval_text_render_scale(
+                &text.render_scale,
+                affine_max_scale(context.transform.mul(local_transform)),
+                context.time_norm,
+                context.time_sec,
+            )?;
+            let cache_key = gpu_text_raster_cache_key(
+                self.prepared_graph_signature,
+                text,
+                context.canvas_size,
+                raster_scale,
+            );
             if let Some(cached) = self.gpu_text_raster_cache.get(&cache_key).cloned() {
                 return Ok(vec![GpuSceneTextureLayer {
                     source: GpuSceneTextureSource::Gpu(cached.texture),
@@ -11714,6 +14396,36 @@ fn eval_scene_vec3(
     ])
 }
 
+fn eval_scene_vec2(
+    expr: &str,
+    time_norm: f32,
+    time_sec: f32,
+    default: [f32; 2],
+) -> Result<[f32; 2], MotionLoomSceneRenderError> {
+    let trimmed = expr
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    let values = trimmed.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.len() != 2 {
+        return Err(MotionLoomSceneRenderError::InvalidExpression {
+            expr: expr.to_string(),
+            message: "expected a two-component vector such as [0.5,0.5]".to_string(),
+        });
+    }
+    Ok([
+        eval_scene_number(values[0], time_norm, time_sec)?,
+        eval_scene_number(values[1], time_norm, time_sec)?,
+    ])
+}
+
 pub(crate) fn eval_scene_number(
     expr: &str,
     time_norm: f32,
@@ -11729,20 +14441,18 @@ pub(crate) fn eval_scene_number(
 
 fn eval_text_render_scale(
     expr: &str,
-    font_size: f32,
+    output_scale: f32,
     time_norm: f32,
     time_sec: f32,
 ) -> Result<f32, MotionLoomSceneRenderError> {
     let trimmed = expr.trim();
     let normalized = trimmed.to_ascii_lowercase();
     let scale = if matches!(normalized.as_str(), "" | "auto") {
-        if font_size < 24.0 {
-            4.0
-        } else if font_size < 64.0 {
-            3.0
-        } else {
-            2.0
-        }
+        // Keep two raster samples per output pixel. SVG primitives evaluate
+        // analytic coverage at composition time; bitmap glyphs need this
+        // supersampling headroom to retain similarly smooth diagonal edges.
+        // Quarter-step buckets avoid rebuilding animated text every frame.
+        (output_scale.max(1.0) * 2.0 * 4.0).ceil() / 4.0
     } else if let Some(without_suffix) = trimmed
         .strip_suffix('x')
         .or_else(|| trimmed.strip_suffix('X'))
@@ -11757,6 +14467,16 @@ fn eval_text_render_scale(
         eval_scene_number(trimmed, time_norm, time_sec)?
     };
     Ok(scale.clamp(1.0, 8.0))
+}
+
+fn affine_max_scale(transform: Affine2) -> f32 {
+    let sum = transform.m00 * transform.m00
+        + transform.m01 * transform.m01
+        + transform.m10 * transform.m10
+        + transform.m11 * transform.m11;
+    let det = transform.m00 * transform.m11 - transform.m01 * transform.m10;
+    let discriminant = (sum * sum - 4.0 * det * det).max(0.0);
+    (0.5 * (sum + discriminant.sqrt())).max(0.0).sqrt()
 }
 
 fn eval_text_edge_smoothing(
@@ -14507,23 +17227,153 @@ mod tests {
     use crate::scene::drawable::{
         GpuSceneNativeAssets, GpuScenePrimitive, GpuSceneTextureLayer, GpuSceneTextureSource,
     };
-    use crate::scene::model::{PathNode, SceneNode};
+    use crate::scene::model::{PathNode, Scene3DNode, SceneNode};
     use crate::scene::spatial::Affine2;
     use crate::scene::text::TextNode;
     use base64::Engine;
     use cosmic_text::Weight;
     use image::{Rgba, RgbaImage};
+    use std::collections::HashMap;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use super::{
-        MotionLoomSceneRenderError, SceneFrameRenderer, ScenePlatformPreviewSurface,
-        ScenePreviewBackend, ScenePreviewPixelFormat, ScenePreviewSurface,
-        ScenePreviewSurfaceOptions, SceneRenderError, SceneRenderProfile, SceneRenderer,
-        apply_animation_targets_at_frame, eval_text_box_padding, eval_text_font_weight,
-        eval_text_tracking_em, graph_logical_render_size, graph_output_size,
-        render_size_root_transform, scene_nodes_for_present, validate_scene_graph,
+        EnvironmentTriangleSpatialIndex, MotionLoomSceneRenderError, ResolvedSceneSurface,
+        SceneFrameRenderer, ScenePlatformPreviewSurface, ScenePreviewBackend,
+        ScenePreviewPixelFormat, ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderError,
+        SceneRenderProfile, SceneRenderer, apply_animation_targets_at_frame,
+        collect_material_binding_scene_ids, eval_text_box_padding, eval_text_font_weight,
+        eval_text_render_scale, eval_text_tracking_em, global_process_liveness,
+        graph_logical_render_size, graph_output_size, graph_requires_scene_resource,
+        raycast_environment_height, render_size_root_transform,
+        resolve_humanoid_kinematic_translation, scene_material_texture_cache_key,
+        scene_nodes_for_present, validate_scene_graph,
     };
+
+    #[test]
+    fn global_process_liveness_skips_scene_scoped_effect_passes() {
+        let scene_present = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="64" height="64" color="#101010" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+    <Effects>
+      <Effect process="finish" />
+    </Effects>
+  </Scene>
+  <Process id="finish">
+    <Tex id="source" fmt="rgba16f" from="scene" />
+    <Tex id="final" fmt="rgba16f" size={[64,64]} />
+    <Pass id="grain" kind="compute" effect="film_grain" in={["source"]} out={["final"]} />
+  </Process>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .expect("scene effect graph");
+        let live = global_process_liveness(&scene_present);
+        assert!(live.passes.is_empty());
+
+        let process_present = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="64" height="64" color="#101010" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Process id="finish">
+    <Tex id="source" fmt="rgba16f" from="scene" />
+    <Tex id="final" fmt="rgba16f" size={[64,64]} />
+    <Pass id="grain" kind="compute" effect="film_grain" in={["source"]} out={["final"]} />
+  </Process>
+  <Present from="finish" />
+</Graph>"##,
+        )
+        .expect("global process graph");
+        let live = global_process_liveness(&process_present);
+        assert!(live.passes.contains("grain"));
+        assert!(live.resources.contains("source"));
+        assert!(live.resources.contains("final"));
+    }
+
+    #[test]
+    fn environment_spatial_index_preserves_raycast_height() {
+        let triangles = [
+            crate::world::model_inspection::EnvironmentWalkableTriangle {
+                points: [[-1.0, 2.0, -1.0], [1.0, 2.0, -1.0], [1.0, 2.0, 1.0]],
+                normal: [0.0, 1.0, 0.0],
+            },
+            crate::world::model_inspection::EnvironmentWalkableTriangle {
+                points: [[-1.0, 2.0, -1.0], [1.0, 2.0, 1.0], [-1.0, 2.0, 1.0]],
+                normal: [0.0, 1.0, 0.0],
+            },
+        ];
+        let index = EnvironmentTriangleSpatialIndex::build(
+            &triangles,
+            None,
+            [3.0, 0.5, -4.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+        );
+        let surface = ResolvedSceneSurface {
+            height: 0.0,
+            centroid: [3.0, 0.0, -4.0],
+            bounds_min: [2.0, -10.0, -5.0],
+            bounds_max: [4.0, 10.0, -3.0],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let height = raycast_environment_height(&index, 3.0, -4.0, Some(&surface));
+        assert_eq!(height, Some(2.5));
+        assert_eq!(
+            raycast_environment_height(&index, 20.0, 20.0, Some(&surface)),
+            None
+        );
+    }
+
+    #[test]
+    fn kinematic_humanoid_capsules_resolve_above_walkable_mesh() {
+        let triangles = [
+            crate::world::model_inspection::EnvironmentWalkableTriangle {
+                points: [[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [2.0, 0.0, 2.0]],
+                normal: [0.0, 1.0, 0.0],
+            },
+            crate::world::model_inspection::EnvironmentWalkableTriangle {
+                points: [[-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], [-2.0, 0.0, 2.0]],
+                normal: [0.0, 1.0, 0.0],
+            },
+        ];
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            &triangles, None, [0.0; 3], [0.0; 3], 1.0,
+        ));
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::from([
+                ("hips".to_string(), [0.0, 0.05, 0.0]),
+                ("chest".to_string(), [0.0, 0.18, 0.0]),
+                ("head".to_string(), [0.0, 0.28, 0.0]),
+            ]),
+            actor_scale: 1.0,
+        };
+        let correction = resolve_humanoid_kinematic_translation(&frame, &[environment]);
+        assert!(
+            correction[1] > 0.08,
+            "expected upward correction: {correction:?}"
+        );
+        assert!(correction[0].abs() < 0.001);
+        assert!(correction[2].abs() < 0.001);
+    }
 
     fn max_rgb(image: &image::RgbaImage) -> u8 {
         image
@@ -14535,6 +17385,195 @@ mod tests {
 
     fn max_green(image: &image::RgbaImage) -> u8 {
         image.pixels().map(|pixel| pixel[1]).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn scene_active_camera_animation_selects_existing_camera_ids() {
+        let graph = parse_graph_script(
+            r#"<Graph fps={30} duration="2s" size={[640,360]}>
+  <Scene id="main">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="2s">
+          <CompositeGroup id="stage" space="3d" depth="true">
+            <Camera3D id="wide" position={[0,1,8]} target={[0,1,0]} />
+            <Camera3D id="close" position={[0,1,3]} target={[0,1,0]} />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="main" property="activeCamera">
+    <Key time="0s" value="wide" />
+    <Key time="1s" value="close" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"#,
+        )
+        .expect("camera switch graph");
+        let resolved = apply_animation_targets_at_frame(&graph, 30)
+            .expect("camera animation")
+            .expect("resolved graph");
+        let SceneNode::Timeline(timeline) = &resolved.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("3D group");
+        };
+        assert_eq!(
+            group
+                .composite
+                .as_ref()
+                .and_then(|composite| composite.active_camera.as_deref()),
+            Some("close")
+        );
+    }
+
+    #[test]
+    fn material_binding_source_scene_rasterizes_at_its_own_size() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="4s" size={[1920,1080]}>
+  <Scene id="phone_ui" size={[430,932]}>
+    <Timeline>
+      <Track id="ui" space="screen">
+        <Sequence from="0s" duration="4s" out="hold">
+          <Layer id="ui_layer" space="screen">
+            <Rect x="0" y="0" width="430" height="932" color="#F8F8F5" />
+            <Rect x="30" y="100" width="370" height="260" color="#8EA9FF" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Scene id="main">
+    <Timeline>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .expect("material source graph");
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+        renderer.prepare_frame_caches(&graph);
+        let scene = renderer
+            .scene_material_sources
+            .get("phone_ui")
+            .cloned()
+            .expect("phone UI Scene");
+        let image = renderer
+            .render_cpu_scene_nodes_scaled(
+                &scene.children,
+                scene.size.expect("explicit UI size"),
+                scene.size.expect("explicit UI size"),
+                0.5,
+                2.0,
+                [0, 0, 0, 0],
+            )
+            .expect("phone UI raster");
+        assert_eq!(image.dimensions(), (430, 932));
+        assert_eq!(image.get_pixel(10, 10).0, [248, 248, 245, 255]);
+        assert_eq!(image.get_pixel(100, 200).0, [142, 169, 255, 255]);
+    }
+
+    #[test]
+    fn material_binding_only_scene_is_not_a_full_frame_graph_resource() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1920,1080]}>
+  <Scene id="phone_ui" size={[430,932]}>
+    <Timeline>
+      <Track space="screen">
+        <Sequence from="0s" duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="430" height="932" color="#ffffff" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Scene id="main">
+    <Timeline>
+      <Track space="3d">
+        <Sequence from="0s" duration="1s">
+          <CompositeGroup id="device" space="3d">
+            <Camera3D position={[0,0,6]} target={[0,0,0]} />
+            <Model id="phone" asset="phone_model">
+              <MaterialBinding material="screen" texture="@scene:phone_ui" />
+            </Model>
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .expect("material-only source graph");
+        let mut material_sources = std::collections::HashSet::new();
+        for scene in &graph.scenes {
+            collect_material_binding_scene_ids(&scene.children, &mut material_sources);
+        }
+        assert!(material_sources.contains("phone_ui"));
+        assert!(!graph_requires_scene_resource(&graph, "phone_ui"));
+        assert!(graph_requires_scene_resource(&graph, "main"));
+    }
+
+    #[test]
+    fn static_material_scene_has_a_stable_texture_cache_key() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[100,100]}>
+  <Scene id="screen" size={[40,80]}>
+    <Timeline>
+      <Track space="screen">
+        <Sequence from="0s" duration="1s">
+          <Layer>
+            <Text value="cached" x="4" y="20" fontSize="12" color="#ffffff" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="screen" />
+</Graph>"##,
+        )
+        .expect("static material Scene");
+        let scene = &graph.scenes[0];
+        let first = scene_material_texture_cache_key(9, scene, (40, 80));
+        let second = scene_material_texture_cache_key(9, scene, (40, 80));
+        assert_eq!(first, second);
+        assert!(first.is_some());
+    }
+
+    #[test]
+    fn inactive_post_pass_reuses_its_input_without_rendering() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[2,2]}>
+  <Process id="finish">
+    <Tex id="source" fmt="rgba8unorm" from="scene" />
+    <Tex id="output" fmt="rgba8unorm" size={[2,2]} />
+    <Pass id="grain" kind="compute" effect="film_grain"
+          in={["source"]} out={["output"]}
+          params={{ active: "0", amount: "1" }} />
+  </Process>
+  <Present from="source" />
+</Graph>"##,
+        )
+        .expect("inactive post pass graph");
+        let input_image = RgbaImage::from_pixel(2, 2, Rgba([12, 34, 56, 255]));
+        let input = super::GraphTextureSource::Cpu(input_image.clone());
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+        let result =
+            pollster::block_on(renderer.apply_scene_post_pass(&input, &graph.passes[0], 0.5, 0.5))
+                .expect("inactive pass should be a no-op");
+        match result {
+            super::GraphTextureSource::Cpu(image) => assert_eq!(image, input_image),
+            super::GraphTextureSource::Gpu(_) => panic!("inactive CPU pass should remain CPU"),
+        }
     }
 
     fn skip_gpu_texture_test(message: impl std::fmt::Display) {
@@ -14984,6 +18023,145 @@ mod tests {
     }
 
     #[test]
+    fn compiled_numeric_animation_graph_is_reused_between_frames() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect id="card" x="0" y="0" width="10" height="10" color="#fff" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="card" property="width">
+    <Key time="0s" value="10" />
+    <Key time="1s" value="20" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .unwrap();
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+        let first = renderer
+            .compiled_animation_graph_for_frame(&graph, 0)
+            .unwrap()
+            .unwrap();
+        let later = renderer
+            .compiled_animation_graph_for_frame(&graph, 20)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &later));
+        assert!(format!("{first:?}").contains("curve"));
+    }
+
+    #[test]
+    fn color_animation_target_interpolates_without_new_dsl_syntax() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect id="card" x="0" y="0" width="10" height="10" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="card" property="color">
+    <Key time="0s" value="#000000" />
+    <Key time="1s" value="#52E8FF" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .unwrap();
+        let animated = apply_animation_targets_at_frame(&graph, 15)
+            .unwrap()
+            .unwrap();
+        let debug = format!("{animated:?}");
+        assert!(
+            debug.contains("#297480"),
+            "unexpected animated graph: {debug}"
+        );
+        let endpoint = apply_animation_targets_at_frame(&graph, 30)
+            .unwrap()
+            .unwrap();
+        let endpoint_debug = format!("{endpoint:?}");
+        assert!(
+            endpoint_debug.contains("#52E8FF"),
+            "unexpected endpoint graph: {endpoint_debug}"
+        );
+
+        let target = crate::dsl::AnimationTargetNode {
+            node: "card".to_string(),
+            property: "color".to_string(),
+            keys: vec![
+                crate::dsl::AnimationKeyNode {
+                    frame: 0,
+                    time: Some("0s".to_string()),
+                    seconds: 0.0,
+                    value: "#B9FF39".to_string(),
+                    ease: "linear".to_string(),
+                },
+                crate::dsl::AnimationKeyNode {
+                    frame: 90,
+                    time: Some("3s".to_string()),
+                    seconds: 3.0,
+                    value: "#52E8FF".to_string(),
+                    ease: "ease_out".to_string(),
+                },
+                crate::dsl::AnimationKeyNode {
+                    frame: 180,
+                    time: Some("6s".to_string()),
+                    seconds: 6.0,
+                    value: "#FF6FAB".to_string(),
+                    ease: "ease_in_out".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            super::sample_dynamic_animation_value(&target, 3.0).unwrap(),
+            "#52E8FF"
+        );
+
+        let rendered_graph = parse_graph_script(
+            r##"<Graph fps={30} duration="6s" size={[64,64]}>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="6s">
+          <Layer>
+            <Rect id="card" x="0" y="0" width="64" height="64" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="card" property="color">
+    <Key time="0s" value="#B9FF39" />
+    <Key time="3s" value="#52E8FF" ease="ease_out" />
+    <Key time="6s" value="#FF6FAB" ease="ease_in_out" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .unwrap();
+        let image = pollster::block_on(super::render_scene_graph_frame(
+            &rendered_graph,
+            90,
+            SceneRenderProfile::Cpu,
+        ))
+        .unwrap();
+        assert_eq!(image.get_pixel(32, 32).0, [82, 232, 255, 255]);
+    }
+
+    #[test]
     fn retained_mixed_scene_instances_repeat_and_quantizes_random_updates() {
         let graph = parse_graph_script(
             r##"
@@ -15101,6 +18279,86 @@ mod tests {
             high_w >= base_w * 3 && high_h >= base_h * 3,
             "expected renderScale=4x to allocate a much larger raster texture, base={base_w}x{base_h}, high={high_w}x{high_h}"
         );
+    }
+
+    #[test]
+    fn scene_text_render_scale_defaults_to_auto() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[800,450]}>
+  <Text value="AUTO" x="0" y="0" fontSize="32" color="#ffffff" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("text graph parse");
+
+        assert_eq!(graph.texts[0].render_scale, "auto");
+    }
+
+    #[test]
+    fn scene_text_auto_keeps_two_samples_per_output_pixel() {
+        assert_eq!(
+            eval_text_render_scale("auto", 1.0, 0.0, 0.0).expect("1080p auto scale"),
+            2.0
+        );
+        assert_eq!(
+            eval_text_render_scale("auto", 2.0, 0.0, 0.0).expect("4K auto scale"),
+            4.0
+        );
+        assert_eq!(
+            eval_text_render_scale("4x", 2.0, 0.0, 0.0).expect("explicit override"),
+            4.0
+        );
+    }
+
+    #[test]
+    fn scene_text_auto_raster_scale_follows_output_transform() {
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+        let auto = basic_text_node("auto");
+        let identity = renderer
+            .rasterize_text_texture_layer(&auto, Affine2::identity(), 1.0, 0.0, 0.0, (800, 450))
+            .expect("identity auto text raster")
+            .expect("identity auto text layer");
+        let scaled = renderer
+            .rasterize_text_texture_layer(&auto, Affine2::scale(4.0), 1.0, 0.0, 0.0, (800, 450))
+            .expect("scaled auto text raster")
+            .expect("scaled auto text layer");
+
+        let (identity_w, _) = cpu_texture_size(identity);
+        let (scaled_w, _) = cpu_texture_size(scaled);
+        assert!(
+            scaled_w > identity_w,
+            "auto should increase glyph resolution for a larger output transform"
+        );
+    }
+
+    #[test]
+    fn scene_text_layout_metrics_are_independent_from_raster_scale() {
+        let mut text_1x = basic_text_node("1x");
+        text_1x.value = "Layout metrics remain stable".to_string();
+        text_1x.x = "center".to_string();
+        text_1x.y = "center".to_string();
+        text_1x.width = Some("260".to_string());
+        let mut text_4x = text_1x.clone();
+        text_4x.render_scale = "4x".to_string();
+
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+        let base = renderer
+            .rasterize_text_base_layer(&text_1x, Affine2::identity(), 1.0, 0.0, 0.0, (800, 450))
+            .expect("1x text raster")
+            .expect("1x text layer");
+        let high = renderer
+            .rasterize_text_base_layer(&text_4x, Affine2::identity(), 1.0, 0.0, 0.0, (800, 450))
+            .expect("4x text raster")
+            .expect("4x text layer");
+
+        assert!((base.transform.m02 - high.transform.m02).abs() <= 0.001);
+        assert!((base.transform.m12 - high.transform.m12).abs() <= 0.001);
+        let base_logical_w = base.image.width() as f32 * base.transform.m00.abs();
+        let high_logical_w = high.image.width() as f32 * high.transform.m00.abs();
+        let base_logical_h = base.image.height() as f32 * base.transform.m11.abs();
+        let high_logical_h = high.image.height() as f32 * high.transform.m11.abs();
+        assert!((base_logical_w - high_logical_w).abs() <= 1.0);
+        assert!((base_logical_h - high_logical_h).abs() <= 1.0);
     }
 
     #[test]
@@ -19370,6 +22628,86 @@ mod tests {
     }
 
     #[test]
+    fn scene_3d_island_stays_on_shared_gpu_texture_path() {
+        let mut renderer = pollster::block_on(SceneRenderer::new(SceneRenderProfile::Gpu)).unwrap();
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[64,48]}>
+  <Scene id="mixed_scene">
+    <Timeline>
+      <Track id="three_d" space="3d">
+        <Sequence from="0s" duration="1s">
+          <CompositeGroup id="island" space="3d">
+            <Camera3D position={[0,0,6]} target={[0,0,0]} />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+      <Track id="overlay" space="screen">
+        <Sequence from="0s" duration="1s">
+          <Layer>
+            <Rect x="8" y="8" width="24" height="16" color="#00ff00" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="mixed_scene" />
+</Graph>
+"##,
+        )
+        .expect("mixed 2D/3D Scene graph parse");
+
+        let gpu_texture = match pollster::block_on(renderer.render_frame_to_wgpu_texture(&graph, 0))
+        {
+            Ok(texture) => texture,
+            Err(SceneRenderError::GpuRender { message }) => {
+                skip_gpu_texture_test(message);
+                return;
+            }
+            Err(err) => panic!("unexpected mixed Scene GPU render error: {err}"),
+        };
+
+        assert_eq!(gpu_texture.width, 64);
+        assert_eq!(gpu_texture.height, 48);
+        assert_eq!(gpu_texture.format, wgpu::TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn gpu_compositor_resize_preserves_device_and_cached_texture_ownership() {
+        let mut renderer =
+            pollster::block_on(SceneFrameRenderer::new_for_profile(SceneRenderProfile::Gpu));
+        if let Err(err) = pollster::block_on(renderer.ensure_gpu_compositor_size(64, 48)) {
+            skip_gpu_texture_test(err);
+            return;
+        }
+        let (first_device, _) = renderer
+            .gpu_compositor
+            .as_ref()
+            .expect("initial compositor")
+            .device_queue();
+        let cached_texture = renderer
+            .gpu_compositor
+            .as_mut()
+            .expect("initial compositor")
+            .upload_gpu_rgba_texture(&RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 255])))
+            .expect("cached GPU texture");
+
+        pollster::block_on(renderer.ensure_gpu_compositor_size(128, 96))
+            .expect("resize compositor");
+        let compositor = renderer
+            .gpu_compositor
+            .as_ref()
+            .expect("resized compositor");
+        let (second_device, _) = compositor.device_queue();
+
+        assert!(Arc::ptr_eq(&first_device, &second_device));
+        assert_eq!((compositor.width, compositor.height), (128, 96));
+        let _view = cached_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+    }
+
+    #[test]
     fn render_frame_to_wgpu_texture_matches_cpu_render_dimensions() {
         let mut cpu_renderer =
             pollster::block_on(SceneRenderer::new(SceneRenderProfile::Cpu)).unwrap();
@@ -19900,6 +23238,71 @@ mod tests {
         assert!(
             matches!(surface, ScenePreviewSurface::CpuBgra { .. }),
             "expected CPU BGRA fallback on Linux from Auto backend"
+        );
+    }
+
+    #[test]
+    fn bone_animation_target_lowers_to_scene_model_override() {
+        let graph = parse_graph_script(
+            r#"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <ModelAsset id="girl_asset" src="girl.glb" />
+  </Assets>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup id="island" space="3d" depth="true">
+              <Model id="girl" asset="girl_asset" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="girl" property="bones.forearm_r.rotationZ">
+    <Key time="0s" value="0" />
+    <Key time="1s" value="-60" ease="linear" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"#,
+        )
+        .expect("bone target graph");
+        let animated = apply_animation_targets_at_frame(&graph, 15)
+            .expect("apply bone target")
+            .expect("animated clone");
+        let SceneNode::Timeline(timeline) = &animated.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("3D group");
+        };
+        let model = group
+            .composite
+            .as_ref()
+            .and_then(|composite| {
+                composite.nodes_3d.iter().find_map(|node| match node {
+                    Scene3DNode::Model(model) => Some(model),
+                    _ => None,
+                })
+            })
+            .expect("3D model");
+        assert_eq!(model.bone_overrides[0].bone, "forearm_r");
+        assert!(
+            model.bone_overrides[0]
+                .rotation_z
+                .as_deref()
+                .is_some_and(|value| value.contains("curve"))
         );
     }
 }

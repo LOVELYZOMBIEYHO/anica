@@ -38,8 +38,7 @@
 //! # Root document export
 //!
 //! `parse_motionloom_document` and the `render_motionloom_document_*`
-//! functions auto-route unified Scene and Process documents. The former
-//! `<World>` DSL tag has been removed; `world` remains a Scene coordinate space.
+//! functions auto-route unified Scene and Process documents.
 //!
 //! ```no_run
 //! use std::path::Path;
@@ -71,23 +70,33 @@
 //! ```
 
 pub use crate::{
-    AssetResolver, AssetSource, GpuCompatibilityIssue, GpuCompatibilityReport,
-    GpuCompatibilitySeverity, GpuCompatibilityTarget, GraphParseError, GraphScript,
-    MemoryAssetResolver, MotionLoomDocument, MotionLoomError, MotionLoomRenderProgress,
-    MotionLoomSceneRenderError, PathAssetResolver, ProcessCategory, ProcessEffectDefinition,
-    ProcessGraph, RenderPassDag, RenderPassDagEdge, RenderPassDagKind, RenderPassDagNode,
-    RenderPassSpace, RootGraphError, RuntimeCompileError, RuntimeFrameOutput,
+    ANIMATION_PROPERTY_DESCRIPTORS, AnimationCapabilityReport, AnimationDiagnostic,
+    AnimationDiagnosticSeverity, AnimationInterpolation, AnimationPropertyDescriptor,
+    AnimationValueType, AssetResolver, AssetSource, AuthoringDiagnostic,
+    AuthoringDiagnosticSeverity, AuthoringStatus, AuthoringSuggestion, AuthoringSummary,
+    EffectiveGraphSummary, GpuCompatibilityIssue, GpuCompatibilityReport, GpuCompatibilitySeverity,
+    GpuCompatibilityTarget, GpuFrameTexture, GraphParseError, GraphScript, MemoryAssetResolver,
+    MotionLoomAuthoringReport, MotionLoomDocument, MotionLoomError, MotionLoomRenderProgress,
+    MotionLoomSceneRenderError, MotionLoomShowcaseSchema, PathAssetResolver, ProcessCategory,
+    ProcessEffectDefinition, ProcessGraph, RenderPassDag, RenderPassDagEdge, RenderPassDagKind,
+    RenderPassDagNode, RenderPassSpace, RootGraphError, RuntimeCompileError, RuntimeFrameOutput,
     RuntimeProcessEffectInstance, RuntimeProcessParamValue, RuntimeProgram, SceneGpuTexture,
     ScenePlatformPreviewSurface, ScenePreviewBackend, ScenePreviewPath, ScenePreviewPixelFormat,
     ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderError, SceneRenderProfile,
     SceneRenderProgress, SceneRenderer, SkeletonDiagnostic, SkeletonDiagnosticSeverity,
-    SkeletonOverlayPrimitive, SkeletonValidationReport, auto_correct_skeleton,
+    SkeletonOverlayPrimitive, SkeletonValidationReport, analyze_motionloom_script,
+    analyze_motionloom_script_for_target, animation_properties_for_node_kind,
+    animation_property_descriptor, animation_property_schema_json, auto_correct_skeleton,
     build_skeleton_overlay, builtin_proportion_profile, builtin_proportion_profiles,
     builtin_skeleton_pose_presets, clear_scene_asset_roots, compile_render_pass_dag,
-    compile_runtime_program, inspect_gpu_compatibility, inspect_root_graph, is_graph_script,
-    is_known_process_kernel, is_process_graph_script, kernel_source_by_name,
-    next_scene_output_path, next_scene_output_path_for_profile, parse_graph_script,
-    parse_motionloom_document, parse_process_graph_script, process_effect_for_id, process_effects,
+    compile_runtime_program, inspect_animation_targets, inspect_glb_environment_bytes,
+    inspect_glb_environment_json, inspect_glb_environment_path, inspect_glb_skeleton_bytes,
+    inspect_glb_skeleton_json, inspect_glb_skeleton_path, inspect_gpu_compatibility,
+    inspect_root_graph, is_graph_script, is_known_process_kernel, is_process_graph_script,
+    kernel_source_by_name, motionloom_analyze_script_for_target_json,
+    motionloom_analyze_script_json, motionloom_showcase_schema_json, next_scene_output_path,
+    next_scene_output_path_for_profile, parse_graph_script, parse_motionloom_document,
+    parse_process_graph_script, process_effect_for_id, process_effects,
     process_effects_for_category, render_motionloom_document_to_png_sequence_with_progress,
     render_motionloom_document_to_png_sequence_with_progress_and_cancel,
     render_motionloom_document_to_video_with_progress,

@@ -17,6 +17,13 @@ pub struct SceneGpuTexture {
     pub format: wgpu::TextureFormat,
 }
 
+/// Preferred engine-wide name for a frame that remains resident on the GPU.
+///
+/// `SceneGpuTexture` remains available as a compatibility name. New integrations
+/// should use this neutral name because the same texture can contain 2D, 3D, or
+/// mixed Scene output.
+pub type GpuFrameTexture = SceneGpuTexture;
+
 /// Pixel formats used by preview surfaces exposed to host applications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScenePreviewPixelFormat {

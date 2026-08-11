@@ -76,6 +76,9 @@ pub struct GraphScript {
     pub actions: Vec<ActionNode>,
     #[serde(default)]
     pub apply_actions: Vec<ApplyActionNode>,
+    /// Time-bounded relationships between 3D model endpoints.
+    #[serde(default)]
+    pub scene_constraints: Vec<SceneConstraintNode>,
     #[serde(default)]
     pub animation_targets: Vec<AnimationTargetNode>,
     #[serde(default)]
@@ -102,6 +105,12 @@ pub struct GraphAssetNode {
     pub decoder: Option<String>,
     #[serde(default)]
     pub color_space: Option<String>,
+    /// Source skeleton convention used by imported animation-only assets.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Optional named clip selected from a multi-animation GLB.
+    #[serde(default)]
+    pub clip: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -111,6 +120,20 @@ pub enum GraphAssetKind {
     Image,
     Model,
     Audio,
+    Animation,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneConstraintNode {
+    pub constraint_type: String,
+    pub source: String,
+    pub target: String,
+    pub at_ms: u64,
+    pub duration_ms: u64,
+    pub solver: String,
+    #[serde(default)]
+    pub weight: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -546,6 +569,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut skeletons = Vec::<SkeletonNode>::new();
     let mut actions = Vec::<ActionNode>::new();
     let mut apply_actions = Vec::<ApplyActionNode>::new();
+    let mut scene_constraints = Vec::<SceneConstraintNode>::new();
     let mut animation_targets = Vec::<AnimationTargetNode>::new();
     let mut layers = Vec::<LayerNode>::new();
     let mut processes = Vec::<ProcessDefinitionNode>::new();
@@ -650,6 +674,13 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         if starts_open_tag(line, "ApplyAction") {
             let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
             apply_actions.push(parse_apply_action_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+
+        if starts_open_tag(line, "Constraint") {
+            let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
+            scene_constraints.push(parse_scene_constraint_node(&tag, i + 1)?);
             i = end_ix + 1;
             continue;
         }
@@ -911,6 +942,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         fps,
         duration_ms,
         size,
+        &assets,
         &inputs,
         &textures,
         &buffers,
@@ -924,6 +956,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         &skeletons,
         &actions,
         &apply_actions,
+        &scene_constraints,
         &layers,
         &world_sources,
         &outputs,
@@ -956,6 +989,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         skeletons,
         actions,
         apply_actions,
+        scene_constraints,
         animation_targets,
         layers,
         processes,
@@ -1009,6 +1043,19 @@ fn parse_animation_target_block(
             line: start + 1,
             message: "<AnimationTarget> requires at least one <Key /> child.".to_string(),
         });
+    }
+    let descriptor = crate::scene::animation::animation_property_descriptor(&property)
+        .expect("AnimationTarget property was validated before its keys");
+    for key in &keys {
+        crate::scene::animation::validate_animation_key_value(descriptor, &key.value).map_err(
+            |reason| GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "AnimationTarget node={node:?} property={property:?} has invalid key value {:?}: {reason}.",
+                    key.value
+                ),
+            },
+        )?;
     }
     keys.sort_by(|a, b| {
         a.seconds
@@ -1073,15 +1120,13 @@ fn parse_animation_key_node(
 }
 
 fn validate_animation_target_property(property: &str, line: usize) -> Result<(), GraphParseError> {
-    match property {
-        "x" | "y" | "rotation" | "scale" | "scaleX" | "scaleY" | "skewX" | "skewY"
-        | "transformOriginX" | "transformOriginY" | "opacity" | "d" => Ok(()),
-        _ => Err(GraphParseError {
+    if crate::scene::animation::animation_property_descriptor(property).is_some() {
+        Ok(())
+    } else {
+        Err(GraphParseError {
             line,
-            message: format!(
-                "AnimationTarget.property only supports x, y, rotation, scale, scaleX, scaleY, skewX, skewY, transformOriginX, transformOriginY, opacity, d; got {property}."
-            ),
-        }),
+            message: format!("AnimationTarget.property is not registered: {property}."),
+        })
     }
 }
 
@@ -1090,6 +1135,7 @@ fn validate_graph(
     fps: f32,
     duration_ms: u64,
     size: (u32, u32),
+    assets: &[GraphAssetNode],
     inputs: &[InputNode],
     textures: &[TexNode],
     buffers: &[BufferNode],
@@ -1103,6 +1149,7 @@ fn validate_graph(
     skeletons: &[SkeletonNode],
     actions: &[ActionNode],
     apply_actions: &[ApplyActionNode],
+    scene_constraints: &[SceneConstraintNode],
     layers: &[LayerNode],
     world_sources: &[WorldSourceNode],
     outputs: &[OutputNode],
@@ -1237,6 +1284,11 @@ fn validate_graph(
     }
 
     let mut action_ids = HashSet::<String>::new();
+    let animation_assets = assets
+        .iter()
+        .filter(|asset| asset.kind == GraphAssetKind::Animation)
+        .map(|asset| (asset.id.as_str(), asset))
+        .collect::<std::collections::HashMap<_, _>>();
     for action in actions {
         if !action_ids.insert(action.id.clone()) {
             return Err(GraphParseError {
@@ -1244,7 +1296,26 @@ fn validate_graph(
                 message: format!("Duplicate action id: {}", action.id),
             });
         }
-        if action.poses.is_empty() && action.iks.is_empty() {
+        if let Some(source) = action.source.as_deref() {
+            if !action.poses.is_empty() || !action.iks.is_empty() {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "External Action {} cannot contain <Pose> or <IK> children.",
+                        action.id
+                    ),
+                });
+            }
+            if !animation_assets.contains_key(source) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Action {} references missing AnimationAsset source: {source}",
+                        action.id
+                    ),
+                });
+            }
+        } else if action.poses.is_empty() && action.iks.is_empty() {
             return Err(GraphParseError {
                 line,
                 message: format!(
@@ -1256,12 +1327,98 @@ fn validate_graph(
     }
     for apply_action in apply_actions {
         if !action_ids.contains(&apply_action.action) {
+            if animation_assets.contains_key(apply_action.action.as_str()) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "ApplyAction.action '{}' references a raw AnimationAsset. Wrap it with <Action id=\"...\" source=\"{}\" sourceProfile=\"...\" clip=\"...\" /> and reference that Action id instead.",
+                        apply_action.action, apply_action.action
+                    ),
+                });
+            }
             return Err(GraphParseError {
                 line,
                 message: format!(
                     "ApplyAction target action not found: {}",
                     apply_action.action
                 ),
+            });
+        }
+        if let Some(root_motion) = apply_action.root_motion.as_deref()
+            && !matches!(root_motion, "none" | "clip" | "in_place" | "match_target")
+        {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ApplyAction rootMotion must be none, clip, in_place, or match_target, got: {root_motion}"
+                ),
+            });
+        }
+    }
+    for apply_action in apply_actions {
+        let Some(group) = apply_action.sync_group.as_deref() else {
+            continue;
+        };
+        for peer in apply_actions.iter().filter(|peer| {
+            peer.sync_group.as_deref() == Some(group) && peer.target != apply_action.target
+        }) {
+            if peer.at_ms != apply_action.at_ms {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "ApplyAction syncGroup '{group}' members must use the same at time."
+                    ),
+                });
+            }
+            if peer.sync_marker != apply_action.sync_marker {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "ApplyAction syncGroup '{group}' members must use the same syncMarker."
+                    ),
+                });
+            }
+        }
+    }
+    for constraint in scene_constraints {
+        if constraint.constraint_type != "position" {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Scene Constraint type must currently be position, got: {}",
+                    constraint.constraint_type
+                ),
+            });
+        }
+        if constraint.solver != "two_bone_ik" {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Scene Constraint solver must currently be two_bone_ik, got: {}",
+                    constraint.solver
+                ),
+            });
+        }
+        let Some((_, source_bone)) = constraint.source.rsplit_once('.') else {
+            return Err(GraphParseError {
+                line,
+                message: "Scene Constraint source must use model-id.canonical-bone syntax."
+                    .to_string(),
+            });
+        };
+        if !matches!(source_bone, "hand_l" | "hand_r" | "foot_l" | "foot_r") {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Scene Constraint two_bone_ik source must end in hand_l, hand_r, foot_l, or foot_r, got: {source_bone}"
+                ),
+            });
+        }
+        if constraint.target.rsplit_once('.').is_none() {
+            return Err(GraphParseError {
+                line,
+                message: "Scene Constraint target must use model-id.canonical-bone syntax."
+                    .to_string(),
             });
         }
     }
@@ -1442,11 +1599,13 @@ fn parse_assets_block(
             (GraphAssetKind::Model, "ModelAsset")
         } else if starts_open_tag(line, "AudioAsset") {
             (GraphAssetKind::Audio, "AudioAsset")
+        } else if starts_open_tag(line, "AnimationAsset") {
+            (GraphAssetKind::Animation, "AnimationAsset")
         } else {
             return Err(GraphParseError {
                 line: i + 1,
                 message: format!(
-                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, or <AudioAsset>, got: {line}"
+                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
                 ),
             });
         };
@@ -1457,6 +1616,15 @@ fn parse_assets_block(
                 message: format!("Invalid <{tag_name}> asset tag."),
             });
         }
+        if kind == GraphAssetKind::Animation
+            && (attr_value(&tag, "profile").is_some() || attr_value(&tag, "clip").is_some())
+        {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: "AnimationAsset is a raw clip container and only owns id/src. Move profile/clip to an executable <Action source=\"...\" sourceProfile=\"...\" clip=\"...\" />."
+                    .to_string(),
+            });
+        }
         assets.push(GraphAssetNode {
             id: strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string(),
             kind,
@@ -1465,6 +1633,8 @@ fn parse_assets_block(
             color_space: attr_value(&tag, "colorSpace")
                 .or_else(|| attr_value(&tag, "color_space"))
                 .map(|v| strip_wrappers(&v).to_string()),
+            profile: attr_value(&tag, "profile").map(|v| strip_wrappers(&v).to_string()),
+            clip: attr_value(&tag, "clip").map(|v| strip_wrappers(&v).to_string()),
         });
         i = end_ix + 1;
     }
@@ -1484,6 +1654,41 @@ fn parse_assets_block(
         }
     }
     Ok((assets, close_ix))
+}
+
+fn parse_scene_constraint_node(
+    block: &str,
+    line: usize,
+) -> Result<SceneConstraintNode, GraphParseError> {
+    let constraint_type = required_attr_value(block, "type", line)
+        .or_else(|_| required_attr_value(block, "kind", line))?;
+    let at_raw = attr_value(block, "at").or_else(|| attr_value(block, "from"));
+    let at_seconds = at_raw
+        .as_deref()
+        .map(|value| parse_time_seconds(value, line, "Constraint.at"))
+        .transpose()?
+        .unwrap_or(0.0)
+        .max(0.0);
+    let duration_seconds = if let Some(value) = attr_value(block, "duration") {
+        parse_time_seconds(&value, line, "Constraint.duration")?.max(0.0)
+    } else if let Some(value) = attr_value(block, "to") {
+        (parse_time_seconds(&value, line, "Constraint.to")? - at_seconds).max(0.0)
+    } else {
+        0.0
+    };
+    Ok(SceneConstraintNode {
+        constraint_type: strip_wrappers(&constraint_type).to_ascii_lowercase(),
+        source: strip_wrappers(&required_attr_value(block, "source", line)?).to_string(),
+        target: strip_wrappers(&required_attr_value(block, "target", line)?).to_string(),
+        at_ms: (at_seconds * 1000.0).round() as u64,
+        duration_ms: (duration_seconds * 1000.0).round() as u64,
+        solver: attr_value(block, "solver")
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+            .unwrap_or_else(|| "two_bone_ik".to_string()),
+        weight: attr_value(block, "weight")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(|| "1".to_string()),
+    })
 }
 
 fn collect_tag_attr_values(
@@ -3065,10 +3270,12 @@ pub(crate) fn strip_wrappers(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorSpace, GraphApplyScope, GraphParseError, InputType, PassCache, PassKind, PassRole,
-        PassTransitionClips, PassTransitionEasing, PassTransitionFallback, PassTransitionMode,
-        Quality, ResourceRef, SceneNode, TextureFormat, is_graph_script, parse_graph_script,
+        ColorSpace, GraphApplyScope, GraphAssetKind, GraphParseError, InputType, PassCache,
+        PassKind, PassRole, PassTransitionClips, PassTransitionEasing, PassTransitionFallback,
+        PassTransitionMode, Quality, ResourceRef, SceneNode, TextureFormat, is_graph_script,
+        parse_graph_script,
     };
+    use crate::scene::model::Scene3DNode;
 
     #[test]
     fn graph_parser_accepts_basic_example() {
@@ -5209,5 +5416,338 @@ Font note: this is not a structured XML comment.
         );
         assert_eq!(pass.transition_clips, Some(PassTransitionClips::Overlap));
         Ok(())
+    }
+
+    #[test]
+    fn graph_parser_accepts_scene_humanoid_actions_ik_and_bone_targets()
+    -> Result<(), GraphParseError> {
+        let script = r#"
+<Graph fps={30} duration="2s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="girl_asset" src="girl.glb" />
+  </Assets>
+  <ModelProfile id="girl_profile" kind="3d" model="girl_asset" preset="humanoid_v1">
+    <Retarget preset="humanoid_v1">
+      <Map from="Right arm_68" to="upper_arm_r" />
+      <Map from="Right elbow_67" to="forearm_r" />
+      <Map from="Right wrist_64" to="hand_r" />
+    </Retarget>
+  </ModelProfile>
+  <Action id="reach" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="upper_arm_r" rotationZ="0" />
+    </Pose>
+    <Pose t="1s">
+      <Bone id="upper_arm_r" rotationX="12" rotationZ="-35" />
+    </Pose>
+    <IK root="upper_arm_r" mid="forearm_r" end="hand_r"
+        targetX="0.8" targetY="1.1" targetZ="0.2" plane="xy" weight="1" />
+  </Action>
+  <ApplyAction target="girl" action="reach" at="0.2s" loop="true"
+               weight="0.8" speed="1.2" blendIn="0.1s" blendOut="0.2s"
+               mode="additive" mask="right_arm" />
+  <Scene id="main_scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="2s">
+          <Layer>
+            <CompositeGroup id="island" space="3d" depth="true">
+              <Camera3D position={[0,1,6]} target={[0,1,0]} />
+              <Model id="girl" asset="girl_asset" profile="girl_profile">
+                <Play clip="Idle" loop="true" speed="1" blendIn="0.2s" mask="upper_body" />
+                <Play clip="Walk" loop="true" speed="1.1" weight="0.35" mask="lower_body" />
+              </Model>
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="girl" property="bones.forearm_r.rotationZ">
+    <Key time="0s" value="0" />
+    <Key time="1s" value="-45" ease="ease_in_out" />
+  </AnimationTarget>
+  <Present from="main_scene" />
+</Graph>
+"#;
+        let graph = parse_graph_script(script)?;
+        assert_eq!(graph.model_profiles[0].kind, "3d");
+        assert_eq!(graph.actions[0].iks[0].target_z, "0.2");
+        assert_eq!(
+            graph.actions[0].poses[1].bones[0].rotation_x.as_deref(),
+            Some("12")
+        );
+        assert_eq!(graph.apply_actions[0].mask, vec!["right_arm"]);
+        assert_eq!(graph.apply_actions[0].blend_in, "0.1");
+        assert_eq!(
+            graph.animation_targets[0].property,
+            "bones.forearm_r.rotationZ"
+        );
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("3D group");
+        };
+        let model = group
+            .composite
+            .as_ref()
+            .and_then(|composite| {
+                composite.nodes_3d.iter().find_map(|node| match node {
+                    Scene3DNode::Model(model) => Some(model),
+                    _ => None,
+                })
+            })
+            .expect("3D model");
+        assert_eq!(model.profile.as_deref(), Some("girl_profile"));
+        assert_eq!(
+            model.play.as_ref().and_then(|play| play.clip.as_deref()),
+            Some("Idle")
+        );
+        assert_eq!(model.plays.len(), 1);
+        assert_eq!(model.plays[0].clip.as_deref(), Some("Walk"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_accepts_external_actions_anchors_constraints_and_camera_switches()
+    -> Result<(), GraphParseError> {
+        let graph = parse_graph_script(
+            r#"
+<Graph fps={30} duration="6s" size={[1920,1080]}>
+  <Assets>
+    <ModelAsset id="model_a" src="character-a.glb" />
+    <ModelAsset id="model_b" src="character-b.glb" />
+    <AnimationAsset id="sneak_walk_source" src="motions/sneak-walk.glb" />
+  </Assets>
+  <Action id="sneak_walk" source="sneak_walk_source"
+          sourceProfile="mixamo_humanoid" clip="Sneak Walk"
+          skeleton="humanoid_v1" duration="3.2s">
+    <Marker id="takeoff" time="0.4s" role="takeoff" />
+    <Marker id="contact" time="1.6s" role="contact" />
+    <Marker id="landing" time="2.8s" role="landing" />
+  </Action>
+  <Scene id="FightScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="6s">
+          <Layer>
+            <CompositeGroup id="stage" space="3d" depth="true">
+              <Model id="character_a" asset="model_a"
+                     profile="motionloom_humanoid_v1" position="@character_a_start" />
+              <Model id="character_b" asset="model_b"
+                     profile="motionloom_humanoid_v1" position={[0,0,0]} />
+              <Anchor id="character_a_start" relativeTo="character_b"
+                      offset={[0,0,-4.2]} space="local" />
+              <Anchor id="character_a_contact" relativeTo="character_b"
+                      offset={[0,0,-0.72]} space="local" />
+              <Camera3D id="camera_feet" position={[0,0.5,5]} target={[0,0.5,0]} />
+              <Camera3D id="camera_medium" position={[2,1.2,5]} target={[0,1,0]} />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <ApplyAction target="character_a" action="sneak_walk" at="0s" duration="3.2s"
+               rootMotion="match_target" destination="character_a_contact"
+               takeoff="character_a_start" contact="character_a_contact"
+               landing="character_a_contact"
+               face="character_b" syncGroup="contact_01" syncMarker="contact" />
+  <Constraint kind="position" source="character_a.hand_r"
+              target="character_b.shoulder_r" from="3.58s" to="4.05s"
+              solver="two_bone_ik" />
+  <AnimationTarget node="FightScene" property="activeCamera">
+    <Key time="0s" value="camera_feet" />
+    <Key time="3.2s" value="camera_medium" />
+  </AnimationTarget>
+  <Present from="FightScene" />
+</Graph>
+"#,
+        )?;
+        assert_eq!(graph.assets[2].kind, GraphAssetKind::Animation);
+        assert_eq!(graph.assets[2].id, "sneak_walk_source");
+        assert_eq!(
+            graph.actions[0].source.as_deref(),
+            Some("sneak_walk_source")
+        );
+        assert_eq!(
+            graph.actions[0].source_profile.as_deref(),
+            Some("mixamo_humanoid")
+        );
+        assert_eq!(graph.actions[0].clip.as_deref(), Some("Sneak Walk"));
+        assert_eq!(graph.actions[0].markers.len(), 3);
+        assert_eq!(graph.actions[0].markers[1].role.as_deref(), Some("contact"));
+        assert_eq!(graph.apply_actions[0].duration_ms, Some(3_200));
+        assert_eq!(
+            graph.apply_actions[0].root_motion.as_deref(),
+            Some("match_target")
+        );
+        assert_eq!(
+            graph.apply_actions[0].destination.as_deref(),
+            Some("character_a_contact")
+        );
+        assert_eq!(
+            graph.apply_actions[0].takeoff.as_deref(),
+            Some("character_a_start")
+        );
+        assert_eq!(
+            graph.apply_actions[0].contact.as_deref(),
+            Some("character_a_contact")
+        );
+        assert_eq!(
+            graph.apply_actions[0].landing.as_deref(),
+            Some("character_a_contact")
+        );
+        assert_eq!(graph.scene_constraints[0].duration_ms, 470);
+        assert_eq!(graph.animation_targets[0].property, "activeCamera");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("group");
+        };
+        let composite = group.composite.as_ref().expect("3D composite");
+        assert_eq!(
+            composite
+                .nodes_3d
+                .iter()
+                .filter(|node| matches!(node, Scene3DNode::Anchor(_)))
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_parser_rejects_apply_action_pointing_to_raw_animation_asset() {
+        let error = parse_graph_script(
+            r#"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <AnimationAsset id="raw_walk" src="walking.glb" />
+  </Assets>
+  <Tex id="out" fmt="rgba8unorm" size={[320,180]} />
+  <ApplyAction target="hero" action="raw_walk" />
+  <Present from="out" />
+</Graph>
+"#,
+        )
+        .expect_err("raw AnimationAsset ids are not executable Actions");
+        assert!(
+            error.message.contains("references a raw AnimationAsset"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn graph_parser_accepts_semantic_environment_surfaces_and_node_anchors() {
+        let graph = parse_graph_script(
+            r#"
+<Graph fps={30} duration="3s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="roof_asset" src="roof.glb" />
+    <ModelAsset id="runner_asset" src="runner.glb" />
+  </Assets>
+  <Scene id="Rooftop">
+    <Timeline>
+      <Track>
+        <Sequence duration="3s">
+          <Layer>
+            <CompositeGroup id="island" space="3d" depth="true">
+              <Environment id="roof" asset="roof_asset" collision="mesh"
+                           up="+Y" forward="+X" unitScale="0.01"
+                           scaleMode="normalize_height">
+                <Surface id="roof_floor" kind="ground" space="asset" height="2.4"
+                         normal={[0,1,0]} centroid={[0,2.4,0]}
+                         boundsMin={[-4,2.35,-3]} boundsMax={[4,2.45,3]} />
+                <Anchor id="takeoff" surface="roof_floor" uv={[0.2,0.5]}
+                        offset={[0,0,0]} />
+                <Anchor id="landing" surface="roof_floor" uv={[0.8,0.5]}
+                        offset={[0,0,0]} />
+              </Environment>
+              <EnvironmentDebug surfaces="true" anchors="true"
+                                actionPath="true" cameras="true" />
+              <Model id="runner" asset="runner_asset" position="@takeoff" />
+              <Camera3D id="wide" position="@takeoff" target="@runner"
+                        up={[0,1,0]} horizonLock="true" roll="2" fov="40" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="Rooftop" />
+</Graph>
+"#,
+        )
+        .expect("semantic Environment graph");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("group");
+        };
+        let composite = group.composite.as_ref().expect("3D composite");
+        let environment = composite
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Model(model) if model.environment => Some(model),
+                _ => None,
+            })
+            .expect("environment model");
+        assert!(environment.r#static);
+        assert_eq!(environment.up, "+Y");
+        assert_eq!(environment.forward, "+X");
+        assert_eq!(environment.unit_scale, "0.01");
+        assert_eq!(environment.surfaces[0].id, "roof_floor");
+        assert_eq!(environment.surfaces[0].space, "asset");
+        assert_eq!(
+            environment.surfaces[0].centroid.as_deref(),
+            Some("[0,2.4,0]")
+        );
+        assert_eq!(
+            composite
+                .nodes_3d
+                .iter()
+                .filter(|node| matches!(node, Scene3DNode::Anchor(_)))
+                .count(),
+            2
+        );
+        assert!(
+            composite
+                .nodes_3d
+                .iter()
+                .any(|node| matches!(node, Scene3DNode::Debug(_)))
+        );
     }
 }

@@ -1,10 +1,22 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/world/render.rs
+
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(target_arch = "wasm32")]
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
 
 use image::{Rgba, RgbaImage, imageops};
 use thiserror::Error;
@@ -16,19 +28,42 @@ use crate::common::gpu_async::{
 use crate::process::runtime::eval_time_expr;
 use crate::scene::render::SceneRenderProfile;
 use crate::world::gltf_loader::{
-    GlbLoadError, GlbMeshData, GlbTextureData, GlbTriangle, load_glb_mesh_data,
-    load_glb_mesh_data_from_bytes,
+    GlbAnimationChannelData, GlbAnimationInterpolation, GlbAnimationProperty, GlbAnimationValues,
+    GlbLoadError, GlbMeshData, GlbTextureData, GlbTriangle, load_glb_animation_data,
+    load_glb_animation_data_from_bytes, load_glb_mesh_data, load_glb_mesh_data_from_bytes,
 };
 use crate::world::model::{
-    WorldAction, WorldActionBone, WorldActor, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
-    WorldDirectionFrame, WorldDirectionalCharacter, WorldGraph, WorldMaterialStyle,
-    WorldModelProfile, WorldNode, WorldPathStyle, WorldRetargetMap, WorldSpritePlayback, WorldTime,
+    WorldAction, WorldActionBone, WorldActor, WorldApplyAction, WorldBackgroundFit, WorldBoneAxis,
+    WorldBoneAxisMap, WorldDirectionFrame, WorldDirectionalCharacter, WorldGraph,
+    WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldRetargetMap,
+    WorldSpritePlayback, WorldTime,
 };
+
+/// Keep native profiling instrumentation out of the browser runtime because
+/// `std::time::Instant` is unsupported on wasm32-unknown-unknown.
+#[cfg(not(target_arch = "wasm32"))]
+type ProfileClock = Instant;
+
+#[cfg(target_arch = "wasm32")]
+struct ProfileClock;
+
+#[cfg(target_arch = "wasm32")]
+impl ProfileClock {
+    fn now() -> Self {
+        Self
+    }
+
+    fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum WorldRenderError {
     #[error("world graph has no presented world '{0}'")]
     MissingWorld(String),
+    #[error("world graph has no actor '{0}'")]
+    MissingActor(String),
     #[error("failed to load background image {path}: {source}")]
     BackgroundImage {
         path: PathBuf,
@@ -45,6 +80,8 @@ pub enum WorldRenderError {
     MissingDirectionalCharacterImage(PathBuf),
     #[error("failed to load GLB model: {0}")]
     Glb(#[from] GlbLoadError),
+    #[error("failed to fetch remote asset {url}: {message}")]
+    RemoteAsset { url: String, message: String },
     #[error("invalid world expression '{expr}': {message}")]
     Expression { expr: String, message: String },
     #[error("failed to create output directory ({path}): {source}")]
@@ -87,6 +124,31 @@ pub enum WorldRenderError {
     Cancelled,
 }
 
+/// CPU-side timings for the most recently submitted true-3D Scene island.
+/// GPU execution time remains available from the parent Scene compositor's
+/// timestamp queries; these fields expose work that previously appeared as an
+/// unexplained preview stall before queue submission.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub struct Scene3DFrameProfile {
+    pub prepare_ms: f64,
+    pub canvas_ms: f64,
+    pub background_ms: f64,
+    pub actor_build_ms: f64,
+    pub asset_resolve_ms: f64,
+    pub animation_sample_ms: f64,
+    pub constraints_ms: f64,
+    pub draw_assembly_ms: f64,
+    pub renderer_init_ms: f64,
+    pub submit_ms: f64,
+    pub readback_ms: f64,
+    pub draw_calls: usize,
+    pub mesh_cache_entries: usize,
+    pub static_draw_plans: usize,
+    pub gpu_resource_entries: usize,
+    pub target_pool_size: usize,
+}
+
 impl From<crate::export::EncodeError> for WorldRenderError {
     fn from(err: crate::export::EncodeError) -> Self {
         use crate::export::EncodeError;
@@ -113,6 +175,13 @@ impl From<crate::export::EncodeError> for WorldRenderError {
 pub struct WorldRenderProgress {
     pub rendered_frames: u32,
     pub total_frames: u32,
+}
+
+/// One frame-local Scene texture replacing a named GLB material base color.
+pub(crate) struct WorldMaterialTextureOverride {
+    pub actor_id: String,
+    pub material: String,
+    pub texture: Arc<GpuWorldTexture>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,7 +460,7 @@ pub fn diagnose_world_graph_actor_gpu_frame(
         duration_ms: graph.duration_ms,
     };
 
-    let overrides = actor_bone_overrides(graph, actor, time)?;
+    let overrides = actor_bone_overrides_for_mesh(graph, actor, Some(&mesh), time)?;
     diagnostics.bone_override_count = overrides.len();
 
     let positions = skinned_actor_positions(graph, actor, &mesh, time)?
@@ -563,6 +632,7 @@ fn diagnose_gpu_shader_projection(
         graph,
         actor,
         mesh,
+        effective_mesh_bounds(mesh),
         &static_draws,
         width,
         height,
@@ -578,6 +648,9 @@ fn diagnose_gpu_shader_projection(
         time,
         model_path,
         &mut skinning_strategy_cache,
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
     )?;
 
     let mut min_x = f32::INFINITY;
@@ -733,9 +806,42 @@ pub struct WorldFrameRenderer {
     asset_resolver: Arc<dyn AssetResolver>,
     image_cache: HashMap<PathBuf, RgbaImage>,
     mesh_cache: HashMap<PathBuf, GlbMeshData>,
+    effective_bounds_cache: HashMap<PathBuf, ([f32; 3], [f32; 3])>,
     gpu_static_draw_cache: HashMap<GpuWorldStaticPlanKey, Vec<GpuWorldStaticDraw>>,
     skinning_strategy_cache: HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
     gpu_renderer: Option<GpuWorldRenderer>,
+    /// Shared Scene GPU context used by the internal 3D backend.
+    gpu_device_queue: Option<(Arc<wgpu::Device>, wgpu::Queue)>,
+    last_frame_profile: Scene3DFrameProfile,
+    last_prepare_stages: Scene3DPrepareStages,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Scene3DPrepareStages {
+    canvas_ms: f64,
+    background_ms: f64,
+    actor_build_ms: f64,
+    actor: ActorBuildStages,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ActorBuildStages {
+    asset_resolve_ms: f64,
+    animation_sample_ms: f64,
+    constraints_ms: f64,
+    draw_assembly_ms: f64,
+}
+
+/// Internal Scene 3D backend name; the legacy World type remains for API compatibility.
+pub(crate) type Scene3DRenderer = WorldFrameRenderer;
+
+/// Canonical humanoid joints sampled from the exact animation/retarget path
+/// used by the GPU renderer. Scene collision consumes this lightweight frame
+/// instead of reading back skinned vertices from the GPU.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Scene3DHumanoidFrame {
+    pub joints: HashMap<String, [f32; 3]>,
+    pub actor_scale: f32,
 }
 
 impl Default for WorldFrameRenderer {
@@ -754,9 +860,126 @@ impl WorldFrameRenderer {
             asset_resolver,
             image_cache: HashMap::new(),
             mesh_cache: HashMap::new(),
+            effective_bounds_cache: HashMap::new(),
             gpu_static_draw_cache: HashMap::new(),
             skinning_strategy_cache: HashMap::new(),
             gpu_renderer: None,
+            gpu_device_queue: None,
+            last_frame_profile: Scene3DFrameProfile::default(),
+            last_prepare_stages: Scene3DPrepareStages::default(),
+        }
+    }
+
+    pub fn last_frame_profile(&self) -> Scene3DFrameProfile {
+        self.last_frame_profile
+    }
+
+    /// Sample canonical humanoid joints without submitting a render pass.
+    /// Asset and animation meshes share the renderer's retained GLB cache.
+    pub(crate) fn sample_humanoid_frame(
+        &mut self,
+        graph: &WorldGraph,
+        actor_id: &str,
+        frame: u32,
+        asset_root: impl AsRef<Path>,
+    ) -> Result<Scene3DHumanoidFrame, WorldRenderError> {
+        let asset_root = asset_root.as_ref();
+        let world = graph
+            .presented_world()
+            .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
+        let actor = world
+            .actors
+            .iter()
+            .find(|actor| actor.id == actor_id)
+            .ok_or_else(|| WorldRenderError::MissingActor(actor_id.to_string()))?;
+        let time = WorldTime {
+            frame,
+            fps: graph.fps,
+            duration_ms: graph.duration_ms,
+        };
+        let mut animation_keys = HashMap::<String, PathBuf>::new();
+        for asset in &graph.animation_assets {
+            let (key, _) = load_cached_glb_animation_resolved(
+                asset_root,
+                &asset.src,
+                WorldPathStyle::Relative,
+                self.asset_resolver.as_ref(),
+                &mut self.mesh_cache,
+            )?;
+            animation_keys.insert(asset.id.clone(), key);
+        }
+        let (model_key, _) = load_cached_glb_mesh_resolved(
+            asset_root,
+            &actor.model,
+            actor.path_style,
+            self.asset_resolver.as_ref(),
+            &mut self.mesh_cache,
+        )?;
+        let mesh = self
+            .mesh_cache
+            .get(&model_key)
+            .expect("model mesh inserted before humanoid collision sampling");
+        let sampled = sample_external_actor_actions(
+            graph,
+            actor,
+            mesh,
+            &animation_keys,
+            &self.mesh_cache,
+            time,
+        )?;
+        let overrides = actor_bone_overrides_for_mesh(graph, actor, Some(mesh), time)?;
+        let matrices = global_node_matrices_with_sampled(mesh, &overrides, &sampled);
+        let pose = actor_frame_pose(actor, time)?;
+        let profile = actor_model_profile(graph, actor);
+        let canonical_bones = [
+            "hips",
+            "spine",
+            "chest",
+            "neck",
+            "head",
+            "shoulder_l",
+            "upper_arm_l",
+            "forearm_l",
+            "hand_l",
+            "shoulder_r",
+            "upper_arm_r",
+            "forearm_r",
+            "hand_r",
+            "upper_leg_l",
+            "lower_leg_l",
+            "foot_l",
+            "toe_l",
+            "upper_leg_r",
+            "lower_leg_r",
+            "foot_r",
+            "toe_r",
+        ];
+        let joints = canonical_bones
+            .into_iter()
+            .filter_map(|bone| {
+                let node_index = target_node_for_canonical_bone(mesh, profile, bone)?;
+                let matrix = matrices.get(node_index).copied()?;
+                Some((
+                    bone.to_string(),
+                    actor_model_point_to_world(matrix_translation(matrix), mesh, pose),
+                ))
+            })
+            .collect();
+        Ok(Scene3DHumanoidFrame {
+            joints,
+            actor_scale: pose.scale,
+        })
+    }
+
+    /// Attach the 3D backend to the Scene compositor's device for zero-copy handoff.
+    pub(crate) fn set_gpu_context(&mut self, device: Arc<wgpu::Device>, queue: wgpu::Queue) {
+        let same_device = self
+            .gpu_device_queue
+            .as_ref()
+            .is_some_and(|(current, _)| Arc::ptr_eq(current, &device));
+        if !same_device {
+            self.gpu_renderer = None;
+            self.gpu_device_queue = Some((device, queue));
         }
     }
 
@@ -814,8 +1037,27 @@ impl WorldFrameRenderer {
         frame: u32,
         asset_root: impl AsRef<Path>,
     ) -> Result<RgbaImage, WorldRenderError> {
-        self.render_frame_gpu_internal(graph, frame, asset_root, false, false)
+        self.render_frame_gpu_internal(graph, frame, asset_root, false, false, &[])
             .await
+    }
+
+    /// Render the internal Scene 3D island without crossing back through CPU memory.
+    pub(crate) async fn render_frame_to_gpu_texture_with_material_overrides(
+        &mut self,
+        graph: &WorldGraph,
+        frame: u32,
+        asset_root: impl AsRef<Path>,
+        material_overrides: &[WorldMaterialTextureOverride],
+    ) -> Result<crate::scene::preview_surface::GpuFrameTexture, WorldRenderError> {
+        self.render_frame_to_gpu_texture_internal(
+            graph,
+            frame,
+            asset_root,
+            false,
+            false,
+            material_overrides,
+        )
+        .await
     }
 
     pub async fn render_frame_gpu_with_ground_grid(
@@ -824,7 +1066,7 @@ impl WorldFrameRenderer {
         frame: u32,
         asset_root: impl AsRef<Path>,
     ) -> Result<RgbaImage, WorldRenderError> {
-        self.render_frame_gpu_internal(graph, frame, asset_root, true, false)
+        self.render_frame_gpu_internal(graph, frame, asset_root, true, false, &[])
             .await
     }
 
@@ -835,7 +1077,7 @@ impl WorldFrameRenderer {
         asset_root: impl AsRef<Path>,
         debug_grid: bool,
     ) -> Result<RgbaImage, WorldRenderError> {
-        self.render_frame_gpu_internal(graph, frame, asset_root, true, debug_grid)
+        self.render_frame_gpu_internal(graph, frame, asset_root, true, debug_grid, &[])
             .await
     }
 
@@ -846,12 +1088,154 @@ impl WorldFrameRenderer {
         asset_root: impl AsRef<Path>,
         ground_grid: bool,
         ground_grid_debug: bool,
+        material_overrides: &[WorldMaterialTextureOverride],
     ) -> Result<RgbaImage, WorldRenderError> {
-        let asset_root = asset_root.as_ref();
+        let prepare_started = ProfileClock::now();
+        let (canvas, width, height, draw_calls, grid_params) = self.prepare_gpu_frame(
+            graph,
+            frame,
+            asset_root.as_ref(),
+            ground_grid,
+            ground_grid_debug,
+            material_overrides,
+            true,
+        )?;
+        let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+        if draw_calls.is_empty() && !ground_grid {
+            return Ok(canvas.expect("readback frame requested a CPU background"));
+        }
+        let init_started = ProfileClock::now();
+        self.ensure_gpu_renderer(width, height).await?;
+        let renderer_init_ms = init_started.elapsed().as_secs_f64() * 1000.0;
+        let render_started = ProfileClock::now();
+        let rendered = self
+            .gpu_renderer
+            .as_mut()
+            .expect("GPU renderer initialized above")
+            .render_readback(
+                canvas
+                    .as_ref()
+                    .expect("readback frame requested a CPU background"),
+                &draw_calls,
+                grid_params,
+            )
+            .await?;
+        let readback_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        self.update_last_frame_profile(
+            prepare_ms,
+            renderer_init_ms,
+            0.0,
+            readback_ms,
+            draw_calls.len(),
+        );
+        Ok(rendered)
+    }
+
+    async fn render_frame_to_gpu_texture_internal(
+        &mut self,
+        graph: &WorldGraph,
+        frame: u32,
+        asset_root: impl AsRef<Path>,
+        ground_grid: bool,
+        ground_grid_debug: bool,
+        material_overrides: &[WorldMaterialTextureOverride],
+    ) -> Result<crate::scene::preview_surface::GpuFrameTexture, WorldRenderError> {
+        let prepare_started = ProfileClock::now();
+        let (canvas, width, height, draw_calls, grid_params) = self.prepare_gpu_frame(
+            graph,
+            frame,
+            asset_root.as_ref(),
+            ground_grid,
+            ground_grid_debug,
+            material_overrides,
+            false,
+        )?;
+        let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+        let init_started = ProfileClock::now();
+        self.ensure_gpu_renderer(width, height).await?;
+        let renderer_init_ms = init_started.elapsed().as_secs_f64() * 1000.0;
+        let submit_started = ProfileClock::now();
+        let texture = self
+            .gpu_renderer
+            .as_mut()
+            .expect("GPU renderer initialized above")
+            .render_to_texture(
+                canvas.as_ref(),
+                &draw_calls,
+                grid_params,
+                Some(wgpu::Color::TRANSPARENT),
+            )?;
+        let submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        self.update_last_frame_profile(
+            prepare_ms,
+            renderer_init_ms,
+            submit_ms,
+            0.0,
+            draw_calls.len(),
+        );
+        Ok(texture)
+    }
+
+    fn update_last_frame_profile(
+        &mut self,
+        prepare_ms: f64,
+        renderer_init_ms: f64,
+        submit_ms: f64,
+        readback_ms: f64,
+        draw_calls: usize,
+    ) {
+        let (gpu_resource_entries, target_pool_size) = self
+            .gpu_renderer
+            .as_ref()
+            .map(|renderer| (renderer.actor_resource_cache.len(), renderer.targets.len()))
+            .unwrap_or_default();
+        self.last_frame_profile = Scene3DFrameProfile {
+            prepare_ms,
+            canvas_ms: self.last_prepare_stages.canvas_ms,
+            background_ms: self.last_prepare_stages.background_ms,
+            actor_build_ms: self.last_prepare_stages.actor_build_ms,
+            asset_resolve_ms: self.last_prepare_stages.actor.asset_resolve_ms,
+            animation_sample_ms: self.last_prepare_stages.actor.animation_sample_ms,
+            constraints_ms: self.last_prepare_stages.actor.constraints_ms,
+            draw_assembly_ms: self.last_prepare_stages.actor.draw_assembly_ms,
+            renderer_init_ms,
+            submit_ms,
+            readback_ms,
+            draw_calls,
+            mesh_cache_entries: self.mesh_cache.len(),
+            static_draw_plans: self.gpu_static_draw_cache.len(),
+            gpu_resource_entries,
+            target_pool_size,
+        };
+    }
+
+    /// Build CPU-authored background and cached GLB draws before GPU submission.
+    fn prepare_gpu_frame(
+        &mut self,
+        graph: &WorldGraph,
+        frame: u32,
+        asset_root: &Path,
+        ground_grid: bool,
+        ground_grid_debug: bool,
+        material_overrides: &[WorldMaterialTextureOverride],
+        include_cpu_background: bool,
+    ) -> Result<
+        (
+            Option<RgbaImage>,
+            u32,
+            u32,
+            Vec<GpuWorldDraw>,
+            Option<GpuGroundGridParams>,
+        ),
+        WorldRenderError,
+    > {
         let (width, height) = graph.output_size();
         let width = width.max(1);
         let height = height.max(1);
-        let mut canvas = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 255]));
+        let canvas_started = ProfileClock::now();
+        let mut canvas = include_cpu_background
+            .then(|| RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 255])));
+        let canvas_ms = canvas_started.elapsed().as_secs_f64() * 1000.0;
         let world = graph
             .presented_world()
             .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
@@ -862,45 +1246,50 @@ impl WorldFrameRenderer {
         };
 
         let resolver = self.asset_resolver.as_ref();
-        draw_world_background(
-            &mut canvas,
-            world,
-            asset_root,
-            resolver,
-            time,
-            &mut self.image_cache,
-        )?;
-        draw_directional_characters(
-            &mut canvas,
-            world,
-            graph.size,
-            asset_root,
-            resolver,
-            time,
-            &mut self.image_cache,
-        )?;
-        let draw_calls = build_actor_gpu_draws(
-            &mut canvas,
+        let background_started = ProfileClock::now();
+        if let Some(canvas) = canvas.as_mut() {
+            draw_world_background(
+                canvas,
+                world,
+                asset_root,
+                resolver,
+                time,
+                &mut self.image_cache,
+            )?;
+            draw_directional_characters(
+                canvas,
+                world,
+                graph.size,
+                asset_root,
+                resolver,
+                time,
+                &mut self.image_cache,
+            )?;
+        }
+        let background_ms = background_started.elapsed().as_secs_f64() * 1000.0;
+        let actor_started = ProfileClock::now();
+        let (draw_calls, actor) = build_actor_gpu_draws(
+            canvas.as_mut(),
+            width,
+            height,
             graph,
             world,
             asset_root,
             resolver,
             time,
             &mut self.mesh_cache,
+            &mut self.effective_bounds_cache,
             &mut self.gpu_static_draw_cache,
             &mut self.skinning_strategy_cache,
+            material_overrides,
         )?;
-        if draw_calls.is_empty() && !ground_grid {
-            return Ok(canvas);
-        }
-
-        let needs_renderer = self
-            .gpu_renderer
-            .as_ref()
-            .is_none_or(|renderer| renderer.width != width || renderer.height != height);
-        if needs_renderer {
-            self.gpu_renderer = Some(GpuWorldRenderer::new(width, height).await?);
-        }
+        let actor_build_ms = actor_started.elapsed().as_secs_f64() * 1000.0;
+        self.last_prepare_stages = Scene3DPrepareStages {
+            canvas_ms,
+            background_ms,
+            actor_build_ms,
+            actor,
+        };
         let grid_params = if ground_grid {
             let camera_view = perspective_camera_view(world, width, height, time)?;
             Some(if ground_grid_debug {
@@ -911,11 +1300,29 @@ impl WorldFrameRenderer {
         } else {
             None
         };
-        self.gpu_renderer
-            .as_mut()
-            .expect("GPU renderer initialized above")
-            .render(&canvas, &draw_calls, grid_params)
-            .await
+        Ok((canvas, width, height, draw_calls, grid_params))
+    }
+
+    /// Reuse the Scene compositor device whenever the 3D backend is embedded.
+    async fn ensure_gpu_renderer(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(), WorldRenderError> {
+        let needs_renderer = self
+            .gpu_renderer
+            .as_ref()
+            .is_none_or(|renderer| renderer.width != width || renderer.height != height);
+        if needs_renderer {
+            self.gpu_renderer = Some(
+                if let Some((device, queue)) = self.gpu_device_queue.clone() {
+                    GpuWorldRenderer::new_with_device(device, queue, width, height).await?
+                } else {
+                    GpuWorldRenderer::new(width, height).await?
+                },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -982,8 +1389,10 @@ impl CharacterDesignGpuViewport {
                     fps: graph.fps,
                     duration_ms: graph.duration_ms,
                 };
+                let cached_mesh = self.renderer.mesh_cache.get(&model_key);
                 diagnostics.bone_override_count =
-                    actor_bone_overrides(graph, actor, time).map_or(0, |overrides| overrides.len());
+                    actor_bone_overrides_for_mesh(graph, actor, cached_mesh, time)
+                        .map_or(0, |overrides| overrides.len());
             }
             diagnostics
         } else {
@@ -1056,8 +1465,10 @@ impl CharacterDesignGpuViewport {
                     fps: graph.fps,
                     duration_ms: graph.duration_ms,
                 };
+                let cached_mesh = self.renderer.mesh_cache.get(&model_key);
                 diagnostics.bone_override_count =
-                    actor_bone_overrides(graph, actor, time).map_or(0, |overrides| overrides.len());
+                    actor_bone_overrides_for_mesh(graph, actor, cached_mesh, time)
+                        .map_or(0, |overrides| overrides.len());
             }
             diagnostics
         } else {
@@ -1085,7 +1496,12 @@ struct GpuWorldRenderer {
     actor_resource_cache: HashMap<GpuWorldResourceKey, GpuWorldActorResource>,
     instance_resource_cache: HashMap<GpuWorldInstanceKey, GpuWorldInstanceResource>,
     actor_sampler: wgpu::Sampler,
-    target: wgpu::Texture,
+    /// Reusable render targets. Triple buffering avoids allocating a new 1080p
+    /// texture merely because the Scene compositor still owns the previous
+    /// frame. Extra targets are only added when an external caller deliberately
+    /// retains every pooled texture.
+    targets: Vec<Arc<wgpu::Texture>>,
+    target_cursor: usize,
     depth_texture: wgpu::Texture,
     readback_buffer: wgpu::Buffer,
     width: u32,
@@ -1133,7 +1549,25 @@ impl GpuWorldRenderer {
         .map_err(|err| WorldRenderError::GpuRender {
             message: format!("device request failed: {err}"),
         })?;
-        let device = Arc::new(device);
+        Self::new_with_device(Arc::new(device), queue, width, height).await
+    }
+
+    /// Build the legacy 3D backend on the Scene compositor's GPU context.
+    async fn new_with_device(
+        device: Arc<wgpu::Device>,
+        queue: wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, WorldRenderError> {
+        let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
+        if width > max_texture_dimension_2d || height > max_texture_dimension_2d {
+            return Err(WorldRenderError::GpuRender {
+                message: format!(
+                    "requested Scene 3D render size {}x{} exceeds GPU max 2D texture dimension {}",
+                    width, height, max_texture_dimension_2d
+                ),
+            });
+        }
         let poller = DevicePoller::start(device.clone());
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1183,6 +1617,36 @@ impl GpuWorldRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
             ],
         });
         let grid_bind_group_layout =
@@ -1217,7 +1681,7 @@ impl GpuWorldRenderer {
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 80,
+                    array_stride: 104,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute {
@@ -1249,6 +1713,16 @@ impl GpuWorldRenderer {
                             format: wgpu::VertexFormat::Float32x4,
                             offset: 64,
                             shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 80,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 92,
+                            shader_location: 7,
                         },
                     ],
                 }],
@@ -1323,16 +1797,18 @@ impl GpuWorldRenderer {
             cache: None,
         });
 
-        let target = Self::make_target_texture(&device, width, height);
+        let targets = (0..3)
+            .map(|_| Arc::new(Self::make_target_texture(&device, width, height)))
+            .collect();
         let depth_texture = Self::make_depth_texture(&device, width, height);
         let actor_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("anica-motionloom-world-gpu-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let padded_bytes_per_row = align_to_256(width.saturating_mul(4));
@@ -1394,7 +1870,8 @@ impl GpuWorldRenderer {
             actor_resource_cache: HashMap::new(),
             instance_resource_cache: HashMap::new(),
             actor_sampler,
-            target,
+            targets,
+            target_cursor: 0,
             depth_texture,
             readback_buffer,
             width,
@@ -1403,13 +1880,54 @@ impl GpuWorldRenderer {
         })
     }
 
-    async fn render(
+    async fn render_readback(
         &mut self,
         background: &RgbaImage,
         draw_calls: &[GpuWorldDraw],
         ground_grid: Option<GpuGroundGridParams>,
     ) -> Result<RgbaImage, WorldRenderError> {
-        if background.width() != self.width || background.height() != self.height {
+        let frame = self.render_to_texture(Some(background), draw_calls, ground_grid, None)?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("anica-motionloom-scene-3d-readback-encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: frame.texture.as_ref(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        self.readback_rgba_async().await
+    }
+
+    /// Submit the 3D draw and return its sampleable texture without readback.
+    fn render_to_texture(
+        &mut self,
+        background: Option<&RgbaImage>,
+        draw_calls: &[GpuWorldDraw],
+        ground_grid: Option<GpuGroundGridParams>,
+        clear_color: Option<wgpu::Color>,
+    ) -> Result<crate::scene::preview_surface::GpuFrameTexture, WorldRenderError> {
+        if let Some(background) = background
+            && (background.width() != self.width || background.height() != self.height)
+        {
             return Err(WorldRenderError::GpuRender {
                 message: format!(
                     "world GPU background size {}x{} does not match renderer {}x{}",
@@ -1420,11 +1938,30 @@ impl GpuWorldRenderer {
                 ),
             });
         }
-        self.write_texture_rgba(&self.target, background.as_raw());
+        let target = self.acquire_target();
+        if clear_color.is_none() {
+            let background = background.ok_or_else(|| WorldRenderError::GpuRender {
+                message: "world GPU render requires a background when no clear color is supplied"
+                    .to_string(),
+            })?;
+            self.write_texture_rgba(&target, background.as_raw());
+        }
         let mut gpu_draws = Vec::<GpuWorldDrawResources>::with_capacity(draw_calls.len());
         for draw in draw_calls {
             if draw.vertices.is_empty() {
                 continue;
+            }
+            let texture_dimensions_changed = self
+                .actor_resource_cache
+                .get(&draw.resource_key)
+                .is_some_and(|resource| {
+                    resource.texture_width != draw.texture.width.max(1)
+                        || resource.texture_height != draw.texture.height.max(1)
+                });
+            if texture_dimensions_changed {
+                self.actor_resource_cache.remove(&draw.resource_key);
+                self.instance_resource_cache
+                    .retain(|key, _| key.resource_key != draw.resource_key);
             }
             if !self.actor_resource_cache.contains_key(&draw.resource_key) {
                 let vertex_bytes = pack_gpu_world_vertices(draw.vertices.as_slice());
@@ -1446,18 +1983,67 @@ impl GpuWorldRenderer {
                 );
                 let actor_texture_view =
                     actor_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let normal_texture = self.make_actor_texture(
+                    draw.normal_texture.as_ref(),
+                    "anica-motionloom-world-gpu-normal-texture",
+                );
+                let normal_texture_view =
+                    normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let metallic_roughness_texture = self.make_actor_texture(
+                    draw.metallic_roughness_texture.as_ref(),
+                    "anica-motionloom-world-gpu-metallic-roughness-texture",
+                );
+                let metallic_roughness_texture_view =
+                    metallic_roughness_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let emissive_texture = self.make_actor_texture(
+                    draw.emissive_texture.as_ref(),
+                    "anica-motionloom-world-gpu-emissive-texture",
+                );
+                let emissive_texture_view =
+                    emissive_texture.create_view(&wgpu::TextureViewDescriptor::default());
                 self.actor_resource_cache.insert(
                     draw.resource_key.clone(),
                     GpuWorldActorResource {
                         vertex_buffer,
                         _texture: actor_texture,
                         texture_view: actor_texture_view,
+                        _normal_texture: normal_texture,
+                        normal_texture_view,
+                        _metallic_roughness_texture: metallic_roughness_texture,
+                        metallic_roughness_texture_view,
+                        _emissive_texture: emissive_texture,
+                        emissive_texture_view,
+                        texture_width: draw.texture.width.max(1),
+                        texture_height: draw.texture.height.max(1),
+                        texture_signature: draw.texture_signature,
                         vertex_count: draw.vertices.len() as u32,
                     },
                 );
+            } else if self
+                .actor_resource_cache
+                .get(&draw.resource_key)
+                .is_some_and(|resource| resource.texture_signature != draw.texture_signature)
+            {
+                let resource = self
+                    .actor_resource_cache
+                    .get_mut(&draw.resource_key)
+                    .expect("GPU actor resource exists before dynamic texture upload");
+                Self::write_gpu_texture_rgba(
+                    &self.queue,
+                    &resource._texture,
+                    draw.texture.as_ref(),
+                );
+                resource.texture_signature = draw.texture_signature;
             }
 
-            let (vertex_buffer, texture_view, vertex_count) = {
+            let (
+                vertex_buffer,
+                texture_view,
+                normal_texture_view,
+                metallic_roughness_texture_view,
+                emissive_texture_view,
+                vertex_count,
+            ) = {
                 let resource = self
                     .actor_resource_cache
                     .get(&draw.resource_key)
@@ -1465,6 +2051,9 @@ impl GpuWorldRenderer {
                 (
                     resource.vertex_buffer.clone(),
                     resource.texture_view.clone(),
+                    resource.normal_texture_view.clone(),
+                    resource.metallic_roughness_texture_view.clone(),
+                    resource.emissive_texture_view.clone(),
                     resource.vertex_count,
                 )
             };
@@ -1508,6 +2097,20 @@ impl GpuWorldRenderer {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(&self.actor_sampler),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&normal_texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(
+                                &metallic_roughness_texture_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&emissive_texture_view),
+                        },
                     ],
                 });
                 self.instance_resource_cache.insert(
@@ -1535,9 +2138,7 @@ impl GpuWorldRenderer {
             });
         }
 
-        let view = self
-            .target
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = self
             .depth_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1553,7 +2154,7 @@ impl GpuWorldRenderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: clear_color.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1586,29 +2187,32 @@ impl GpuWorldRenderer {
                 pass.draw(0..draw.vertex_count, 0..1);
             }
         }
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.padded_bytes_per_row),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
         self.queue.submit([encoder.finish()]);
-        self.readback_rgba_async().await
+        Ok(crate::scene::preview_surface::GpuFrameTexture {
+            texture: target,
+            width: self.width,
+            height: self.height,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+        })
+    }
+
+    fn acquire_target(&mut self) -> Arc<wgpu::Texture> {
+        let pool_len = self.targets.len();
+        for offset in 0..pool_len {
+            let index = (self.target_cursor + offset) % pool_len;
+            if Arc::strong_count(&self.targets[index]) == 1 {
+                self.target_cursor = (index + 1) % pool_len;
+                return Arc::clone(&self.targets[index]);
+            }
+        }
+        let target = Arc::new(Self::make_target_texture(
+            self.device.as_ref(),
+            self.width,
+            self.height,
+        ));
+        self.targets.push(Arc::clone(&target));
+        self.target_cursor = 0;
+        target
     }
 
     fn make_target_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -1624,6 +2228,7 @@ impl GpuWorldRenderer {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
@@ -1716,6 +2321,38 @@ impl GpuWorldRenderer {
         gpu_texture
     }
 
+    fn write_gpu_texture_rgba(
+        queue: &wgpu::Queue,
+        gpu_texture: &wgpu::Texture,
+        texture: &GpuWorldTexture,
+    ) {
+        let width = texture.width.max(1);
+        let height = texture.height.max(1);
+        let expected_len = width as usize * height as usize * 4;
+        if texture.rgba.len() != expected_len {
+            return;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: gpu_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texture.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width.saturating_mul(4)),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     async fn readback_rgba_async(&self) -> Result<RgbaImage, WorldRenderError> {
         let slice = self.readback_buffer.slice(..);
         BufferMapAsyncFuture::new(&self._poller, &self.readback_buffer)
@@ -1754,6 +2391,15 @@ struct GpuWorldActorResource {
     vertex_buffer: wgpu::Buffer,
     _texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
+    _normal_texture: wgpu::Texture,
+    normal_texture_view: wgpu::TextureView,
+    _metallic_roughness_texture: wgpu::Texture,
+    metallic_roughness_texture_view: wgpu::TextureView,
+    _emissive_texture: wgpu::Texture,
+    emissive_texture_view: wgpu::TextureView,
+    texture_width: u32,
+    texture_height: u32,
+    texture_signature: u64,
     vertex_count: u32,
 }
 
@@ -1765,7 +2411,7 @@ struct GpuWorldInstanceResource {
 }
 
 fn pack_gpu_world_vertices(vertices: &[GpuWorldVertex]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vertices.len().saturating_mul(80));
+    let mut out = Vec::with_capacity(vertices.len().saturating_mul(104));
     for vertex in vertices {
         for value in vertex.position {
             out.extend_from_slice(&value.to_ne_bytes());
@@ -1785,12 +2431,18 @@ fn pack_gpu_world_vertices(vertices: &[GpuWorldVertex]) -> Vec<u8> {
         for value in vertex.color {
             out.extend_from_slice(&value.to_ne_bytes());
         }
+        for value in vertex.tangent {
+            out.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in vertex.bitangent {
+            out.extend_from_slice(&value.to_ne_bytes());
+        }
     }
     out
 }
 
 fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(144);
+    let mut out = Vec::with_capacity(192);
     for vector in [
         params.canvas,
         params.model,
@@ -1801,6 +2453,9 @@ fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
         params.camera2,
         params.camera3,
         params.style,
+        params.material0,
+        params.material1,
+        params.material2,
     ] {
         for value in vector {
             out.extend_from_slice(&value.to_ne_bytes());
@@ -1839,13 +2494,15 @@ fn pack_f32x3_vertices(vertices: &[[f32; 3]]) -> Vec<u8> {
 }
 
 fn pack_gpu_world_bones(bones: &[[f32; 16]]) -> Vec<u8> {
-    let matrices = if bones.is_empty() {
-        vec![mat4_identity()]
-    } else {
-        bones.to_vec()
-    };
-    let mut out = Vec::with_capacity(matrices.len().saturating_mul(64));
-    for matrix in matrices {
+    let matrix_count = bones.len().max(1);
+    let mut out = Vec::with_capacity(matrix_count.saturating_mul(64));
+    if bones.is_empty() {
+        for value in mat4_identity() {
+            out.extend_from_slice(&value.to_ne_bytes());
+        }
+        return out;
+    }
+    for matrix in bones {
         for value in matrix {
             out.extend_from_slice(&value.to_ne_bytes());
         }
@@ -1869,6 +2526,9 @@ struct Params {
     camera2: vec4<f32>,
     camera3: vec4<f32>,
     style: vec4<f32>,
+    material0: vec4<f32>,
+    material1: vec4<f32>,
+    material2: vec4<f32>,
 };
 
 struct BoneMatrices {
@@ -1882,19 +2542,27 @@ struct VertexIn {
     @location(3) weights: vec4<f32>,
     @location(4) uv: vec2<f32>,
     @location(5) color: vec4<f32>,
+    @location(6) tangent: vec3<f32>,
+    @location(7) bitangent: vec3<f32>,
 };
 
 struct VertexOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
-    @location(2) light: f32,
+    @location(2) world_position: vec3<f32>,
+    @location(3) normal: vec3<f32>,
+    @location(4) tangent: vec3<f32>,
+    @location(5) bitangent: vec3<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> bones: BoneMatrices;
 @group(0) @binding(2) var actor_texture: texture_2d<f32>;
 @group(0) @binding(3) var actor_sampler: sampler;
+@group(0) @binding(4) var normal_texture: texture_2d<f32>;
+@group(0) @binding(5) var metallic_roughness_texture: texture_2d<f32>;
+@group(0) @binding(6) var emissive_texture: texture_2d<f32>;
 
 fn bone_transform(joint: f32, position: vec3<f32>) -> vec3<f32> {
     let joint_index = u32(max(joint + 0.5, 0.0));
@@ -1936,6 +2604,8 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let weight_sum = input.weights.x + input.weights.y + input.weights.z + input.weights.w;
     var skinned = input.position;
     var skinned_normal = input.normal;
+    var skinned_tangent = input.tangent;
+    var skinned_bitangent = input.bitangent;
     if (weight_sum > 0.000001) {
         skinned =
             bone_transform(input.joints.x, input.position) * (input.weights.x / weight_sum) +
@@ -1947,6 +2617,16 @@ fn vs_main(input: VertexIn) -> VertexOut {
             bone_transform_vector(input.joints.y, input.normal) * (input.weights.y / weight_sum) +
             bone_transform_vector(input.joints.z, input.normal) * (input.weights.z / weight_sum) +
             bone_transform_vector(input.joints.w, input.normal) * (input.weights.w / weight_sum);
+        skinned_tangent =
+            bone_transform_vector(input.joints.x, input.tangent) * (input.weights.x / weight_sum) +
+            bone_transform_vector(input.joints.y, input.tangent) * (input.weights.y / weight_sum) +
+            bone_transform_vector(input.joints.z, input.tangent) * (input.weights.z / weight_sum) +
+            bone_transform_vector(input.joints.w, input.tangent) * (input.weights.w / weight_sum);
+        skinned_bitangent =
+            bone_transform_vector(input.joints.x, input.bitangent) * (input.weights.x / weight_sum) +
+            bone_transform_vector(input.joints.y, input.bitangent) * (input.weights.y / weight_sum) +
+            bone_transform_vector(input.joints.z, input.bitangent) * (input.weights.z / weight_sum) +
+            bone_transform_vector(input.joints.w, input.bitangent) * (input.weights.w / weight_sum);
     }
 
     let local = vec3<f32>(
@@ -1958,6 +2638,8 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let world = params.actor.xyz + rotated;
 
     let normal_world = normalize(actor_rotate(skinned_normal));
+    let tangent_world = normalize(actor_rotate(skinned_tangent));
+    let bitangent_world = normalize(actor_rotate(skinned_bitangent));
     let right = params.camera1.xyz;
     let up = params.camera2.xyz;
     let forward = params.camera3.xyz;
@@ -1973,21 +2655,62 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let far = max(params.camera2.w, params.camera1.w + 0.001);
     let ndc_z = clamp(1.0 - ((safe_z - params.camera1.w) / (far - params.camera1.w)), 0.0, 1.0);
 
-    let view_normal = normalize(vec3<f32>(
-        dot(normal_world, right),
-        dot(normal_world, up),
-        dot(normal_world, forward),
-    ));
-    let light_dir = normalize(vec3<f32>(-0.35, 0.75, 0.55));
-    let diffuse = max(dot(view_normal, light_dir), 0.0);
-    let light = clamp(0.54 + diffuse * 0.48, 0.42, 1.08);
-
     var out: VertexOut;
-    out.pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);
+    // Preserve camera-space depth in clip-space w. The previous shader wrote
+    // already-divided NDC coordinates with w=1, which forced affine varying
+    // interpolation and visibly warped material UVs on oblique surfaces.
+    out.pos = vec4<f32>(ndc_x * safe_z, ndc_y * safe_z, ndc_z * safe_z, safe_z);
     out.color = input.color;
     out.uv = input.uv;
-    out.light = mix(1.0, light, params.style.y);
+    out.world_position = world;
+    out.normal = normal_world;
+    out.tangent = tangent_world;
+    out.bitangent = bitangent_world;
     return out;
+}
+
+fn distribution_ggx(normal: vec3<f32>, halfway: vec3<f32>, roughness: f32) -> f32 {
+    let alpha = roughness * roughness;
+    let alpha2 = alpha * alpha;
+    let n_dot_h = max(dot(normal, halfway), 0.0);
+    let denominator = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0;
+    return alpha2 / max(3.14159265 * denominator * denominator, 0.000001);
+}
+
+fn geometry_schlick_ggx(n_dot_v: f32, roughness: f32) -> f32 {
+    let k = ((roughness + 1.0) * (roughness + 1.0)) / 8.0;
+    return n_dot_v / max(n_dot_v * (1.0 - k) + k, 0.000001);
+}
+
+fn geometry_smith(normal: vec3<f32>, view: vec3<f32>, light: vec3<f32>, roughness: f32) -> f32 {
+    return geometry_schlick_ggx(max(dot(normal, view), 0.0), roughness) *
+        geometry_schlick_ggx(max(dot(normal, light), 0.0), roughness);
+}
+
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+fn direct_pbr(
+    normal: vec3<f32>,
+    view: vec3<f32>,
+    light: vec3<f32>,
+    radiance: vec3<f32>,
+    base_color: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+    f0: vec3<f32>,
+) -> vec3<f32> {
+    let halfway = normalize(view + light);
+    let n_dot_l = max(dot(normal, light), 0.0);
+    let n_dot_v = max(dot(normal, view), 0.0);
+    let distribution = distribution_ggx(normal, halfway, roughness);
+    let geometry = geometry_smith(normal, view, light, roughness);
+    let fresnel = fresnel_schlick(max(dot(halfway, view), 0.0), f0);
+    let specular = (distribution * geometry * fresnel) / max(4.0 * n_dot_v * n_dot_l, 0.0001);
+    let diffuse_weight = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic);
+    let diffuse = diffuse_weight * base_color / 3.14159265;
+    return (diffuse + specular) * radiance * n_dot_l;
 }
 
 @fragment
@@ -1998,7 +2721,60 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (alpha <= 0.001) {
         discard;
     }
-    return vec4<f32>(sampled.rgb * input.color.rgb * input.light, alpha);
+    let base_srgb = clamp(sampled.rgb * input.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let base_color = pow(base_srgb, vec3<f32>(2.2));
+    let mr_sample = textureSample(metallic_roughness_texture, actor_sampler, uv);
+    let metallic = clamp(params.material0.x * mr_sample.b, 0.0, 1.0);
+    let roughness = clamp(params.material0.y * mr_sample.g, 0.045, 1.0);
+
+    let geometric_normal = normalize(input.normal);
+    let tangent = normalize(input.tangent - geometric_normal * dot(input.tangent, geometric_normal));
+    let bitangent_sign = select(-1.0, 1.0, dot(cross(geometric_normal, tangent), input.bitangent) >= 0.0);
+    let bitangent = normalize(cross(geometric_normal, tangent)) * bitangent_sign;
+    let sampled_normal = textureSample(normal_texture, actor_sampler, uv).xyz * 2.0 - 1.0;
+    let tangent_normal = normalize(vec3<f32>(
+        sampled_normal.x * params.material0.z,
+        sampled_normal.y * params.material0.z,
+        sampled_normal.z,
+    ));
+    let normal = normalize(
+        tangent * tangent_normal.x + bitangent * tangent_normal.y + geometric_normal * tangent_normal.z
+    );
+
+    let view = normalize(params.camera0.xyz - input.world_position);
+    let dielectric_f0 = vec3<f32>(0.04) * params.material0.w * params.material2.rgb;
+    let f0 = mix(dielectric_f0, base_color, metallic);
+    let key_light = normalize(vec3<f32>(-0.42, 0.78, 0.47));
+    let fill_light = normalize(vec3<f32>(0.68, 0.28, 0.51));
+    var lit = direct_pbr(
+        normal, view, key_light, vec3<f32>(4.2, 4.0, 3.75),
+        base_color, metallic, roughness, f0
+    );
+    lit += direct_pbr(
+        normal, view, fill_light, vec3<f32>(1.25, 1.45, 1.75),
+        base_color, metallic, roughness, f0
+    );
+    let n_dot_v = max(dot(normal, view), 0.0);
+    let environment_fresnel = fresnel_schlick(n_dot_v, f0);
+    let diffuse_ambient = base_color * (1.0 - metallic) * vec3<f32>(0.18, 0.19, 0.22);
+    let specular_ambient = environment_fresnel * (0.08 + (1.0 - roughness) * 0.24);
+    lit += diffuse_ambient + specular_ambient;
+
+    let emissive_sample = pow(
+        clamp(textureSample(emissive_texture, actor_sampler, uv).rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
+        vec3<f32>(2.2)
+    );
+    lit += emissive_sample * params.material1.rgb;
+    let force_unlit = max(params.material1.w, params.material2.w);
+    let lighting_mix = params.style.y * (1.0 - force_unlit);
+    let shaded = mix(base_color, lit, lighting_mix);
+    let surface_exposure = mix(params.style.z, 1.0, params.material2.w);
+    let exposed = shaded * surface_exposure;
+    // Reinhard compression keeps metallic highlights and black glass readable.
+    let mapped = exposed / (vec3<f32>(1.0) + exposed);
+    let tone_mapped = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    let display = mix(tone_mapped, base_srgb, params.material2.w);
+    return vec4<f32>(display, alpha);
 }
 "#;
 
@@ -2052,7 +2828,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let ndc_x = (screen_x / params.canvas.x) * 2.0 - 1.0;
     let ndc_y = 1.0 - (screen_y / params.canvas.y) * 2.0;
     let ndc_z = clamp(1.0 - ((safe_z - near) / (far - near)), 0.0, 1.0);
-    out.pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);
+    out.pos = vec4<f32>(ndc_x * safe_z, ndc_y * safe_z, ndc_z * safe_z, safe_z);
     return out;
 }
 
@@ -2786,12 +3562,36 @@ fn perspective_camera_view(
     if !forward[0].is_finite() || !forward[1].is_finite() || !forward[2].is_finite() {
         forward = [0.0, 0.0, -1.0];
     }
-    let world_up = [0.0, 1.0, 0.0];
+    let mut world_up = [
+        eval_number(&world.camera.up_x, 0.0, time)?,
+        eval_number(&world.camera.up_y, 1.0, time)?,
+        eval_number(&world.camera.up_z, 0.0, time)?,
+    ];
+    world_up = normalize3(world_up);
+    if !world_up[0].is_finite() || !world_up[1].is_finite() || !world_up[2].is_finite() {
+        world_up = [0.0, 1.0, 0.0];
+    }
     let mut right = normalize3(cross3(forward, world_up));
     if !right[0].is_finite() || !right[1].is_finite() || !right[2].is_finite() {
         right = [1.0, 0.0, 0.0];
     }
-    let up = normalize3(cross3(right, forward));
+    let mut up = normalize3(cross3(right, forward));
+    let roll = eval_number(&world.camera.roll, 0.0, time)?.to_radians();
+    if roll.abs() > f32::EPSILON {
+        let cos_r = roll.cos();
+        let sin_r = roll.sin();
+        let rolled_right = [
+            right[0] * cos_r + up[0] * sin_r,
+            right[1] * cos_r + up[1] * sin_r,
+            right[2] * cos_r + up[2] * sin_r,
+        ];
+        up = [
+            up[0] * cos_r - right[0] * sin_r,
+            up[1] * cos_r - right[1] * sin_r,
+            up[2] * cos_r - right[2] * sin_r,
+        ];
+        right = rolled_right;
+    }
     let focal_px = (height_f * 0.5) / (fov * 0.5).tan().max(0.001);
     let far = distance.max(1.0) + width_f.max(height_f) / height_f * 24.0;
     Ok(PerspectiveCameraView {
@@ -2844,14 +3644,13 @@ fn draw_actor_debug_projections(
     let distance = eval_number(&world.camera.distance, 3.2, time)?.max(0.2);
 
     for actor in &world.actors {
-        let (model_key, mesh) =
-            load_glb_mesh_resolved(asset_root, &actor.model, actor.path_style, resolver)?;
-        if !mesh_cache.contains_key(&model_key) {
-            mesh_cache.insert(model_key.clone(), mesh);
-        }
-        let mesh = mesh_cache
-            .get(&model_key)
-            .expect("mesh cache entry inserted before render");
+        let (_, mesh) = load_cached_glb_mesh_resolved(
+            asset_root,
+            &actor.model,
+            actor.path_style,
+            resolver,
+            mesh_cache,
+        )?;
         let x = eval_number(&actor.x, 0.0, time)?;
         let y = eval_number(&actor.y, 0.0, time)?;
         let z = eval_number(&actor.z, 0.0, time)?;
@@ -2908,51 +3707,128 @@ fn draw_actor_debug_projections(
 
 #[allow(clippy::too_many_arguments)]
 fn build_actor_gpu_draws(
-    canvas: &mut RgbaImage,
+    mut canvas: Option<&mut RgbaImage>,
+    width: u32,
+    height: u32,
     graph: &WorldGraph,
     world: &WorldNode,
     asset_root: &Path,
     resolver: &dyn AssetResolver,
     time: WorldTime,
     mesh_cache: &mut HashMap<PathBuf, GlbMeshData>,
+    effective_bounds_cache: &mut HashMap<PathBuf, ([f32; 3], [f32; 3])>,
     gpu_static_draw_cache: &mut HashMap<GpuWorldStaticPlanKey, Vec<GpuWorldStaticDraw>>,
     skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
-) -> Result<Vec<GpuWorldDraw>, WorldRenderError> {
+    material_overrides: &[WorldMaterialTextureOverride],
+) -> Result<(Vec<GpuWorldDraw>, ActorBuildStages), WorldRenderError> {
     let camera_zoom = eval_number(&world.camera.zoom, 1.0, time)?.max(0.05);
-    let camera_view = perspective_camera_view(world, canvas.width(), canvas.height(), time)?;
+    let camera_view = perspective_camera_view(world, width, height, time)?;
     let mut draws = Vec::new();
 
+    // Resolve animation-only GLBs into the same retained mesh cache. Only
+    // skeleton channels are sampled; their geometry is never submitted.
+    let asset_started = ProfileClock::now();
+    let mut animation_keys = HashMap::<String, PathBuf>::new();
+    for asset in &graph.animation_assets {
+        let (key, _) = load_cached_glb_animation_resolved(
+            asset_root,
+            &asset.src,
+            WorldPathStyle::Relative,
+            resolver,
+            mesh_cache,
+        )?;
+        animation_keys.insert(asset.id.clone(), key);
+    }
+
+    // Prepare every actor before drawing so cross-actor constraints can inspect
+    // both sampled skeletons at the same frame.
+    let mut model_keys = HashMap::<String, PathBuf>::new();
     for actor in &world.actors {
-        let (model_key, mesh) =
-            load_glb_mesh_resolved(asset_root, &actor.model, actor.path_style, resolver)?;
-        if !mesh_cache.contains_key(&model_key) {
-            mesh_cache.insert(model_key.clone(), mesh);
-        }
+        let (model_key, _) = load_cached_glb_mesh_resolved(
+            asset_root,
+            &actor.model,
+            actor.path_style,
+            resolver,
+            mesh_cache,
+        )?;
+        model_keys.insert(actor.id.clone(), model_key);
+    }
+    let asset_resolve_ms = asset_started.elapsed().as_secs_f64() * 1000.0;
+    let animation_started = ProfileClock::now();
+    let mut sampled_by_actor = HashMap::<String, HashMap<usize, SampledNodeTrs>>::new();
+    let mut poses = HashMap::<String, ActorFramePose>::new();
+    for actor in &world.actors {
+        let model_key = model_keys
+            .get(&actor.id)
+            .expect("actor model key prepared before animation sampling");
         let mesh = mesh_cache
-            .get(&model_key)
-            .expect("mesh cache entry inserted before render");
-        let x = eval_number(&actor.x, 0.0, time)?;
-        let y = eval_number(&actor.y, 0.0, time)?;
-        let z = eval_number(&actor.z, 0.0, time)?;
-        let yaw = eval_number(&actor.yaw, 0.0, time)?;
-        let pitch = eval_number(&actor.pitch, 0.0, time)?;
-        let roll = eval_number(&actor.roll, 0.0, time)?;
-        let scale = eval_number(&actor.scale, 1.0, time)?.max(0.01);
-        let opacity = eval_number(&actor.opacity, 1.0, time)?.clamp(0.0, 1.0);
+            .get(model_key)
+            .expect("target GLB inserted before external animation sampling");
+        sampled_by_actor.insert(
+            actor.id.clone(),
+            sample_external_actor_actions(graph, actor, mesh, &animation_keys, mesh_cache, time)?,
+        );
+        poses.insert(actor.id.clone(), actor_frame_pose(actor, time)?);
+    }
+    let animation_sample_ms = animation_started.elapsed().as_secs_f64() * 1000.0;
+    let constraints_started = ProfileClock::now();
+    let constraint_overrides = scene_constraint_overrides(
+        graph,
+        world,
+        &model_keys,
+        mesh_cache,
+        &sampled_by_actor,
+        &poses,
+        time,
+    )?;
+    let constraints_ms = constraints_started.elapsed().as_secs_f64() * 1000.0;
+
+    let draw_started = ProfileClock::now();
+    for actor in &world.actors {
+        let model_key = model_keys
+            .get(&actor.id)
+            .expect("actor model key prepared before rendering");
+        let mesh = mesh_cache
+            .get(model_key)
+            .expect("target GLB inserted before rendering");
+        let effective_bounds = *effective_bounds_cache
+            .entry(model_key.clone())
+            .or_insert_with(|| effective_mesh_bounds(mesh));
+        let external_sampled = sampled_by_actor
+            .get(&actor.id)
+            .expect("actor sample prepared before rendering");
+        let pose = poses
+            .get(&actor.id)
+            .copied()
+            .expect("actor pose prepared before rendering");
+        let actor_constraint_overrides = constraint_overrides
+            .get(&actor.id)
+            .cloned()
+            .unwrap_or_default();
+        let x = pose.position[0];
+        let y = pose.position[1];
+        let z = pose.position[2];
+        let yaw = pose.rotation_deg[1];
+        let pitch = pose.rotation_deg[0];
+        let roll = pose.rotation_deg[2];
+        let scale = pose.scale;
+        let opacity = pose.opacity;
         if mesh.positions.is_empty() || mesh.indices.len() < 3 {
-            draw_actor_placeholder(
-                canvas,
-                actor,
-                false,
-                x,
-                y,
-                yaw,
-                0.0,
-                35.0,
-                3.2,
-                scale * camera_zoom,
-                opacity,
-            );
+            if let Some(canvas) = canvas.as_deref_mut() {
+                draw_actor_placeholder(
+                    canvas,
+                    actor,
+                    false,
+                    x,
+                    y,
+                    yaw,
+                    0.0,
+                    35.0,
+                    3.2,
+                    scale * camera_zoom,
+                    opacity,
+                );
+            }
             continue;
         }
         let static_plan_key = GpuWorldStaticPlanKey {
@@ -2965,7 +3841,7 @@ fn build_actor_gpu_draws(
             hide_materials: actor.hide_materials.clone(),
         };
         if !gpu_static_draw_cache.contains_key(&static_plan_key) {
-            let static_draws = build_actor_mesh_gpu_static_draws(actor, mesh, &model_key);
+            let static_draws = build_actor_mesh_gpu_static_draws(actor, mesh, model_key);
             gpu_static_draw_cache.insert(static_plan_key.clone(), static_draws);
         }
         let static_draws = gpu_static_draw_cache
@@ -2975,9 +3851,10 @@ fn build_actor_gpu_draws(
             graph,
             actor,
             mesh,
+            effective_bounds,
             static_draws,
-            canvas.width(),
-            canvas.height(),
+            width,
+            height,
             x,
             y,
             z,
@@ -2988,12 +3865,414 @@ fn build_actor_gpu_draws(
             scale * camera_zoom,
             opacity,
             time,
-            &model_key,
+            model_key,
             skinning_strategy_cache,
+            material_overrides,
+            external_sampled,
+            &actor_constraint_overrides,
         )?;
         draws.extend(actor_draws);
     }
-    Ok(draws)
+    let draw_assembly_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
+    Ok((
+        draws,
+        ActorBuildStages {
+            asset_resolve_ms,
+            animation_sample_ms,
+            constraints_ms,
+            draw_assembly_ms,
+        },
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActorFramePose {
+    position: [f32; 3],
+    rotation_deg: [f32; 3],
+    scale: f32,
+    opacity: f32,
+}
+
+fn actor_frame_pose(
+    actor: &WorldActor,
+    time: WorldTime,
+) -> Result<ActorFramePose, WorldRenderError> {
+    Ok(ActorFramePose {
+        position: [
+            eval_number(&actor.x, 0.0, time)?,
+            eval_number(&actor.y, 0.0, time)?,
+            eval_number(&actor.z, 0.0, time)?,
+        ],
+        rotation_deg: [
+            eval_number(&actor.pitch, 0.0, time)?,
+            eval_number(&actor.yaw, 0.0, time)?,
+            eval_number(&actor.roll, 0.0, time)?,
+        ],
+        scale: eval_number(&actor.scale, 1.0, time)?.max(0.01),
+        opacity: eval_number(&actor.opacity, 1.0, time)?.clamp(0.0, 1.0),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scene_constraint_overrides(
+    graph: &WorldGraph,
+    world: &WorldNode,
+    model_keys: &HashMap<String, PathBuf>,
+    mesh_cache: &HashMap<PathBuf, GlbMeshData>,
+    sampled_by_actor: &HashMap<String, HashMap<usize, SampledNodeTrs>>,
+    poses: &HashMap<String, ActorFramePose>,
+    time: WorldTime,
+) -> Result<HashMap<String, HashMap<String, BoneOverride>>, WorldRenderError> {
+    let mut out = HashMap::<String, HashMap<String, BoneOverride>>::new();
+    let now_ms = time.time_sec() * 1000.0;
+    for constraint in &graph.constraints {
+        if now_ms < constraint.at_ms as f32
+            || now_ms > constraint.at_ms.saturating_add(constraint.duration_ms) as f32
+        {
+            continue;
+        }
+        let Some((source_actor_id, source_bone)) = constraint.source.rsplit_once('.') else {
+            continue;
+        };
+        let Some(source_actor) = world
+            .actors
+            .iter()
+            .find(|actor| actor.id == source_actor_id)
+        else {
+            continue;
+        };
+        let Some(source_mesh) = model_keys
+            .get(source_actor_id)
+            .and_then(|key| mesh_cache.get(key))
+        else {
+            continue;
+        };
+        let Some(source_pose) = poses.get(source_actor_id).copied() else {
+            continue;
+        };
+        let source_sampled = sampled_by_actor
+            .get(source_actor_id)
+            .cloned()
+            .unwrap_or_default();
+        let target_world = if let Some(point) = constraint.target_point {
+            point
+        } else {
+            let Some((target_actor_id, target_bone)) = constraint.target.rsplit_once('.') else {
+                continue;
+            };
+            let Some(target_actor) = world
+                .actors
+                .iter()
+                .find(|actor| actor.id == target_actor_id)
+            else {
+                continue;
+            };
+            let Some(target_mesh) = model_keys
+                .get(target_actor_id)
+                .and_then(|key| mesh_cache.get(key))
+            else {
+                continue;
+            };
+            let Some(target_pose) = poses.get(target_actor_id).copied() else {
+                continue;
+            };
+            let target_sampled = sampled_by_actor
+                .get(target_actor_id)
+                .cloned()
+                .unwrap_or_default();
+            let target_profile = actor_model_profile(graph, target_actor);
+            let Some(target_node_index) =
+                target_node_for_canonical_bone(target_mesh, target_profile, target_bone)
+            else {
+                continue;
+            };
+            let target_overrides =
+                actor_bone_overrides_for_mesh(graph, target_actor, Some(target_mesh), time)?;
+            let target_matrices =
+                global_node_matrices_with_sampled(target_mesh, &target_overrides, &target_sampled);
+            let Some(target_matrix) = target_matrices.get(target_node_index).copied() else {
+                continue;
+            };
+            actor_model_point_to_world(matrix_translation(target_matrix), target_mesh, target_pose)
+        };
+        let target_source_local =
+            actor_world_point_to_model(target_world, source_mesh, source_pose);
+        let Some((root_bone, mid_bone, end_bone)) = humanoid_two_bone_chain(source_bone) else {
+            continue;
+        };
+        let source_profile = actor_model_profile(graph, source_actor);
+        let Some(root_index) =
+            target_node_for_canonical_bone(source_mesh, source_profile, root_bone)
+        else {
+            continue;
+        };
+        let Some(mid_index) = target_node_for_canonical_bone(source_mesh, source_profile, mid_bone)
+        else {
+            continue;
+        };
+        let Some(end_index) = target_node_for_canonical_bone(source_mesh, source_profile, end_bone)
+        else {
+            continue;
+        };
+        let root_name = source_mesh.nodes[root_index]
+            .name
+            .as_deref()
+            .unwrap_or(root_bone);
+        let mid_name = source_mesh.nodes[mid_index]
+            .name
+            .as_deref()
+            .unwrap_or(mid_bone);
+        let end_name = source_mesh.nodes[end_index]
+            .name
+            .as_deref()
+            .unwrap_or(end_bone);
+        let weight = eval_number(&constraint.weight, 1.0, time)?.clamp(0.0, 1.0);
+        if weight <= f32::EPSILON {
+            continue;
+        }
+        let source_overrides = if let Some(overrides) = out.get_mut(source_actor_id) {
+            overrides
+        } else {
+            let base = actor_bone_overrides_for_mesh(graph, source_actor, Some(source_mesh), time)?;
+            out.entry(source_actor_id.to_string()).or_insert(base)
+        };
+        solve_two_bone_constraint(
+            source_mesh,
+            root_name,
+            mid_name,
+            end_name,
+            root_index,
+            mid_index,
+            end_index,
+            target_source_local,
+            weight,
+            &source_sampled,
+            source_overrides,
+        );
+    }
+    Ok(out)
+}
+
+fn humanoid_two_bone_chain(end: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match end {
+        "hand_l" => Some(("upper_arm_l", "forearm_l", "hand_l")),
+        "hand_r" => Some(("upper_arm_r", "forearm_r", "hand_r")),
+        "foot_l" => Some(("upper_leg_l", "lower_leg_l", "foot_l")),
+        "foot_r" => Some(("upper_leg_r", "lower_leg_r", "foot_r")),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_two_bone_constraint(
+    mesh: &GlbMeshData,
+    root_name: &str,
+    mid_name: &str,
+    _end_name: &str,
+    root_index: usize,
+    mid_index: usize,
+    end_index: usize,
+    target: [f32; 3],
+    weight: f32,
+    sampled: &HashMap<usize, SampledNodeTrs>,
+    overrides: &mut HashMap<String, BoneOverride>,
+) {
+    let matrices = global_node_matrices_with_sampled(mesh, overrides, sampled);
+    let root = matrix_translation(matrices[root_index]);
+    let mid = matrix_translation(matrices[mid_index]);
+    let end = matrix_translation(matrices[end_index]);
+    let planes = [
+        (0usize, 1usize, 2usize),
+        (0usize, 2usize, 1usize),
+        (1usize, 2usize, 0usize),
+    ];
+    let (u, v, rotation_axis) = planes
+        .into_iter()
+        .max_by(|(a_u, a_v, _), (b_u, b_v, _)| {
+            let a = (target[*a_u] - root[*a_u]).powi(2) + (target[*a_v] - root[*a_v]).powi(2);
+            let b = (target[*b_u] - root[*b_u]).powi(2) + (target[*b_v] - root[*b_v]).powi(2);
+            a.total_cmp(&b)
+        })
+        .unwrap_or((0, 1, 2));
+    let length_a = distance_2d(root, mid, u, v).max(0.0001);
+    let length_b = distance_2d(mid, end, u, v).max(0.0001);
+    let delta = [target[u] - root[u], target[v] - root[v]];
+    let distance = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt().clamp(
+        (length_a - length_b).abs() + 0.0001,
+        length_a + length_b - 0.0001,
+    );
+    let target_angle = delta[1].atan2(delta[0]);
+    let root_offset = ((length_a * length_a + distance * distance - length_b * length_b)
+        / (2.0 * length_a * distance))
+        .clamp(-1.0, 1.0)
+        .acos();
+    let current_bend =
+        (mid[v] - root[v]) * (end[u] - mid[u]) - (mid[u] - root[u]) * (end[v] - mid[v]);
+    let bend_sign = if current_bend.abs() <= 0.0001 {
+        if root_name.ends_with("_l") { 1.0 } else { -1.0 }
+    } else {
+        current_bend.signum()
+    };
+    let desired_root_angle = target_angle + bend_sign * root_offset;
+    let desired_mid = [
+        root[u] + desired_root_angle.cos() * length_a,
+        root[v] + desired_root_angle.sin() * length_a,
+    ];
+    let desired_second_angle = (target[v] - desired_mid[1]).atan2(target[u] - desired_mid[0]);
+    let current_root_angle = segment_angle(root, mid, u, v);
+    let root_response = local_axis_plane_response_with_sampled(
+        mesh,
+        overrides,
+        sampled,
+        root_name,
+        root_index,
+        mid_index,
+        rotation_axis,
+        u,
+        v,
+    );
+    let root_delta = normalize_angle(desired_root_angle - current_root_angle).to_degrees()
+        / stable_axis_response(root_response);
+    let mut root_solved = overrides.clone();
+    root_solved
+        .entry(root_name.to_string())
+        .or_insert_with(BoneOverride::identity)
+        .rotation_deg[rotation_axis] += root_delta;
+    let solved = global_node_matrices_with_sampled(mesh, &root_solved, sampled);
+    let solved_mid = matrix_translation(solved[mid_index]);
+    let solved_end = matrix_translation(solved[end_index]);
+    let current_second_angle = segment_angle(solved_mid, solved_end, u, v);
+    let mid_response = local_axis_plane_response_with_sampled(
+        mesh,
+        &root_solved,
+        sampled,
+        mid_name,
+        mid_index,
+        end_index,
+        rotation_axis,
+        u,
+        v,
+    );
+    let mid_delta = normalize_angle(desired_second_angle - current_second_angle).to_degrees()
+        / stable_axis_response(mid_response);
+    overrides
+        .entry(root_name.to_string())
+        .or_insert_with(BoneOverride::identity)
+        .rotation_deg[rotation_axis] += root_delta * weight;
+    overrides
+        .entry(mid_name.to_string())
+        .or_insert_with(BoneOverride::identity)
+        .rotation_deg[rotation_axis] += mid_delta * weight;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_axis_plane_response_with_sampled(
+    mesh: &GlbMeshData,
+    overrides: &HashMap<String, BoneOverride>,
+    sampled: &HashMap<usize, SampledNodeTrs>,
+    node_name: &str,
+    start_index: usize,
+    end_index: usize,
+    rotation_axis: usize,
+    u: usize,
+    v: usize,
+) -> f32 {
+    const PROBE_DEGREES: f32 = 1.0;
+    let matrices = global_node_matrices_with_sampled(mesh, overrides, sampled);
+    let base_angle = segment_angle(
+        matrix_translation(matrices[start_index]),
+        matrix_translation(matrices[end_index]),
+        u,
+        v,
+    );
+    let mut probed = overrides.clone();
+    probed
+        .entry(node_name.to_string())
+        .or_insert_with(BoneOverride::identity)
+        .rotation_deg[rotation_axis] += PROBE_DEGREES;
+    let matrices = global_node_matrices_with_sampled(mesh, &probed, sampled);
+    let probed_angle = segment_angle(
+        matrix_translation(matrices[start_index]),
+        matrix_translation(matrices[end_index]),
+        u,
+        v,
+    );
+    normalize_angle(probed_angle - base_angle).to_degrees() / PROBE_DEGREES
+}
+
+fn actor_model_point_to_world(
+    point: [f32; 3],
+    mesh: &GlbMeshData,
+    pose: ActorFramePose,
+) -> [f32; 3] {
+    let height = (mesh.bounds_max[1] - mesh.bounds_min[1]).abs().max(0.001);
+    let center_x = (mesh.bounds_min[0] + mesh.bounds_max[0]) * 0.5;
+    let center_z = (mesh.bounds_min[2] + mesh.bounds_max[2]) * 0.5;
+    let local = [
+        (point[0] - center_x) * pose.scale / height,
+        (point[1] - mesh.bounds_min[1]) * pose.scale / height,
+        (point[2] - center_z) * pose.scale / height,
+    ];
+    let rotated = rotate_actor_vector(local, pose.rotation_deg);
+    std::array::from_fn(|axis| pose.position[axis] + rotated[axis])
+}
+
+fn actor_world_point_to_model(
+    point: [f32; 3],
+    mesh: &GlbMeshData,
+    pose: ActorFramePose,
+) -> [f32; 3] {
+    let world = std::array::from_fn(|axis| point[axis] - pose.position[axis]);
+    let local = inverse_rotate_actor_vector(world, pose.rotation_deg);
+    let height = (mesh.bounds_max[1] - mesh.bounds_min[1]).abs().max(0.001);
+    let center_x = (mesh.bounds_min[0] + mesh.bounds_max[0]) * 0.5;
+    let center_z = (mesh.bounds_min[2] + mesh.bounds_max[2]) * 0.5;
+    [
+        local[0] * height / pose.scale + center_x,
+        local[1] * height / pose.scale + mesh.bounds_min[1],
+        local[2] * height / pose.scale + center_z,
+    ]
+}
+
+fn rotate_actor_vector(mut value: [f32; 3], rotation_deg: [f32; 3]) -> [f32; 3] {
+    let [pitch, yaw, roll] = rotation_deg.map(f32::to_radians);
+    value = rotate_y(value, yaw);
+    value = rotate_x(value, pitch);
+    rotate_z(value, roll)
+}
+
+fn inverse_rotate_actor_vector(mut value: [f32; 3], rotation_deg: [f32; 3]) -> [f32; 3] {
+    let [pitch, yaw, roll] = rotation_deg.map(f32::to_radians);
+    value = rotate_z(value, -roll);
+    value = rotate_x(value, -pitch);
+    rotate_y(value, -yaw)
+}
+
+fn rotate_x(value: [f32; 3], angle: f32) -> [f32; 3] {
+    let (sin, cos) = angle.sin_cos();
+    [
+        value[0],
+        value[1] * cos - value[2] * sin,
+        value[1] * sin + value[2] * cos,
+    ]
+}
+
+fn rotate_y(value: [f32; 3], angle: f32) -> [f32; 3] {
+    let (sin, cos) = angle.sin_cos();
+    [
+        value[0] * cos + value[2] * sin,
+        value[1],
+        -value[0] * sin + value[2] * cos,
+    ]
+}
+
+fn rotate_z(value: [f32; 3], angle: f32) -> [f32; 3] {
+    let (sin, cos) = angle.sin_cos();
+    [
+        value[0] * cos - value[1] * sin,
+        value[0] * sin + value[1] * cos,
+        value[2],
+    ]
 }
 
 fn skinned_actor_positions(
@@ -3012,15 +4291,16 @@ fn skinned_actor_positions(
         return Ok(None);
     }
 
-    let overrides = actor_bone_overrides(graph, actor, time)?;
-    if overrides.is_empty() {
+    let overrides = actor_bone_overrides_for_mesh(graph, actor, Some(mesh), time)?;
+    let has_clip = actor_has_clip_layers(actor) && !mesh.animations.is_empty();
+    if overrides.is_empty() && !has_clip {
         return Ok(None);
     }
-    if !overrides_match_nodes(mesh, &overrides) {
+    if !has_clip && !overrides_match_nodes(mesh, &overrides) {
         return Ok(None);
     }
 
-    let global_matrices = global_node_matrices(mesh, &overrides);
+    let global_matrices = actor_global_node_matrices(graph, actor, mesh, time, &overrides, None)?;
     let joint_matrices = skin
         .joints
         .iter()
@@ -3069,30 +4349,64 @@ fn skinned_actor_positions(
     Ok(Some(out))
 }
 
-fn actor_joint_matrices(
+struct ActorJointFrame {
+    global_matrices: Option<Vec<[f32; 16]>>,
+}
+
+fn prepare_actor_joint_frame(
     graph: &WorldGraph,
     actor: &WorldActor,
     mesh: &GlbMeshData,
-    model_path: &Path,
-    mesh_node: Option<usize>,
     time: WorldTime,
-    skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
-) -> Result<Vec<[f32; 16]>, WorldRenderError> {
+    external_sampled: &HashMap<usize, SampledNodeTrs>,
+    constraint_overrides: &HashMap<String, BoneOverride>,
+) -> Result<ActorJointFrame, WorldRenderError> {
     let Some(skin) = mesh.skin.as_ref() else {
-        return Ok(vec![mat4_identity()]);
+        return Ok(ActorJointFrame {
+            global_matrices: None,
+        });
     };
     if mesh.nodes.is_empty()
         || mesh.joints.len() != mesh.positions.len()
         || mesh.weights.len() != mesh.positions.len()
     {
-        return Ok(vec![mat4_identity()]);
+        return Ok(ActorJointFrame {
+            global_matrices: None,
+        });
     }
 
-    let overrides = actor_bone_overrides(graph, actor, time)?;
-    if overrides.is_empty() || !overrides_match_nodes(mesh, &overrides) {
-        return Ok(vec![mat4_identity(); skin.joints.len().max(1)]);
+    let mut overrides = actor_bone_overrides_for_mesh(graph, actor, Some(mesh), time)?;
+    for (bone, value) in constraint_overrides {
+        overrides.insert(bone.clone(), *value);
     }
-    let global_matrices = global_node_matrices(mesh, &overrides);
+    let has_clip = (actor_has_clip_layers(actor) && !mesh.animations.is_empty())
+        || !external_sampled.is_empty();
+    if !has_clip && (overrides.is_empty() || !overrides_match_nodes(mesh, &overrides)) {
+        let _ = skin;
+        return Ok(ActorJointFrame {
+            global_matrices: None,
+        });
+    }
+    let global_matrices =
+        actor_global_node_matrices(graph, actor, mesh, time, &overrides, Some(external_sampled))?;
+    Ok(ActorJointFrame {
+        global_matrices: Some(global_matrices),
+    })
+}
+
+fn actor_joint_matrices(
+    mesh: &GlbMeshData,
+    model_path: &Path,
+    mesh_node: Option<usize>,
+    frame: &ActorJointFrame,
+    skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
+) -> Vec<[f32; 16]> {
+    let Some(skin) = mesh.skin.as_ref() else {
+        return vec![mat4_identity()];
+    };
+    let Some(global_matrices) = frame.global_matrices.as_deref() else {
+        return vec![mat4_identity(); skin.joints.len().max(1)];
+    };
     let cache_key = SkinningStrategyKey {
         model_path: model_path.to_path_buf(),
         mesh_node,
@@ -3111,7 +4425,7 @@ fn actor_joint_matrices(
     if joint_matrices.is_empty() {
         joint_matrices.push(mat4_identity());
     }
-    Ok(joint_matrices)
+    joint_matrices
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3442,6 +4756,15 @@ impl BoneOverride {
         self.scale *= 1.0 + (other.scale - 1.0) * weight;
     }
 
+    fn replaced_with(other: Self, weight: f32) -> Self {
+        let weight = weight.clamp(0.0, 1.0);
+        Self {
+            translation: std::array::from_fn(|axis| other.translation[axis] * weight),
+            rotation_deg: std::array::from_fn(|axis| other.rotation_deg[axis] * weight),
+            scale: 1.0 + (other.scale - 1.0) * weight,
+        }
+    }
+
     fn is_identity(self) -> bool {
         self.translation.iter().all(|value| value.abs() <= 0.0001)
             && self.rotation_deg.iter().all(|value| value.abs() <= 0.0001)
@@ -3449,9 +4772,10 @@ impl BoneOverride {
     }
 }
 
-fn actor_bone_overrides(
+fn actor_bone_overrides_for_mesh(
     graph: &WorldGraph,
     actor: &WorldActor,
+    mesh: Option<&GlbMeshData>,
     time: WorldTime,
 ) -> Result<HashMap<String, BoneOverride>, WorldRenderError> {
     let profile = actor_model_profile(graph, actor);
@@ -3476,6 +4800,13 @@ fn actor_bone_overrides(
     let mut out = HashMap::<String, BoneOverride>::new();
     if let Some(axis_map) = axis_map {
         for axis in &axis_map.axes {
+            // A raw external clip already carries a complete pose relative to
+            // its source bind pose. Reapplying the target's semantic rest
+            // offset double-corrects calibrated limbs (for example, Reze's
+            // relaxed-arm -90 degree offset turned a Mixamo walk forwards).
+            if external_action_drives_bone(graph, actor, &axis.bone, time)? {
+                continue;
+            }
             let transform = rest_pose_axis_transform(axis, axis_map, time)?;
             if transform.is_identity() {
                 continue;
@@ -3495,6 +4826,15 @@ fn actor_bone_overrides(
         .iter()
         .filter(|apply| apply.target == actor.id)
     {
+        let elapsed_ms = time.time_sec() * 1000.0 - apply.at_ms as f32;
+        if elapsed_ms < 0.0
+            || (!apply.r#loop
+                && apply
+                    .duration_ms
+                    .is_some_and(|duration| elapsed_ms > duration as f32))
+        {
+            continue;
+        }
         let Some(action) = graph
             .actions
             .iter()
@@ -3507,29 +4847,304 @@ fn actor_bone_overrides(
                 continue;
             }
         }
-        let Some(action_time) = action_local_time_sec(action, apply.at_ms, apply.r#loop, time)
+        let mut speed = eval_number(&apply.speed, 1.0, time)?.max(0.0);
+        if !apply.r#loop
+            && let Some(duration_ms) = apply.duration_ms.filter(|duration| *duration > 0)
+        {
+            speed *= action.duration_ms as f32 / duration_ms as f32;
+        }
+        let Some(action_time) =
+            action_local_time_sec(action, apply.at_ms, apply.r#loop, speed, time)
         else {
             continue;
         };
-        let weight = eval_number(&apply.weight, 1.0, time)?.clamp(0.0, 1.0);
+        let weight = (eval_number(&apply.weight, 1.0, time)?
+            * action_blend_envelope(action, apply, action_time, speed, time)?)
+        .clamp(0.0, 1.0);
         if weight <= 0.0 {
             continue;
         }
 
         for (bone_id, transform) in action_pose_transform(action, action_time, time, axis_map)? {
-            if transform.is_identity() {
+            if transform.is_identity() || !bone_matches_body_mask(&bone_id, &apply.mask) {
                 continue;
             }
             let node_name = bone_to_node
                 .get(bone_id.as_str())
                 .copied()
                 .unwrap_or(bone_id.as_str());
-            out.entry(node_name.to_string())
-                .or_insert_with(BoneOverride::identity)
-                .add_weighted(transform, weight);
+            if apply.mode.eq_ignore_ascii_case("additive") {
+                out.entry(node_name.to_string())
+                    .or_insert_with(BoneOverride::identity)
+                    .add_weighted(transform, weight);
+            } else {
+                out.insert(
+                    node_name.to_string(),
+                    BoneOverride::replaced_with(transform, weight),
+                );
+            }
+        }
+        if let Some(mesh) = mesh {
+            apply_two_bone_ik_overrides(
+                mesh,
+                action,
+                &bone_to_node,
+                &apply.mask,
+                weight,
+                time,
+                &mut out,
+            )?;
         }
     }
     Ok(out)
+}
+
+fn external_action_drives_bone(
+    graph: &WorldGraph,
+    actor: &WorldActor,
+    canonical_bone: &str,
+    time: WorldTime,
+) -> Result<bool, WorldRenderError> {
+    for apply in graph
+        .apply_actions
+        .iter()
+        .filter(|apply| apply.target == actor.id)
+    {
+        if !graph
+            .animation_assets
+            .iter()
+            .any(|asset| asset.id == apply.action)
+        {
+            continue;
+        }
+        let elapsed_ms = time.time_sec() * 1000.0 - apply.at_ms as f32;
+        if elapsed_ms < 0.0
+            || (!apply.r#loop
+                && apply
+                    .duration_ms
+                    .is_some_and(|duration| elapsed_ms > duration as f32))
+        {
+            continue;
+        }
+        if eval_number(&apply.weight, 1.0, time)? <= f32::EPSILON {
+            continue;
+        }
+        if bone_matches_body_mask(canonical_bone, &apply.mask) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_two_bone_ik_overrides(
+    mesh: &GlbMeshData,
+    action: &WorldAction,
+    bone_to_node: &HashMap<&str, &str>,
+    mask: &[String],
+    action_weight: f32,
+    time: WorldTime,
+    overrides: &mut HashMap<String, BoneOverride>,
+) -> Result<(), WorldRenderError> {
+    for ik in &action.iks {
+        if !bone_matches_body_mask(&ik.root, mask) && !bone_matches_body_mask(&ik.mid, mask) {
+            continue;
+        }
+        let root_name = bone_to_node
+            .get(ik.root.as_str())
+            .copied()
+            .unwrap_or(ik.root.as_str());
+        let mid_name = bone_to_node
+            .get(ik.mid.as_str())
+            .copied()
+            .unwrap_or(ik.mid.as_str());
+        let end_name = bone_to_node
+            .get(ik.end.as_str())
+            .copied()
+            .unwrap_or(ik.end.as_str());
+        let Some(root_index) = node_index_by_name(mesh, root_name) else {
+            continue;
+        };
+        let Some(mid_index) = node_index_by_name(mesh, mid_name) else {
+            continue;
+        };
+        let Some(end_index) = node_index_by_name(mesh, end_name) else {
+            continue;
+        };
+
+        let matrices = global_node_matrices(mesh, overrides);
+        let root = matrix_translation(matrices[root_index]);
+        let mid = matrix_translation(matrices[mid_index]);
+        let end = matrix_translation(matrices[end_index]);
+        let target = [
+            eval_number(&ik.target_x, end[0], time)?,
+            eval_number(&ik.target_y, end[1], time)?,
+            eval_number(&ik.target_z, end[2], time)?,
+        ];
+        let ik_weight = (eval_number(&ik.weight, 1.0, time)? * action_weight).clamp(0.0, 1.0);
+        if ik_weight <= f32::EPSILON {
+            continue;
+        }
+        let (u, v, rotation_axis) = match ik.plane.to_ascii_lowercase().as_str() {
+            "xz" => (0usize, 2usize, 1usize),
+            "yz" => (1usize, 2usize, 0usize),
+            _ => (0usize, 1usize, 2usize),
+        };
+        let length_a = distance_2d(root, mid, u, v).max(0.0001);
+        let length_b = distance_2d(mid, end, u, v).max(0.0001);
+        let target_delta = [target[u] - root[u], target[v] - root[v]];
+        let target_distance = (target_delta[0] * target_delta[0]
+            + target_delta[1] * target_delta[1])
+            .sqrt()
+            .clamp(
+                (length_a - length_b).abs() + 0.0001,
+                length_a + length_b - 0.0001,
+            );
+        let target_angle = target_delta[1].atan2(target_delta[0]);
+        let mut bend_sign = eval_number(&ik.bend, 1.0, time)?.signum();
+        if bend_sign == 0.0 {
+            bend_sign = 1.0;
+        }
+        if let (Some(px), Some(py)) = (&ik.pole_x, &ik.pole_y) {
+            let pole = [
+                eval_number(px, mid[0], time)?,
+                eval_number(py, mid[1], time)?,
+                ik.pole_z
+                    .as_ref()
+                    .map(|value| eval_number(value, mid[2], time))
+                    .transpose()?
+                    .unwrap_or(mid[2]),
+            ];
+            let cross =
+                target_delta[0] * (pole[v] - root[v]) - target_delta[1] * (pole[u] - root[u]);
+            if cross.abs() > 0.0001 {
+                bend_sign = cross.signum();
+            }
+        }
+        let root_offset = ((length_a * length_a + target_distance * target_distance
+            - length_b * length_b)
+            / (2.0 * length_a * target_distance))
+            .clamp(-1.0, 1.0)
+            .acos();
+        let desired_root_angle = target_angle + bend_sign * root_offset;
+        let desired_mid = [
+            root[u] + desired_root_angle.cos() * length_a,
+            root[v] + desired_root_angle.sin() * length_a,
+        ];
+        let desired_second_angle = (target[v] - desired_mid[1]).atan2(target[u] - desired_mid[0]);
+        let current_root_angle = segment_angle(root, mid, u, v);
+        let root_response = local_axis_plane_response(
+            mesh,
+            overrides,
+            root_name,
+            root_index,
+            mid_index,
+            rotation_axis,
+            u,
+            v,
+        );
+        let root_delta = normalize_angle(desired_root_angle - current_root_angle).to_degrees()
+            / stable_axis_response(root_response);
+
+        // The elbow is solved after applying the full root correction. Measuring
+        // both local-axis responses from the actual node matrices handles mirrored
+        // limbs and rigs whose local Z axis points opposite to the solve plane.
+        let mut root_solved_overrides = overrides.clone();
+        root_solved_overrides
+            .entry(root_name.to_string())
+            .or_insert_with(BoneOverride::identity)
+            .rotation_deg[rotation_axis] += root_delta;
+        let root_solved_matrices = global_node_matrices(mesh, &root_solved_overrides);
+        let solved_mid = matrix_translation(root_solved_matrices[mid_index]);
+        let solved_end = matrix_translation(root_solved_matrices[end_index]);
+        let current_second_angle = segment_angle(solved_mid, solved_end, u, v);
+        let mid_response = local_axis_plane_response(
+            mesh,
+            &root_solved_overrides,
+            mid_name,
+            mid_index,
+            end_index,
+            rotation_axis,
+            u,
+            v,
+        );
+        let mid_delta = normalize_angle(desired_second_angle - current_second_angle).to_degrees()
+            / stable_axis_response(mid_response);
+
+        overrides
+            .entry(root_name.to_string())
+            .or_insert_with(BoneOverride::identity)
+            .rotation_deg[rotation_axis] += root_delta * ik_weight;
+        overrides
+            .entry(mid_name.to_string())
+            .or_insert_with(BoneOverride::identity)
+            .rotation_deg[rotation_axis] += mid_delta * ik_weight;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_axis_plane_response(
+    mesh: &GlbMeshData,
+    overrides: &HashMap<String, BoneOverride>,
+    node_name: &str,
+    start_index: usize,
+    end_index: usize,
+    rotation_axis: usize,
+    u: usize,
+    v: usize,
+) -> f32 {
+    const PROBE_DEGREES: f32 = 1.0;
+    let matrices = global_node_matrices(mesh, overrides);
+    let start = matrix_translation(matrices[start_index]);
+    let end = matrix_translation(matrices[end_index]);
+    let base_angle = segment_angle(start, end, u, v);
+
+    let mut probed = overrides.clone();
+    probed
+        .entry(node_name.to_string())
+        .or_insert_with(BoneOverride::identity)
+        .rotation_deg[rotation_axis] += PROBE_DEGREES;
+    let probed_matrices = global_node_matrices(mesh, &probed);
+    let probed_start = matrix_translation(probed_matrices[start_index]);
+    let probed_end = matrix_translation(probed_matrices[end_index]);
+    normalize_angle(segment_angle(probed_start, probed_end, u, v) - base_angle).to_degrees()
+        / PROBE_DEGREES
+}
+
+fn stable_axis_response(response: f32) -> f32 {
+    if response.abs() < 0.05 { 1.0 } else { response }
+}
+
+fn segment_angle(start: [f32; 3], end: [f32; 3], u: usize, v: usize) -> f32 {
+    (end[v] - start[v]).atan2(end[u] - start[u])
+}
+
+fn node_index_by_name(mesh: &GlbMeshData, name: &str) -> Option<usize> {
+    mesh.nodes
+        .iter()
+        .find(|node| node.name.as_deref() == Some(name))
+        .map(|node| node.index)
+}
+
+fn matrix_translation(matrix: [f32; 16]) -> [f32; 3] {
+    [matrix[12], matrix[13], matrix[14]]
+}
+
+fn distance_2d(a: [f32; 3], b: [f32; 3], u: usize, v: usize) -> f32 {
+    let du = b[u] - a[u];
+    let dv = b[v] - a[v];
+    (du * du + dv * dv).sqrt()
+}
+
+fn normalize_angle(mut angle: f32) -> f32 {
+    while angle > std::f32::consts::PI {
+        angle -= std::f32::consts::TAU;
+    }
+    while angle < -std::f32::consts::PI {
+        angle += std::f32::consts::TAU;
+    }
+    angle
 }
 
 fn actor_model_profile<'a>(
@@ -3577,13 +5192,14 @@ fn action_local_time_sec(
     action: &WorldAction,
     at_ms: u64,
     should_loop: bool,
+    speed: f32,
     time: WorldTime,
 ) -> Option<f32> {
     let duration_sec = action.duration_ms as f32 / 1000.0;
     if duration_sec <= f32::EPSILON {
         return Some(0.0);
     }
-    let local = time.time_sec() - at_ms as f32 / 1000.0;
+    let local = (time.time_sec() - at_ms as f32 / 1000.0) * speed;
     if local < 0.0 {
         return None;
     }
@@ -3592,6 +5208,90 @@ fn action_local_time_sec(
     } else {
         Some(local.min(duration_sec))
     }
+}
+
+fn action_blend_envelope(
+    action: &WorldAction,
+    apply: &WorldApplyAction,
+    action_time: f32,
+    speed: f32,
+    time: WorldTime,
+) -> Result<f32, WorldRenderError> {
+    let blend_in = eval_number(&apply.blend_in, 0.0, time)?.max(0.0);
+    let blend_out = eval_number(&apply.blend_out, 0.0, time)?.max(0.0);
+    let elapsed = ((time.time_sec() - apply.at_ms as f32 / 1000.0) * speed).max(0.0);
+    let duration = action.duration_ms as f32 / 1000.0;
+    let cycle_time = if apply.r#loop && duration > f32::EPSILON {
+        action_time % duration
+    } else {
+        action_time
+    };
+    let fade_in = if blend_in <= f32::EPSILON {
+        1.0
+    } else {
+        (elapsed / blend_in).clamp(0.0, 1.0)
+    };
+    let fade_out = if blend_out <= f32::EPSILON || duration <= f32::EPSILON {
+        1.0
+    } else {
+        ((duration - cycle_time) / blend_out).clamp(0.0, 1.0)
+    };
+    Ok(fade_in.min(fade_out))
+}
+
+fn bone_matches_body_mask(bone: &str, masks: &[String]) -> bool {
+    if masks.is_empty() {
+        return true;
+    }
+    let normalized = bone.to_ascii_lowercase().replace([' ', '-', '.'], "_");
+    masks.iter().any(|mask| {
+        let mask = mask.to_ascii_lowercase().replace([' ', '-', '.'], "_");
+        if mask == normalized || mask == "all" || mask == "full_body" {
+            return true;
+        }
+        match mask.as_str() {
+            "upper_body" => [
+                "hips", "spine", "chest", "neck", "head", "shoulder", "arm", "forearm", "hand",
+                "wrist", "finger",
+            ]
+            .iter()
+            .any(|part| normalized.contains(part)),
+            "lower_body" => [
+                "hips", "pelvis", "leg", "thigh", "knee", "calf", "ankle", "foot", "toe",
+            ]
+            .iter()
+            .any(|part| normalized.contains(part)),
+            "left_arm" => {
+                (normalized.contains("left") || normalized.ends_with("_l"))
+                    && [
+                        "shoulder", "arm", "elbow", "forearm", "wrist", "hand", "finger",
+                    ]
+                    .iter()
+                    .any(|part| normalized.contains(part))
+            }
+            "right_arm" => {
+                (normalized.contains("right") || normalized.ends_with("_r"))
+                    && [
+                        "shoulder", "arm", "elbow", "forearm", "wrist", "hand", "finger",
+                    ]
+                    .iter()
+                    .any(|part| normalized.contains(part))
+            }
+            "left_leg" => {
+                (normalized.contains("left") || normalized.ends_with("_l"))
+                    && ["leg", "thigh", "knee", "calf", "ankle", "foot", "toe"]
+                        .iter()
+                        .any(|part| normalized.contains(part))
+            }
+            "right_leg" => {
+                (normalized.contains("right") || normalized.ends_with("_r"))
+                    && ["leg", "thigh", "knee", "calf", "ankle", "foot", "toe"]
+                        .iter()
+                        .any(|part| normalized.contains(part))
+            }
+            _ => normalized.starts_with(&mask),
+        }
+    })
 }
 
 fn action_pose_transform(
@@ -3817,17 +5517,713 @@ fn parse_axis_binding(raw: &str) -> Option<(usize, f32)> {
     Some((axis, sign * scale))
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SampledNodeTrs {
+    translation: Option<[f32; 3]>,
+    rotation: Option<[f32; 4]>,
+    scale: Option<[f32; 3]>,
+}
+
+fn actor_global_node_matrices(
+    graph: &WorldGraph,
+    actor: &WorldActor,
+    mesh: &GlbMeshData,
+    time: WorldTime,
+    overrides: &HashMap<String, BoneOverride>,
+    external_sampled: Option<&HashMap<usize, SampledNodeTrs>>,
+) -> Result<Vec<[f32; 16]>, WorldRenderError> {
+    let mut sampled = sample_actor_clip(graph, actor, mesh, time)?;
+    if let Some(external) = external_sampled {
+        for (node, value) in external {
+            sampled.insert(*node, *value);
+        }
+    }
+    Ok(global_node_matrices_with_sampled(mesh, overrides, &sampled))
+}
+
+fn sample_actor_clip(
+    graph: &WorldGraph,
+    actor: &WorldActor,
+    mesh: &GlbMeshData,
+    time: WorldTime,
+) -> Result<HashMap<usize, SampledNodeTrs>, WorldRenderError> {
+    let profile = actor_model_profile(graph, actor);
+    let mut sampled = HashMap::<usize, SampledNodeTrs>::new();
+    for play in actor_play_layers(actor) {
+        let animation = match play.clip.as_deref() {
+            Some(name) => mesh
+                .animations
+                .iter()
+                .find(|animation| animation.name.as_deref() == Some(name)),
+            None => mesh.animations.first(),
+        };
+        let Some(animation) = animation else {
+            continue;
+        };
+        let speed = eval_number(&play.speed, 1.0, time)?.max(0.0);
+        let raw_time = time.time_sec() * speed;
+        let duration = animation.duration.max(0.0);
+        let clip_time = if play.r#loop && duration > f32::EPSILON {
+            raw_time % duration
+        } else {
+            raw_time.min(duration)
+        };
+        let blend_in = eval_number(&play.blend_in, 0.0, time)?.max(0.0);
+        let blend_out = eval_number(&play.blend_out, 0.0, time)?.max(0.0);
+        let mut weight = eval_number(&play.weight, 1.0, time)?.clamp(0.0, 1.0);
+        if blend_in > f32::EPSILON {
+            weight *= (raw_time / blend_in).clamp(0.0, 1.0);
+        }
+        if !play.r#loop && blend_out > f32::EPSILON && duration > f32::EPSILON {
+            weight *= ((duration - clip_time) / blend_out).clamp(0.0, 1.0);
+        }
+        if weight <= f32::EPSILON {
+            continue;
+        }
+
+        for channel in &animation.channels {
+            let Some(node) = mesh.nodes.get(channel.node_index) else {
+                continue;
+            };
+            if !clip_node_matches_mask(node.name.as_deref(), profile, &play.mask) {
+                continue;
+            }
+            let entry = sampled.entry(channel.node_index).or_default();
+            match sample_animation_channel(channel, clip_time) {
+                Some(GlbAnimationValues::Vec3(values)) => {
+                    let Some(value) = values.first().copied() else {
+                        continue;
+                    };
+                    match channel.property {
+                        GlbAnimationProperty::Translation => {
+                            entry.translation = Some(lerp_vec3(
+                                entry.translation.unwrap_or(node.translation),
+                                value,
+                                weight,
+                            ))
+                        }
+                        GlbAnimationProperty::Scale => {
+                            entry.scale =
+                                Some(lerp_vec3(entry.scale.unwrap_or(node.scale), value, weight))
+                        }
+                        GlbAnimationProperty::Rotation => {}
+                    }
+                }
+                Some(GlbAnimationValues::Quat(values)) => {
+                    if let Some(value) = values.first().copied() {
+                        entry.rotation = Some(nlerp_quat(
+                            entry.rotation.unwrap_or(node.rotation),
+                            value,
+                            weight,
+                        ));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(sampled)
+}
+
+fn sample_external_actor_actions(
+    graph: &WorldGraph,
+    actor: &WorldActor,
+    target_mesh: &GlbMeshData,
+    animation_keys: &HashMap<String, PathBuf>,
+    mesh_cache: &HashMap<PathBuf, GlbMeshData>,
+    time: WorldTime,
+) -> Result<HashMap<usize, SampledNodeTrs>, WorldRenderError> {
+    let target_profile = actor_model_profile(graph, actor);
+    let target_rest_matrices = bind_pose_node_matrices(target_mesh);
+    let target_rest_global = target_rest_matrices
+        .iter()
+        .copied()
+        .map(quat_from_mat4_rotation)
+        .collect::<Vec<_>>();
+    let mut sampled = HashMap::<usize, SampledNodeTrs>::new();
+    for apply in graph
+        .apply_actions
+        .iter()
+        .filter(|apply| apply.target == actor.id)
+    {
+        let Some(asset) = graph
+            .animation_assets
+            .iter()
+            .find(|asset| asset.id == apply.action)
+        else {
+            continue;
+        };
+        let Some(source_mesh) = animation_keys
+            .get(&asset.id)
+            .and_then(|key| mesh_cache.get(key))
+        else {
+            continue;
+        };
+        let source_rest_matrices = global_node_matrices(source_mesh, &HashMap::new());
+        let source_rest_global = source_rest_matrices
+            .iter()
+            .copied()
+            .map(quat_from_mat4_rotation)
+            .collect::<Vec<_>>();
+        let animation = if let Some(name) = asset.clip.as_deref() {
+            source_mesh
+                .animations
+                .iter()
+                .find(|animation| animation.name.as_deref() == Some(name))
+                .ok_or_else(|| WorldRenderError::GpuRender {
+                    message: format!(
+                        "AnimationAsset '{}' clip not found in '{}': {name}",
+                        asset.id, asset.src
+                    ),
+                })?
+        } else {
+            source_mesh
+                .animations
+                .first()
+                .ok_or_else(|| WorldRenderError::GpuRender {
+                    message: format!(
+                        "AnimationAsset '{}' contains no animation clips: {}",
+                        asset.id, asset.src
+                    ),
+                })?
+        };
+        let speed = eval_number(&apply.speed, 1.0, time)?.max(0.0);
+        let timeline_elapsed = time.time_sec() - apply.at_ms as f32 / 1000.0;
+        let elapsed = timeline_elapsed * speed;
+        if timeline_elapsed < 0.0 {
+            continue;
+        }
+        let authored_duration = apply.duration_ms.map(|value| value as f32 / 1000.0);
+        if !apply.r#loop && authored_duration.is_some_and(|duration| timeline_elapsed > duration) {
+            continue;
+        }
+        let clip_duration = animation.duration.max(0.0);
+        let clip_time = if !apply.r#loop
+            && let Some(duration) = authored_duration.filter(|duration| *duration > f32::EPSILON)
+        {
+            (timeline_elapsed / duration).clamp(0.0, 1.0) * clip_duration * speed
+        } else if apply.r#loop && clip_duration > f32::EPSILON {
+            elapsed % clip_duration
+        } else {
+            elapsed.min(clip_duration)
+        };
+        let mut weight = eval_number(&apply.weight, 1.0, time)?.clamp(0.0, 1.0);
+        let blend_in = eval_number(&apply.blend_in, 0.0, time)?.max(0.0);
+        let blend_out = eval_number(&apply.blend_out, 0.0, time)?.max(0.0);
+        if blend_in > f32::EPSILON {
+            weight *= (timeline_elapsed / blend_in).clamp(0.0, 1.0);
+        }
+        if !apply.r#loop && blend_out > f32::EPSILON {
+            let end = authored_duration.unwrap_or(clip_duration);
+            weight *= ((end - timeline_elapsed) / blend_out).clamp(0.0, 1.0);
+        }
+        if weight <= f32::EPSILON {
+            continue;
+        }
+
+        // Reconstruct the complete source hierarchy for this frame, transfer
+        // each canonical bone's model-space delta, then derive the target's
+        // local rotation from its already-retargeted parent. This is the key
+        // difference between humanoid retargeting and copying local channels.
+        let source_local_rotations = animation
+            .channels
+            .iter()
+            .filter(|channel| channel.property == GlbAnimationProperty::Rotation)
+            .filter_map(|channel| {
+                let GlbAnimationValues::Quat(values) =
+                    sample_animation_channel(channel, clip_time)?
+                else {
+                    return None;
+                };
+                values
+                    .first()
+                    .copied()
+                    .map(|value| (channel.node_index, quat_normalize_xyzw(value)))
+            })
+            .collect::<HashMap<_, _>>();
+        let source_sampled_trs = source_local_rotations
+            .iter()
+            .map(|(index, rotation)| {
+                (
+                    *index,
+                    SampledNodeTrs {
+                        rotation: Some(*rotation),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let source_animated_matrices =
+            global_node_matrices_with_sampled(source_mesh, &HashMap::new(), &source_sampled_trs);
+        let source_animated_global = source_animated_matrices
+            .iter()
+            .copied()
+            .map(quat_from_mat4_rotation)
+            .collect::<Vec<_>>();
+        let mut mapped_rotations = animation
+            .channels
+            .iter()
+            .filter(|channel| channel.property == GlbAnimationProperty::Rotation)
+            .filter_map(|channel| {
+                let source_node = source_mesh.nodes.get(channel.node_index)?;
+                let canonical =
+                    canonical_humanoid_bone(source_node.name.as_deref()?, &asset.profile)?;
+                if !bone_matches_body_mask(&canonical, &apply.mask) {
+                    return None;
+                }
+                let target_index =
+                    target_node_for_canonical_bone(target_mesh, target_profile, &canonical)?;
+                Some((channel.node_index, target_index, canonical))
+            })
+            .collect::<Vec<_>>();
+        mapped_rotations
+            .sort_by_key(|(_, target_index, _)| node_hierarchy_depth(target_mesh, *target_index));
+        let mut target_animated_global = HashMap::<usize, [f32; 4]>::new();
+        for (source_index, target_index, canonical) in mapped_rotations {
+            let Some(target_node) = target_mesh.nodes.get(target_index) else {
+                continue;
+            };
+            let source_rest = source_rest_global
+                .get(source_index)
+                .copied()
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let source_animated = source_animated_global
+                .get(source_index)
+                .copied()
+                .unwrap_or(source_rest);
+            let target_rest = target_rest_global
+                .get(target_index)
+                .copied()
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let desired_global = canonical_child_bone(&canonical)
+                .and_then(|child| {
+                    let source_child = target_node_for_canonical_bone(source_mesh, None, child)?;
+                    let target_child =
+                        target_node_for_canonical_bone(target_mesh, target_profile, child)?;
+                    let source_rest_direction =
+                        direction_between_nodes(&source_rest_matrices, source_index, source_child)?;
+                    let source_animated_direction = direction_between_nodes(
+                        &source_animated_matrices,
+                        source_index,
+                        source_child,
+                    )?;
+                    let target_rest_direction =
+                        direction_between_nodes(&target_rest_matrices, target_index, target_child)?;
+                    let source_swing =
+                        quat_from_to(source_rest_direction, source_animated_direction)?;
+                    let desired_target_direction =
+                        quat_rotate_vec3(source_swing, target_rest_direction);
+                    let target_swing =
+                        quat_from_to(target_rest_direction, desired_target_direction)?;
+                    Some(quat_normalize_xyzw(quat_mul_xyzw(
+                        target_swing,
+                        target_rest,
+                    )))
+                })
+                .unwrap_or_else(|| {
+                    let rest_space_delta =
+                        quat_mul_xyzw(quat_conjugate_xyzw(source_rest), source_animated);
+                    quat_normalize_xyzw(quat_mul_xyzw(target_rest, rest_space_delta))
+                });
+            let parent_global = target_node
+                .parent
+                .and_then(|parent| target_animated_global.get(&parent).copied())
+                .or_else(|| {
+                    target_node
+                        .parent
+                        .and_then(|parent| target_rest_global.get(parent).copied())
+                })
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let desired_local = quat_normalize_xyzw(quat_mul_xyzw(
+                quat_conjugate_xyzw(parent_global),
+                desired_global,
+            ));
+            target_animated_global.insert(target_index, desired_global);
+            let entry = sampled.entry(target_index).or_default();
+            entry.rotation = Some(nlerp_quat(
+                entry.rotation.unwrap_or(target_node.rotation),
+                desired_local,
+                weight,
+            ));
+        }
+
+        for channel in &animation.channels {
+            let Some(source_node) = source_mesh.nodes.get(channel.node_index) else {
+                continue;
+            };
+            let Some(source_name) = source_node.name.as_deref() else {
+                continue;
+            };
+            let Some(canonical) = canonical_humanoid_bone(source_name, &asset.profile) else {
+                continue;
+            };
+            if !bone_matches_body_mask(&canonical, &apply.mask) {
+                continue;
+            }
+            let Some(target_index) =
+                target_node_for_canonical_bone(target_mesh, target_profile, &canonical)
+            else {
+                continue;
+            };
+            let Some(target_node) = target_mesh.nodes.get(target_index) else {
+                continue;
+            };
+            let entry = sampled.entry(target_index).or_default();
+            match sample_animation_channel(channel, clip_time) {
+                Some(GlbAnimationValues::Quat(_)) => {}
+                Some(GlbAnimationValues::Vec3(values)) => {
+                    let Some(value) = values.first().copied() else {
+                        continue;
+                    };
+                    match channel.property {
+                        GlbAnimationProperty::Translation
+                            if canonical == "hips"
+                                && apply.root_motion.as_deref() == Some("clip") =>
+                        {
+                            let delta: [f32; 3] = std::array::from_fn(|axis| {
+                                value[axis] - source_node.translation[axis]
+                            });
+                            let translated: [f32; 3] = std::array::from_fn(|axis| {
+                                target_node.translation[axis] + delta[axis]
+                            });
+                            entry.translation = Some(lerp_vec3(
+                                entry.translation.unwrap_or(target_node.translation),
+                                translated,
+                                weight,
+                            ));
+                        }
+                        GlbAnimationProperty::Scale => {
+                            entry.scale = Some(lerp_vec3(
+                                entry.scale.unwrap_or(target_node.scale),
+                                value,
+                                weight,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(sampled)
+}
+
+fn target_node_for_canonical_bone(
+    mesh: &GlbMeshData,
+    profile: Option<&WorldModelProfile>,
+    canonical: &str,
+) -> Option<usize> {
+    let mapped = profile
+        .and_then(|profile| profile.retarget.as_ref())
+        .and_then(|retarget| {
+            retarget
+                .maps
+                .iter()
+                .find(|map| map.to == canonical)
+                .map(|map| map.from.as_str())
+        });
+    if let Some(mapped) = mapped
+        && let Some(index) = node_index_by_name(mesh, mapped)
+    {
+        return Some(index);
+    }
+    mesh.nodes.iter().find_map(|node| {
+        let name = node.name.as_deref()?;
+        (canonical_humanoid_bone(name, "auto").as_deref() == Some(canonical)).then_some(node.index)
+    })
+}
+
+fn canonical_humanoid_bone(raw: &str, _profile: &str) -> Option<String> {
+    let normalized = raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace("mixamorig:", "")
+        .replace([' ', '-', '.', '_'], "");
+    let canonical = match normalized.as_str() {
+        "hips" | "pelvis" => "hips",
+        "spine" | "spine01" => "spine",
+        "spine1" | "chest" => "chest",
+        "spine2" | "spine03" | "upperchest" => "chest",
+        "neck" | "neck01" => "neck",
+        "head" => "head",
+        "leftshoulder" => "shoulder_l",
+        "leftarm" | "leftupperarm" => "upper_arm_l",
+        "leftforearm" | "leftlowerarm" => "forearm_l",
+        "lefthand" | "leftwrist" => "hand_l",
+        "rightshoulder" => "shoulder_r",
+        "rightarm" | "rightupperarm" => "upper_arm_r",
+        "rightforearm" | "rightlowerarm" => "forearm_r",
+        "righthand" | "rightwrist" => "hand_r",
+        "leftupleg" | "leftthigh" | "leftupperleg" => "upper_leg_l",
+        "leftleg" | "leftcalf" | "leftlowerleg" => "lower_leg_l",
+        "leftfoot" | "leftankle" => "foot_l",
+        "lefttoebase" | "lefttoe" => "toe_l",
+        "rightupleg" | "rightthigh" | "rightupperleg" => "upper_leg_r",
+        "rightleg" | "rightcalf" | "rightlowerleg" => "lower_leg_r",
+        "rightfoot" | "rightankle" => "foot_r",
+        "righttoebase" | "righttoe" => "toe_r",
+        "shoulderl" | "claviclel" => "shoulder_l",
+        "upperarml" => "upper_arm_l",
+        "forearml" | "lowerarml" => "forearm_l",
+        "handl" => "hand_l",
+        "shoulderr" | "clavicler" => "shoulder_r",
+        "upperarmr" => "upper_arm_r",
+        "forearmr" | "lowerarmr" => "forearm_r",
+        "handr" => "hand_r",
+        "upperlegl" | "thighl" => "upper_leg_l",
+        "lowerlegl" | "calfl" => "lower_leg_l",
+        "footl" => "foot_l",
+        "toel" | "balll" | "ballleafl" => "toe_l",
+        "upperlegr" | "thighr" => "upper_leg_r",
+        "lowerlegr" | "calfr" => "lower_leg_r",
+        "footr" => "foot_r",
+        "toer" | "ballr" | "ballleafr" => "toe_r",
+        _ => return None,
+    };
+    Some(canonical.to_string())
+}
+
+fn quat_conjugate_xyzw(value: [f32; 4]) -> [f32; 4] {
+    [-value[0], -value[1], -value[2], value[3]]
+}
+
+fn quat_mul_xyzw(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn quat_normalize_xyzw(value: [f32; 4]) -> [f32; 4] {
+    let length = value.iter().map(|part| part * part).sum::<f32>().sqrt();
+    if length <= f32::EPSILON {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        std::array::from_fn(|axis| value[axis] / length)
+    }
+}
+
+fn canonical_child_bone(canonical: &str) -> Option<&'static str> {
+    match canonical {
+        "hips" => Some("spine"),
+        "spine" => Some("chest"),
+        "chest" => Some("neck"),
+        "neck" => Some("head"),
+        "shoulder_l" => Some("upper_arm_l"),
+        "upper_arm_l" => Some("forearm_l"),
+        "forearm_l" => Some("hand_l"),
+        "shoulder_r" => Some("upper_arm_r"),
+        "upper_arm_r" => Some("forearm_r"),
+        "forearm_r" => Some("hand_r"),
+        "upper_leg_l" => Some("lower_leg_l"),
+        "lower_leg_l" => Some("foot_l"),
+        "foot_l" => Some("toe_l"),
+        "upper_leg_r" => Some("lower_leg_r"),
+        "lower_leg_r" => Some("foot_r"),
+        "foot_r" => Some("toe_r"),
+        _ => None,
+    }
+}
+
+fn direction_between_nodes(matrices: &[[f32; 16]], from: usize, to: usize) -> Option<[f32; 3]> {
+    let from = matrix_translation(*matrices.get(from)?);
+    let to = matrix_translation(*matrices.get(to)?);
+    normalize_vec3([to[0] - from[0], to[1] - from[1], to[2] - from[2]])
+}
+
+fn quat_rotate_vec3(rotation: [f32; 4], value: [f32; 3]) -> [f32; 3] {
+    let vector = [value[0], value[1], value[2], 0.0];
+    let rotated = quat_mul_xyzw(
+        quat_mul_xyzw(rotation, vector),
+        quat_conjugate_xyzw(rotation),
+    );
+    [rotated[0], rotated[1], rotated[2]]
+}
+
+fn quat_from_to(from: [f32; 3], to: [f32; 3]) -> Option<[f32; 4]> {
+    let from = normalize_vec3(from)?;
+    let to = normalize_vec3(to)?;
+    let dot = (from[0] * to[0] + from[1] * to[1] + from[2] * to[2]).clamp(-1.0, 1.0);
+    if dot > 1.0 - 1.0e-6 {
+        return Some([0.0, 0.0, 0.0, 1.0]);
+    }
+    if dot < -1.0 + 1.0e-6 {
+        let seed = if from[0].abs() < from[1].abs() {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let axis = normalize_vec3([
+            from[1] * seed[2] - from[2] * seed[1],
+            from[2] * seed[0] - from[0] * seed[2],
+            from[0] * seed[1] - from[1] * seed[0],
+        ])?;
+        return Some([axis[0], axis[1], axis[2], 0.0]);
+    }
+    let cross = [
+        from[1] * to[2] - from[2] * to[1],
+        from[2] * to[0] - from[0] * to[2],
+        from[0] * to[1] - from[1] * to[0],
+    ];
+    Some(quat_normalize_xyzw([
+        cross[0],
+        cross[1],
+        cross[2],
+        1.0 + dot,
+    ]))
+}
+
+fn node_hierarchy_depth(mesh: &GlbMeshData, mut index: usize) -> usize {
+    let mut depth = 0usize;
+    while let Some(parent) = mesh.nodes.get(index).and_then(|node| node.parent) {
+        depth += 1;
+        index = parent;
+        if depth > mesh.nodes.len() {
+            break;
+        }
+    }
+    depth
+}
+
+fn actor_play_layers(actor: &WorldActor) -> impl Iterator<Item = &WorldPlay> {
+    actor.play.iter().chain(actor.plays.iter())
+}
+
+fn actor_has_clip_layers(actor: &WorldActor) -> bool {
+    actor_play_layers(actor).next().is_some()
+}
+
+fn clip_node_matches_mask(
+    raw_name: Option<&str>,
+    profile: Option<&WorldModelProfile>,
+    masks: &[String],
+) -> bool {
+    if masks.is_empty() {
+        return true;
+    }
+    let Some(raw_name) = raw_name else {
+        return false;
+    };
+    let canonical = profile
+        .and_then(|profile| profile.retarget.as_ref())
+        .and_then(|retarget| {
+            retarget
+                .maps
+                .iter()
+                .find(|map| map.from == raw_name)
+                .map(|map| map.to.as_str())
+        })
+        .unwrap_or(raw_name);
+    bone_matches_body_mask(canonical, masks)
+}
+
+fn sample_animation_channel(
+    channel: &GlbAnimationChannelData,
+    time: f32,
+) -> Option<GlbAnimationValues> {
+    if channel.times.is_empty() {
+        return None;
+    }
+    let last_index = channel.times.len().saturating_sub(1);
+    let next = channel
+        .times
+        .partition_point(|key| *key < time)
+        .min(last_index);
+    let previous = next.saturating_sub(1);
+    let span = (channel.times[next] - channel.times[previous]).max(f32::EPSILON);
+    let alpha = if next == previous || channel.interpolation == GlbAnimationInterpolation::Step {
+        0.0
+    } else {
+        ((time - channel.times[previous]) / span).clamp(0.0, 1.0)
+    };
+    match &channel.values {
+        GlbAnimationValues::Vec3(values) => {
+            let from = values.get(previous).copied()?;
+            let to = values.get(next).copied().unwrap_or(from);
+            Some(GlbAnimationValues::Vec3(vec![lerp_vec3(from, to, alpha)]))
+        }
+        GlbAnimationValues::Quat(values) => {
+            let from = values.get(previous).copied()?;
+            let to = values.get(next).copied().unwrap_or(from);
+            Some(GlbAnimationValues::Quat(vec![nlerp_quat(from, to, alpha)]))
+        }
+    }
+}
+
+fn lerp_vec3(from: [f32; 3], to: [f32; 3], alpha: f32) -> [f32; 3] {
+    std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * alpha)
+}
+
+fn nlerp_quat(mut from: [f32; 4], mut to: [f32; 4], alpha: f32) -> [f32; 4] {
+    let dot = (0..4).map(|axis| from[axis] * to[axis]).sum::<f32>();
+    if dot < 0.0 {
+        for value in &mut to {
+            *value = -*value;
+        }
+    }
+    let mut out = std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * alpha);
+    let length = out.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if length > f32::EPSILON {
+        for value in &mut out {
+            *value /= length;
+        }
+    } else {
+        from = [0.0, 0.0, 0.0, 1.0];
+        out = from;
+    }
+    out
+}
+
 fn global_node_matrices(
     mesh: &GlbMeshData,
     overrides: &HashMap<String, BoneOverride>,
+) -> Vec<[f32; 16]> {
+    global_node_matrices_with_sampled(mesh, overrides, &HashMap::new())
+}
+
+/// Joint bind transforms are the authoritative rest coordinate frames for a
+/// skinned mesh. Node TRS alone can describe the same joint positions while
+/// carrying a different bone roll, which breaks cross-rig animation transfer.
+fn bind_pose_node_matrices(mesh: &GlbMeshData) -> Vec<[f32; 16]> {
+    let mut matrices = global_node_matrices(mesh, &HashMap::new());
+    if let Some(skin) = &mesh.skin {
+        for joint in &skin.joints {
+            if let Some(bind_global) = mat4_inverse_affine(joint.inverse_bind_matrix)
+                && let Some(slot) = matrices.get_mut(joint.node_index)
+            {
+                *slot = bind_global;
+            }
+        }
+    }
+    matrices
+}
+
+fn global_node_matrices_with_sampled(
+    mesh: &GlbMeshData,
+    overrides: &HashMap<String, BoneOverride>,
+    sampled: &HashMap<usize, SampledNodeTrs>,
 ) -> Vec<[f32; 16]> {
     let local = mesh
         .nodes
         .iter()
         .map(|node| {
-            let base = node
-                .matrix
-                .unwrap_or_else(|| mat4_from_trs(node.translation, node.rotation, node.scale));
+            let sample = sampled.get(&node.index).copied().unwrap_or_default();
+            let base = if sample.translation.is_some()
+                || sample.rotation.is_some()
+                || sample.scale.is_some()
+            {
+                mat4_from_trs(
+                    sample.translation.unwrap_or(node.translation),
+                    sample.rotation.unwrap_or(node.rotation),
+                    sample.scale.unwrap_or(node.scale),
+                )
+            } else {
+                node.matrix
+                    .unwrap_or_else(|| mat4_from_trs(node.translation, node.rotation, node.scale))
+            };
             let Some(name) = node.name.as_deref() else {
                 return base;
             };
@@ -3960,6 +6356,36 @@ fn mat4_rotation_z(angle: f32) -> [f32; 16] {
         0.0, 0.0, 1.0, 0.0, //
         0.0, 0.0, 0.0, 1.0,
     ]
+}
+
+fn quat_from_mat4_rotation(matrix: [f32; 16]) -> [f32; 4] {
+    let x = normalize_vec3([matrix[0], matrix[1], matrix[2]]).unwrap_or([1.0, 0.0, 0.0]);
+    let y = normalize_vec3([matrix[4], matrix[5], matrix[6]]).unwrap_or([0.0, 1.0, 0.0]);
+    let z = normalize_vec3([matrix[8], matrix[9], matrix[10]]).unwrap_or([0.0, 0.0, 1.0]);
+    let m00 = x[0];
+    let m01 = y[0];
+    let m02 = z[0];
+    let m10 = x[1];
+    let m11 = y[1];
+    let m12 = z[1];
+    let m20 = x[2];
+    let m21 = y[2];
+    let m22 = z[2];
+    let trace = m00 + m11 + m22;
+    let quat = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s]
+    };
+    quat_normalize_xyzw(quat)
 }
 
 fn mat4_from_quat(quat: [f32; 4]) -> [f32; 16] {
@@ -4198,6 +6624,8 @@ struct ProjectedTriangle {
 struct GpuWorldVertex {
     position: [f32; 3],
     normal: [f32; 3],
+    tangent: [f32; 3],
+    bitangent: [f32; 3],
     joints: [f32; 4],
     weights: [f32; 4],
     uv: [f32; 2],
@@ -4210,15 +6638,35 @@ struct GpuWorldDraw {
     instance_key: GpuWorldInstanceKey,
     vertices: Arc<Vec<GpuWorldVertex>>,
     texture: Arc<GpuWorldTexture>,
+    normal_texture: Arc<GpuWorldTexture>,
+    metallic_roughness_texture: Arc<GpuWorldTexture>,
+    emissive_texture: Arc<GpuWorldTexture>,
+    texture_signature: u64,
     bone_matrices: Vec<[f32; 16]>,
     params: GpuWorldParams,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GpuWorldTexture {
+pub(crate) struct GpuWorldTexture {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    signature: u64,
+}
+
+impl GpuWorldTexture {
+    fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+        rgba.hash(&mut hasher);
+        Self {
+            width,
+            height,
+            rgba,
+            signature: hasher.finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4232,6 +6680,7 @@ struct GpuWorldDrawKey {
 struct GpuWorldResourceKey {
     model_path: PathBuf,
     draw_key: GpuWorldDrawKey,
+    binding_actor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4261,6 +6710,9 @@ struct GpuWorldStaticDraw {
     resource_key: GpuWorldResourceKey,
     vertices: Arc<Vec<GpuWorldVertex>>,
     texture: Arc<GpuWorldTexture>,
+    normal_texture: Arc<GpuWorldTexture>,
+    metallic_roughness_texture: Arc<GpuWorldTexture>,
+    emissive_texture: Arc<GpuWorldTexture>,
     mesh_node: Option<usize>,
 }
 
@@ -4275,6 +6727,9 @@ struct GpuWorldParams {
     camera2: [f32; 4],
     camera3: [f32; 4],
     style: [f32; 4],
+    material0: [f32; 4],
+    material1: [f32; 4],
+    material2: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4347,6 +6802,7 @@ fn build_actor_mesh_gpu_draws(
     graph: &WorldGraph,
     actor: &WorldActor,
     mesh: &GlbMeshData,
+    effective_bounds: ([f32; 3], [f32; 3]),
     static_draws: &[GpuWorldStaticDraw],
     width: u32,
     height: u32,
@@ -4362,18 +6818,48 @@ fn build_actor_mesh_gpu_draws(
     time: WorldTime,
     model_path: &Path,
     skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
+    material_overrides: &[WorldMaterialTextureOverride],
+    external_sampled: &HashMap<usize, SampledNodeTrs>,
+    constraint_overrides: &HashMap<String, BoneOverride>,
 ) -> Result<Vec<GpuWorldDraw>, WorldRenderError> {
+    for binding in material_overrides
+        .iter()
+        .filter(|binding| binding.actor_id == actor.id)
+    {
+        let exists = mesh.materials.iter().any(|material| {
+            material
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&binding.material))
+        });
+        if !exists {
+            return Err(WorldRenderError::GpuRender {
+                message: format!(
+                    "MaterialBinding on actor '{}' references missing GLB material '{}'",
+                    actor.id, binding.material
+                ),
+            });
+        }
+    }
     let width_f = width.max(1) as f32;
     let height_f = height.max(1) as f32;
-    let model_height = (mesh.bounds_max[1] - mesh.bounds_min[1]).abs().max(0.001);
-    let model_center_x = (mesh.bounds_min[0] + mesh.bounds_max[0]) * 0.5;
-    let model_center_z = (mesh.bounds_min[2] + mesh.bounds_max[2]) * 0.5;
+    let (effective_min, effective_max) = effective_bounds;
+    let model_height = (effective_max[1] - effective_min[1]).abs().max(0.001);
+    let model_center_x = (effective_min[0] + effective_max[0]) * 0.5;
+    let model_center_z = (effective_min[2] + effective_max[2]) * 0.5;
     let world_scale = scale / model_height;
+    let exposure = actor
+        .material
+        .as_ref()
+        .map(|material| eval_number(&material.exposure, 1.0, time))
+        .transpose()?
+        .unwrap_or(1.0)
+        .clamp(0.05, 8.0);
     let params = GpuWorldParams {
         canvas: [width_f, height_f, width_f * 0.5, height_f * 0.5],
         model: [
             model_center_x,
-            mesh.bounds_min[1],
+            effective_min[1],
             model_center_z,
             world_scale,
         ],
@@ -4411,34 +6897,106 @@ fn build_actor_mesh_gpu_draws(
         style: [
             opacity.clamp(0.0, 1.0),
             actor_material_light_mix(actor),
-            0.0,
+            exposure,
             0.0,
         ],
+        material0: [1.0, 1.0, 1.0, 1.0],
+        material1: [0.0, 0.0, 0.0, 0.0],
+        material2: [1.0, 1.0, 1.0, 0.0],
     };
     let mut draws = Vec::<GpuWorldDraw>::with_capacity(static_draws.len());
+    let joint_frame = prepare_actor_joint_frame(
+        graph,
+        actor,
+        mesh,
+        time,
+        external_sampled,
+        constraint_overrides,
+    )?;
+    // A GLB commonly splits one skinned mesh into several material draws. Bone
+    // matrices depend on the actor and mesh node, not on the material, so do
+    // not resample/retarget the entire skeleton once per material primitive.
+    let mut bone_matrices_by_node =
+        HashMap::<Option<usize>, Vec<[f32; 16]>>::with_capacity(static_draws.len().min(8));
     for static_draw in static_draws {
         if static_draw.vertices.is_empty() {
             continue;
         }
-        let bone_matrices = actor_joint_matrices(
-            graph,
-            actor,
-            mesh,
-            model_path,
-            static_draw.mesh_node,
-            time,
-            skinning_strategy_cache,
-        )?;
+        let bone_matrices =
+            if let Some(matrices) = bone_matrices_by_node.get(&static_draw.mesh_node) {
+                matrices.clone()
+            } else {
+                let matrices = actor_joint_matrices(
+                    mesh,
+                    model_path,
+                    static_draw.mesh_node,
+                    &joint_frame,
+                    skinning_strategy_cache,
+                );
+                bone_matrices_by_node.insert(static_draw.mesh_node, matrices.clone());
+                matrices
+            };
+        let material = static_draw
+            .resource_key
+            .draw_key
+            .material
+            .and_then(|index| mesh.materials.get(index));
+        let mut draw_params = params;
+        if let Some(material) = material {
+            draw_params.material0 = [
+                material.metallic_factor.clamp(0.0, 1.0),
+                material.roughness_factor.clamp(0.04, 1.0),
+                material.normal_scale.clamp(0.0, 4.0),
+                material.specular_factor.clamp(0.0, 2.0),
+            ];
+            draw_params.material1 = [
+                material.emissive_factor[0].max(0.0) * material.emissive_strength.max(0.0),
+                material.emissive_factor[1].max(0.0) * material.emissive_strength.max(0.0),
+                material.emissive_factor[2].max(0.0) * material.emissive_strength.max(0.0),
+                if material.unlit { 1.0 } else { 0.0 },
+            ];
+            draw_params.material2 = [
+                material.specular_color_factor[0].clamp(0.0, 2.0),
+                material.specular_color_factor[1].clamp(0.0, 2.0),
+                material.specular_color_factor[2].clamp(0.0, 2.0),
+                0.0,
+            ];
+        }
+        let texture_override = material.and_then(|material| {
+            let material_name = material.name.as_deref()?;
+            material_overrides.iter().find(|binding| {
+                binding.actor_id == actor.id && binding.material.eq_ignore_ascii_case(material_name)
+            })
+        });
+        let texture = texture_override.map_or_else(
+            || Arc::clone(&static_draw.texture),
+            |binding| Arc::clone(&binding.texture),
+        );
+        if texture_override.is_some() {
+            // A bound Scene is a display surface: preserve the authored UI rather than
+            // allowing the room lighting to turn it grey or black.
+            draw_params.material1[3] = 1.0;
+            draw_params.material2[3] = 1.0;
+        }
+        let texture_signature = gpu_world_texture_signature(texture.as_ref());
+        let mut resource_key = static_draw.resource_key.clone();
+        if texture_override.is_some() {
+            resource_key.binding_actor = Some(actor.id.clone());
+        }
         draws.push(GpuWorldDraw {
             instance_key: GpuWorldInstanceKey {
                 actor_id: actor.id.clone(),
-                resource_key: static_draw.resource_key.clone(),
+                resource_key: resource_key.clone(),
             },
-            resource_key: static_draw.resource_key.clone(),
+            resource_key,
             vertices: Arc::clone(&static_draw.vertices),
-            texture: Arc::clone(&static_draw.texture),
+            texture,
+            normal_texture: Arc::clone(&static_draw.normal_texture),
+            metallic_roughness_texture: Arc::clone(&static_draw.metallic_roughness_texture),
+            emissive_texture: Arc::clone(&static_draw.emissive_texture),
+            texture_signature,
             bone_matrices: bone_matrices.clone(),
-            params,
+            params: draw_params,
         });
     }
     Ok(draws)
@@ -4466,6 +7024,15 @@ fn build_actor_mesh_gpu_static_draws(
         [111, 145, 190]
     };
     let mut chunks = Vec::<GpuWorldDrawChunk>::new();
+    let static_node_matrices = if mesh.skin.is_none() {
+        Some(global_node_matrices_with_sampled(
+            mesh,
+            &HashMap::new(),
+            &HashMap::new(),
+        ))
+    } else {
+        None
+    };
     for triangle in &mesh.triangles {
         if actor_hides_triangle(actor, mesh, triangle) {
             continue;
@@ -4496,18 +7063,44 @@ fn build_actor_mesh_gpu_static_draws(
             .get_mut(chunk_index)
             .expect("GPU world draw chunk inserted before vertex push");
         let indices = triangle.indices;
-        let fallback_normal = triangle_normal(mesh, indices).unwrap_or([0.0, 0.0, 1.0]);
+        let node_matrix = triangle
+            .mesh_node
+            .and_then(|index| static_node_matrices.as_ref()?.get(index))
+            .copied();
+        let transformed_triangle = indices.map(|index| {
+            let position = mesh
+                .positions
+                .get(index as usize)
+                .copied()
+                .unwrap_or([0.0; 3]);
+            node_matrix
+                .map(|matrix| transform_point_mat4(matrix, position))
+                .unwrap_or(position)
+        });
+        let fallback_normal = triangle_normal_from_points(transformed_triangle)
+            .or_else(|| triangle_normal(mesh, indices))
+            .unwrap_or([0.0, 0.0, 1.0]);
+        let (mut tangent, mut bitangent) =
+            triangle_tangent_frame(mesh, indices, uvs, fallback_normal);
+        if let Some(matrix) = node_matrix {
+            tangent = normalize3(transform_vector_mat4(matrix, tangent));
+            bitangent = normalize3(transform_vector_mat4(matrix, bitangent));
+        }
         for i in 0..3 {
             let vertex_index = indices[i] as usize;
-            let Some(position) = mesh.positions.get(vertex_index).copied() else {
+            let Some(mut position) = mesh.positions.get(vertex_index).copied() else {
                 continue;
             };
-            let normal = mesh
+            let mut normal = mesh
                 .normals
                 .get(vertex_index)
                 .copied()
                 .flatten()
                 .unwrap_or(fallback_normal);
+            if let Some(matrix) = node_matrix {
+                position = transform_point_mat4(matrix, position);
+                normal = normalize3(transform_vector_mat4(matrix, normal));
+            }
             let joints = mesh
                 .joints
                 .get(vertex_index)
@@ -4543,6 +7136,8 @@ fn build_actor_mesh_gpu_static_draws(
             chunk.vertices.push(GpuWorldVertex {
                 position,
                 normal,
+                tangent,
+                bitangent,
                 joints,
                 weights,
                 uv: uvs[i].unwrap_or([0.0, 0.0]),
@@ -4558,15 +7153,112 @@ fn build_actor_mesh_gpu_static_draws(
         let resource_key = GpuWorldResourceKey {
             model_path: model_path.to_path_buf(),
             draw_key: chunk.key,
+            binding_actor: None,
         };
         draws.push(GpuWorldStaticDraw {
             resource_key,
             vertices: Arc::new(chunk.vertices),
             texture: Arc::new(chunk.texture),
+            normal_texture: Arc::new(gpu_texture_for_index(
+                mesh,
+                chunk
+                    .key
+                    .material
+                    .and_then(|index| mesh.materials.get(index))
+                    .and_then(|material| material.normal_texture),
+                [128, 128, 255, 255],
+            )),
+            metallic_roughness_texture: Arc::new(gpu_texture_for_index(
+                mesh,
+                chunk
+                    .key
+                    .material
+                    .and_then(|index| mesh.materials.get(index))
+                    .and_then(|material| material.metallic_roughness_texture),
+                [255, 255, 255, 255],
+            )),
+            emissive_texture: Arc::new(gpu_texture_for_index(
+                mesh,
+                chunk
+                    .key
+                    .material
+                    .and_then(|index| mesh.materials.get(index))
+                    .and_then(|material| material.emissive_texture),
+                [255, 255, 255, 255],
+            )),
             mesh_node: chunk.mesh_node,
         });
     }
     draws
+}
+
+fn effective_mesh_bounds(mesh: &GlbMeshData) -> ([f32; 3], [f32; 3]) {
+    if mesh.skin.is_some() || mesh.triangles.is_empty() {
+        return (mesh.bounds_min, mesh.bounds_max);
+    }
+    let matrices = global_node_matrices_with_sampled(mesh, &HashMap::new(), &HashMap::new());
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut found = false;
+    for triangle in &mesh.triangles {
+        let matrix = triangle
+            .mesh_node
+            .and_then(|index| matrices.get(index))
+            .copied();
+        for index in triangle.indices {
+            let Some(mut point) = mesh.positions.get(index as usize).copied() else {
+                continue;
+            };
+            if let Some(matrix) = matrix {
+                point = transform_point_mat4(matrix, point);
+            }
+            for axis in 0..3 {
+                min[axis] = min[axis].min(point[axis]);
+                max[axis] = max[axis].max(point[axis]);
+            }
+            found = true;
+        }
+    }
+    if found {
+        (min, max)
+    } else {
+        (mesh.bounds_min, mesh.bounds_max)
+    }
+}
+
+fn transform_point_mat4(matrix: [f32; 16], point: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0] * point[0] + matrix[4] * point[1] + matrix[8] * point[2] + matrix[12],
+        matrix[1] * point[0] + matrix[5] * point[1] + matrix[9] * point[2] + matrix[13],
+        matrix[2] * point[0] + matrix[6] * point[1] + matrix[10] * point[2] + matrix[14],
+    ]
+}
+
+fn transform_vector_mat4(matrix: [f32; 16], vector: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0] * vector[0] + matrix[4] * vector[1] + matrix[8] * vector[2],
+        matrix[1] * vector[0] + matrix[5] * vector[1] + matrix[9] * vector[2],
+        matrix[2] * vector[0] + matrix[6] * vector[1] + matrix[10] * vector[2],
+    ]
+}
+
+fn triangle_normal_from_points(points: [[f32; 3]; 3]) -> Option<[f32; 3]> {
+    let ab = [
+        points[1][0] - points[0][0],
+        points[1][1] - points[0][1],
+        points[1][2] - points[0][2],
+    ];
+    let ac = [
+        points[2][0] - points[0][0],
+        points[2][1] - points[0][1],
+        points[2][2] - points[0][2],
+    ];
+    let normal = cross3(ab, ac);
+    let normalized = normalize3(normal);
+    normalized
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(normalized)
 }
 
 fn triangle_normal(mesh: &GlbMeshData, indices: [u32; 3]) -> Option<[f32; 3]> {
@@ -4580,6 +7272,46 @@ fn triangle_normal(mesh: &GlbMeshData, indices: [u32; 3]) -> Option<[f32; 3]> {
         ab[2] * ac[0] - ab[0] * ac[2],
         ab[0] * ac[1] - ab[1] * ac[0],
     ])
+}
+
+fn triangle_tangent_frame(
+    mesh: &GlbMeshData,
+    indices: [u32; 3],
+    uvs: [Option<[f32; 2]>; 3],
+    normal: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let positions = indices.map(|index| mesh.positions.get(index as usize).copied());
+    if let ([Some(p0), Some(p1), Some(p2)], [Some(uv0), Some(uv1), Some(uv2)]) = (positions, uvs) {
+        let edge1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let edge2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let duv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
+        let duv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
+        let determinant = duv1[0] * duv2[1] - duv1[1] * duv2[0];
+        if determinant.abs() > 0.000001 {
+            let inverse = determinant.recip();
+            let tangent = normalize_vec3([
+                (edge1[0] * duv2[1] - edge2[0] * duv1[1]) * inverse,
+                (edge1[1] * duv2[1] - edge2[1] * duv1[1]) * inverse,
+                (edge1[2] * duv2[1] - edge2[2] * duv1[1]) * inverse,
+            ]);
+            let bitangent = normalize_vec3([
+                (edge2[0] * duv1[0] - edge1[0] * duv2[0]) * inverse,
+                (edge2[1] * duv1[0] - edge1[1] * duv2[0]) * inverse,
+                (edge2[2] * duv1[0] - edge1[2] * duv2[0]) * inverse,
+            ]);
+            if let (Some(tangent), Some(bitangent)) = (tangent, bitangent) {
+                return (tangent, bitangent);
+            }
+        }
+    }
+    let reference = if normal[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let tangent = normalize_vec3(cross3(reference, normal)).unwrap_or([1.0, 0.0, 0.0]);
+    let bitangent = normalize_vec3(cross3(normal, tangent)).unwrap_or([0.0, 1.0, 0.0]);
+    (tangent, bitangent)
 }
 
 fn normalize_vec3(value: [f32; 3]) -> Option<[f32; 3]> {
@@ -4668,20 +7400,49 @@ fn gpu_texture_for_material(
 ) -> GpuWorldTexture {
     if let Some(texture_index) = key.texture {
         if let Some(texture) = mesh.textures.get(texture_index).and_then(Option::as_ref) {
-            return GpuWorldTexture {
-                width: texture.width,
-                height: texture.height,
-                rgba: texture.rgba.clone(),
-            };
+            return GpuWorldTexture::new(texture.width, texture.height, texture.rgba.clone());
         }
     }
 
     let color = material_color(mesh, material_index, fallback, 1.0, 1.0);
-    GpuWorldTexture {
-        width: 1,
-        height: 1,
-        rgba: vec![color[0], color[1], color[2], color[3]],
+    GpuWorldTexture::new(1, 1, vec![color[0], color[1], color[2], color[3]])
+}
+
+fn gpu_texture_for_index(
+    mesh: &GlbMeshData,
+    texture_index: Option<usize>,
+    fallback: [u8; 4],
+) -> GpuWorldTexture {
+    if let Some(texture) = texture_index
+        .and_then(|index| mesh.textures.get(index))
+        .and_then(Option::as_ref)
+    {
+        return GpuWorldTexture::new(texture.width, texture.height, texture.rgba.clone());
     }
+    GpuWorldTexture::new(1, 1, fallback.to_vec())
+}
+
+fn gpu_world_texture_from_image(image: &RgbaImage) -> GpuWorldTexture {
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    let row_bytes = width as usize * 4;
+    let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+    // Scene rasters use a top-left origin while glTF UVs use a bottom-left
+    // texture origin. Flip only live Scene bindings; embedded GLB images keep
+    // their authored orientation.
+    for row in (0..height as usize).rev() {
+        let start = row * row_bytes;
+        rgba.extend_from_slice(&image.as_raw()[start..start + row_bytes]);
+    }
+    GpuWorldTexture::new(width, height, rgba)
+}
+
+pub(crate) fn gpu_world_texture_from_rgba_image(image: &RgbaImage) -> Arc<GpuWorldTexture> {
+    Arc::new(gpu_world_texture_from_image(image))
+}
+
+fn gpu_world_texture_signature(texture: &GpuWorldTexture) -> u64 {
+    texture.signature
 }
 
 type TexturedTriangleSource<'a> = (&'a GlbTextureData, [f32; 4], [[f32; 2]; 3]);
@@ -4841,12 +7602,7 @@ fn draw_actor_placeholder(
         3.0,
     );
 
-    let label_hint = if actor
-        .play
-        .as_ref()
-        .and_then(|play| play.clip.as_ref())
-        .is_some()
-    {
+    let label_hint = if actor_play_layers(actor).any(|play| play.clip.is_some()) {
         Rgba([255, 225, 120, (190.0 * opacity) as u8])
     } else {
         Rgba([180, 210, 255, (170.0 * opacity) as u8])
@@ -5205,6 +7961,74 @@ enum ResolvedWorldAsset {
     Missing { key: PathBuf },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_REMOTE_WORLD_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+
+fn is_remote_world_asset_source(src: &str) -> bool {
+    url::Url::parse(src)
+        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_remote_world_asset_bytes(src: &str) -> Result<Vec<u8>, WorldRenderError> {
+    let response = ureq::get(src)
+        .set("User-Agent", "MotionLoom Scene3DRenderer")
+        .call()
+        .map_err(|err| WorldRenderError::RemoteAsset {
+            url: src.to_string(),
+            message: match err {
+                ureq::Error::Status(code, response) => {
+                    format!("HTTP {code} {}", response.status_text())
+                }
+                other => other.to_string(),
+            },
+        })?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_REMOTE_WORLD_ASSET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| WorldRenderError::RemoteAsset {
+            url: src.to_string(),
+            message: source.to_string(),
+        })?;
+    if bytes.is_empty() {
+        return Err(WorldRenderError::RemoteAsset {
+            url: src.to_string(),
+            message: "response body was empty".to_string(),
+        });
+    }
+    if bytes.len() as u64 > MAX_REMOTE_WORLD_ASSET_BYTES {
+        return Err(WorldRenderError::RemoteAsset {
+            url: src.to_string(),
+            message: format!(
+                "asset exceeds the {} MiB native download limit",
+                MAX_REMOTE_WORLD_ASSET_BYTES / (1024 * 1024)
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+fn resolve_remote_world_asset(src: &str) -> Result<ResolvedWorldAsset, WorldRenderError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bytes = fetch_remote_world_asset_bytes(src)?;
+        Ok(ResolvedWorldAsset::Bytes {
+            key: PathBuf::from(src),
+            bytes,
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err(WorldRenderError::RemoteAsset {
+            url: src.to_string(),
+            message: "browser hosts must preload URL assets into the renderer".to_string(),
+        })
+    }
+}
+
 impl ResolvedWorldAsset {
     /// Cache key used to deduplicate loaded images. For filesystem assets this
     /// is the resolved path; for memory assets it is the original source name.
@@ -5232,6 +8056,12 @@ fn resolve_world_asset_source(
         }),
         Ok(AssetSource::Path(resolved_path)) => {
             // The resolver may return the raw source path (e.g. PathAssetResolver).
+            // A URL returned by that resolver is not a filesystem path: native
+            // Scene3DRenderer downloads it, while browser hosts continue to
+            // supply asynchronously prefetched bytes through MemoryAssetResolver.
+            if is_remote_world_asset_source(src) {
+                return resolve_remote_world_asset(src);
+            }
             // Resolve relative paths against the asset root and verify existence on
             // native platforms. On WASM there is no filesystem, so treat Path results
             // as missing and rely on memory assets instead.
@@ -5258,11 +8088,11 @@ fn resolve_world_asset_source(
                 })
             }
         }
-        Ok(AssetSource::Url(url)) => Err(WorldRenderError::Expression {
-            expr: src.to_string(),
-            message: format!("URL asset source is not supported for world assets: {url}"),
-        }),
+        Ok(AssetSource::Url(url)) => resolve_remote_world_asset(&url),
         Err(_) => {
+            if is_remote_world_asset_source(src) {
+                return resolve_remote_world_asset(src);
+            }
             let path = resolve_asset_path_with_style(asset_root, src, path_style);
             if path.exists() {
                 Ok(ResolvedWorldAsset::Path(path))
@@ -5321,12 +8151,176 @@ fn load_glb_mesh_resolved(
     Ok((key, mesh))
 }
 
+/// Load a GLB motion source. Unlike model loading, this accepts a valid GLB
+/// containing nodes, a skeleton, and animation clips without mesh geometry.
+fn load_glb_animation_resolved(
+    asset_root: &Path,
+    src: &str,
+    path_style: WorldPathStyle,
+    resolver: &dyn AssetResolver,
+) -> Result<(PathBuf, GlbMeshData), WorldRenderError> {
+    let resolved = resolve_world_asset_source(asset_root, src, path_style, resolver)?;
+    let key = resolved.key().to_path_buf();
+    let animation = match resolved {
+        ResolvedWorldAsset::Path(path) => load_glb_animation_data(&path)?,
+        ResolvedWorldAsset::Bytes { bytes, .. } => {
+            load_glb_animation_data_from_bytes(&key, &bytes)?
+        }
+        ResolvedWorldAsset::Missing { .. } => {
+            return Err(GlbLoadError::Io {
+                path: key,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "GLB animation asset not found",
+                ),
+            }
+            .into());
+        }
+    };
+    Ok((key, animation))
+}
+
+fn glb_mesh_source_cache_key(asset_root: &Path, src: &str, path_style: WorldPathStyle) -> PathBuf {
+    if is_remote_world_asset_source(src) {
+        PathBuf::from(src)
+    } else {
+        resolve_asset_path_with_style(asset_root, src, path_style)
+    }
+}
+
+fn load_cached_glb_mesh_resolved<'a>(
+    asset_root: &Path,
+    src: &str,
+    path_style: WorldPathStyle,
+    resolver: &dyn AssetResolver,
+    mesh_cache: &'a mut HashMap<PathBuf, GlbMeshData>,
+) -> Result<(PathBuf, &'a GlbMeshData), WorldRenderError> {
+    let source_key = glb_mesh_source_cache_key(asset_root, src, path_style);
+    if !mesh_cache.contains_key(&source_key) {
+        let (_, mesh) = load_glb_mesh_resolved(asset_root, src, path_style, resolver)?;
+        mesh_cache.insert(source_key.clone(), mesh);
+    }
+    let mesh = mesh_cache
+        .get(&source_key)
+        .expect("mesh cache entry inserted before render");
+    Ok((source_key, mesh))
+}
+
+fn load_cached_glb_animation_resolved<'a>(
+    asset_root: &Path,
+    src: &str,
+    path_style: WorldPathStyle,
+    resolver: &dyn AssetResolver,
+    mesh_cache: &'a mut HashMap<PathBuf, GlbMeshData>,
+) -> Result<(PathBuf, &'a GlbMeshData), WorldRenderError> {
+    let source_key = glb_mesh_source_cache_key(asset_root, src, path_style);
+    if !mesh_cache.contains_key(&source_key) {
+        let (_, animation) = load_glb_animation_resolved(asset_root, src, path_style, resolver)?;
+        mesh_cache.insert(source_key.clone(), animation);
+    }
+    let animation = mesh_cache
+        .get(&source_key)
+        .expect("animation cache entry inserted before sampling");
+    Ok((source_key, animation))
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::Path,
+        thread,
+    };
 
+    use crate::asset::PathAssetResolver;
     use crate::world::{parse_world_graph_script, render_world_frame};
+
+    #[test]
+    fn native_world_asset_resolver_fetches_http_url_as_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local asset server");
+        let address = listener.local_addr().expect("local asset server address");
+        let body = b"small universal GLB fixture".to_vec();
+        let expected = body.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept asset request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read asset request");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: model/gltf-binary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write asset response headers");
+            stream.write_all(&body).expect("write asset response body");
+        });
+
+        let url = format!("http://{address}/iphone.glb");
+        let resolved = super::resolve_world_asset_source(
+            Path::new("."),
+            &url,
+            crate::world::WorldPathStyle::Relative,
+            &PathAssetResolver,
+        )
+        .expect("native URL asset should resolve");
+        server.join().expect("asset server thread");
+
+        match resolved {
+            super::ResolvedWorldAsset::Bytes { key, bytes } => {
+                assert_eq!(key, std::path::PathBuf::from(url));
+                assert_eq!(bytes, expected);
+            }
+            _ => panic!("remote URL must resolve to in-memory bytes"),
+        }
+    }
+
+    #[test]
+    fn remote_glb_url_is_its_stable_mesh_cache_key() {
+        let url = "https://raw.githubusercontent.com/example/assets/iphone.glb";
+        assert!(super::is_remote_world_asset_source(url));
+        assert_eq!(
+            super::glb_mesh_source_cache_key(
+                Path::new("ignored"),
+                url,
+                crate::world::WorldPathStyle::Relative,
+            ),
+            std::path::PathBuf::from(url)
+        );
+    }
+
+    #[test]
+    fn world_pbr_shader_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(super::WGPU_WORLD_SHADER)
+            .expect("world PBR WGSL must parse");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("world PBR WGSL must validate");
+    }
+
+    #[test]
+    fn world_pbr_shader_preserves_clip_w_for_perspective_correct_uvs() {
+        assert!(super::WGPU_WORLD_SHADER.contains(
+            "out.pos = vec4<f32>(ndc_x * safe_z, ndc_y * safe_z, ndc_z * safe_z, safe_z);"
+        ));
+        assert!(
+            !super::WGPU_WORLD_SHADER.contains("out.pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);")
+        );
+    }
+
+    #[test]
+    fn scene_material_texture_flips_top_left_raster_to_gltf_uv_origin() {
+        let mut image = image::RgbaImage::new(1, 2);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        image.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        let texture = super::gpu_world_texture_from_image(&image);
+        assert_eq!(texture.rgba, vec![0, 0, 255, 255, 255, 0, 0, 255]);
+    }
 
     #[test]
     fn world_camera_yaw_rotates_actor_world_position() {
@@ -5339,6 +8333,537 @@ mod tests {
         assert!((side.x - 1.0).abs() < 0.001);
         assert!(side.depth.abs() < 0.001);
         assert!((side.yaw - 45.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn glb_clip_channel_samples_between_keyframes() {
+        let channel = super::GlbAnimationChannelData {
+            node_index: 0,
+            property: super::GlbAnimationProperty::Translation,
+            interpolation: super::GlbAnimationInterpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: super::GlbAnimationValues::Vec3(vec![[0.0, 2.0, 4.0], [8.0, 6.0, 0.0]]),
+        };
+
+        let Some(super::GlbAnimationValues::Vec3(values)) =
+            super::sample_animation_channel(&channel, 0.25)
+        else {
+            panic!("expected sampled translation");
+        };
+        assert_eq!(values, vec![[2.0, 3.0, 3.0]]);
+    }
+
+    #[test]
+    fn multiple_glb_clip_layers_crossfade_in_source_order() {
+        let channel = |value| super::GlbAnimationChannelData {
+            node_index: 0,
+            property: super::GlbAnimationProperty::Translation,
+            interpolation: super::GlbAnimationInterpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: super::GlbAnimationValues::Vec3(vec![value, value]),
+        };
+        let mesh = super::GlbMeshData {
+            path: std::path::PathBuf::from("clips.glb"),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            texcoords: Vec::new(),
+            colors: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: Vec::new(),
+            triangles: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            mesh_names: Vec::new(),
+            nodes: vec![crate::world::GlbNodeData {
+                index: 0,
+                name: Some("hips".to_string()),
+                parent: None,
+                children: Vec::new(),
+                mesh: None,
+                skin: None,
+                translation: [0.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+                matrix: None,
+            }],
+            skin: None,
+            animations: vec![
+                crate::world::gltf_loader::GlbAnimationData {
+                    name: Some("A".to_string()),
+                    duration: 1.0,
+                    channels: vec![channel([10.0, 0.0, 0.0])],
+                },
+                crate::world::gltf_loader::GlbAnimationData {
+                    name: Some("B".to_string()),
+                    duration: 1.0,
+                    channels: vec![channel([20.0, 0.0, 0.0])],
+                },
+            ],
+            bounds_min: [0.0, 0.0, 0.0],
+            bounds_max: [0.0, 0.0, 0.0],
+        };
+        let play = |name: &str| crate::world::WorldPlay {
+            clip: Some(name.to_string()),
+            r#loop: false,
+            speed: "1".to_string(),
+            weight: "0.5".to_string(),
+            blend_in: "0".to_string(),
+            blend_out: "0".to_string(),
+            mask: Vec::new(),
+        };
+        let actor = crate::world::WorldActor {
+            id: "girl".to_string(),
+            model: "clips.glb".to_string(),
+            path_style: crate::world::WorldPathStyle::Relative,
+            hide_meshes: Vec::new(),
+            hide_materials: Vec::new(),
+            profile: None,
+            rig: None,
+            retarget: None,
+            x: "0".to_string(),
+            y: "0".to_string(),
+            z: "0".to_string(),
+            yaw: "0".to_string(),
+            pitch: "0".to_string(),
+            roll: "0".to_string(),
+            scale: "1".to_string(),
+            opacity: "1".to_string(),
+            material: None,
+            play: Some(play("A")),
+            plays: vec![play("B")],
+        };
+        let graph = crate::world::WorldGraph {
+            id: None,
+            version: None,
+            fps: 30.0,
+            duration_ms: 1_000,
+            duration_explicit: true,
+            size: (1, 1),
+            render_size: None,
+            model_profiles: Vec::new(),
+            worlds: Vec::new(),
+            retargets: Vec::new(),
+            actions: Vec::new(),
+            apply_actions: Vec::new(),
+            animation_assets: Vec::new(),
+            constraints: Vec::new(),
+            present: crate::world::WorldPresent {
+                from: String::new(),
+            },
+        };
+        let sampled = super::sample_actor_clip(
+            &graph,
+            &actor,
+            &mesh,
+            crate::world::WorldTime {
+                frame: 30,
+                fps: 30.0,
+                duration_ms: 1_000,
+            },
+        )
+        .expect("sample clip layers");
+        assert_eq!(sampled[&0].translation, Some([12.5, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn humanoid_body_masks_match_canonical_sides() {
+        assert!(super::bone_matches_body_mask(
+            "upper_arm_r",
+            &["right_arm".to_string()]
+        ));
+        assert!(!super::bone_matches_body_mask(
+            "upper_arm_l",
+            &["right_arm".to_string()]
+        ));
+        assert!(super::bone_matches_body_mask(
+            "lower_leg_l",
+            &["lower_body".to_string()]
+        ));
+    }
+
+    #[test]
+    fn quaternius_humanoid_joint_names_map_to_canonical_bones() {
+        let cases = [
+            ("pelvis", "hips"),
+            ("spine_01", "spine"),
+            ("spine_03", "chest"),
+            ("neck_01", "neck"),
+            ("clavicle_l", "shoulder_l"),
+            ("upperarm_l", "upper_arm_l"),
+            ("lowerarm_r", "forearm_r"),
+            ("thigh_l", "upper_leg_l"),
+            ("calf_r", "lower_leg_r"),
+            ("ball_l", "toe_l"),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                super::canonical_humanoid_bone(source, "quaternius_humanoid").as_deref(),
+                Some(expected),
+                "failed to canonicalize Quaternius joint '{source}'"
+            );
+        }
+    }
+
+    #[test]
+    fn external_mixamo_clip_maps_rotation_to_canonical_target_bone() {
+        let node = |name: &str| crate::world::GlbNodeData {
+            index: 0,
+            name: Some(name.to_string()),
+            parent: None,
+            children: Vec::new(),
+            mesh: None,
+            skin: None,
+            translation: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0, 1.0, 1.0],
+            matrix: None,
+        };
+        let empty_mesh = |path: &str, node| super::GlbMeshData {
+            path: std::path::PathBuf::from(path),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            texcoords: Vec::new(),
+            colors: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: Vec::new(),
+            triangles: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            mesh_names: Vec::new(),
+            nodes: vec![node],
+            skin: None,
+            animations: Vec::new(),
+            bounds_min: [0.0, 0.0, 0.0],
+            bounds_max: [1.0, 1.0, 1.0],
+        };
+        let mut source = empty_mesh("walk.glb", node("mixamorig:RightArm"));
+        source
+            .animations
+            .push(crate::world::gltf_loader::GlbAnimationData {
+                name: Some("Walk".to_string()),
+                duration: 1.0,
+                channels: vec![super::GlbAnimationChannelData {
+                    node_index: 0,
+                    property: super::GlbAnimationProperty::Rotation,
+                    interpolation: super::GlbAnimationInterpolation::Linear,
+                    times: vec![0.0, 1.0],
+                    values: super::GlbAnimationValues::Quat(vec![
+                        [0.0, 0.0, 0.0, 1.0],
+                        [
+                            0.0,
+                            0.0,
+                            std::f32::consts::FRAC_1_SQRT_2,
+                            std::f32::consts::FRAC_1_SQRT_2,
+                        ],
+                    ]),
+                }],
+            });
+        let target = empty_mesh("target.glb", node("upper_arm_r"));
+        let actor = crate::world::WorldActor {
+            id: "character_a".to_string(),
+            model: "target.glb".to_string(),
+            path_style: crate::world::WorldPathStyle::Relative,
+            hide_meshes: Vec::new(),
+            hide_materials: Vec::new(),
+            profile: Some("motionloom_humanoid_v1".to_string()),
+            rig: None,
+            retarget: None,
+            x: "0".to_string(),
+            y: "0".to_string(),
+            z: "0".to_string(),
+            yaw: "0".to_string(),
+            pitch: "0".to_string(),
+            roll: "0".to_string(),
+            scale: "1".to_string(),
+            opacity: "1".to_string(),
+            material: None,
+            play: None,
+            plays: Vec::new(),
+        };
+        let graph = crate::world::WorldGraph {
+            id: None,
+            version: None,
+            fps: 30.0,
+            duration_ms: 1_000,
+            duration_explicit: true,
+            size: (1, 1),
+            render_size: None,
+            model_profiles: vec![crate::world::WorldModelProfile {
+                id: "motionloom_humanoid_v1".to_string(),
+                model: "target.glb".to_string(),
+                preset: "humanoid_v1".to_string(),
+                retarget: Some(crate::world::WorldProfileRetarget {
+                    preset: "humanoid_v1".to_string(),
+                    maps: vec![crate::world::WorldRetargetMap {
+                        from: "upper_arm_r".to_string(),
+                        to: "upper_arm_r".to_string(),
+                    }],
+                }),
+                bone_axis_map: Some(crate::world::WorldBoneAxisMap {
+                    axes: vec![crate::world::WorldBoneAxis {
+                        bone: "upper_arm_r".to_string(),
+                        forward: Some("rotationZ:-1".to_string()),
+                        side: Some("rotationX:-1".to_string()),
+                        twist: Some("rotationY:1".to_string()),
+                        bend: None,
+                        turn: None,
+                        rest_forward: None,
+                        rest_side: Some("-90".to_string()),
+                        rest_twist: None,
+                        rest_bend: None,
+                        rest_turn: None,
+                    }],
+                }),
+            }],
+            worlds: Vec::new(),
+            retargets: Vec::new(),
+            actions: Vec::new(),
+            apply_actions: vec![crate::world::WorldApplyAction {
+                target: "character_a".to_string(),
+                action: "walk".to_string(),
+                at_ms: 0,
+                r#loop: false,
+                weight: "1".to_string(),
+                speed: "1".to_string(),
+                blend_in: "0".to_string(),
+                blend_out: "0".to_string(),
+                mode: "override".to_string(),
+                mask: Vec::new(),
+                duration_ms: None,
+                root_motion: None,
+                destination: None,
+                face: None,
+                sync_group: None,
+                sync_marker: None,
+            }],
+            animation_assets: vec![crate::world::WorldAnimationAsset {
+                id: "walk".to_string(),
+                src: "walk.glb".to_string(),
+                profile: "mixamo_humanoid".to_string(),
+                clip: Some("Walk".to_string()),
+            }],
+            constraints: Vec::new(),
+            present: crate::world::WorldPresent {
+                from: String::new(),
+            },
+        };
+        let source_key = std::path::PathBuf::from("walk.glb");
+        let mesh_cache = std::collections::HashMap::from([(source_key.clone(), source)]);
+        let sampled = super::sample_external_actor_actions(
+            &graph,
+            &actor,
+            &target,
+            &std::collections::HashMap::from([("walk".to_string(), source_key)]),
+            &mesh_cache,
+            crate::world::WorldTime {
+                frame: 15,
+                fps: 30.0,
+                duration_ms: 1_000,
+            },
+        )
+        .expect("sample external Mixamo clip");
+        let rotation = sampled[&0].rotation.expect("mapped target rotation");
+        assert!(rotation[2].abs() > 0.3, "rotation={rotation:?}");
+        let overrides = super::actor_bone_overrides_for_mesh(
+            &graph,
+            &actor,
+            Some(&target),
+            crate::world::WorldTime {
+                frame: 15,
+                fps: 30.0,
+                duration_ms: 1_000,
+            },
+        )
+        .expect("external clip rest calibration");
+        assert!(
+            !overrides.contains_key("upper_arm_r"),
+            "externally driven arm must not receive its semantic rest offset twice"
+        );
+    }
+
+    #[test]
+    fn action_blend_envelope_fades_in_and_out() {
+        let action = crate::world::WorldAction {
+            id: "wave".to_string(),
+            skeleton: "humanoid_v1".to_string(),
+            intent: None,
+            duration_ms: 2_000,
+            poses: Vec::new(),
+            iks: Vec::new(),
+        };
+        let apply = crate::world::WorldApplyAction {
+            target: "girl".to_string(),
+            action: "wave".to_string(),
+            at_ms: 0,
+            r#loop: false,
+            weight: "1".to_string(),
+            speed: "1".to_string(),
+            blend_in: "0.5".to_string(),
+            blend_out: "0.5".to_string(),
+            mode: "override".to_string(),
+            mask: Vec::new(),
+            duration_ms: None,
+            root_motion: None,
+            destination: None,
+            face: None,
+            sync_group: None,
+            sync_marker: None,
+        };
+        let entering = crate::world::WorldTime {
+            frame: 6,
+            fps: 30.0,
+            duration_ms: 2_000,
+        };
+        let leaving = crate::world::WorldTime {
+            frame: 57,
+            fps: 30.0,
+            duration_ms: 2_000,
+        };
+
+        let fade_in = super::action_blend_envelope(&action, &apply, 0.2, 1.0, entering)
+            .expect("fade-in envelope");
+        let fade_out = super::action_blend_envelope(&action, &apply, 1.9, 1.0, leaving)
+            .expect("fade-out envelope");
+        assert!((fade_in - 0.4).abs() < 0.001);
+        assert!((fade_out - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn two_bone_ik_reaches_target_with_local_axis_calibration() {
+        let node = |index, name: &str, parent, children, translation| crate::world::GlbNodeData {
+            index,
+            name: Some(name.to_string()),
+            parent,
+            children,
+            mesh: None,
+            skin: None,
+            translation,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0, 1.0, 1.0],
+            matrix: None,
+        };
+        let mesh = super::GlbMeshData {
+            path: std::path::PathBuf::from("analytic-ik.glb"),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            texcoords: Vec::new(),
+            colors: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: Vec::new(),
+            triangles: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            mesh_names: Vec::new(),
+            nodes: vec![
+                node(0, "upper", None, vec![1], [0.0, 0.0, 0.0]),
+                node(1, "lower", Some(0), vec![2], [1.0, 0.0, 0.0]),
+                node(2, "hand", Some(1), Vec::new(), [1.0, 0.0, 0.0]),
+            ],
+            skin: None,
+            animations: Vec::new(),
+            bounds_min: [0.0, 0.0, 0.0],
+            bounds_max: [2.0, 0.0, 0.0],
+        };
+        let action = crate::world::WorldAction {
+            id: "reach".to_string(),
+            skeleton: "humanoid_v1".to_string(),
+            intent: None,
+            duration_ms: 1_000,
+            poses: Vec::new(),
+            iks: vec![crate::world::WorldActionIk {
+                root: "upper".to_string(),
+                mid: "lower".to_string(),
+                end: "hand".to_string(),
+                target_x: "1".to_string(),
+                target_y: "1".to_string(),
+                target_z: "0".to_string(),
+                pole_x: None,
+                pole_y: None,
+                pole_z: None,
+                plane: "xy".to_string(),
+                bend: "1".to_string(),
+                weight: "1".to_string(),
+            }],
+        };
+        let mut overrides = std::collections::HashMap::new();
+        super::apply_two_bone_ik_overrides(
+            &mesh,
+            &action,
+            &std::collections::HashMap::new(),
+            &[],
+            1.0,
+            crate::world::WorldTime {
+                frame: 0,
+                fps: 30.0,
+                duration_ms: 1_000,
+            },
+            &mut overrides,
+        )
+        .expect("solve analytic IK");
+        let matrices = super::global_node_matrices(&mesh, &overrides);
+        let hand = super::matrix_translation(matrices[2]);
+        assert!((hand[0] - 1.0).abs() < 0.02, "hand x={}", hand[0]);
+        assert!((hand[1] - 1.0).abs() < 0.02, "hand y={}", hand[1]);
+    }
+
+    #[test]
+    fn scene_constraint_two_bone_solver_reaches_sampled_target() {
+        let node = |index, name: &str, parent, children, translation| crate::world::GlbNodeData {
+            index,
+            name: Some(name.to_string()),
+            parent,
+            children,
+            mesh: None,
+            skin: None,
+            translation,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0, 1.0, 1.0],
+            matrix: None,
+        };
+        let mesh = super::GlbMeshData {
+            path: std::path::PathBuf::from("scene-constraint.glb"),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            texcoords: Vec::new(),
+            colors: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: Vec::new(),
+            triangles: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            mesh_names: Vec::new(),
+            nodes: vec![
+                node(0, "upper_arm_r", None, vec![1], [0.0, 0.0, 0.0]),
+                node(1, "forearm_r", Some(0), vec![2], [1.0, 0.0, 0.0]),
+                node(2, "hand_r", Some(1), Vec::new(), [1.0, 0.0, 0.0]),
+            ],
+            skin: None,
+            animations: Vec::new(),
+            bounds_min: [0.0, 0.0, 0.0],
+            bounds_max: [2.0, 1.0, 0.0],
+        };
+        let mut overrides = std::collections::HashMap::new();
+        super::solve_two_bone_constraint(
+            &mesh,
+            "upper_arm_r",
+            "forearm_r",
+            "hand_r",
+            0,
+            1,
+            2,
+            [1.0, 1.0, 0.0],
+            1.0,
+            &std::collections::HashMap::new(),
+            &mut overrides,
+        );
+        let matrices = super::global_node_matrices(&mesh, &overrides);
+        let hand = super::matrix_translation(matrices[2]);
+        assert!((hand[0] - 1.0).abs() < 0.02, "hand x={}", hand[0]);
+        assert!((hand[1] - 1.0).abs() < 0.02, "hand y={}", hand[1]);
     }
 
     #[test]

@@ -48,12 +48,17 @@ pub(crate) fn apply_action_graph_at_time(
     let mut next = graph.clone();
 
     for apply in &graph.apply_actions {
-        let action = action_map.get(apply.action.as_str()).ok_or_else(|| {
-            MotionLoomSceneRenderError::InvalidExpression {
+        let Some(action) = action_map.get(apply.action.as_str()) else {
+            return Err(MotionLoomSceneRenderError::InvalidExpression {
                 expr: apply.action.clone(),
                 message: "ApplyAction references an unknown Action".to_string(),
-            }
-        })?;
+            });
+        };
+        // External Actions are sampled by the retained 3D renderer. They are
+        // still real Action nodes; AnimationAsset ids never enter this API.
+        if action.source.is_some() {
+            continue;
+        }
         let samples = sample_action_bones(action, apply, time_norm, time_sec)?;
         if samples.is_empty() && action.iks.is_empty() {
             continue;

@@ -9,10 +9,53 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    GraphParseError, GraphScript, MotionLoomSceneRenderError, SceneGpuTexture, ScenePreviewBackend,
-    ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderProfile, SceneRenderer,
-    parse_graph_script,
+    GraphParseError, GraphScript, MotionLoomSceneRenderError, SceneGpuTexture, SceneNode,
+    ScenePreviewBackend, ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderProfile,
+    SceneRenderer, parse_graph_script,
 };
+
+fn collect_sequence_activation_frames(
+    nodes: &[SceneNode],
+    fps: f32,
+    total_frames: u32,
+    base_ms: u64,
+    sampled_frames: &mut Vec<u32>,
+) {
+    for node in nodes {
+        let (children, child_base_ms) = match node {
+            SceneNode::Sequence(sequence) => {
+                let activation_ms = base_ms.saturating_add(sequence.from_ms);
+                sampled_frames.push(
+                    ((activation_ms as f32 / 1000.0) * fps)
+                        .ceil()
+                        .clamp(0.0, total_frames.saturating_sub(1) as f32)
+                        as u32,
+                );
+                (&sequence.children, activation_ms)
+            }
+            SceneNode::Timeline(value) => (&value.children, base_ms),
+            SceneNode::Track(value) => (&value.children, base_ms),
+            SceneNode::Chain(value) => (&value.children, base_ms.saturating_add(value.from_ms)),
+            SceneNode::Group(value) => (&value.children, base_ms),
+            SceneNode::Puppet(value) => (&value.children, base_ms),
+            SceneNode::Part(value) => (&value.children, base_ms),
+            SceneNode::Repeat(value) => (&value.children, base_ms),
+            SceneNode::Mask(value) => (&value.children, base_ms),
+            SceneNode::Precompose(value) => (&value.children, base_ms),
+            SceneNode::Layer(value) => (&value.children, base_ms),
+            SceneNode::Camera(value) => (&value.children, base_ms),
+            SceneNode::Character(value) => (&value.children, base_ms),
+            _ => continue,
+        };
+        collect_sequence_activation_frames(
+            children,
+            fps,
+            total_frames,
+            child_base_ms,
+            sampled_frames,
+        );
+    }
+}
 
 /// Quality presets shared by native live-preview hosts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,6 +97,139 @@ impl WgpuPreviewQuality {
             Self::HighSpeed => 3,
             Self::UltraSpeed => 4,
         }
+    }
+
+    /// Return the next lower-cost preview preset without changing export quality.
+    pub const fn faster(self) -> Self {
+        match self {
+            Self::Full => Self::Balanced,
+            Self::Balanced => Self::Speed,
+            Self::Speed => Self::HighSpeed,
+            Self::HighSpeed | Self::UltraSpeed => Self::UltraSpeed,
+        }
+    }
+
+    /// Return the next higher-quality preview preset.
+    pub const fn sharper(self) -> Self {
+        match self {
+            Self::Full | Self::Balanced => Self::Full,
+            Self::Speed => Self::Balanced,
+            Self::HighSpeed => Self::Speed,
+            Self::UltraSpeed => Self::HighSpeed,
+        }
+    }
+}
+
+/// Result of warming a graph before interactive playback begins.
+///
+/// Preloading submits representative frames through the same GPU path used by
+/// playback. This compiles pipelines and fills GLB, animation, material, mesh,
+/// text, and environment caches while the host can still show a loading state.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WgpuPreviewPreloadReport {
+    pub sampled_frames: Vec<u32>,
+    pub asset_declarations: usize,
+}
+
+/// Opt-in frame-budget controller for interactive preview hosts.
+///
+/// It only recommends an existing preview quality; it never mutates a graph or
+/// affects export. A manual quality selection can lock the controller until the
+/// host explicitly re-enables it.
+#[derive(Clone, Debug)]
+pub struct WgpuPreviewAdaptiveController {
+    enabled: bool,
+    manual_lock: bool,
+    target_frame_ms: f32,
+    slow_streak: u32,
+    fast_streak: u32,
+    cooldown_frames: u32,
+}
+
+impl WgpuPreviewAdaptiveController {
+    pub fn for_fps(fps: f32) -> Self {
+        Self {
+            enabled: true,
+            manual_lock: false,
+            target_frame_ms: 1000.0 / fps.clamp(1.0, 60.0),
+            slow_streak: 0,
+            fast_streak: 0,
+            cooldown_frames: 0,
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.reset_samples();
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled && !self.manual_lock
+    }
+
+    pub fn set_target_fps(&mut self, fps: f32) {
+        self.target_frame_ms = 1000.0 / fps.clamp(1.0, 60.0);
+        self.reset_samples();
+    }
+
+    pub fn lock_manual(&mut self) {
+        self.manual_lock = true;
+        self.reset_samples();
+    }
+
+    pub fn resume_auto(&mut self) {
+        self.manual_lock = false;
+        self.reset_samples();
+    }
+
+    /// Observe one complete renderer frame and optionally recommend a new preset.
+    pub fn observe(
+        &mut self,
+        quality: WgpuPreviewQuality,
+        frame_ms: f32,
+    ) -> Option<WgpuPreviewQuality> {
+        if !self.enabled() || !frame_ms.is_finite() || frame_ms <= 0.0 {
+            return None;
+        }
+        if self.cooldown_frames > 0 {
+            self.cooldown_frames -= 1;
+            return None;
+        }
+
+        if frame_ms > self.target_frame_ms * 1.15 {
+            self.slow_streak += 1;
+            self.fast_streak = 0;
+        } else if frame_ms < self.target_frame_ms * 0.65 {
+            self.fast_streak += 1;
+            self.slow_streak = 0;
+        } else {
+            self.slow_streak = 0;
+            self.fast_streak = 0;
+        }
+
+        if self.slow_streak >= 8 {
+            self.reset_samples();
+            let next = quality.faster();
+            if next != quality {
+                self.cooldown_frames = 30;
+                return Some(next);
+            }
+        }
+        if self.fast_streak >= 90 {
+            self.reset_samples();
+            let next = quality.sharper();
+            if next != quality {
+                self.cooldown_frames = 90;
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn reset_samples(&mut self) {
+        self.slow_streak = 0;
+        self.fast_streak = 0;
+        self.cooldown_frames = 0;
     }
 }
 
@@ -205,6 +381,53 @@ impl WgpuPreviewEngine {
         self.gpu_renderer = None;
     }
 
+    /// Warm representative action boundaries before interactive playback.
+    ///
+    /// This is additive and optional. Existing hosts can keep rendering frames
+    /// exactly as before; latency-sensitive hosts can call it while presenting
+    /// their loading UI. No CPU readback is performed.
+    pub async fn preload_graph_resources(
+        &mut self,
+        graph: &GraphScript,
+    ) -> Result<WgpuPreviewPreloadReport, WgpuPreviewEngineError> {
+        let Some(renderer) = self.gpu_renderer.as_mut() else {
+            return Err(WgpuPreviewEngineError::NoRenderer);
+        };
+        let fps = graph.fps.max(1.0);
+        let total_frames = (((graph.duration_ms as f32 / 1000.0) * fps).ceil() as u32).max(1);
+        let mut sampled_frames = vec![0];
+        sampled_frames.extend(graph.apply_actions.iter().map(|apply| {
+            ((apply.at_ms as f32 / 1000.0) * fps)
+                .round()
+                .clamp(0.0, total_frames.saturating_sub(1) as f32) as u32
+        }));
+        for scene in &graph.scenes {
+            collect_sequence_activation_frames(
+                &scene.children,
+                fps,
+                total_frames,
+                0,
+                &mut sampled_frames,
+            );
+        }
+        sampled_frames.sort_unstable();
+        sampled_frames.dedup();
+        // Keep loading bounded for scripts containing hundreds of tiny cues.
+        if sampled_frames.len() > 16 {
+            sampled_frames.truncate(16);
+        }
+        for frame in sampled_frames.iter().copied() {
+            renderer
+                .render_frame_to_wgpu_texture(graph, frame)
+                .await
+                .map_err(WgpuPreviewEngineError::Render)?;
+        }
+        Ok(WgpuPreviewPreloadReport {
+            sampled_frames,
+            asset_declarations: graph.assets.len(),
+        })
+    }
+
     /// Render to the fastest displayable preview surface, falling back to CPU BGRA.
     pub async fn render_preview_surface_with_cpu_fallback(
         &mut self,
@@ -336,6 +559,14 @@ impl WgpuPreviewEngine {
         self.gpu_renderer
             .as_ref()
             .map(SceneRenderer::last_cpu_frame_profile)
+    }
+
+    /// Breakdown of the most recently rendered retained 3D island.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn last_3d_frame_profile(&self) -> Option<crate::Scene3DFrameProfile> {
+        self.gpu_renderer
+            .as_ref()
+            .map(SceneRenderer::last_3d_frame_profile)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -496,7 +727,61 @@ impl WgpuPreviewEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{WgpuPreviewEngine, WgpuPreviewGraphCache};
+    use super::{
+        WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewGraphCache,
+        WgpuPreviewQuality, collect_sequence_activation_frames,
+    };
+
+    #[test]
+    fn preview_preload_includes_delayed_scene_sequence_activation() {
+        let graph = crate::parse_graph_script(
+            r##"<Graph fps={30} duration="10s" size={[64,64]}>
+  <Scene id="main">
+    <Timeline>
+      <Track space="3d">
+        <Sequence from="5.58s" duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="8" height="8" color="#ffffff" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##,
+        )
+        .expect("delayed 3D scene");
+        let mut sampled_frames = vec![0];
+        collect_sequence_activation_frames(
+            &graph.scenes[0].children,
+            graph.fps,
+            300,
+            0,
+            &mut sampled_frames,
+        );
+        assert!(sampled_frames.contains(&168));
+    }
+
+    #[test]
+    fn adaptive_preview_downgrades_only_after_sustained_slow_frames() {
+        let mut adaptive = WgpuPreviewAdaptiveController::for_fps(30.0);
+        for _ in 0..7 {
+            assert_eq!(adaptive.observe(WgpuPreviewQuality::Full, 50.0), None);
+        }
+        assert_eq!(
+            adaptive.observe(WgpuPreviewQuality::Full, 50.0),
+            Some(WgpuPreviewQuality::Balanced)
+        );
+    }
+
+    #[test]
+    fn manual_preview_quality_disables_adaptation() {
+        let mut adaptive = WgpuPreviewAdaptiveController::for_fps(30.0);
+        adaptive.lock_manual();
+        for _ in 0..20 {
+            assert_eq!(adaptive.observe(WgpuPreviewQuality::Full, 80.0), None);
+        }
+    }
 
     #[test]
     fn scales_quoted_numeric_lens_param() {

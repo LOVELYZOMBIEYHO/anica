@@ -271,7 +271,10 @@ renderer.render_frame_to_wgpu_texture(&graph, frame).await?
 Renders a frame to a MotionLoom-owned `wgpu::Texture`.
 
 Use this when the host wants GPU output without managing the target texture
-itself.
+itself. The preferred output type name is `GpuFrameTexture`;
+`SceneGpuTexture` remains available for source compatibility. Mixed Scene
+frames containing `<CompositeGroup space="3d">` stay on the shared wgpu device
+and are sampled by the Scene compositor without a CPU readback/re-upload.
 
 ### `SceneRenderer::render_frame_to_wgpu_target_texture`
 
@@ -401,6 +404,30 @@ tooling that needs to inspect or generate UI-editable scene graphs:
   `time` or `frame` timing.
 - `SkeletonNode`, `SkeletonBoneNode`, `ActionNode`, `ActionPoseNode`,
   `ActionBoneNode`, `ApplyActionNode`, and IK data inside actions for rigs.
+- Unified Scene 3D models accept optional `profile`, `rig`, `retarget`, and
+  `<Play>` data. A `kind="3d"` ModelProfile plus Action/ApplyAction lowers to
+  the existing GPU skinning backend. `AnimationTarget` also accepts typed
+  `bones.<canonical-bone>.<component>` paths, and 3D Actions can carry
+  analytic two-bone IK, blending, speed, loop, and body-mask metadata.
+- Scene DSL exposes external motion through a low-level `AnimationAsset`
+  wrapped by an executable `Action`; `ApplyAction` accepts only Action ids.
+  It also exposes relative 3D `Anchor` placement, timed `ApplyAction`
+  destination/facing controls,
+  cross-model two-bone `Constraint`, and discrete Scene `activeCamera`
+  switching. These features lower into the existing Scene 3D renderer and do
+  not restore the removed public `<World>` authoring root.
+- Static GLB stages use the additive `Environment` specialization of `Model`,
+  with a declared coordinate profile and nested semantic `Surface` and `Anchor`
+  nodes. Surfaces can carry asset-space centroid/bounds/normal evidence; anchors
+  can use normalized surface UV coordinates. `Camera3D` position/target, Model
+  position, `ApplyAction.destination`, `face`, `takeoff`, `contact`, `landing`,
+  and `ground` can share the resulting ids. Runtime grounding raycasts the
+  transformed walkable triangles. External Actions may contain semantic
+  `Marker` nodes, allowing root motion to follow authored action phases instead
+  of fixed percentages. `Camera3D.up`, `roll`, and `horizonLock` make imported
+  environments camera-safe. `ApplyAction.groundOffset` separates a target rig's
+  root origin from the physical surface while preserving all older action
+  syntax.
 - `CharacterNode` and `PartNode` for bone-attached or dense vector artwork.
 - `PuppetNode`, `PinNode`, `MeshTopologyNode`, `VertexNode`, `TriangleNode`,
   `EdgeNode`, and `RegionNode` for AE-style pin deformation and optional manual
@@ -426,9 +453,38 @@ Frame-key UI integrations can use:
   node/property channel.
 - `replace_editable_animation_targets(script, targets)` to replace the full
   editor keyframe set.
+- `editable_animation_target(script, node, property)` and
+  `remove_editable_animation_target(...)` for channel-local editing that keeps
+  unrelated source formatting.
 
 These helpers re-parse generated DSL after write-back, so UI saves fail fast
 instead of emitting invalid MotionLoom text.
+
+Animation capability discovery is available through
+`animation_property_descriptor`, `animation_properties_for_node_kind`,
+`animation_property_schema_json`, and `inspect_animation_targets`. They share
+the typed registry used by parser validation and rendering; hosts should not
+maintain a separate property whitelist.
+
+For an LLM authoring loop, use `motionloom_analyze_script_json` or
+`motionloom_analyze_script_for_target_json`. These APIs always return a
+machine-readable `MotionLoomAuthoringReport`, including parse and compile
+status, source-addressed errors and warnings, effective graph facts, and
+recommended repairs. Invalid authored DSL is represented by
+`status: "unrenderable"` rather than a thrown WASM exception.
+
+`motionloom_showcase_schema_json` serves a separate purpose: it extracts the
+language slice demonstrated by one example for dataset learning and generates
+the `schema.json` stored beside that showcase's `main.motionloom`.
+
+Environment asset inspection is available through
+`inspect_glb_environment_path`, `inspect_glb_environment_bytes`, and
+`inspect_glb_environment_json`. Reports contain renderer-space bounds,
+coordinate-profile evidence, transformed walkable triangle Surface proposals,
+Anchor proposals, confidence, diagnostics, and a starter DSL fragment. The WASM wrapper
+`motionloom_inspect_glb_environment_json(asset_label, bytes)` operates on bytes
+that a browser host has already fetched; inspection never requires a public
+`World` authoring API.
 
 Low-level kernel resolution helpers such as `default_kernel_for_effect` and
 `resolve_pass_kernel` are also kept for compatibility. Prefer the process
@@ -452,6 +508,9 @@ unified `<Scene>` and place true-3D content in a `space="3d"` track.
 | Export parsed scene graph to video | `render_scene_graph_to_video_with_progress` |
 | Build Layer FX runtime | `parse_process_graph_script` + `compile_runtime_program` |
 | Discover available process effects | `process_effects` |
+| Analyze LLM-authored DSL and suggest repairs | `motionloom_analyze_script_json` |
+| Analyze for a specific renderer | `motionloom_analyze_script_for_target_json` |
+| Generate one example's learning schema | `motionloom_showcase_schema_json` |
 | GPU preview texture | `SceneRenderer::render_frame_to_wgpu_texture` |
 | Host-owned zero-copy target | `SceneRenderer::render_frame_to_wgpu_target_texture` |
 | Cross-platform preview abstraction | `SceneRenderer::render_frame_to_preview_surface` |

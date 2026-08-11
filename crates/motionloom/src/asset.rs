@@ -16,17 +16,17 @@ use std::sync::Mutex;
 /// - Scene image/SVG loading (`load_rgba_image_source`, `load_svg_source`)
 /// - World background image, directional character sprite, and GLB mesh loading
 ///
-/// Not yet implemented:
-/// - Remote URL fetching (native `ureq`, WASM `fetch`)
-/// - WebCodecs video encoding output
+/// Remote Scene images, SVGs, and 3D model assets are fetched with `ureq` on
+/// native hosts. Browser hosts fetch asynchronously and register the resulting
+/// bytes in a `MemoryAssetResolver` under the unchanged DSL URL.
 #[derive(Debug, Clone)]
 pub enum AssetSource {
     /// Native filesystem path.
     Path(PathBuf),
     /// In-memory bytes (e.g. a loaded file or Blob).
     Bytes(Vec<u8>),
-    /// Remote URL. Native builds fetch with `ureq`; WASM builds fetch with
-    /// `fetch`.
+    /// Remote URL. Native renderers fetch with `ureq`; WASM hosts preload with
+    /// `fetch` and register the bytes under this URL.
     Url(String),
 }
 

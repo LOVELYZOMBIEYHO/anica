@@ -15,8 +15,8 @@ mod preview_host_platform;
 
 use motionloom::{
     PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,
-    PreviewInteractionNode, SceneCpuFrameProfile, WgpuPreviewEngine, WgpuPreviewQuality,
-    parse_graph_script,
+    PreviewInteractionNode, Scene3DFrameProfile, SceneCpuFrameProfile,
+    WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewQuality, parse_graph_script,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
@@ -233,6 +233,13 @@ fn preview_host_debug_log(message: impl AsRef<str>) {
     }
 }
 
+fn preview_feature_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |value| {
+        let value = value.trim();
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
 #[derive(Clone, Debug)]
 enum PreviewHostUserEvent {
     Command(PreviewCommand),
@@ -287,6 +294,8 @@ struct LivePreviewApp {
     overlay_pipeline: Option<wgpu::RenderPipeline>,
     picking_pipeline: Option<wgpu::RenderPipeline>,
     quality: WgpuPreviewQuality,
+    adaptive_quality: WgpuPreviewAdaptiveController,
+    pending_preload: bool,
     last_cursor_pos: Option<(f64, f64)>,
     frame: u32,
     total_frames: u32,
@@ -304,6 +313,7 @@ struct LivePreviewApp {
     last_render_ms: f32,
     last_gpu_frame_ms: Option<f64>,
     last_cpu_profile: SceneCpuFrameProfile,
+    last_3d_profile: Scene3DFrameProfile,
     last_present_ms: f32,
     render_times: Vec<f32>,
     present_times: Vec<f32>,
@@ -380,6 +390,7 @@ impl LivePreviewApp {
         host_events: Option<PreviewEventBroadcaster>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (script_source, script) = if let Some(script_source) = script_source {
+            configure_scene_asset_root_for_source(&script_source);
             let script = load_script_source(&script_source)?;
             (script_source, script)
         } else {
@@ -417,6 +428,14 @@ impl LivePreviewApp {
             overlay_pipeline: None,
             picking_pipeline: None,
             quality: WgpuPreviewQuality::Full,
+            adaptive_quality: {
+                let mut adaptive = WgpuPreviewAdaptiveController::for_fps(fps);
+                adaptive.set_enabled(
+                    auto_advance && preview_feature_enabled("MOTIONLOOM_PREVIEW_ADAPTIVE", false),
+                );
+                adaptive
+            },
+            pending_preload: preview_feature_enabled("MOTIONLOOM_PREVIEW_PRELOAD", true),
             last_cursor_pos: None,
             frame: 0,
             total_frames,
@@ -434,6 +453,7 @@ impl LivePreviewApp {
             last_render_ms: 0.0,
             last_gpu_frame_ms: None,
             last_cpu_profile: SceneCpuFrameProfile::default(),
+            last_3d_profile: Scene3DFrameProfile::default(),
             last_present_ms: 0.0,
             render_times: Vec::with_capacity(240),
             present_times: Vec::with_capacity(240),
@@ -490,6 +510,11 @@ impl LivePreviewApp {
     }
 
     fn set_quality(&mut self, quality: WgpuPreviewQuality) {
+        self.adaptive_quality.lock_manual();
+        self.set_quality_internal(quality);
+    }
+
+    fn set_quality_internal(&mut self, quality: WgpuPreviewQuality) {
         if self.quality == quality {
             return;
         }
@@ -498,7 +523,15 @@ impl LivePreviewApp {
         self.request_redraw();
     }
 
+    fn resume_adaptive_quality(&mut self) {
+        self.adaptive_quality.resume_auto();
+        self.request_redraw();
+    }
+
     fn load_script_text(&mut self, script: String, source: Option<String>) -> Result<(), String> {
+        if let Some(source) = source.as_deref() {
+            configure_scene_asset_root_for_source(source);
+        }
         let graph = parse_graph_script(&script)
             .map_err(|err| format!("line {}: {}", err.line, err.message))?;
         let fps = graph.fps.max(1.0);
@@ -509,7 +542,9 @@ impl LivePreviewApp {
         self.script_source = source.unwrap_or_else(|| "preview-host-script".to_string());
         self.base_script = script;
         self.base_graph = graph;
+        self.adaptive_quality.set_target_fps(fps);
         self.overrides.clear();
+        self.pending_preload = preview_feature_enabled("MOTIONLOOM_PREVIEW_PRELOAD", true);
         self.rebuild_graph_for_quality();
         Ok(())
     }
@@ -1524,9 +1559,33 @@ impl LivePreviewApp {
     }
 
     fn render(&mut self) {
+        if self.pending_preload {
+            let preload = {
+                let (Some(graph), Some(preview_engine)) =
+                    (self.graph.as_ref(), self.preview_engine.as_mut())
+                else {
+                    return;
+                };
+                pollster::block_on(preview_engine.preload_graph_resources(graph))
+            };
+            match preload {
+                Ok(report) => preview_host_debug_log(format!(
+                    "preloaded {} declared asset(s) at frame(s) {:?}",
+                    report.asset_declarations, report.sampled_frames
+                )),
+                Err(err) => {
+                    eprintln!("preview preload failed: {err}");
+                    self.broadcast_event(PreviewEvent::Error {
+                        message: format!("preview preload failed: {err}"),
+                    });
+                }
+            }
+            self.pending_preload = false;
+            self.restart_playback_clock();
+        }
         self.update_frame_from_wall_clock();
         let render_start = Instant::now();
-        let (frame_texture, gpu_frame_ms, cpu_profile) = {
+        let (frame_texture, gpu_frame_ms, cpu_profile, profile_3d) = {
             let (Some(graph), Some(preview_engine)) =
                 (self.graph.as_ref(), self.preview_engine.as_mut())
             else {
@@ -1545,6 +1604,7 @@ impl LivePreviewApp {
                 texture,
                 preview_engine.last_gpu_frame_ms(),
                 preview_engine.last_cpu_frame_profile().unwrap_or_default(),
+                preview_engine.last_3d_frame_profile().unwrap_or_default(),
             )
         };
         let render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
@@ -1694,6 +1754,7 @@ impl LivePreviewApp {
         self.last_render_ms = render_ms;
         self.last_gpu_frame_ms = gpu_frame_ms;
         self.last_cpu_profile = cpu_profile;
+        self.last_3d_profile = profile_3d;
         self.last_present_ms = present_ms;
         self.render_times.push(render_ms);
         self.present_times.push(present_ms);
@@ -1707,6 +1768,15 @@ impl LivePreviewApp {
         self.broadcast_event(PreviewEvent::Rendered {
             frame: rendered_frame,
         });
+        if let Some(quality) = self.adaptive_quality.observe(self.quality, render_ms) {
+            preview_host_debug_log(format!(
+                "adaptive preview quality: {} -> {} after {:.2} ms frame",
+                self.quality.label(),
+                quality.label(),
+                render_ms
+            ));
+            self.set_quality_internal(quality);
+        }
         self.update_title();
         self.print_stats();
     }
@@ -1749,10 +1819,12 @@ impl LivePreviewApp {
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "pending".to_string());
         window.set_title(&format!(
-            "MotionLoom wgpu live preview | frame {}/{} | CPU submit {:.2} ms | GPU {} ms | avg {:.2} ms | min/max {:.2}/{:.2} ms | blit {:.2} ms | timeline {:.1} fps | target {}x{} | surface {:?} | quality {} (1 Full, 2 Balanced, 3 Speed, 4 High Speed, 5 Ultra Speed) | {}",
+            "MotionLoom wgpu live preview | frame {}/{} | CPU submit {:.2} ms | 3D prep/submit {:.2}/{:.2} ms | GPU {} ms | avg {:.2} ms | min/max {:.2}/{:.2} ms | blit {:.2} ms | timeline {:.1} fps | target {}x{} | surface {:?} | quality {} (0 Auto, 1 Full, 2 Balanced, 3 Speed, 4 High Speed, 5 Ultra Speed) | {}",
             self.frame,
             self.total_frames,
             self.last_render_ms,
+            self.last_3d_profile.prepare_ms,
+            self.last_3d_profile.submit_ms,
             gpu_frame_label,
             avg_render,
             min_render,
@@ -1780,7 +1852,7 @@ impl LivePreviewApp {
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "pending".to_string());
         println!(
-            "quality={} target={}x{} frame={}/{} cpu_submit_last_ms={:.2} expression_ms={:.3} traversal_ms={:.3} upload_ms={:.3} encode_ms={:.3} wait_ms={:.3} gpu_last_ms={} gpu_timestamp_supported={} render_avg_ms={:.2} render_min_ms={:.2} render_max_ms={:.2} blit_last_ms={:.2} blit_avg_ms={:.2}",
+            "quality={} target={}x{} frame={}/{} cpu_submit_last_ms={:.2} expression_ms={:.3} traversal_ms={:.3} upload_ms={:.3} encode_ms={:.3} wait_ms={:.3} scene3d_prepare_ms={:.3} scene3d_submit_ms={:.3} scene3d_draw_calls={} scene3d_resources={} scene3d_targets={} gpu_last_ms={} gpu_timestamp_supported={} render_avg_ms={:.2} render_min_ms={:.2} render_max_ms={:.2} blit_last_ms={:.2} blit_avg_ms={:.2}",
             self.quality.label(),
             self.target_width,
             self.target_height,
@@ -1792,6 +1864,11 @@ impl LivePreviewApp {
             self.last_cpu_profile.upload_ms,
             self.last_cpu_profile.encode_ms,
             self.last_cpu_profile.wait_ms,
+            self.last_3d_profile.prepare_ms,
+            self.last_3d_profile.submit_ms,
+            self.last_3d_profile.draw_calls,
+            self.last_3d_profile.gpu_resource_entries,
+            self.last_3d_profile.target_pool_size,
             gpu_frame_label,
             self.preview_engine
                 .as_ref()
@@ -1866,6 +1943,9 @@ impl ApplicationHandler<PreviewHostUserEvent> for LivePreviewApp {
                         }
                         PhysicalKey::Code(KeyCode::Digit5) => {
                             self.set_quality(WgpuPreviewQuality::UltraSpeed);
+                        }
+                        PhysicalKey::Code(KeyCode::Digit0) => {
+                            self.resume_adaptive_quality();
                         }
                         _ => {}
                     }
@@ -1959,6 +2039,23 @@ fn max_or_zero(values: &[f32]) -> f32 {
 
 fn is_http_url(value: &str) -> bool {
     value.starts_with("https://") || value.starts_with("http://")
+}
+
+fn local_scene_asset_root_for_source(source: &str) -> Option<std::path::PathBuf> {
+    if source.is_empty() || is_http_url(source) {
+        return None;
+    }
+    let parent = std::path::Path::new(source).parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
+}
+
+fn configure_scene_asset_root_for_source(source: &str) {
+    if let Some(root) = local_scene_asset_root_for_source(source) {
+        motionloom::set_scene_asset_roots(vec![root]);
+    }
 }
 
 fn load_script_source(source: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -2197,7 +2294,7 @@ fn format_live_number(value: f32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::aspect_fit_viewport;
+    use super::{aspect_fit_viewport, local_scene_asset_root_for_source};
 
     #[test]
     fn aspect_fit_viewport_letterboxes_wide_surface() {
@@ -2220,6 +2317,23 @@ mod tests {
         assert_eq!(
             aspect_fit_viewport(600, 450, 1200, 900),
             (0.0, 0.0, 600.0, 450.0)
+        );
+    }
+
+    #[test]
+    fn local_script_source_uses_its_parent_as_asset_root() {
+        let root = local_scene_asset_root_for_source("showcase/s-000070/main.motionloom")
+            .expect("local script should have an asset root");
+        assert!(root.ends_with("showcase/s-000070"));
+    }
+
+    #[test]
+    fn remote_script_source_does_not_create_a_filesystem_asset_root() {
+        assert!(
+            local_scene_asset_root_for_source(
+                "https://example.com/showcase/s-000070/main.motionloom"
+            )
+            .is_none()
         );
     }
 }

@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/world/model.rs
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -14,7 +18,36 @@ pub struct WorldGraph {
     pub retargets: Vec<WorldRetarget>,
     pub actions: Vec<WorldAction>,
     pub apply_actions: Vec<WorldApplyAction>,
+    /// Animation-only GLB sources used by Scene ApplyAction nodes.
+    #[serde(default)]
+    pub animation_assets: Vec<WorldAnimationAsset>,
+    /// Cross-actor constraints lowered from the public Scene DSL.
+    #[serde(default)]
+    pub constraints: Vec<WorldConstraint>,
     pub present: WorldPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldAnimationAsset {
+    pub id: String,
+    pub src: String,
+    pub profile: String,
+    pub clip: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldConstraint {
+    pub constraint_type: String,
+    pub source: String,
+    pub target: String,
+    /// Internal Scene bridge target used for deterministic environment contact.
+    /// Public DSL constraints continue to resolve actor.bone targets unchanged.
+    #[serde(default)]
+    pub target_point: Option<[f32; 3]>,
+    pub at_ms: u64,
+    pub duration_ms: u64,
+    pub solver: String,
+    pub weight: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -93,6 +126,12 @@ pub struct WorldCamera {
     pub yaw: String,
     pub pitch: String,
     pub roll: String,
+    #[serde(default = "default_world_camera_up_x")]
+    pub up_x: String,
+    #[serde(default = "default_world_camera_up_y")]
+    pub up_y: String,
+    #[serde(default = "default_world_camera_up_z")]
+    pub up_z: String,
     pub distance: String,
     pub zoom: String,
     pub fov: String,
@@ -115,12 +154,27 @@ impl Default for WorldCamera {
             yaw: "0".to_string(),
             pitch: "0".to_string(),
             roll: "0".to_string(),
+            up_x: "0".to_string(),
+            up_y: "1".to_string(),
+            up_z: "0".to_string(),
             distance: "3.2".to_string(),
             zoom: "1".to_string(),
             fov: "35".to_string(),
             orthographic_scale: None,
         }
     }
+}
+
+fn default_world_camera_up_x() -> String {
+    "0".to_string()
+}
+
+fn default_world_camera_up_y() -> String {
+    "1".to_string()
+}
+
+fn default_world_camera_up_z() -> String {
+    "0".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -143,6 +197,8 @@ pub struct WorldActor {
     pub opacity: String,
     pub material: Option<WorldMaterial>,
     pub play: Option<WorldPlay>,
+    #[serde(default)]
+    pub plays: Vec<WorldPlay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -216,6 +272,12 @@ pub struct WorldMaterial {
     pub style: WorldMaterialStyle,
     pub outline: bool,
     pub outline_width: String,
+    #[serde(default = "default_world_material_exposure")]
+    pub exposure: String,
+}
+
+fn default_world_material_exposure() -> String {
+    "1".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -223,6 +285,14 @@ pub struct WorldPlay {
     pub clip: Option<String>,
     pub r#loop: bool,
     pub speed: String,
+    #[serde(default = "default_world_action_speed")]
+    pub weight: String,
+    #[serde(default = "default_world_action_zero")]
+    pub blend_in: String,
+    #[serde(default = "default_world_action_zero")]
+    pub blend_out: String,
+    #[serde(default)]
+    pub mask: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -281,6 +351,24 @@ pub struct WorldAction {
     pub intent: Option<String>,
     pub duration_ms: u64,
     pub poses: Vec<WorldActionPose>,
+    #[serde(default)]
+    pub iks: Vec<WorldActionIk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldActionIk {
+    pub root: String,
+    pub mid: String,
+    pub end: String,
+    pub target_x: String,
+    pub target_y: String,
+    pub target_z: String,
+    pub pole_x: Option<String>,
+    pub pole_y: Option<String>,
+    pub pole_z: Option<String>,
+    pub plane: String,
+    pub bend: String,
+    pub weight: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -316,6 +404,40 @@ pub struct WorldApplyAction {
     pub at_ms: u64,
     pub r#loop: bool,
     pub weight: String,
+    #[serde(default = "default_world_action_speed")]
+    pub speed: String,
+    #[serde(default = "default_world_action_zero")]
+    pub blend_in: String,
+    #[serde(default = "default_world_action_zero")]
+    pub blend_out: String,
+    #[serde(default = "default_world_action_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub mask: Vec<String>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub root_motion: Option<String>,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub face: Option<String>,
+    #[serde(default)]
+    pub sync_group: Option<String>,
+    #[serde(default)]
+    pub sync_marker: Option<String>,
+}
+
+fn default_world_action_speed() -> String {
+    "1".to_string()
+}
+
+fn default_world_action_zero() -> String {
+    "0".to_string()
+}
+
+fn default_world_action_mode() -> String {
+    "override".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

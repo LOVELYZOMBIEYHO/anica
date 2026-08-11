@@ -108,6 +108,14 @@ pub(crate) struct TextAnimatorRasterParams<'a> {
     pub(crate) time_sec: f32,
 }
 
+pub(crate) struct TextRasterParams {
+    pub(crate) offset_x: i32,
+    pub(crate) offset_y: i32,
+    pub(crate) raster_scale: f32,
+    pub(crate) opacity: f32,
+    pub(crate) max_lines: Option<usize>,
+}
+
 #[derive(Clone)]
 pub(crate) struct TextLayerEffectSpec {
     pub(crate) stroke: Option<TextLayerStroke>,
@@ -478,11 +486,13 @@ pub(crate) fn draw_text_buffer_with_animators(
                 continue;
             }
 
-            let physical_glyph = glyph.physical((0.0, 0.0), 1.0);
+            let physical_glyph = glyph.physical((0.0, 0.0), params.raster_scale);
             let glyph_color = Color::rgba(visual.color[0], visual.color[1], visual.color[2], 255);
-            let anchor_x =
-                physical_glyph.x as f32 + params.offset_x as f32 + glyph.w.max(1.0) * 0.5;
-            let anchor_y = run.line_y + physical_glyph.y as f32 + params.offset_y as f32;
+            let raster_line_y = run.line_y * params.raster_scale;
+            let anchor_x = physical_glyph.x as f32
+                + params.offset_x as f32
+                + glyph.w.max(1.0) * params.raster_scale * 0.5;
+            let anchor_y = raster_line_y + physical_glyph.y as f32 + params.offset_y as f32;
             let (sin_t, cos_t) = visual.rotation.to_radians().sin_cos();
 
             swash_cache.with_pixels(
@@ -491,7 +501,8 @@ pub(crate) fn draw_text_buffer_with_animators(
                 glyph_color,
                 |x, y, color| {
                     let raw_x = physical_glyph.x + x + params.offset_x;
-                    let raw_y = run.line_y as i32 + physical_glyph.y + y + params.offset_y;
+                    let raw_y =
+                        raster_line_y.round() as i32 + physical_glyph.y + y + params.offset_y;
                     let local_x = raw_x as f32 - anchor_x;
                     let local_y = raw_y as f32 - anchor_y;
                     let scaled_x = local_x * visual.scale_x;
@@ -519,6 +530,50 @@ pub(crate) fn draw_text_buffer_with_animators(
         }
     }
     Ok(())
+}
+
+pub(crate) fn draw_text_buffer_scaled(
+    buffer: &Buffer,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    layer: &mut RgbaImage,
+    color: Color,
+    params: TextRasterParams,
+) {
+    for (visual_line_ix, run) in buffer.layout_runs().enumerate() {
+        if params
+            .max_lines
+            .is_some_and(|max_lines| visual_line_ix >= max_lines)
+        {
+            continue;
+        }
+        let raster_line_y = (run.line_y * params.raster_scale).round() as i32;
+        for glyph in run.glyphs.iter() {
+            // Shape and line-break at logical resolution, then request only the
+            // glyph bitmap at output resolution. This keeps layout invariant.
+            let physical_glyph = glyph.physical((0.0, 0.0), params.raster_scale);
+            let glyph_color = glyph.color_opt.unwrap_or(color);
+            swash_cache.with_pixels(
+                font_system,
+                physical_glyph.cache_key,
+                glyph_color,
+                |x, y, pixel_color| {
+                    let px = physical_glyph.x + x + params.offset_x;
+                    let py = raster_line_y + physical_glyph.y + y + params.offset_y;
+                    if px < 0 || py < 0 {
+                        return;
+                    }
+                    let (px, py) = (px as u32, py as u32);
+                    if px >= layer.width() || py >= layer.height() {
+                        return;
+                    }
+                    let (sr, sg, sb, sa) = pixel_color.as_rgba_tuple();
+                    let sa = ((sa as f32) * params.opacity).round().clamp(0.0, 255.0) as u8;
+                    blend_pixel(layer, px, py, [sr, sg, sb, sa]);
+                },
+            );
+        }
+    }
 }
 
 fn text_glyph_visual(

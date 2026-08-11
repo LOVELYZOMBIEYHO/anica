@@ -235,11 +235,32 @@ pub struct SkeletonControlNode {
 #[serde(rename_all = "camelCase")]
 pub struct ActionNode {
     pub id: String,
+    /// Optional raw AnimationAsset backing this executable Action.
+    /// When set, the Action is external and must not contain Pose/IK children.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Optional clip selected from a multi-clip AnimationAsset.
+    #[serde(default)]
+    pub clip: Option<String>,
+    /// Skeleton convention used by the external clip before retargeting.
+    #[serde(default)]
+    pub source_profile: Option<String>,
     pub skeleton: Option<String>,
     pub duration_ms: u64,
     pub poses: Vec<ActionPoseNode>,
     #[serde(default)]
     pub iks: Vec<ActionIkNode>,
+    #[serde(default)]
+    pub markers: Vec<ActionMarkerNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionMarkerNode {
+    pub id: String,
+    pub time_ms: u64,
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -255,7 +276,25 @@ pub struct ActionBoneNode {
     pub id: String,
     pub x: Option<String>,
     pub y: Option<String>,
+    #[serde(default)]
+    pub z: Option<String>,
     pub rotation: Option<String>,
+    #[serde(default)]
+    pub rotation_x: Option<String>,
+    #[serde(default)]
+    pub rotation_y: Option<String>,
+    #[serde(default)]
+    pub rotation_z: Option<String>,
+    #[serde(default)]
+    pub forward: Option<String>,
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default)]
+    pub twist: Option<String>,
+    #[serde(default)]
+    pub bend: Option<String>,
+    #[serde(default)]
+    pub turn: Option<String>,
     pub scale: Option<String>,
     pub opacity: Option<String>,
 }
@@ -270,6 +309,16 @@ pub struct ActionIkNode {
     pub chain: Vec<String>,
     pub target_x: String,
     pub target_y: String,
+    #[serde(default = "default_action_zero")]
+    pub target_z: String,
+    #[serde(default)]
+    pub pole_x: Option<String>,
+    #[serde(default)]
+    pub pole_y: Option<String>,
+    #[serde(default)]
+    pub pole_z: Option<String>,
+    #[serde(default = "default_action_ik_plane")]
+    pub plane: String,
     pub bend: String,
     pub weight: String,
     pub iterations: String,
@@ -281,6 +330,67 @@ pub struct ApplyActionNode {
     pub target: String,
     pub action: String,
     pub at_ms: u64,
+    #[serde(default)]
+    pub r#loop: bool,
+    #[serde(default = "default_action_one")]
+    pub weight: String,
+    #[serde(default = "default_action_one")]
+    pub speed: String,
+    #[serde(default = "default_action_zero")]
+    pub blend_in: String,
+    #[serde(default = "default_action_zero")]
+    pub blend_out: String,
+    #[serde(default = "default_action_blend_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub mask: Vec<String>,
+    /// Optional authored window. Omitted values preserve clip-defined timing.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub root_motion: Option<String>,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub takeoff: Option<String>,
+    #[serde(default)]
+    pub contact: Option<String>,
+    #[serde(default)]
+    pub landing: Option<String>,
+    #[serde(default)]
+    pub face: Option<String>,
+    #[serde(default)]
+    pub sync_group: Option<String>,
+    #[serde(default)]
+    pub sync_marker: Option<String>,
+    /// Optional Environment Surface id used for deterministic vertical
+    /// grounding without enabling a full rigid-body simulation.
+    #[serde(default)]
+    pub ground: Option<String>,
+    /// Vertical offset between the model root and its planted foot plane.
+    /// This keeps grounding independent of how a GLB author positioned the
+    /// skeleton origin (pelvis, floor, or another convention).
+    #[serde(default = "default_action_zero")]
+    pub ground_offset: String,
+    /// `auto` enables the renderer's humanoid foot-contact stabilization.
+    #[serde(default)]
+    pub foot_lock: Option<String>,
+}
+
+fn default_action_ik_plane() -> String {
+    "xy".to_string()
+}
+
+fn default_action_zero() -> String {
+    "0".to_string()
+}
+
+fn default_action_one() -> String {
+    "1".to_string()
+}
+
+fn default_action_blend_mode() -> String {
+    "override".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -571,6 +681,7 @@ fn validate_scene_model_profile_refs_in_nodes(
             SceneNode::Character(character) => {
                 if let Some(model_profile) = character.model_profile.as_deref()
                     && !model_profile_ids.contains(model_profile)
+                    && !is_builtin_humanoid_profile(model_profile)
                 {
                     return Err(GraphParseError {
                         line,
@@ -584,6 +695,22 @@ fn validate_scene_model_profile_refs_in_nodes(
                 )?;
             }
             SceneNode::Group(group) => {
+                if let Some(composite) = group.composite.as_ref() {
+                    for model in composite.nodes_3d.iter().filter_map(|node| match node {
+                        Scene3DNode::Model(model) => Some(model),
+                        _ => None,
+                    }) {
+                        if let Some(profile) = model.profile.as_deref()
+                            && !model_profile_ids.contains(profile)
+                            && !is_builtin_humanoid_profile(profile)
+                        {
+                            return Err(GraphParseError {
+                                line,
+                                message: format!("Model profile not found: {profile}"),
+                            });
+                        }
+                    }
+                }
                 validate_scene_model_profile_refs_in_nodes(
                     &group.children,
                     model_profile_ids,
@@ -636,6 +763,13 @@ fn validate_scene_model_profile_refs_in_nodes(
         }
     }
     Ok(())
+}
+
+fn is_builtin_humanoid_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        "motionloom_humanoid_v1" | "humanoid_v1" | "mixamo_humanoid"
+    )
 }
 
 pub(crate) fn parse_scene_root_block(
@@ -1484,14 +1618,47 @@ pub(crate) fn parse_action_block(
     start: usize,
 ) -> Result<(ActionNode, usize), GraphParseError> {
     let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
-    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Action")?;
     let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
+    let source = attr_value(&open_tag, "source").map(|v| strip_wrappers(&v).to_string());
+    let clip = attr_value(&open_tag, "clip").map(|v| strip_wrappers(&v).to_string());
+    let source_profile = attr_value(&open_tag, "sourceProfile")
+        .or_else(|| attr_value(&open_tag, "source_profile"))
+        .or_else(|| attr_value(&open_tag, "profile"))
+        .map(|v| strip_wrappers(&v).to_string());
     let skeleton = attr_value(&open_tag, "skeleton")
         .or_else(|| attr_value(&open_tag, "rig"))
         .map(|v| strip_wrappers(&v).to_string());
+
+    if is_self_closing_tag(&open_tag) {
+        if source.is_none() {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "External Action {id} must reference an <AnimationAsset> with source=\"...\"."
+                ),
+            });
+        }
+        return Ok((
+            ActionNode {
+                id,
+                source,
+                clip,
+                source_profile,
+                skeleton,
+                duration_ms: 0,
+                poses: Vec::new(),
+                iks: Vec::new(),
+                markers: Vec::new(),
+            },
+            open_end_ix,
+        ));
+    }
+
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Action")?;
     let duration_explicit = attr_value(&open_tag, "duration").is_some();
     let mut poses = Vec::<ActionPoseNode>::new();
     let mut iks = Vec::<ActionIkNode>::new();
+    let mut markers = Vec::<ActionMarkerNode>::new();
     let mut i = open_end_ix + 1;
 
     while i < close_ix {
@@ -1501,20 +1668,53 @@ pub(crate) fn parse_action_block(
             continue;
         }
         if starts_open_tag(line, "Pose") {
+            if source.is_some() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "External Action {id} cannot contain <Pose>; use <Marker /> metadata only."
+                    ),
+                });
+            }
             let (pose, end_ix) = parse_action_pose_block(lines, i)?;
             poses.push(pose);
             i = end_ix + 1;
             continue;
         }
         if starts_open_tag(line, "IK") {
+            if source.is_some() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "External Action {id} cannot contain <IK>; apply constraints after the clip."
+                    ),
+                });
+            }
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
             iks.push(parse_action_ik_node(&tag, i + 1)?);
             i = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "Marker") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let marker_id = strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string();
+            let time = required_attr_value(&tag, "time", i + 1)
+                .or_else(|_| required_attr_value(&tag, "t", i + 1))?;
+            let time_ms =
+                (parse_time_seconds(&time, i + 1, "Marker.time")?.max(0.0) * 1000.0).round() as u64;
+            markers.push(ActionMarkerNode {
+                id: marker_id,
+                time_ms,
+                role: attr_value(&tag, "role").map(|value| strip_wrappers(&value).to_string()),
+            });
+            i = end_ix + 1;
+            continue;
+        }
         return Err(GraphParseError {
             line: i + 1,
-            message: format!("<Action> only accepts <Pose> or <IK /> children, got: {line}"),
+            message: format!(
+                "<Action> only accepts <Pose>, <IK /> or <Marker /> children, got: {line}"
+            ),
         });
     }
 
@@ -1528,7 +1728,7 @@ pub(crate) fn parse_action_block(
             .max()
             .unwrap_or(0)
     };
-    if duration_ms == 0 {
+    if duration_ms == 0 && source.is_none() {
         return Err(GraphParseError {
             line: start + 1,
             message: format!("Action {id} duration must be greater than zero."),
@@ -1538,10 +1738,14 @@ pub(crate) fn parse_action_block(
     Ok((
         ActionNode {
             id,
+            source,
+            clip,
+            source_profile,
             skeleton,
             duration_ms,
             poses,
             iks,
+            markers,
         },
         close_ix,
     ))
@@ -1586,9 +1790,24 @@ fn parse_action_bone_node(block: &str, line: usize) -> Result<ActionBoneNode, Gr
         id,
         x: attr_value(block, "x").map(|v| strip_wrappers(&v).to_string()),
         y: attr_value(block, "y").map(|v| strip_wrappers(&v).to_string()),
+        z: attr_value(block, "z").map(|v| strip_wrappers(&v).to_string()),
         rotation: attr_value(block, "rotation")
             .or_else(|| attr_value(block, "rotate"))
             .map(|v| strip_wrappers(&v).to_string()),
+        rotation_x: attr_value(block, "rotationX")
+            .or_else(|| attr_value(block, "rotation_x"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        rotation_y: attr_value(block, "rotationY")
+            .or_else(|| attr_value(block, "rotation_y"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        rotation_z: attr_value(block, "rotationZ")
+            .or_else(|| attr_value(block, "rotation_z"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        forward: attr_value(block, "forward").map(|v| strip_wrappers(&v).to_string()),
+        side: attr_value(block, "side").map(|v| strip_wrappers(&v).to_string()),
+        twist: attr_value(block, "twist").map(|v| strip_wrappers(&v).to_string()),
+        bend: attr_value(block, "bend").map(|v| strip_wrappers(&v).to_string()),
+        turn: attr_value(block, "turn").map(|v| strip_wrappers(&v).to_string()),
         scale: attr_value(block, "scale").map(|v| strip_wrappers(&v).to_string()),
         opacity: attr_value(block, "opacity").map(|v| strip_wrappers(&v).to_string()),
     })
@@ -1636,6 +1855,11 @@ fn parse_action_ik_node(block: &str, line: usize) -> Result<ActionIkNode, GraphP
         .map(|v| strip_wrappers(&v).to_string())?;
     let target_y = required_attr_value_any(block, &["targetY", "target_y", "y"], line)
         .map(|v| strip_wrappers(&v).to_string())?;
+    let target_z = attr_value(block, "targetZ")
+        .or_else(|| attr_value(block, "target_z"))
+        .or_else(|| attr_value(block, "z"))
+        .map(|v| strip_wrappers(&v).to_string())
+        .unwrap_or_else(|| "0".to_string());
     let bend = attr_value(block, "bend")
         .or_else(|| attr_value(block, "pole"))
         .map(|v| strip_wrappers(&v).to_string())
@@ -1655,6 +1879,19 @@ fn parse_action_ik_node(block: &str, line: usize) -> Result<ActionIkNode, GraphP
         chain,
         target_x,
         target_y,
+        target_z,
+        pole_x: attr_value(block, "poleX")
+            .or_else(|| attr_value(block, "pole_x"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        pole_y: attr_value(block, "poleY")
+            .or_else(|| attr_value(block, "pole_y"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        pole_z: attr_value(block, "poleZ")
+            .or_else(|| attr_value(block, "pole_z"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        plane: attr_value(block, "plane")
+            .map(|v| strip_wrappers(&v).to_ascii_lowercase())
+            .unwrap_or_else(default_action_ik_plane),
         bend,
         weight,
         iterations,
@@ -1673,11 +1910,73 @@ pub(crate) fn parse_apply_action_node(
         .transpose()?
         .map(|seconds| (seconds.max(0.0) * 1000.0).round() as u64)
         .unwrap_or(0);
+    let mask = attr_value(block, "mask")
+        .map(|value| parse_scene_string_list(strip_wrappers(&value)))
+        .unwrap_or_default();
     Ok(ApplyActionNode {
         target,
         action,
         at_ms,
+        r#loop: attr_value(block, "loop")
+            .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+            .unwrap_or(false),
+        weight: attr_value(block, "weight")
+            .map(|v| strip_wrappers(&v).to_string())
+            .unwrap_or_else(default_action_one),
+        speed: attr_value(block, "speed")
+            .map(|v| strip_wrappers(&v).to_string())
+            .unwrap_or_else(default_action_one),
+        blend_in: parse_optional_seconds_expr(block, &["blendIn", "blend_in"], line)?,
+        blend_out: parse_optional_seconds_expr(block, &["blendOut", "blend_out"], line)?,
+        mode: attr_value(block, "mode")
+            .map(|v| strip_wrappers(&v).to_ascii_lowercase())
+            .unwrap_or_else(default_action_blend_mode),
+        mask,
+        duration_ms: attr_value(block, "duration")
+            .as_deref()
+            .map(|value| parse_time_seconds(value, line, "duration"))
+            .transpose()?
+            .map(|seconds| (seconds.max(0.0) * 1000.0).round() as u64),
+        root_motion: attr_value(block, "rootMotion")
+            .or_else(|| attr_value(block, "root_motion"))
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase()),
+        destination: attr_value(block, "destination")
+            .map(|value| strip_wrappers(&value).to_string()),
+        takeoff: attr_value(block, "takeoff").map(|value| strip_wrappers(&value).to_string()),
+        contact: attr_value(block, "contact").map(|value| strip_wrappers(&value).to_string()),
+        landing: attr_value(block, "landing").map(|value| strip_wrappers(&value).to_string()),
+        face: attr_value(block, "face").map(|value| strip_wrappers(&value).to_string()),
+        sync_group: attr_value(block, "syncGroup")
+            .or_else(|| attr_value(block, "sync_group"))
+            .map(|value| strip_wrappers(&value).to_string()),
+        sync_marker: attr_value(block, "syncMarker")
+            .or_else(|| attr_value(block, "sync_marker"))
+            .map(|value| strip_wrappers(&value).to_string()),
+        ground: attr_value(block, "ground").map(|value| strip_wrappers(&value).to_string()),
+        ground_offset: attr_value(block, "groundOffset")
+            .or_else(|| attr_value(block, "ground_offset"))
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(default_action_zero),
+        foot_lock: attr_value(block, "footLock")
+            .or_else(|| attr_value(block, "foot_lock"))
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase()),
     })
+}
+
+fn parse_optional_seconds_expr(
+    block: &str,
+    names: &[&str],
+    line: usize,
+) -> Result<String, GraphParseError> {
+    let Some(raw) = names.iter().find_map(|name| attr_value(block, name)) else {
+        return Ok(default_action_zero());
+    };
+    let value = strip_wrappers(&raw);
+    if value.ends_with("ms") || value.ends_with('s') {
+        return parse_time_seconds(value, line, names[0])
+            .map(|seconds| seconds.max(0.0).to_string());
+    }
+    Ok(value.to_string())
 }
 
 fn parse_timeline_block(
@@ -2023,6 +2322,12 @@ fn parse_composite_group_block(
                 position: scene_attr_or_default(&tag, &["position"], "[0,0,6]"),
                 target: scene_attr_or_default(&tag, &["target"], "[0,0,0]"),
                 fov: scene_attr_or_default(&tag, &["fov"], "35"),
+                up: scene_attr_or_default(&tag, &["up"], "[0,1,0]"),
+                roll: scene_attr_or_default(&tag, &["roll"], "0"),
+                horizon_lock: attr_value(&tag, "horizonLock")
+                    .or_else(|| attr_value(&tag, "horizon_lock"))
+                    .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+                    .unwrap_or(false),
             }));
             i = end_ix + 1;
             continue;
@@ -2037,9 +2342,56 @@ fn parse_composite_group_block(
             i = end_ix + 1;
             continue;
         }
-        if starts_open_tag(line, "Model") || starts_open_tag(line, "ModelLayer") {
+        if starts_open_tag(line, "EnvironmentDebug") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let enabled = |name: &str| {
+                attr_value(&tag, name)
+                    .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+                    .unwrap_or(true)
+            };
+            nodes_3d.push(Scene3DNode::Debug(SceneEnvironmentDebugNode {
+                axes: enabled("axes"),
+                bounds: enabled("bounds"),
+                surfaces: enabled("surfaces"),
+                anchors: enabled("anchors"),
+                action_path: enabled("actionPath"),
+                cameras: enabled("cameras"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Anchor") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let space = scene_attr_or_default(&tag, &["space"], "local").to_ascii_lowercase();
+            if !matches!(space.as_str(), "local" | "world") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Invalid <Anchor space=\"{space}\">. Expected local or world."
+                    ),
+                });
+            }
+            nodes_3d.push(Scene3DNode::Anchor(SceneAnchor3DNode {
+                id: strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string(),
+                relative_to: strip_wrappers(&required_attr_value(&tag, "relativeTo", i + 1)?)
+                    .to_string(),
+                offset: scene_attr_or_default(&tag, &["offset"], "[0,0,0]"),
+                space,
+                node: scene_optional_attr(&tag, &["node"]),
+                surface: scene_optional_attr(&tag, &["surface"]),
+                uv: scene_optional_attr(&tag, &["uv"]),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Model")
+            || starts_open_tag(line, "ModelLayer")
+            || starts_open_tag(line, "Environment")
+        {
             let tag_name = if starts_open_tag(line, "ModelLayer") {
                 "ModelLayer"
+            } else if starts_open_tag(line, "Environment") {
+                "Environment"
             } else {
                 "Model"
             };
@@ -2050,6 +2402,11 @@ fn parse_composite_group_block(
                 find_matching_close_tag(lines, tag_end_ix + 1, tag_name)?
             };
             let mut material_bindings = Vec::new();
+            let mut play = None;
+            let mut plays = Vec::new();
+            let mut bone_overrides = Vec::new();
+            let mut surfaces = Vec::new();
+            let mut nested_anchors = Vec::new();
             let mut j = tag_end_ix + 1;
             while j < model_close_ix {
                 if starts_open_tag(lines[j].trim(), "MaterialBinding") {
@@ -2069,11 +2426,123 @@ fn parse_composite_group_block(
                     j = binding_end_ix + 1;
                     continue;
                 }
+                if starts_open_tag(lines[j].trim(), "Play") {
+                    let (play_tag, play_end_ix) = collect_self_closing_block(lines, j)?;
+                    let parsed_play = SceneModelPlayNode {
+                        clip: attr_value(&play_tag, "clip").map(|v| strip_wrappers(&v).to_string()),
+                        r#loop: attr_value(&play_tag, "loop")
+                            .map(|v| matches!(strip_wrappers(&v), "true" | "1" | "yes" | "on"))
+                            .unwrap_or(true),
+                        speed: scene_attr_or_default(&play_tag, &["speed"], "1"),
+                        weight: scene_attr_or_default(&play_tag, &["weight"], "1"),
+                        blend_in: parse_optional_seconds_expr(
+                            &play_tag,
+                            &["blendIn", "blend_in"],
+                            j + 1,
+                        )?,
+                        blend_out: parse_optional_seconds_expr(
+                            &play_tag,
+                            &["blendOut", "blend_out"],
+                            j + 1,
+                        )?,
+                        mask: attr_value(&play_tag, "mask")
+                            .map(|v| parse_scene_string_list(strip_wrappers(&v)))
+                            .unwrap_or_default(),
+                    };
+                    if play.is_none() {
+                        play = Some(parsed_play);
+                    } else {
+                        plays.push(parsed_play);
+                    }
+                    j = play_end_ix + 1;
+                    continue;
+                }
+                if starts_open_tag(lines[j].trim(), "BoneOverride") {
+                    let (bone_tag, bone_end_ix) = collect_self_closing_block(lines, j)?;
+                    bone_overrides.push(SceneModelBoneOverrideNode {
+                        bone: strip_wrappers(&required_attr_value(&bone_tag, "bone", j + 1)?)
+                            .to_string(),
+                        x: scene_optional_attr(&bone_tag, &["x"]),
+                        y: scene_optional_attr(&bone_tag, &["y"]),
+                        z: scene_optional_attr(&bone_tag, &["z"]),
+                        rotation_x: scene_optional_attr(&bone_tag, &["rotationX", "rotation_x"]),
+                        rotation_y: scene_optional_attr(&bone_tag, &["rotationY", "rotation_y"]),
+                        rotation_z: scene_optional_attr(
+                            &bone_tag,
+                            &["rotationZ", "rotation_z", "rotation"],
+                        ),
+                        scale: scene_optional_attr(&bone_tag, &["scale"]),
+                    });
+                    j = bone_end_ix + 1;
+                    continue;
+                }
+                if starts_open_tag(lines[j].trim(), "Surface") {
+                    let (surface_tag, surface_end_ix) = collect_self_closing_block(lines, j)?;
+                    let kind = scene_attr_or_default(&surface_tag, &["kind"], "ground")
+                        .to_ascii_lowercase();
+                    if !matches!(kind.as_str(), "ground" | "obstacle" | "wall") {
+                        return Err(GraphParseError {
+                            line: j + 1,
+                            message: format!(
+                                "Invalid <Surface kind=\"{kind}\">. Expected ground, obstacle, or wall."
+                            ),
+                        });
+                    }
+                    surfaces.push(SceneSurface3DNode {
+                        id: strip_wrappers(&required_attr_value(&surface_tag, "id", j + 1)?)
+                            .to_string(),
+                        node: scene_optional_attr(&surface_tag, &["node"]),
+                        kind,
+                        height: scene_attr_or_default(&surface_tag, &["height"], "0"),
+                        normal: scene_attr_or_default(&surface_tag, &["normal"], "[0,1,0]"),
+                        space: scene_attr_or_default(&surface_tag, &["space"], "scene")
+                            .to_ascii_lowercase(),
+                        centroid: scene_optional_attr(&surface_tag, &["centroid"]),
+                        bounds_min: scene_optional_attr(&surface_tag, &["boundsMin", "bounds_min"]),
+                        bounds_max: scene_optional_attr(&surface_tag, &["boundsMax", "bounds_max"]),
+                    });
+                    j = surface_end_ix + 1;
+                    continue;
+                }
+                if starts_open_tag(lines[j].trim(), "Anchor") {
+                    let (anchor_tag, anchor_end_ix) = collect_self_closing_block(lines, j)?;
+                    let environment_id =
+                        strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string();
+                    let space = scene_attr_or_default(&anchor_tag, &["space"], "local")
+                        .to_ascii_lowercase();
+                    if !matches!(space.as_str(), "local" | "world") {
+                        return Err(GraphParseError {
+                            line: j + 1,
+                            message: format!(
+                                "Invalid nested <Anchor space=\"{space}\">. Expected local or world."
+                            ),
+                        });
+                    }
+                    nested_anchors.push(SceneAnchor3DNode {
+                        id: strip_wrappers(&required_attr_value(&anchor_tag, "id", j + 1)?)
+                            .to_string(),
+                        relative_to: scene_optional_attr(
+                            &anchor_tag,
+                            &["relativeTo", "relative_to"],
+                        )
+                        .unwrap_or(environment_id),
+                        offset: scene_attr_or_default(&anchor_tag, &["offset"], "[0,0,0]"),
+                        space,
+                        node: scene_optional_attr(&anchor_tag, &["node"]),
+                        surface: scene_optional_attr(&anchor_tag, &["surface"]),
+                        uv: scene_optional_attr(&anchor_tag, &["uv"]),
+                    });
+                    j = anchor_end_ix + 1;
+                    continue;
+                }
                 j += 1;
             }
             nodes_3d.push(Scene3DNode::Model(SceneModel3DNode {
                 id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
                 asset: strip_wrappers(&required_attr_value(&tag, "asset", i + 1)?).to_string(),
+                profile: scene_optional_attr(&tag, &["profile"]),
+                rig: scene_optional_attr(&tag, &["rig"]),
+                retarget: scene_optional_attr(&tag, &["retarget"]),
                 position: scene_attr_or_default(&tag, &["position"], "[0,0,0]"),
                 position_x: attr_value(&tag, "positionX").map(|v| strip_wrappers(&v).to_string()),
                 position_y: attr_value(&tag, "positionY").map(|v| strip_wrappers(&v).to_string()),
@@ -2083,12 +2552,97 @@ fn parse_composite_group_block(
                 rotation_y: attr_value(&tag, "rotationY").map(|v| strip_wrappers(&v).to_string()),
                 rotation_z: attr_value(&tag, "rotationZ").map(|v| strip_wrappers(&v).to_string()),
                 scale: scene_attr_or_default(&tag, &["scale"], "1"),
+                environment: tag_name == "Environment",
+                r#static: attr_value(&tag, "static")
+                    .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+                    .unwrap_or(tag_name == "Environment"),
+                collision: scene_optional_attr(&tag, &["collision"]),
+                up: scene_attr_or_default(&tag, &["up"], "+Y"),
+                forward: scene_attr_or_default(&tag, &["forward"], "+Z"),
+                unit_scale: scene_attr_or_default(&tag, &["unitScale", "unit_scale"], "1"),
+                scale_mode: scene_attr_or_default(
+                    &tag,
+                    &["scaleMode", "scale_mode"],
+                    "normalize_height",
+                )
+                .to_ascii_lowercase(),
+                cast_shadow: attr_value(&tag, "castShadow")
+                    .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+                    .unwrap_or(true),
+                receive_shadow: attr_value(&tag, "receiveShadow")
+                    .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+                    .unwrap_or(true),
+                surfaces,
+                exposure: scene_attr_or_default(&tag, &["exposure"], "1"),
                 material_bindings,
+                play,
+                plays,
+                bone_overrides,
             }));
+            nodes_3d.extend(nested_anchors.into_iter().map(Scene3DNode::Anchor));
             i = model_close_ix + 1;
             continue;
         }
         i += 1;
+    }
+
+    let model_ids = nodes_3d
+        .iter()
+        .filter_map(|node| match node {
+            Scene3DNode::Model(model) => model.id.as_deref(),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let anchor_ids = nodes_3d
+        .iter()
+        .filter_map(|node| match node {
+            Scene3DNode::Anchor(anchor) => Some(anchor.id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    for node in &nodes_3d {
+        match node {
+            Scene3DNode::Anchor(anchor) if !model_ids.contains(anchor.relative_to.as_str()) => {
+                return Err(GraphParseError {
+                    line: start + 1,
+                    message: format!(
+                        "Anchor '{}' relativeTo Model not found in this CompositeGroup: {}",
+                        anchor.id, anchor.relative_to
+                    ),
+                });
+            }
+            Scene3DNode::Model(model) => {
+                if let Some(anchor) = model.position.trim().strip_prefix('@')
+                    && !anchor_ids.contains(anchor)
+                {
+                    return Err(GraphParseError {
+                        line: start + 1,
+                        message: format!(
+                            "Model position anchor not found in this CompositeGroup: {anchor}"
+                        ),
+                    });
+                }
+            }
+            Scene3DNode::Camera(camera) => {
+                for (attribute, value) in [
+                    ("position", camera.position.as_str()),
+                    ("target", camera.target.as_str()),
+                ] {
+                    let Some(reference) = value.trim().strip_prefix('@') else {
+                        continue;
+                    };
+                    if !anchor_ids.contains(reference) && !model_ids.contains(reference) {
+                        return Err(GraphParseError {
+                            line: start + 1,
+                            message: format!(
+                                "Camera3D {attribute}=\"@{reference}\" references unknown Anchor or Model '{reference}'."
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     let synthetic_group_tag = open_tag.replacen("<CompositeGroup", "<Group", 1);
@@ -2099,6 +2653,7 @@ fn parse_composite_group_block(
         composite_order,
         depth,
         format,
+        active_camera: None,
         nodes_3d,
     });
     Ok((group, close_ix))
@@ -3304,6 +3859,14 @@ fn scene_attr_or_default(block: &str, names: &[&str], default_value: &str) -> St
         .unwrap_or_else(|| default_value.to_string())
 }
 
+fn scene_optional_attr(block: &str, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| attr_value(block, name))
+        .map(|value| strip_wrappers(&value).to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) fn parse_text_node(
     block: &str,
     line: usize,
@@ -3343,7 +3906,7 @@ pub(crate) fn parse_text_node(
     let render_scale = attr_value(block, "renderScale")
         .or_else(|| attr_value(block, "render_scale"))
         .map(|v| strip_wrappers(&v).to_string())
-        .unwrap_or_else(|| "1x".to_string());
+        .unwrap_or_else(|| "auto".to_string());
     let antialias = attr_value(block, "antialias")
         .or_else(|| attr_value(block, "antiAlias"))
         .or_else(|| attr_value(block, "aa"))

@@ -243,7 +243,7 @@
       ],
       "animationTarget": {
         "recommended": false,
-        "notes": "Camera attributes can already use curve(...). AnimationTarget can be added later if the UI wants frame-key editing for camera properties."
+        "notes": "Camera attributes support both inline curve(...) authoring and frame-editable AnimationTarget channels. Query animation_property_schema_json() for the runtime-owned typed property registry."
       }
     },
     {
@@ -410,6 +410,82 @@
           "zDepth"
         ],
         "notes": "Use AnimationTarget + Key for frame-editable UI timelines, or curve(...) directly for hand-authored DSL."
+      }
+    },
+    {
+      "kind": "Model3D",
+      "dslTag": "Model",
+      "displayName": "Skinned GLB Model",
+      "description": "A true-3D Scene model. Optional kind=3d ModelProfile mapping exposes canonical humanoid bones to Action, IK, and AnimationTarget.",
+      "placement": {
+        "requiredParent": "CompositeGroup(space=3d)",
+        "selfClosing": false,
+        "normalLayerVisualNode": false
+      },
+      "propertyGroups": [
+        {
+          "id": "rig",
+          "label": "Rig and Retarget",
+          "properties": [
+            {
+              "name": "profile",
+              "type": "nodeRef",
+              "animatable": false,
+              "ui": {
+                "control": "modelProfilePicker",
+                "filter": "ModelProfile(kind=3d)"
+              },
+              "notes": "Maps canonical humanoid bone ids to raw GLB joint names."
+            },
+            {
+              "name": "action",
+              "type": "nodeRef",
+              "animatable": false,
+              "ui": {
+                "control": "actionLayerList"
+              },
+              "notes": "ApplyAction layers expose loop, speed, weight, blendIn, blendOut, mode, and body mask controls."
+            },
+            {
+              "name": "clipLayers",
+              "type": "list",
+              "animatable": false,
+              "ui": {
+                "control": "modelClipLayerList"
+              },
+              "notes": "Each Play child selects an embedded GLB clip with loop, speed, weight, blendIn, blendOut, and body mask. Multiple entries crossfade in source order."
+            },
+            {
+              "name": "ik",
+              "type": "twoBoneIk",
+              "animatable": true,
+              "ui": {
+                "control": "twoBoneIk",
+                "planes": ["xy", "xz", "yz"]
+              },
+              "notes": "Select canonical root/mid/end bones, a target, optional pole point, solve plane, and weight."
+            }
+          ]
+        }
+      ],
+      "animationTarget": {
+        "recommended": true,
+        "properties": [
+          "position",
+          "rotationX",
+          "rotationY",
+          "rotationZ",
+          "scale",
+          "exposure",
+          "bones.*.x",
+          "bones.*.y",
+          "bones.*.z",
+          "bones.*.rotationX",
+          "bones.*.rotationY",
+          "bones.*.rotationZ",
+          "bones.*.scale"
+        ],
+        "notes": "The editor should populate the wildcard bone segment from the selected ModelProfile canonical mapping."
       }
     }
   ],

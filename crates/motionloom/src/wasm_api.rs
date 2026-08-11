@@ -4,21 +4,43 @@
 
 use wasm_bindgen::prelude::*;
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use web_sys::HtmlCanvasElement;
 
 use crate::asset::MemoryAssetResolver;
+use crate::authoring::{
+    motionloom_analyze_script_for_target_json as analyze_script_for_target_json,
+    motionloom_analyze_script_json as analyze_script_json,
+    motionloom_showcase_schema_json as showcase_schema_json,
+};
 use crate::dsl::{GraphScript, is_graph_script, parse_graph_script};
 use crate::process::cpu_renderer::render_process_frame_cpu;
 #[cfg(target_arch = "wasm32")]
 use crate::process::wasm_webgpu::render_process_frame_to_canvas_gpu as render_process_frame_to_canvas_gpu_impl;
+use crate::scene::animation::{animation_property_schema_json, inspect_animation_targets};
 use crate::scene::model::{GroupNode, SceneNode};
 use crate::scene::render::{SceneRenderProfile, SceneRenderer, render_scene_graph_frame};
-use crate::world::{WorldFrameRenderer, is_world_graph_script, parse_world_graph_script};
+use crate::world::{
+    WorldFrameRenderer, inspect_glb_environment_json, inspect_glb_skeleton_json,
+    is_world_graph_script, parse_world_graph_script,
+};
 
 fn js_error(message: String) -> JsValue {
     js_sys::Error::new(&message).into()
+}
+
+/// Surface Rust panic locations in the browser instead of an opaque WASM
+/// `unreachable`, which makes GPU-path failures actionable for hosts.
+fn install_wasm_panic_hook() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "MotionLoom WASM panic: {info}"
+            )));
+        }));
+    });
 }
 
 fn set_group_numeric_attr(group: &mut GroupNode, attr: &str, value: &str) -> bool {
@@ -161,6 +183,55 @@ pub fn motionloom_parse_summary(script: &str) -> Result<String, JsValue> {
     Err(js_error(
         "script does not look like a scene or world graph".to_string(),
     ))
+}
+
+/// Return the same AnimationTarget capability registry used by native editors.
+#[wasm_bindgen]
+pub fn motionloom_animation_property_schema_json() -> String {
+    animation_property_schema_json()
+}
+
+/// Analyze one DSL revision and return parse, semantic, compatibility, and repair diagnostics.
+#[wasm_bindgen]
+pub fn motionloom_analyze_script_json(script: &str) -> String {
+    analyze_script_json(script)
+}
+
+/// Analyze one DSL revision for a concrete renderer such as `wasm-webgpu`.
+#[wasm_bindgen]
+pub fn motionloom_analyze_script_for_target_json(script: &str, target: &str) -> String {
+    analyze_script_for_target_json(script, target)
+}
+
+/// Return the machine-readable syntax slice demonstrated by one showcase script.
+#[wasm_bindgen]
+pub fn motionloom_showcase_schema_json(script: &str) -> String {
+    showcase_schema_json(script)
+}
+
+/// Inspect GLB bytes and propose humanoid mapping, axes, rest pose, and confidence.
+#[wasm_bindgen]
+pub fn motionloom_inspect_glb_skeleton_json(
+    asset_label: &str,
+    bytes: &[u8],
+) -> Result<String, JsValue> {
+    inspect_glb_skeleton_json(bytes, asset_label).map_err(|err| js_error(err.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn motionloom_inspect_glb_environment_json(
+    asset_label: &str,
+    bytes: &[u8],
+) -> Result<String, JsValue> {
+    inspect_glb_environment_json(bytes, asset_label).map_err(|err| js_error(err.to_string()))
+}
+
+/// Return structured AnimationTarget binding diagnostics for one graph script.
+#[wasm_bindgen]
+pub fn motionloom_inspect_animation_targets(script: &str) -> Result<String, JsValue> {
+    let graph = parse_graph_script(script).map_err(|err| js_error(err.to_string()))?;
+    serde_json::to_string_pretty(&inspect_animation_targets(&graph))
+        .map_err(|err| js_error(err.to_string()))
 }
 
 /// Render one frame of a scene graph script to an RGBA byte buffer.
@@ -378,6 +449,7 @@ impl WasmSceneRenderer {
     /// Parse `script` and prepare a renderer.
     #[wasm_bindgen(constructor)]
     pub fn new(script: &str, profile: &str) -> Result<WasmSceneRenderer, JsValue> {
+        install_wasm_panic_hook();
         let graph = parse_graph_script(script).map_err(|err| js_error(err.to_string()))?;
         let profile = parse_profile(profile)?;
         Ok(Self {
@@ -393,6 +465,7 @@ impl WasmSceneRenderer {
     /// Browser hosts should prefer this factory for animated GPU preview loops
     /// because repeated frame renders reuse the same Rust/WGPU renderer.
     pub async fn create(script: &str, profile: &str) -> Result<WasmSceneRenderer, JsValue> {
+        install_wasm_panic_hook();
         let graph = parse_graph_script(script).map_err(|err| js_error(err.to_string()))?;
         let profile = parse_profile(profile)?;
         let resolver = Arc::new(MemoryAssetResolver::new());

@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/world/gltf_loader.rs
+
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -47,8 +51,45 @@ pub struct GlbMeshData {
     pub mesh_names: Vec<Option<String>>,
     pub nodes: Vec<GlbNodeData>,
     pub skin: Option<GlbSkinData>,
+    pub animations: Vec<GlbAnimationData>,
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlbAnimationData {
+    pub name: Option<String>,
+    pub duration: f32,
+    pub channels: Vec<GlbAnimationChannelData>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlbAnimationChannelData {
+    pub node_index: usize,
+    pub property: GlbAnimationProperty,
+    pub interpolation: GlbAnimationInterpolation,
+    pub times: Vec<f32>,
+    pub values: GlbAnimationValues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlbAnimationProperty {
+    Translation,
+    Rotation,
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlbAnimationInterpolation {
+    Linear,
+    Step,
+    CubicSpline,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GlbAnimationValues {
+    Vec3(Vec<[f32; 3]>),
+    Quat(Vec<[f32; 4]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +105,16 @@ pub struct GlbMaterialData {
     pub name: Option<String>,
     pub base_color_factor: [f32; 4],
     pub base_color_texture: Option<usize>,
+    pub metallic_roughness_texture: Option<usize>,
+    pub normal_texture: Option<usize>,
+    pub normal_scale: f32,
     pub emissive_texture: Option<usize>,
     pub emissive_factor: [f32; 3],
+    pub emissive_strength: f32,
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub specular_factor: f32,
+    pub specular_color_factor: [f32; 3],
     pub alpha_mode: GlbAlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
@@ -79,8 +128,16 @@ impl Default for GlbMaterialData {
             name: None,
             base_color_factor: [1.0, 1.0, 1.0, 1.0],
             base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
             emissive_texture: None,
             emissive_factor: [0.0, 0.0, 0.0],
+            emissive_strength: 1.0,
+            metallic_factor: 1.0,
+            roughness_factor: 1.0,
+            specular_factor: 1.0,
+            specular_color_factor: [1.0, 1.0, 1.0],
             alpha_mode: GlbAlphaMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
@@ -190,6 +247,15 @@ pub fn load_glb_mesh_data(path: impl AsRef<Path>) -> Result<GlbMeshData, GlbLoad
     parse_glb_mesh_data(path, &bytes)
 }
 
+/// Load nodes, skinning data, and animation clips from a GLB that may not
+/// contain renderable mesh primitives. Mixamo "Without Skin" exports use this
+/// shape after conversion to glTF.
+pub fn load_glb_animation_data(path: impl AsRef<Path>) -> Result<GlbMeshData, GlbLoadError> {
+    let path = path.as_ref();
+    let bytes = read_file(path)?;
+    parse_glb_animation_data(path, &bytes)
+}
+
 /// Load GLB metadata from an in-memory byte buffer.
 pub fn load_glb_metadata_from_bytes(
     path: &Path,
@@ -204,6 +270,14 @@ pub fn load_glb_mesh_data_from_bytes(
     bytes: &[u8],
 ) -> Result<GlbMeshData, GlbLoadError> {
     parse_glb_mesh_data(path, bytes)
+}
+
+/// In-memory counterpart to [`load_glb_animation_data`].
+pub fn load_glb_animation_data_from_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<GlbMeshData, GlbLoadError> {
+    parse_glb_animation_data(path, bytes)
 }
 
 pub fn parse_glb_metadata(path: &Path, bytes: &[u8]) -> Result<GlbMetadata, GlbLoadError> {
@@ -228,6 +302,21 @@ pub fn parse_glb_metadata(path: &Path, bytes: &[u8]) -> Result<GlbMetadata, GlbL
 }
 
 pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, GlbLoadError> {
+    parse_glb_data(path, bytes, true)
+}
+
+/// Parse an animation-only GLB while retaining the same data representation
+/// used by model clips. Geometry arrays remain empty when the source has no
+/// `meshes` entry.
+pub fn parse_glb_animation_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, GlbLoadError> {
+    parse_glb_data(path, bytes, false)
+}
+
+fn parse_glb_data(
+    path: &Path,
+    bytes: &[u8],
+    require_renderable_mesh: bool,
+) -> Result<GlbMeshData, GlbLoadError> {
     let chunks = parse_gltf_or_glb_chunks(path, bytes)?;
     let draco_import = chunks
         .json
@@ -251,6 +340,7 @@ pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, Glb
     let materials = read_materials(&chunks);
     let nodes = read_nodes(&chunks);
     let skin = read_skin(&chunks, path, &nodes)?;
+    let animations = read_animations(&chunks, path)?;
     let mut positions = Vec::<[f32; 3]>::new();
     let mut normals = Vec::<Option<[f32; 3]>>::new();
     let mut texcoords = Vec::<Option<[f32; 2]>>::new();
@@ -260,9 +350,12 @@ pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, Glb
     let mut indices = Vec::<u32>::new();
     let mut triangles = Vec::<GlbTriangle>::new();
 
-    let Some(meshes) = chunks.json.get("meshes").and_then(Value::as_array) else {
-        return invalid(path, "missing meshes array");
-    };
+    let meshes = chunks
+        .json
+        .get("meshes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mesh_names = meshes
         .iter()
         .map(|mesh| {
@@ -407,10 +500,14 @@ pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, Glb
         }
     }
 
-    if positions.is_empty() || triangles.is_empty() {
+    if require_renderable_mesh && (positions.is_empty() || triangles.is_empty()) {
         return invalid(path, "no triangle POSITION/index data found");
     }
-    let (bounds_min, bounds_max) = compute_bounds(&positions);
+    let (bounds_min, bounds_max) = if positions.is_empty() {
+        ([0.0; 3], [0.0; 3])
+    } else {
+        compute_bounds(&positions)
+    };
     Ok(GlbMeshData {
         path: path.to_path_buf(),
         positions,
@@ -426,6 +523,7 @@ pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, Glb
         mesh_names,
         nodes,
         skin,
+        animations,
         bounds_min,
         bounds_max,
     })
@@ -866,11 +964,24 @@ fn read_textures(
     let mut textures = Vec::<Option<GlbTextureData>>::new();
     if let Some(texture_nodes) = chunks.json.get("textures").and_then(Value::as_array) {
         for texture_node in texture_nodes {
-            let source = json_usize(texture_node, "source");
+            let source = texture_source_index(texture_node);
             textures.push(source.and_then(|index| images.get(index).cloned().flatten()));
         }
     }
     Ok(textures)
+}
+
+fn texture_source_index(texture_node: &Value) -> Option<usize> {
+    json_usize(texture_node, "source").or_else(|| {
+        texture_node
+            .get("extensions")
+            .and_then(|extensions| {
+                extensions
+                    .get("EXT_texture_webp")
+                    .or_else(|| extensions.get("KHR_texture_basisu"))
+            })
+            .and_then(|extension| json_usize(extension, "source"))
+    })
 }
 
 fn read_image_node(
@@ -937,6 +1048,25 @@ fn read_materials(chunks: &GlbChunks) -> Vec<GlbMaterialData> {
                     out.base_color_texture = pbr
                         .and_then(|pbr| pbr.get("baseColorTexture"))
                         .and_then(|tex| json_usize(tex, "index"));
+                    out.metallic_roughness_texture = pbr
+                        .and_then(|pbr| pbr.get("metallicRoughnessTexture"))
+                        .and_then(|tex| json_usize(tex, "index"));
+                    out.metallic_factor = pbr
+                        .and_then(|pbr| pbr.get("metallicFactor"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0) as f32;
+                    out.roughness_factor = pbr
+                        .and_then(|pbr| pbr.get("roughnessFactor"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0) as f32;
+                    out.normal_texture = material
+                        .get("normalTexture")
+                        .and_then(|tex| json_usize(tex, "index"));
+                    out.normal_scale = material
+                        .get("normalTexture")
+                        .and_then(|tex| tex.get("scale"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0) as f32;
                     if let Some(spec_gloss) = material.get("extensions").and_then(|extensions| {
                         extensions.get("KHR_materials_pbrSpecularGlossiness")
                     }) {
@@ -971,6 +1101,30 @@ fn read_materials(chunks: &GlbChunks) -> Vec<GlbMaterialData> {
                         })
                         .unwrap_or([0.0, 0.0, 0.0]);
                     out.emissive_factor = emissive_factor;
+                    out.emissive_strength = material
+                        .get("extensions")
+                        .and_then(|extensions| extensions.get("KHR_materials_emissive_strength"))
+                        .and_then(|extension| extension.get("emissiveStrength"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0) as f32;
+                    if let Some(specular) = material
+                        .get("extensions")
+                        .and_then(|extensions| extensions.get("KHR_materials_specular"))
+                    {
+                        out.specular_factor = specular
+                            .get("specularFactor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(1.0) as f32;
+                        if let Some(color) = specular
+                            .get("specularColorFactor")
+                            .and_then(Value::as_array)
+                        {
+                            for axis in 0..3 {
+                                out.specular_color_factor[axis] =
+                                    color.get(axis).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                            }
+                        }
+                    }
                     out.alpha_mode = match material
                         .get("alphaMode")
                         .and_then(Value::as_str)
@@ -1267,6 +1421,156 @@ fn read_skin(
         skeleton: json_usize(skin, "skeleton"),
         joints,
     }))
+}
+
+fn read_animations(chunks: &GlbChunks, path: &Path) -> Result<Vec<GlbAnimationData>, GlbLoadError> {
+    let Some(animations) = chunks.json.get("animations").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(animations.len());
+    for animation in animations {
+        let samplers = animation
+            .get("samplers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut channels_out = Vec::new();
+        let mut duration = 0.0f32;
+        for channel in animation
+            .get("channels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(sampler_index) = json_usize(channel, "sampler") else {
+                continue;
+            };
+            let Some(sampler) = samplers.get(sampler_index) else {
+                continue;
+            };
+            let Some(node_index) = channel
+                .get("target")
+                .and_then(|target| json_usize(target, "node"))
+            else {
+                continue;
+            };
+            let property = match channel
+                .get("target")
+                .and_then(|target| target.get("path"))
+                .and_then(Value::as_str)
+            {
+                Some("translation") => GlbAnimationProperty::Translation,
+                Some("rotation") => GlbAnimationProperty::Rotation,
+                Some("scale") => GlbAnimationProperty::Scale,
+                _ => continue,
+            };
+            let Some(input) = json_usize(sampler, "input") else {
+                continue;
+            };
+            let Some(output) = json_usize(sampler, "output") else {
+                continue;
+            };
+            let interpolation = match sampler
+                .get("interpolation")
+                .and_then(Value::as_str)
+                .unwrap_or("LINEAR")
+            {
+                "STEP" => GlbAnimationInterpolation::Step,
+                "CUBICSPLINE" => GlbAnimationInterpolation::CubicSpline,
+                _ => GlbAnimationInterpolation::Linear,
+            };
+            let times = read_float_scalars(chunks, input, path)?;
+            if times.is_empty() {
+                continue;
+            }
+            duration = duration.max(times.last().copied().unwrap_or(0.0));
+            let cubic = interpolation == GlbAnimationInterpolation::CubicSpline;
+            let values = match property {
+                GlbAnimationProperty::Rotation => {
+                    let values = read_float_vec4(chunks, output, path)?;
+                    GlbAnimationValues::Quat(cubic_values(values, times.len(), cubic))
+                }
+                GlbAnimationProperty::Translation | GlbAnimationProperty::Scale => {
+                    let values = read_positions(chunks, output, path)?;
+                    GlbAnimationValues::Vec3(cubic_values(values, times.len(), cubic))
+                }
+            };
+            channels_out.push(GlbAnimationChannelData {
+                node_index,
+                property,
+                interpolation,
+                times,
+                values,
+            });
+        }
+        out.push(GlbAnimationData {
+            name: animation
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            duration,
+            channels: channels_out,
+        });
+    }
+    Ok(out)
+}
+
+fn cubic_values<T: Copy>(values: Vec<T>, key_count: usize, cubic: bool) -> Vec<T> {
+    if !cubic || values.len() < key_count.saturating_mul(3) {
+        return values;
+    }
+    (0..key_count)
+        .filter_map(|index| values.get(index * 3 + 1).copied())
+        .collect()
+}
+
+fn read_float_scalars(
+    chunks: &GlbChunks,
+    accessor_index: usize,
+    path: &Path,
+) -> Result<Vec<f32>, GlbLoadError> {
+    let accessor = parse_accessor(chunks, accessor_index, path)?;
+    if accessor.component_type != 5126 || accessor.item_type != "SCALAR" {
+        return invalid(path, "animation input accessor must be float SCALAR");
+    }
+    let view = parse_buffer_view(chunks, accessor.buffer_view, path)?;
+    let stride = view.byte_stride.unwrap_or(4);
+    let base = view.byte_offset + accessor.byte_offset;
+    (0..accessor.count)
+        .map(|index| {
+            read_f32(&chunks.bin, base + index * stride)
+                .ok_or_else(|| invalid_err(path, "truncated animation input accessor"))
+        })
+        .collect()
+}
+
+fn read_float_vec4(
+    chunks: &GlbChunks,
+    accessor_index: usize,
+    path: &Path,
+) -> Result<Vec<[f32; 4]>, GlbLoadError> {
+    let accessor = parse_accessor(chunks, accessor_index, path)?;
+    if accessor.component_type != 5126 || accessor.item_type != "VEC4" {
+        return invalid(path, "animation rotation accessor must be float VEC4");
+    }
+    let view = parse_buffer_view(chunks, accessor.buffer_view, path)?;
+    let stride = view.byte_stride.unwrap_or(16);
+    let base = view.byte_offset + accessor.byte_offset;
+    let mut out = Vec::with_capacity(accessor.count);
+    for index in 0..accessor.count {
+        let offset = base + index * stride;
+        out.push([
+            read_f32(&chunks.bin, offset)
+                .ok_or_else(|| invalid_err(path, "truncated animation VEC4 accessor"))?,
+            read_f32(&chunks.bin, offset + 4)
+                .ok_or_else(|| invalid_err(path, "truncated animation VEC4 accessor"))?,
+            read_f32(&chunks.bin, offset + 8)
+                .ok_or_else(|| invalid_err(path, "truncated animation VEC4 accessor"))?,
+            read_f32(&chunks.bin, offset + 12)
+                .ok_or_else(|| invalid_err(path, "truncated animation VEC4 accessor"))?,
+        ]);
+    }
+    Ok(out)
 }
 
 fn read_mat4s(
@@ -1589,8 +1893,54 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        GlbChunks, load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data, read_materials,
+        GlbChunks, load_glb_mesh_data, load_glb_metadata, parse_glb_animation_data,
+        parse_glb_mesh_data, read_materials, texture_source_index,
     };
+
+    #[test]
+    fn animation_only_gltf_is_accepted_without_weakening_model_loading() {
+        let source = br#"{
+          "asset":{"version":"2.0"},
+          "scene":0,
+          "scenes":[{"nodes":[0]}],
+          "nodes":[{"name":"mixamorig:Hips"}],
+          "skins":[{"joints":[0]}],
+          "animations":[{"name":"Walk","channels":[],"samplers":[]}]
+        }"#;
+        let path = std::path::Path::new("motion-only.gltf");
+
+        let animation =
+            parse_glb_animation_data(path, source).expect("animation-only glTF should load");
+        assert!(animation.positions.is_empty());
+        assert_eq!(animation.nodes.len(), 1);
+        assert_eq!(animation.animations.len(), 1);
+        assert_eq!(animation.animations[0].name.as_deref(), Some("Walk"));
+
+        let model_error = parse_glb_mesh_data(path, source)
+            .expect_err("ModelAsset loading must still require renderable geometry");
+        assert!(
+            model_error
+                .to_string()
+                .contains("no triangle POSITION/index data")
+        );
+    }
+
+    #[test]
+    fn resolves_core_webp_and_basisu_texture_sources() {
+        assert_eq!(texture_source_index(&json!({ "source": 3 })), Some(3));
+        assert_eq!(
+            texture_source_index(&json!({
+                "extensions": { "EXT_texture_webp": { "source": 7 } }
+            })),
+            Some(7)
+        );
+        assert_eq!(
+            texture_source_index(&json!({
+                "extensions": { "KHR_texture_basisu": { "source": 9 } }
+            })),
+            Some(9)
+        );
+    }
 
     #[test]
     fn loads_example_glb_metadata_when_present() {
@@ -1721,5 +2071,49 @@ mod tests {
         assert!(materials[0].specular_glossiness);
         assert_eq!(materials[0].base_color_texture, Some(3));
         assert_eq!(materials[0].base_color_factor, [0.7, 0.6, 0.5, 0.9]);
+    }
+
+    #[test]
+    fn parses_metallic_roughness_normal_emissive_and_specular_material() {
+        let chunks = GlbChunks {
+            version: 2,
+            json_len: 0,
+            bin_len: 0,
+            json: json!({
+                "materials": [{
+                    "name": "black_glass",
+                    "pbrMetallicRoughness": {
+                        "metallicFactor": 0.72,
+                        "roughnessFactor": 0.18,
+                        "metallicRoughnessTexture": { "index": 4 }
+                    },
+                    "normalTexture": { "index": 5, "scale": 0.65 },
+                    "emissiveTexture": { "index": 6 },
+                    "emissiveFactor": [0.1, 0.2, 0.3],
+                    "extensions": {
+                        "KHR_materials_emissive_strength": { "emissiveStrength": 2.5 },
+                        "KHR_materials_specular": {
+                            "specularFactor": 0.8,
+                            "specularColorFactor": [0.9, 0.85, 0.75]
+                        }
+                    }
+                }]
+            }),
+            bin: Vec::new(),
+        };
+        let materials = read_materials(&chunks);
+        assert_eq!(materials.len(), 1);
+        let material = &materials[0];
+        assert_eq!(material.name.as_deref(), Some("black_glass"));
+        assert_eq!(material.metallic_roughness_texture, Some(4));
+        assert_eq!(material.normal_texture, Some(5));
+        assert_eq!(material.emissive_texture, Some(6));
+        assert_eq!(material.metallic_factor, 0.72);
+        assert_eq!(material.roughness_factor, 0.18);
+        assert_eq!(material.normal_scale, 0.65);
+        assert_eq!(material.emissive_factor, [0.1, 0.2, 0.3]);
+        assert_eq!(material.emissive_strength, 2.5);
+        assert_eq!(material.specular_factor, 0.8);
+        assert_eq!(material.specular_color_factor, [0.9, 0.85, 0.75]);
     }
 }

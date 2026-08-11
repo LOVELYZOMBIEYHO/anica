@@ -11,6 +11,10 @@ fn default_text_scene_one() -> String {
     "1".to_string()
 }
 
+fn default_text_render_scale() -> String {
+    "auto".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextNode {
@@ -39,7 +43,7 @@ pub struct TextNode {
     pub align: Option<String>,
     pub tracking: Option<String>,
     pub font_size: String,
-    #[serde(default = "default_text_scene_one")]
+    #[serde(default = "default_text_render_scale")]
     pub render_scale: String,
     pub antialias: Option<String>,
     pub edge_smoothing: Option<String>,

@@ -31,15 +31,18 @@ use gpui_component::{
     white,
 };
 use image::{ImageBuffer, Rgba, RgbaImage};
+use motionloom::experimental::{Scene3DNode, SceneNode};
 use motionloom::{
     EditableAnimationKey, EditableAnimationTarget, GraphScript, MotionLoomDocument,
     MotionLoomRenderProgress, PreviewCommand, PreviewEvent, PreviewInteractionMode,
     PreviewInteractionNode, RuntimeProgram, ScenePlatformPreviewSurface, ScenePreviewBackend,
     ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderProfile, SceneRenderer,
-    WgpuPreviewEngine, WgpuPreviewGraphCache, WgpuPreviewQuality, WorldFrameRenderer, WorldGraph,
-    WorldPathStyle, compile_runtime_program, extract_editable_animation_timeline, is_graph_script,
-    is_world_graph_script, load_glb_mesh_data, next_scene_output_path_for_profile,
-    parse_graph_script, parse_motionloom_document, parse_world_graph_script,
+    WgpuPreviewEngine, WgpuPreviewGraphCache, WgpuPreviewQuality, WorldActor, WorldBackground,
+    WorldBackgroundFit, WorldCamera, WorldFrameRenderer, WorldGraph, WorldModelProfile, WorldNode,
+    WorldPathStyle, WorldPresent, WorldProfileRetarget, WorldRetargetMap, compile_runtime_program,
+    extract_editable_animation_timeline, is_graph_script, is_world_graph_script,
+    load_glb_mesh_data, next_scene_output_path_for_profile, parse_graph_script,
+    parse_motionloom_document, parse_world_graph_script,
     render_motionloom_document_to_video_with_progress_and_cancel, render_scene_graph_frame,
     replace_editable_animation_targets, upsert_editable_animation_target,
 };
@@ -6741,19 +6744,24 @@ impl MotionLoomPage {
     fn build_glb_skeleton_report(&self) -> Result<GlbSkeletonInspectReport, String> {
         let raw = self.script_text.trim();
         if raw.is_empty() {
-            return Err("Inspect GLB needs a MotionLoom world DSL script.".to_string());
+            return Err("Inspect GLB needs a MotionLoom Graph script.".to_string());
         }
-        if !is_world_graph_script(raw) {
-            return Err(
-                "Inspect GLB requires a unified <Graph> containing <World> or <World>.".to_string(),
-            );
-        }
-        let graph = parse_world_graph_script(raw).map_err(|err| {
-            format!(
-                "World parse error before GLB inspect at line {}: {}",
-                err.line, err.message
-            )
-        })?;
+        let graph = if is_world_graph_script(raw) {
+            parse_world_graph_script(raw).map_err(|err| {
+                format!(
+                    "Legacy 3D parse error before GLB inspect at line {}: {}",
+                    err.line, err.message
+                )
+            })?
+        } else {
+            let scene_graph = parse_graph_script(raw).map_err(|err| {
+                format!(
+                    "Scene parse error before GLB inspect at line {}: {}",
+                    err.line, err.message
+                )
+            })?;
+            Self::scene_graph_for_glb_inspector(&scene_graph)?
+        };
         let asset_root = Self::world_asset_root();
         let mut actors = Vec::<GlbSkeletonActorReport>::new();
 
@@ -6912,7 +6920,7 @@ impl MotionLoomPage {
         }
 
         if actors.is_empty() {
-            return Err("No <Actor model=\"...glb\"> found in current world graph.".to_string());
+            return Err("No skinned <Model> was found in the current Scene graph.".to_string());
         }
 
         let retarget_draft = Self::build_retarget_draft(&actors);
@@ -6942,6 +6950,144 @@ impl MotionLoomPage {
             calibrated_model_profile_draft,
             actors,
         })
+    }
+
+    fn scene_graph_for_glb_inspector(graph: &GraphScript) -> Result<WorldGraph, String> {
+        let model_assets = graph
+            .assets
+            .iter()
+            .filter(|asset| asset.kind == motionloom::GraphAssetKind::Model)
+            .map(|asset| (asset.id.clone(), asset.src.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut actors = Vec::new();
+        for scene in &graph.scenes {
+            Self::collect_scene_glb_actors(&scene.children, &model_assets, &mut actors);
+        }
+        Self::collect_scene_glb_actors(&graph.scene_nodes, &model_assets, &mut actors);
+        if actors.is_empty() {
+            return Err("No <Model asset=\"...\"> found inside a 3D CompositeGroup.".to_string());
+        }
+        let model_profiles = graph
+            .model_profiles
+            .iter()
+            .filter(|profile| profile.kind.eq_ignore_ascii_case("3d"))
+            .map(|profile| WorldModelProfile {
+                id: profile.id.clone(),
+                model: profile.model.clone().unwrap_or_default(),
+                preset: profile.preset.clone(),
+                retarget: profile
+                    .retarget
+                    .as_ref()
+                    .map(|retarget| WorldProfileRetarget {
+                        preset: retarget.preset.clone(),
+                        maps: retarget
+                            .maps
+                            .iter()
+                            .map(|map| WorldRetargetMap {
+                                from: map.from.clone(),
+                                to: map.to.clone(),
+                            })
+                            .collect(),
+                    }),
+                bone_axis_map: None,
+            })
+            .collect();
+        let world_id = "__scene_glb_inspector".to_string();
+        Ok(WorldGraph {
+            id: Some(world_id.clone()),
+            version: Some("scene-inspector-v1".to_string()),
+            fps: graph.fps,
+            duration_ms: graph.duration_ms,
+            duration_explicit: graph.duration_explicit,
+            size: graph.size,
+            render_size: graph.render_size,
+            model_profiles,
+            worlds: vec![WorldNode {
+                id: world_id.clone(),
+                background: Some(WorldBackground {
+                    id: None,
+                    src: None,
+                    fit: WorldBackgroundFit::Stretch,
+                    color: "#00000000".to_string(),
+                    opacity: "1".to_string(),
+                }),
+                camera: WorldCamera::default(),
+                actors,
+                directional_characters: Vec::new(),
+            }],
+            retargets: Vec::new(),
+            actions: Vec::new(),
+            apply_actions: Vec::new(),
+            animation_assets: Vec::new(),
+            constraints: Vec::new(),
+            present: WorldPresent { from: world_id },
+        })
+    }
+
+    fn collect_scene_glb_actors(
+        nodes: &[SceneNode],
+        assets: &HashMap<String, String>,
+        actors: &mut Vec<WorldActor>,
+    ) {
+        for node in nodes {
+            let children = match node {
+                SceneNode::Timeline(node) => Some(node.children.as_slice()),
+                SceneNode::Track(node) => Some(node.children.as_slice()),
+                SceneNode::Sequence(node) => Some(node.children.as_slice()),
+                SceneNode::Chain(node) => Some(node.children.as_slice()),
+                SceneNode::Group(node) => {
+                    if let Some(composite) = node.composite.as_ref() {
+                        for model in composite.nodes_3d.iter().filter_map(|node| match node {
+                            Scene3DNode::Model(model) => Some(model),
+                            _ => None,
+                        }) {
+                            let actor_id = model
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| format!("scene_model_{}", actors.len()));
+                            let source = assets
+                                .get(&model.asset)
+                                .cloned()
+                                .unwrap_or_else(|| model.asset.clone());
+                            actors.push(WorldActor {
+                                id: actor_id,
+                                model: source,
+                                path_style: WorldPathStyle::Relative,
+                                hide_meshes: Vec::new(),
+                                hide_materials: Vec::new(),
+                                profile: model.profile.clone(),
+                                rig: model.rig.clone(),
+                                retarget: model.retarget.clone(),
+                                x: "0".to_string(),
+                                y: "0".to_string(),
+                                z: "0".to_string(),
+                                yaw: "0".to_string(),
+                                pitch: "0".to_string(),
+                                roll: "0".to_string(),
+                                scale: "1".to_string(),
+                                opacity: "1".to_string(),
+                                material: None,
+                                play: None,
+                                plays: Vec::new(),
+                            });
+                        }
+                    }
+                    Some(node.children.as_slice())
+                }
+                SceneNode::Part(node) => Some(node.children.as_slice()),
+                SceneNode::Repeat(node) => Some(node.children.as_slice()),
+                SceneNode::Mask(node) => Some(node.children.as_slice()),
+                SceneNode::Precompose(node) => Some(node.children.as_slice()),
+                SceneNode::Layer(node) => Some(node.children.as_slice()),
+                SceneNode::Camera(node) => Some(node.children.as_slice()),
+                SceneNode::Character(node) => Some(node.children.as_slice()),
+                SceneNode::Puppet(node) => Some(node.children.as_slice()),
+                _ => None,
+            };
+            if let Some(children) = children {
+                Self::collect_scene_glb_actors(children, assets, actors);
+            }
+        }
     }
 
     fn resolve_world_model_path(
@@ -7053,13 +7199,12 @@ impl MotionLoomPage {
         } else {
             Self::infer_bone_axis_map_lines(mesh, maps)
         };
-        let correction_lines = Self::infer_rest_pose_correction_lines(mesh, maps);
-
         let mut out = String::new();
         out.push_str(&format!(
             "<ModelProfile id=\"{}\"\n",
             Self::xml_attr_escape(&profile_id)
         ));
+        out.push_str("              kind=\"3d\"\n");
         out.push_str(&format!(
             "              model=\"{}\"\n",
             Self::xml_attr_escape(model)
@@ -7088,16 +7233,6 @@ impl MotionLoomPage {
                 out.push('\n');
             }
             out.push_str("  </BoneAxisMap>\n");
-        }
-
-        if !correction_lines.is_empty() {
-            out.push_str("\n  <RestPoseCorrection>\n");
-            for line in correction_lines {
-                out.push_str("    ");
-                out.push_str(&line);
-                out.push('\n');
-            }
-            out.push_str("  </RestPoseCorrection>\n");
         }
 
         out.push_str("</ModelProfile>");
@@ -7639,57 +7774,6 @@ impl MotionLoomPage {
                     "<Axis bone=\"{}\" {} />",
                     Self::xml_attr_escape(bone),
                     attrs
-                ));
-            }
-        }
-
-        out
-    }
-
-    fn infer_rest_pose_correction_lines(
-        mesh: &motionloom::GlbMeshData,
-        maps: &[(String, String)],
-    ) -> Vec<String> {
-        let bone_to_node = Self::bone_to_node_name(maps);
-        let node_name_to_index = Self::node_name_to_index(&mesh.nodes);
-        let global = Self::glb_global_node_matrices(&mesh.nodes);
-        let positions = global
-            .iter()
-            .map(|matrix| Self::mat4_transform_point(*matrix, [0.0, 0.0, 0.0]))
-            .collect::<Vec<_>>();
-        let mut out = Vec::new();
-
-        for (forearm, upper_arm, hand) in [
-            ("forearm_r", "upper_arm_r", "hand_r"),
-            ("forearm_l", "upper_arm_l", "hand_l"),
-        ] {
-            let Some(upper_dir) = Self::bone_direction(
-                upper_arm,
-                Some(forearm),
-                &positions,
-                &bone_to_node,
-                &node_name_to_index,
-            ) else {
-                continue;
-            };
-            let Some(forearm_dir) = Self::bone_direction(
-                forearm,
-                Some(hand),
-                &positions,
-                &bone_to_node,
-                &node_name_to_index,
-            ) else {
-                continue;
-            };
-            let straightness = Self::vec3_dot(upper_dir, forearm_dir).clamp(-1.0, 1.0);
-            if straightness > 0.72 {
-                let amount = (((straightness - 0.72) / 0.28) * 10.0)
-                    .clamp(4.0, 10.0)
-                    .round();
-                out.push(format!(
-                    "<Bone bone=\"{}\" bend=\"{}\" />",
-                    Self::xml_attr_escape(forearm),
-                    amount
                 ));
             }
         }
@@ -8542,7 +8626,7 @@ impl MotionLoomPage {
                         div()
                             .text_xs()
                             .text_color(white().opacity(0.66))
-                            .child("This reads the current world DSL once, lists GLB skin joints, generates humanoid_v1 Retarget, simulates rotationX/Y/Z endpoint movement for Auto Calibration Preview, and builds copyable ModelProfile drafts. It does not affect frame preview/render speed."),
+                            .child("This reads the current Scene DSL once, lists GLB skin joints, generates a humanoid_v1 Retarget, simulates rotationX/Y/Z endpoint movement for Auto Calibration Preview, and builds copyable kind=\"3d\" ModelProfile drafts. It does not affect frame preview/render speed."),
                     )
                     .child(
                         div()
