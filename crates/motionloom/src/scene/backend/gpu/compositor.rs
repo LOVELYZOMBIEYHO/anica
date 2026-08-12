@@ -89,6 +89,8 @@ pub(crate) struct WgpuSceneCompositor {
     instance: Option<wgpu::Instance>,
     #[cfg(target_arch = "wasm32")]
     adapter: Option<wgpu::Adapter>,
+    #[cfg(target_arch = "wasm32")]
+    canvas_presenter: Option<WasmCanvasPresenter>,
     device: Arc<wgpu::Device>,
     queue: wgpu::Queue,
     _poller: DevicePoller,
@@ -150,6 +152,72 @@ pub(crate) struct WgpuSceneCompositor {
     timestamp_marker_pipeline: Option<wgpu::ComputePipeline>,
 }
 
+#[cfg(target_arch = "wasm32")]
+struct WasmCanvasPresenter {
+    canvas: web_sys::HtmlCanvasElement,
+    surface: wgpu::Surface<'static>,
+    format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    present_mode: wgpu::PresentMode,
+    width: u32,
+    height: u32,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmCanvasPresenter {
+    fn configure(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.surface.configure(
+            device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: self.format,
+                width,
+                height,
+                present_mode: self.present_mode,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: self.alpha_mode,
+                view_formats: vec![],
+            },
+        );
+        self.width = width;
+        self.height = height;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+const WGPU_CANVAS_PRESENT_SHADER: &str = r#"
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    var out: VertexOut;
+    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    let dims = textureDimensions(src_tex);
+    let max_px = dims - vec2<u32>(1u, 1u);
+    let px = min(vec2<u32>(u32(in.position.x), u32(in.position.y)), max_px);
+    let color = textureLoad(src_tex, vec2<i32>(px), 0);
+    return vec4<f32>(color.rgb, 1.0);
+}
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ShapeBenchmarkRender {
     pub(crate) texture: GpuSceneNativeTexture,
@@ -182,6 +250,129 @@ impl WgpuPresentationContext {
 }
 
 impl WgpuSceneCompositor {
+    #[cfg(target_arch = "wasm32")]
+    fn create_canvas_presenter(
+        &self,
+        canvas: web_sys::HtmlCanvasElement,
+        width: u32,
+        height: u32,
+    ) -> Result<WasmCanvasPresenter, MotionLoomSceneRenderError> {
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            MotionLoomSceneRenderError::GpuRender {
+                message: "canvas presentation requires an internally-created wgpu instance; use the default constructor instead of new_with_device".to_string(),
+            }
+        })?;
+        let adapter = self.adapter.as_ref().ok_or_else(|| {
+            MotionLoomSceneRenderError::GpuRender {
+                message: "canvas presentation requires an internally-created wgpu adapter; use the default constructor instead of new_with_device".to_string(),
+            }
+        })?;
+        let surface = instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|err| MotionLoomSceneRenderError::GpuRender {
+                message: format!("canvas surface creation failed: {err}"),
+            })?;
+        let caps = surface.get_capabilities(adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|format| {
+                matches!(
+                    format,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
+            .or_else(|| caps.formats.first().copied())
+            .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                message: "canvas surface has no supported texture formats".to_string(),
+            })?;
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        };
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+            wgpu::PresentMode::Fifo
+        } else {
+            caps.present_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::PresentMode::AutoVsync)
+        };
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("anica-motionloom-scene-canvas-present-shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WGPU_CANVAS_PRESENT_SHADER)),
+            });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("anica-motionloom-scene-canvas-present-bgl"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    }],
+                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("anica-motionloom-scene-canvas-present-pipeline-layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("anica-motionloom-scene-canvas-present-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+        let mut presenter = WasmCanvasPresenter {
+            canvas,
+            surface,
+            format,
+            alpha_mode,
+            present_mode,
+            width: 0,
+            height: 0,
+            bind_group_layout,
+            pipeline,
+        };
+        presenter.configure(&self.device, width, height);
+        Ok(presenter)
+    }
+
     pub(crate) fn device_queue(&self) -> (Arc<wgpu::Device>, wgpu::Queue) {
         (self.device.clone(), self.queue.clone())
     }
@@ -1446,6 +1637,8 @@ impl WgpuSceneCompositor {
             instance: presentation.instance,
             #[cfg(target_arch = "wasm32")]
             adapter: presentation.adapter,
+            #[cfg(target_arch = "wasm32")]
+            canvas_presenter: None,
             device,
             queue,
             _poller: poller,
@@ -1514,179 +1707,52 @@ impl WgpuSceneCompositor {
     /// internal RGBA scene texture into the canvas swapchain texture.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn present_texture_to_canvas(
-        &self,
+        &mut self,
         texture: &GpuSceneNativeTexture,
         canvas: &web_sys::HtmlCanvasElement,
     ) -> Result<(), MotionLoomSceneRenderError> {
         let width = texture.width.max(1);
         let height = texture.height.max(1);
-        canvas.set_width(width);
-        canvas.set_height(height);
+        // Assigning the same canvas size still resets the browser's drawing
+        // buffer. More importantly, creating/configuring a new wgpu Surface and
+        // compiling a presentation pipeline every frame makes Chromium retain
+        // GPU objects until a later collection cycle. Long-running previews
+        // therefore grow without bound, especially at 4K.
+        if canvas.width() != width {
+            canvas.set_width(width);
+        }
+        if canvas.height() != height {
+            canvas.set_height(height);
+        }
 
-        let Some(instance) = self.instance.as_ref() else {
-            return Err(MotionLoomSceneRenderError::GpuRender {
-                message: "canvas presentation requires an internally-created wgpu instance; \
-                          use the default constructor instead of new_with_device"
-                    .to_string(),
-            });
-        };
-        let Some(adapter) = self.adapter.as_ref() else {
-            return Err(MotionLoomSceneRenderError::GpuRender {
-                message: "canvas presentation requires an internally-created wgpu adapter; \
-                          use the default constructor instead of new_with_device"
-                    .to_string(),
-            });
-        };
-
-        let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-            .map_err(|err| MotionLoomSceneRenderError::GpuRender {
-                message: format!("canvas surface creation failed: {err}"),
-            })?;
-        let caps = surface.get_capabilities(adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|format| {
-                matches!(
-                    format,
-                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
-                )
-            })
-            .or_else(|| caps.formats.first().copied())
-            .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
-                message: "canvas surface has no supported texture formats".to_string(),
-            })?;
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            wgpu::CompositeAlphaMode::Opaque
-        } else {
-            caps.alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
-        };
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
-            wgpu::PresentMode::Fifo
-        } else {
-            caps.present_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::PresentMode::AutoVsync)
-        };
-
-        surface.configure(
-            &self.device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format,
-                width,
-                height,
-                present_mode,
-                desired_maximum_frame_latency: 2,
-                alpha_mode,
-                view_formats: vec![],
-            },
-        );
-        let frame =
-            surface
-                .get_current_texture()
-                .map_err(|err| MotionLoomSceneRenderError::GpuRender {
-                    message: format!("canvas surface frame acquisition failed: {err}"),
-                })?;
+        let same_canvas = self.canvas_presenter.as_ref().is_some_and(|presenter| {
+            js_sys::Object::is(presenter.canvas.as_ref(), canvas.as_ref())
+        });
+        if !same_canvas {
+            self.canvas_presenter =
+                Some(self.create_canvas_presenter(canvas.clone(), width, height)?);
+        }
+        let presenter = self
+            .canvas_presenter
+            .as_mut()
+            .expect("canvas presenter initialized above");
+        if presenter.width != width || presenter.height != height {
+            presenter.configure(&self.device, width, height);
+        }
+        let frame = presenter.surface.get_current_texture().map_err(|err| {
+            MotionLoomSceneRenderError::GpuRender {
+                message: format!("canvas surface frame acquisition failed: {err}"),
+            }
+        })?;
         let target_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let source_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("anica-motionloom-scene-canvas-present-shader"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                    r#"
-@group(0) @binding(0) var src_tex: texture_2d<f32>;
-
-struct VertexOut {
-    @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    var out: VertexOut;
-    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let dims = textureDimensions(src_tex);
-    let max_px = dims - vec2<u32>(1u, 1u);
-    let px = min(vec2<u32>(u32(in.position.x), u32(in.position.y)), max_px);
-    let color = textureLoad(src_tex, vec2<i32>(px), 0);
-    return vec4<f32>(color.rgb, 1.0);
-}
-"#,
-                )),
-            });
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("anica-motionloom-scene-canvas-present-bgl"),
-                    entries: &[wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    }],
-                });
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("anica-motionloom-scene-canvas-present-pipeline-layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("anica-motionloom-scene-canvas-present-pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("anica-motionloom-scene-canvas-present-bg"),
-            layout: &bind_group_layout,
+            layout: &presenter.bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&source_view),
@@ -1712,7 +1778,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&presenter.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -1837,7 +1903,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     /// collection and compute-shape passes.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn debug_present_uploaded_texture_to_canvas(
-        &self,
+        &mut self,
         canvas: &web_sys::HtmlCanvasElement,
         width: u32,
         height: u32,

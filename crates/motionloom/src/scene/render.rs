@@ -4919,7 +4919,7 @@ impl SceneFrameRenderer {
             .await?;
         let compositor =
             self.gpu_compositor
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
                     message: "GPU compositor was not initialized".to_string(),
                 })?;
