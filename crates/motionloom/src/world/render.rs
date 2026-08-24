@@ -3673,7 +3673,9 @@ fn sample_shadow(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     var visibility = 0.0;
     for (var y = -1; y <= 1; y = y + 1) {
         for (var x = -1; x <= 1; x = x + 1) {
-            visibility += textureSampleCompare(
+            // Explicit level-zero comparison avoids derivative-dependent
+            // sampling inside fragment-varying shadow bounds on WebGPU.
+            visibility += textureSampleCompareLevel(
                 shadow_texture,
                 shadow_sampler,
                 coordinate.xy + vec2<f32>(f32(x), f32(y)) * texel,
@@ -10534,6 +10536,15 @@ mod tests {
         validator
             .validate(&module)
             .expect("world PBR WGSL must validate");
+    }
+
+    #[test]
+    fn world_pbr_shadow_sampling_uses_explicit_level_for_webgpu() {
+        assert!(
+            super::WGPU_WORLD_SHADER.contains("textureSampleCompareLevel("),
+            "shadow comparison sampling must not require uniform derivative control flow"
+        );
+        assert!(!super::WGPU_WORLD_SHADER.contains("textureSampleCompare("));
     }
 
     #[test]
