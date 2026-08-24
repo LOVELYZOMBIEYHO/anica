@@ -8,7 +8,9 @@ use crate::simulation::clock::SimulationClock;
 use crate::simulation::error::SimulationError;
 use crate::simulation::model::{
     AttractionNode, ClothNode, ColliderNode, HairStrandFieldNode, ParticleEmitterNode,
-    SimulationBindingNode, SimulationResourceNode, WindNode,
+    RigidBodyAngularVelocity, RigidBodyColliderSize, RigidBodyDimension, RigidBodyLinearVelocity,
+    RigidBodyNode, RigidBodyShape, RigidBodyType, SimulationBindingNode, SimulationResourceNode,
+    WindNode,
 };
 
 pub fn apply_scene_simulation_at_frame(
@@ -118,6 +120,7 @@ fn apply_bindings(
     resources: &Resources,
     clock: SimulationClock,
 ) -> Result<(), SimulationError> {
+    apply_rigid_bodies_2d(nodes, bindings, clock);
     for binding in bindings {
         match binding {
             SimulationBindingNode::Hinge(binding) => {
@@ -130,26 +133,7 @@ fn apply_bindings(
                     group.rotation = format!("{:.4}", angle * binding.stiffness);
                 });
             }
-            SimulationBindingNode::RigidBody2D(binding) => {
-                let time = clock.time_seconds();
-                mutate_group(nodes, &binding.target, |group| {
-                    group.x = format!(
-                        "{:.4}",
-                        sample_numeric(&group.x, clock) + binding.velocity[0] * time
-                    );
-                    group.y = format!(
-                        "{:.4}",
-                        sample_numeric(&group.y, clock)
-                            + binding.velocity[1] * time
-                            + 90.0 * time * time
-                    );
-                    group.rotation = format!(
-                        "{:.4}",
-                        sample_numeric(&group.rotation, clock)
-                            + binding.angular_velocity.to_degrees() * time
-                    );
-                });
-            }
+            SimulationBindingNode::RigidBody(_) => {}
             SimulationBindingNode::Cloth(binding) => {
                 mutate_group(nodes, &binding.target, |group| {
                     deform_group_curves(group, binding, clock.time_seconds());
@@ -190,6 +174,201 @@ fn apply_bindings(
 
     apply_curve_bindings(nodes, bindings, resources, clock)?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct RigidBodyState2D<'a> {
+    body: &'a RigidBodyNode,
+    authored_position: [f32; 2],
+    position: [f32; 2],
+    half_extent: [f32; 2],
+    velocity: [f32; 2],
+    rotation_delta: f32,
+    angular_velocity: f32,
+}
+
+fn apply_rigid_bodies_2d(
+    nodes: &mut [SceneNode],
+    bindings: &[SimulationBindingNode],
+    clock: SimulationClock,
+) {
+    let mut states = bindings
+        .iter()
+        .filter_map(|binding| match binding {
+            SimulationBindingNode::RigidBody(body) if body.dimension == RigidBodyDimension::D2 => {
+                let authored_position = group_position(nodes, &body.target, clock)?;
+                let RigidBodyLinearVelocity::D2(velocity) = body.velocity else {
+                    return None;
+                };
+                let RigidBodyAngularVelocity::D2(angular_velocity) = body.angular_velocity else {
+                    return None;
+                };
+                Some(RigidBodyState2D {
+                    body,
+                    authored_position,
+                    position: authored_position,
+                    half_extent: rigid_body_2d_half_extent(body),
+                    velocity,
+                    rotation_delta: 0.0,
+                    angular_velocity,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if states.is_empty() {
+        return;
+    }
+
+    sample_rigid_bodies_2d(&mut states, clock.time_seconds());
+    for state in states {
+        if state.body.body_type != RigidBodyType::Dynamic {
+            continue;
+        }
+        mutate_group(nodes, &state.body.target, |group| {
+            group.x = format!("{:.4}", state.position[0]);
+            group.y = format!("{:.4}", state.position[1]);
+            group.rotation = format!(
+                "{:.4}",
+                sample_numeric(&group.rotation, clock) + state.rotation_delta
+            );
+        });
+    }
+}
+
+fn rigid_body_2d_half_extent(body: &RigidBodyNode) -> [f32; 2] {
+    let RigidBodyColliderSize::D2(size) = body.size else {
+        return [0.5, 0.5];
+    };
+    match body.shape {
+        RigidBodyShape::Circle => [body.radius, body.radius],
+        RigidBodyShape::Capsule => [body.radius, body.height * 0.5 + body.radius],
+        _ => [size[0] * 0.5, size[1] * 0.5],
+    }
+}
+
+fn sample_rigid_bodies_2d(states: &mut [RigidBodyState2D<'_>], time: f32) {
+    const STEP: f32 = 1.0 / 120.0;
+    let mut remaining = time.max(0.0);
+    while remaining > 0.0 {
+        let dt = remaining.min(rigid_body_2d_step(states, STEP));
+        for state in states.iter_mut() {
+            match state.body.body_type {
+                RigidBodyType::Static | RigidBodyType::Kinematic => {
+                    state.position = state.authored_position;
+                }
+                RigidBodyType::Dynamic => {
+                    let RigidBodyLinearVelocity::D2(gravity) = state.body.gravity else {
+                        continue;
+                    };
+                    let linear_decay = (-state.body.linear_damping * dt).exp();
+                    let angular_decay = (-state.body.angular_damping * dt).exp();
+                    for axis in 0..2 {
+                        state.velocity[axis] =
+                            (state.velocity[axis] + gravity[axis] * dt) * linear_decay;
+                        state.position[axis] += state.velocity[axis] * dt;
+                    }
+                    state.angular_velocity *= angular_decay;
+                    state.rotation_delta += state.angular_velocity.to_degrees() * dt;
+                }
+            }
+        }
+
+        // A stable axis-aligned proxy keeps random-access preview deterministic.
+        for _ in 0..4 {
+            for a in 0..states.len() {
+                for b in (a + 1)..states.len() {
+                    resolve_rigid_body_2d_pair(states, a, b);
+                }
+            }
+        }
+        remaining -= dt;
+    }
+}
+
+fn rigid_body_2d_step(states: &[RigidBodyState2D<'_>], fixed_step: f32) -> f32 {
+    states
+        .iter()
+        .filter(|state| {
+            state.body.body_type == RigidBodyType::Dynamic && state.body.continuous_collision
+        })
+        .fold(fixed_step, |step, state| {
+            let RigidBodyLinearVelocity::D2(gravity) = state.body.gravity else {
+                return step;
+            };
+            let projected_velocity = [
+                state.velocity[0] + gravity[0] * fixed_step,
+                state.velocity[1] + gravity[1] * fixed_step,
+            ];
+            let speed = projected_velocity[0].hypot(projected_velocity[1]);
+            let safe_distance = state.half_extent[0].min(state.half_extent[1]) * 0.5;
+            if speed > 1.0e-6 {
+                step.min((safe_distance / speed).clamp(1.0 / 1000.0, fixed_step))
+            } else {
+                step
+            }
+        })
+}
+
+fn resolve_rigid_body_2d_pair(states: &mut [RigidBodyState2D<'_>], a: usize, b: usize) {
+    let (left, right) = states.split_at_mut(b);
+    let a = &mut left[a];
+    let b = &mut right[0];
+    if a.body.body_type != RigidBodyType::Dynamic && b.body.body_type != RigidBodyType::Dynamic {
+        return;
+    }
+    let delta = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
+    let overlap = [
+        a.half_extent[0] + b.half_extent[0] - delta[0].abs(),
+        a.half_extent[1] + b.half_extent[1] - delta[1].abs(),
+    ];
+    if overlap[0] <= 0.0 || overlap[1] <= 0.0 {
+        return;
+    }
+    let axis = usize::from(overlap[1] < overlap[0]);
+    let sign = if delta[axis] >= 0.0 { 1.0 } else { -1.0 };
+    let normal = if axis == 0 { [sign, 0.0] } else { [0.0, sign] };
+    let inverse_mass_a = if a.body.body_type == RigidBodyType::Dynamic {
+        1.0 / a.body.mass.max(0.0001)
+    } else {
+        0.0
+    };
+    let inverse_mass_b = if b.body.body_type == RigidBodyType::Dynamic {
+        1.0 / b.body.mass.max(0.0001)
+    } else {
+        0.0
+    };
+    let inverse_mass_sum = inverse_mass_a + inverse_mass_b;
+    if inverse_mass_sum <= 0.0 {
+        return;
+    }
+    let correction = overlap[axis] / inverse_mass_sum;
+    for component in 0..2 {
+        a.position[component] -= normal[component] * correction * inverse_mass_a;
+        b.position[component] += normal[component] * correction * inverse_mass_b;
+    }
+
+    let relative_velocity = [b.velocity[0] - a.velocity[0], b.velocity[1] - a.velocity[1]];
+    let normal_speed = relative_velocity[0] * normal[0] + relative_velocity[1] * normal[1];
+    if normal_speed >= 0.0 {
+        return;
+    }
+    let restitution = a.body.restitution.min(b.body.restitution);
+    let impulse = -(1.0 + restitution) * normal_speed / inverse_mass_sum;
+    for component in 0..2 {
+        a.velocity[component] -= normal[component] * impulse * inverse_mass_a;
+        b.velocity[component] += normal[component] * impulse * inverse_mass_b;
+    }
+
+    let tangent = [-normal[1], normal[0]];
+    let tangent_speed = relative_velocity[0] * tangent[0] + relative_velocity[1] * tangent[1];
+    let friction = (a.body.friction * b.body.friction).sqrt();
+    let friction_impulse =
+        (-tangent_speed / inverse_mass_sum).clamp(-impulse * friction, impulse * friction);
+    for component in 0..2 {
+        a.velocity[component] -= tangent[component] * friction_impulse * inverse_mass_a;
+        b.velocity[component] += tangent[component] * friction_impulse * inverse_mass_b;
+    }
 }
 
 fn apply_curve_bindings(
@@ -834,7 +1013,7 @@ mod tests {
             <Group id="body">
               <Circle x="80" y="80" radius="20" color="#fff" />
             </Group>
-            <RigidBody2D id="physics" target="body" mass="1" velocity={[80,-20]} angularVelocity="0.5" />
+            <RigidBody id="physics" target="body" dimension="2d" type="dynamic" shape="box" mass="1" velocity={[80,-20]} angularVelocity="0.5" gravity={[0,180]} />
           </Layer>
         </Sequence>
       </Track>
@@ -845,6 +1024,47 @@ mod tests {
 "##,
             12,
         );
+    }
+
+    #[test]
+    fn dynamic_2d_body_settles_on_static_body() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="2s" size={[320,240]}>
+  <Scene id="s">
+    <Timeline>
+      <Track>
+        <Sequence from="0s" duration="2s">
+          <Layer>
+            <Group id="ball" x="160" y="20">
+              <Circle radius="10" color="#fff" />
+            </Group>
+            <Group id="floor" x="160" y="100">
+              <Rect x="-100" y="-10" width="200" height="20" color="#fff" />
+            </Group>
+            <RigidBody id="ball_body" target="ball" dimension="2d" type="dynamic" shape="circle" radius="10" gravity={[0,300]} restitution="0" />
+            <RigidBody id="floor_body" target="floor" dimension="2d" type="static" shape="box" size={[200,20]} />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="s" />
+</Graph>
+"##,
+        )
+        .expect("parse 2D rigid bodies");
+        let output = super::apply_scene_simulation_at_frame(&graph, 59)
+            .expect("simulate rigid bodies")
+            .expect("simulation graph");
+        let clock = crate::simulation::clock::SimulationClock {
+            fps: 30.0,
+            frame: 59,
+            duration_seconds: 2.0,
+        };
+        let position = super::group_position(&output.scenes[0].children, "ball", clock)
+            .expect("dynamic target position");
+        assert!((position[1] - 80.0).abs() < 0.2, "position={position:?}");
     }
 
     #[test]
@@ -863,7 +1083,7 @@ mod tests {
             <Group id="b" x="180" y="120">
               <Circle x="0" y="0" radius="12" color="#fff" />
             </Group>
-            <RigidBody2D id="physics" target="b" mass="1" velocity={[0,-80]} angularVelocity="0" />
+            <RigidBody id="physics" target="b" dimension="2d" type="dynamic" shape="box" mass="1" velocity={[0,-80]} angularVelocity="0" gravity={[0,180]} />
             <DistanceConstraint a="a" b="b" distance="120" stiffness="1" />
           </Layer>
         </Sequence>

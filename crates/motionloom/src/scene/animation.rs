@@ -201,19 +201,34 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
         "width",
         "px",
         "number",
-        &["Rect", "Line", "FaceJaw", "Mask", "Puppet", "Text"]
+        &[
+            "Rect",
+            "Line",
+            "FaceJaw",
+            "Mask",
+            "Puppet",
+            "Text",
+            "RectAreaLight"
+        ]
     ),
     number_property!(
         "height",
         "px",
         "number",
-        &["Rect", "FaceJaw", "Mask", "Puppet"]
+        &["Rect", "FaceJaw", "Mask", "Puppet", "RectAreaLight"]
     ),
     number_property!(
         "radius",
         "px",
         "number",
-        &["Rect", "Circle", "Mask", "Pin", "Simulation"]
+        &[
+            "Rect",
+            "Circle",
+            "Mask",
+            "Pin",
+            "Simulation",
+            "AmbientOcclusion"
+        ]
     ),
     number_property!("radiusX", "px", "number", &["Ellipse"]),
     number_property!("radiusY", "px", "number", &["Ellipse"]),
@@ -266,7 +281,12 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
     number_property!("z", "px", "number", &["Layer"]),
     number_property!("zDepth", "px", "number", &["Layer", "Track"]),
     number_property!("rotationX", "deg", "angle", &["Layer", "Model"]),
-    number_property!("rotationY", "deg", "angle", &["Layer", "Model"]),
+    number_property!(
+        "rotationY",
+        "deg",
+        "angle",
+        &["Layer", "Model", "EnvironmentLight"]
+    ),
     number_property!("rotationZ", "deg", "angle", &["Model"]),
     number_property!("positionX", "world", "number", &["Model"]),
     number_property!("positionY", "world", "number", &["Model"]),
@@ -293,8 +313,42 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
     number_property!("shakeY", "px", "number", &["Camera"]),
     number_property!("zoom", "ratio", "number", &["Camera"]),
     number_property!("fov", "deg", "angle", &["Camera3D"]),
-    number_property!("intensity", "ratio", "number", &["EnvironmentLight"]),
-    number_property!("exposure", "stops", "number", &["Model"]),
+    number_property!(
+        "intensity",
+        "ratio",
+        "number",
+        &[
+            "EnvironmentLight",
+            "DirectionalLight",
+            "PointLight",
+            "SpotLight",
+            "RectAreaLight",
+            "AmbientOcclusion",
+            "ContactShadow"
+        ]
+    ),
+    number_property!(
+        "backgroundIntensity",
+        "ratio",
+        "number",
+        &["EnvironmentLight"]
+    ),
+    number_property!("backgroundBlur", "ratio", "slider", &["EnvironmentLight"]),
+    number_property!("diffuseIntensity", "ratio", "number", &["EnvironmentLight"]),
+    number_property!(
+        "specularIntensity",
+        "ratio",
+        "number",
+        &["EnvironmentLight"]
+    ),
+    number_property!("range", "world", "number", &["PointLight", "SpotLight"]),
+    number_property!("innerCone", "deg", "angle", &["SpotLight"]),
+    number_property!("outerCone", "deg", "angle", &["SpotLight"]),
+    number_property!("distance", "world", "number", &["ContactShadow"]),
+    number_property!("softness", "ratio", "slider", &["ContactShadow"]),
+    number_property!("exposure", "stops", "number", &["Model", "ColorManagement"]),
+    number_property!("whiteBalance", "kelvin", "number", &["ColorManagement"]),
+    number_property!("contrast", "ratio", "number", &["ColorManagement"]),
     number_property!("amount", "ratio", "slider", &["Puppet", "Simulation"]),
     number_property!("jointSoftness", "ratio", "slider", &["Puppet"]),
     number_property!("stiffness", "ratio", "slider", &["Puppet", "Simulation"]),
@@ -617,11 +671,42 @@ fn collect_scene_node_kinds(nodes: &[SceneNode], node_kinds: &mut HashMap<String
                                 node.id.as_ref(),
                                 "EnvironmentLight",
                             ),
+                            Scene3DNode::DirectionalLight(node) => collect_optional_id(
+                                node_kinds,
+                                node.id.as_ref(),
+                                "DirectionalLight",
+                            ),
+                            Scene3DNode::PointLight(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "PointLight")
+                            }
+                            Scene3DNode::SpotLight(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "SpotLight")
+                            }
+                            Scene3DNode::RectAreaLight(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "RectAreaLight")
+                            }
+                            Scene3DNode::AmbientOcclusion(node) => collect_optional_id(
+                                node_kinds,
+                                node.id.as_ref(),
+                                "AmbientOcclusion",
+                            ),
+                            Scene3DNode::ContactShadow(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "ContactShadow")
+                            }
+                            Scene3DNode::ColorManagement(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "ColorManagement")
+                            }
                             Scene3DNode::Model(node) => {
                                 collect_optional_id(node_kinds, node.id.as_ref(), "Model")
                             }
+                            Scene3DNode::VolumeRepeat(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "Repeat")
+                            }
                             Scene3DNode::Anchor(node) => {
                                 node_kinds.insert(node.id.clone(), "Anchor3D");
+                            }
+                            Scene3DNode::RigidBody(node) => {
+                                node_kinds.insert(node.id.clone(), "RigidBody");
                             }
                             Scene3DNode::Debug(_) => {}
                         }
@@ -658,7 +743,7 @@ fn simulation_binding_id(
         SimulationBindingNode::DynamicCurve(node) => node.id.as_ref(),
         SimulationBindingNode::DistanceConstraint(node) => node.id.as_ref(),
         SimulationBindingNode::Hinge(node) => node.id.as_ref(),
-        SimulationBindingNode::RigidBody2D(node) => Some(&node.id),
+        SimulationBindingNode::RigidBody(node) => Some(&node.id),
         SimulationBindingNode::ParticleEmitter(node) => Some(&node.id),
         SimulationBindingNode::Cloth(node) => Some(&node.id),
         SimulationBindingNode::HairStrandField(node) => Some(&node.id),
@@ -698,6 +783,28 @@ mod tests {
                 .value_type,
             AnimationValueType::Number
         );
+    }
+
+    #[test]
+    fn registry_exposes_animatable_scene_lighting_channels() {
+        for property in [
+            "intensity",
+            "rotationY",
+            "backgroundIntensity",
+            "specularIntensity",
+            "range",
+            "innerCone",
+            "outerCone",
+            "width",
+            "radius",
+            "whiteBalance",
+            "contrast",
+        ] {
+            assert!(
+                animation_property_descriptor(property).is_some(),
+                "missing lighting animation property {property}"
+            );
+        }
     }
 
     #[test]

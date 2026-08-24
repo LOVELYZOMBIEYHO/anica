@@ -4343,6 +4343,7 @@ dependencies = [
  "cosmic-text",
  "draco-gltf",
  "exmex",
+ "half",
  "image",
  "js-sys",
  "lyon_tessellation",

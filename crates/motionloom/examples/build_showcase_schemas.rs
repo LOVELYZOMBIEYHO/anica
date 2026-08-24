@@ -16,9 +16,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut needs_repair = 0usize;
     let mut unrenderable = 0usize;
     let mut diagnostic_codes = BTreeMap::<String, usize>::new();
-    for entry in fs::read_dir(&showcase_root)? {
-        let entry = entry?;
-        let directory = entry.path();
+    // Accept either the showcase root or one showcase directory so targeted
+    // updates do not rewrite unrelated generated schemas in a dirty worktree.
+    let directories = if showcase_root.join("main.motionloom").is_file() {
+        vec![showcase_root.clone()]
+    } else {
+        fs::read_dir(&showcase_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect()
+    };
+    for directory in directories {
         if !directory.is_dir() {
             continue;
         }

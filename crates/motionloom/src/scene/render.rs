@@ -19,7 +19,10 @@ use std::sync::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 
-use crate::dsl::{GraphAssetKind, GraphScript, ProcessDefinitionNode};
+use crate::dsl::{
+    GraphAssetKind, GraphAssetSource, GraphScript, PrimitiveAssetNode, PrimitiveColliderShape,
+    PrimitiveCollisionMode, PrimitiveGeometry, ProcessDefinitionNode,
+};
 use crate::process::model::{PassNode, PassParam};
 use crate::process::runtime::{
     CompiledTimeExpr, apply_curve_ease, eval_time_expr, parse_curve_ease,
@@ -87,8 +90,8 @@ use crate::scene::model::{
     CameraNode, CharacterNode, CircleNode, CompositeGroupConfig, DefsNode, EllipseNode,
     FaceJawNode, FilterDef, FontDef, GradientDef, GroupNode, LineNode, MaskNode, MaterialDef,
     NoiseDef, PaletteNode, PartNode, PathNode, PixelGridNode, PolylineNode, PrecomposeNode,
-    PuppetNode, RectNode, RepeatNode, Scene3DNode, SceneEffectRef, SceneLayerNode, SceneNode,
-    SceneRootNode, SceneTrackNode, TextureDef, UseNode,
+    PuppetNode, RectNode, RepeatNode, Scene3DNode, SceneCamera3DNode, SceneEffectRef,
+    SceneLayerNode, SceneNode, SceneRootNode, SceneTrackNode, TextureDef, UseNode,
 };
 pub use crate::scene::resource::{clear_scene_asset_roots, set_scene_asset_roots};
 use crate::scene::resource::{
@@ -385,7 +388,14 @@ fn sample_dynamic_animation_value(
             });
     }
     if descriptor.value_type == AnimationValueType::Discrete {
-        return Ok(previous.value.clone());
+        // A cut owns the frame at its exact key time. Using only the previous
+        // value made intermediate camera cuts arrive one frame late whenever
+        // a discrete track contained three or more keys.
+        return Ok(if time_sec >= next.seconds {
+            next.value.clone()
+        } else {
+            previous.value.clone()
+        });
     }
     let duration = (next.seconds - previous.seconds).max(f32::EPSILON);
     let easing = parse_curve_ease(&next.ease).map_err(|message| {
@@ -462,7 +472,7 @@ fn simulation_binding_id(
         SimulationBindingNode::DynamicCurve(node) => node.id.as_deref(),
         SimulationBindingNode::DistanceConstraint(node) => node.id.as_deref(),
         SimulationBindingNode::Hinge(node) => node.id.as_deref(),
-        SimulationBindingNode::RigidBody2D(node) => Some(&node.id),
+        SimulationBindingNode::RigidBody(node) => Some(&node.id),
         SimulationBindingNode::ParticleEmitter(node) => Some(&node.id),
         SimulationBindingNode::Cloth(node) => Some(&node.id),
         SimulationBindingNode::HairStrandField(node) => Some(&node.id),
@@ -1163,8 +1173,72 @@ fn apply_animation_property_to_3d_nodes(
                 }
             }
             Scene3DNode::EnvironmentLight(light) if light.id.as_deref() == Some(node_id) => {
-                if property == "intensity" {
-                    light.intensity = value.to_string();
+                match property {
+                    "intensity" => light.intensity = value.to_string(),
+                    "rotationY" => light.rotation_y = value.to_string(),
+                    "backgroundIntensity" => light.background_intensity = value.to_string(),
+                    "backgroundBlur" => light.background_blur = value.to_string(),
+                    "diffuseIntensity" => light.diffuse_intensity = value.to_string(),
+                    "specularIntensity" => light.specular_intensity = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::DirectionalLight(light) if light.id.as_deref() == Some(node_id) => {
+                match property {
+                    "direction" => light.direction = value.to_string(),
+                    "intensity" => light.intensity = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::PointLight(light) if light.id.as_deref() == Some(node_id) => {
+                match property {
+                    "position" => light.position = value.to_string(),
+                    "intensity" => light.intensity = value.to_string(),
+                    "range" => light.range = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::SpotLight(light) if light.id.as_deref() == Some(node_id) => match property
+            {
+                "position" => light.position = value.to_string(),
+                "direction" => light.direction = value.to_string(),
+                "intensity" => light.intensity = value.to_string(),
+                "range" => light.range = value.to_string(),
+                "innerCone" => light.inner_cone = value.to_string(),
+                "outerCone" => light.outer_cone = value.to_string(),
+                _ => {}
+            },
+            Scene3DNode::RectAreaLight(light) if light.id.as_deref() == Some(node_id) => {
+                match property {
+                    "position" => light.position = value.to_string(),
+                    "direction" => light.direction = value.to_string(),
+                    "intensity" => light.intensity = value.to_string(),
+                    "width" => light.width = value.to_string(),
+                    "height" => light.height = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::AmbientOcclusion(node) if node.id.as_deref() == Some(node_id) => {
+                match property {
+                    "intensity" => node.intensity = value.to_string(),
+                    "radius" => node.radius = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::ContactShadow(node) if node.id.as_deref() == Some(node_id) => {
+                match property {
+                    "intensity" => node.intensity = value.to_string(),
+                    "distance" => node.distance = value.to_string(),
+                    "softness" => node.softness = value.to_string(),
+                    _ => {}
+                }
+            }
+            Scene3DNode::ColorManagement(node) if node.id.as_deref() == Some(node_id) => {
+                match property {
+                    "exposure" => node.exposure = value.to_string(),
+                    "whiteBalance" => node.white_balance = value.to_string(),
+                    "contrast" => node.contrast = value.to_string(),
+                    _ => {}
                 }
             }
             Scene3DNode::Model(model) if model.id.as_deref() == Some(node_id) => match property {
@@ -1384,9 +1458,10 @@ use crate::world::render::Scene3DRenderer;
 use crate::world::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldAnimationAsset,
     WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
-    WorldCamera, WorldCameraControl, WorldCameraProjection, WorldConstraint, WorldGraph,
-    WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay,
-    WorldPresent, WorldProfileRetarget, WorldRetargetMap, parse_world_graph_script,
+    WorldCamera, WorldCameraControl, WorldCameraProjection, WorldColorManagement, WorldConstraint,
+    WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind, WorldLighting, WorldMaterial,
+    WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldPresent,
+    WorldProfileRetarget, WorldRetargetMap, parse_world_graph_script,
 };
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use image::{Rgba, RgbaImage, imageops::FilterType};
@@ -1398,6 +1473,261 @@ use depth::{
     SceneDepthContext, scene_depth_track_sort_key, scene_layer_effective_z_depth,
     scene_z_depth_transform,
 };
+
+/// Expand a 3D volume Repeat into ordinary Model nodes for the current frame.
+/// Geometry and material resources remain shared by the retained world cache;
+/// only deterministic per-instance transforms change over time.
+fn expand_scene_volume_repeats(
+    composite: &CompositeGroupConfig,
+    time_norm: f32,
+    time_sec: f32,
+) -> Result<Vec<Scene3DNode>, MotionLoomSceneRenderError> {
+    let mut expanded = Vec::new();
+    for node in &composite.nodes_3d {
+        let Scene3DNode::VolumeRepeat(repeat) = node else {
+            expanded.push(node.clone());
+            continue;
+        };
+        let bounds_min = eval_scene_vec3(&repeat.bounds_min, time_norm, time_sec, [-1.0; 3])?;
+        let bounds_max = eval_scene_vec3(&repeat.bounds_max, time_norm, time_sec, [1.0; 3])?;
+        let velocity = eval_scene_vec3(&repeat.velocity, time_norm, time_sec, [0.0, -1.0, 0.0])?;
+        let scale_range = eval_scene_vec2(&repeat.scale_range, time_norm, time_sec, [1.0, 1.0])?;
+        let lifetime = scene_repeat_duration_seconds(&repeat.lifetime).max(0.001);
+        let template_position =
+            eval_scene_vec3(&repeat.template.position, time_norm, time_sec, [0.0; 3])?;
+        let template_scale = eval_scene_number(&repeat.template.scale, time_norm, time_sec)?;
+        for index in 0..repeat.count {
+            let phase = if repeat.phase == "even" {
+                index as f32 / repeat.count.max(1) as f32
+            } else {
+                repeat_hash_unit(repeat.seed, index, 0)
+            };
+            let absolute = (time_sec.max(0.0) / lifetime + phase).max(0.0);
+            let cycle = absolute.floor() as u32;
+            let local_time = absolute.fract() * lifetime;
+            let cycle_seed = if repeat.respawn == "random" {
+                repeat.seed.wrapping_add(cycle.wrapping_mul(0x9e37_79b9))
+            } else {
+                repeat.seed
+            };
+            let mut position = [0.0; 3];
+            for axis in 0..3 {
+                let low = bounds_min[axis].min(bounds_max[axis]);
+                let high = bounds_min[axis].max(bounds_max[axis]);
+                let span = (high - low).max(0.0001);
+                let base = low + repeat_hash_unit(cycle_seed, index, axis as u32 + 1) * span;
+                position[axis] = low + (base + velocity[axis] * local_time - low).rem_euclid(span);
+                position[axis] += template_position[axis];
+            }
+            let scale_t = repeat_hash_unit(repeat.seed, index, 7);
+            let instance_scale = scale_range[0] + (scale_range[1] - scale_range[0]) * scale_t;
+            let mut model = repeat.template.clone();
+            let repeat_id = repeat.id.as_deref().unwrap_or("volume_repeat");
+            model.id = Some(format!("{repeat_id}_{index:04}"));
+            model.position = format!("[{:.6},{:.6},{:.6}]", position[0], position[1], position[2]);
+            model.position_x = None;
+            model.position_y = None;
+            model.position_z = None;
+            model.scale = (template_scale * instance_scale.max(0.001)).to_string();
+            expanded.push(Scene3DNode::Model(model));
+        }
+    }
+    Ok(expanded)
+}
+
+/// Parse the literal duration accepted by volume Repeat without making it an
+/// animatable expression; deterministic lifecycle boundaries stay portable.
+fn scene_repeat_duration_seconds(value: &str) -> f32 {
+    let value = value.trim();
+    if let Some(ms) = value.strip_suffix("ms") {
+        return ms.trim().parse::<f32>().unwrap_or(1000.0) / 1000.0;
+    }
+    value
+        .strip_suffix('s')
+        .unwrap_or(value)
+        .trim()
+        .parse::<f32>()
+        .unwrap_or(1.0)
+}
+
+/// Stable integer hashing avoids host RNG differences in replay and export.
+fn repeat_hash_unit(seed: u32, index: u32, channel: u32) -> f32 {
+    let mut value = seed ^ index.wrapping_mul(0x85eb_ca6b) ^ channel.wrapping_mul(0xc2b2_ae35);
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^= value >> 16;
+    value as f32 / u32::MAX as f32
+}
+
+/// Evaluate authored Scene lighting once before crossing the internal 3D bridge.
+fn scene_world_lighting(
+    composite: &CompositeGroupConfig,
+    image_assets: &HashMap<String, String>,
+    time_norm: f32,
+    time_sec: f32,
+) -> Result<WorldLighting, MotionLoomSceneRenderError> {
+    let mut lighting = WorldLighting::default();
+    for node in &composite.nodes_3d {
+        match node {
+            Scene3DNode::EnvironmentLight(node) => {
+                let authored_src = image_assets
+                    .get(&node.asset)
+                    .cloned()
+                    .unwrap_or_else(|| node.asset.clone());
+                let src = if authored_src.starts_with("http://")
+                    || authored_src.starts_with("https://")
+                    || authored_src.starts_with("data:")
+                {
+                    authored_src
+                } else {
+                    let resolved = resolve_local_scene_asset_path(&authored_src);
+                    std::fs::canonicalize(&resolved)
+                        .unwrap_or(resolved)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                lighting.environment = Some(WorldEnvironmentLighting {
+                    src,
+                    mapping: node.mapping.clone(),
+                    intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
+                    rotation_y_degrees: eval_scene_number(&node.rotation_y, time_norm, time_sec)?,
+                    visible: node.visible,
+                    background_intensity: eval_scene_number(
+                        &node.background_intensity,
+                        time_norm,
+                        time_sec,
+                    )?
+                    .max(0.0),
+                    background_blur: eval_scene_number(&node.background_blur, time_norm, time_sec)?
+                        .clamp(0.0, 1.0),
+                    diffuse_intensity: eval_scene_number(
+                        &node.diffuse_intensity,
+                        time_norm,
+                        time_sec,
+                    )?
+                    .max(0.0),
+                    specular_intensity: eval_scene_number(
+                        &node.specular_intensity,
+                        time_norm,
+                        time_sec,
+                    )?
+                    .max(0.0),
+                });
+            }
+            Scene3DNode::DirectionalLight(node) => lighting.lights.push(WorldLight {
+                id: node.id.clone(),
+                kind: WorldLightKind::Directional,
+                position: [0.0; 3],
+                direction: eval_scene_vec3(
+                    &node.direction,
+                    time_norm,
+                    time_sec,
+                    [-0.4, -1.0, -0.35],
+                )?,
+                color: scene_light_color(&node.color)?,
+                intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
+                range: 0.0,
+                inner_cone_degrees: 0.0,
+                outer_cone_degrees: 0.0,
+                width: 0.0,
+                height: 0.0,
+                cast_shadow: node.cast_shadow,
+                shadow_strength: eval_scene_number(&node.shadow_strength, time_norm, time_sec)?
+                    .clamp(0.0, 1.0),
+            }),
+            Scene3DNode::PointLight(node) => lighting.lights.push(WorldLight {
+                id: node.id.clone(),
+                kind: WorldLightKind::Point,
+                position: eval_scene_vec3(&node.position, time_norm, time_sec, [0.0; 3])?,
+                direction: [0.0, -1.0, 0.0],
+                color: scene_light_color(&node.color)?,
+                intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
+                range: eval_scene_number(&node.range, time_norm, time_sec)?.max(0.001),
+                inner_cone_degrees: 0.0,
+                outer_cone_degrees: 0.0,
+                width: 0.0,
+                height: 0.0,
+                cast_shadow: node.cast_shadow,
+                shadow_strength: 0.8,
+            }),
+            Scene3DNode::SpotLight(node) => lighting.lights.push(WorldLight {
+                id: node.id.clone(),
+                kind: WorldLightKind::Spot,
+                position: eval_scene_vec3(&node.position, time_norm, time_sec, [0.0; 3])?,
+                direction: eval_scene_vec3(&node.direction, time_norm, time_sec, [0.0, -1.0, 0.0])?,
+                color: scene_light_color(&node.color)?,
+                intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
+                range: eval_scene_number(&node.range, time_norm, time_sec)?.max(0.001),
+                inner_cone_degrees: eval_scene_number(&node.inner_cone, time_norm, time_sec)?
+                    .clamp(0.0, 89.0),
+                outer_cone_degrees: eval_scene_number(&node.outer_cone, time_norm, time_sec)?
+                    .clamp(0.1, 89.9),
+                width: 0.0,
+                height: 0.0,
+                cast_shadow: node.cast_shadow,
+                shadow_strength: 0.8,
+            }),
+            Scene3DNode::RectAreaLight(node) => lighting.lights.push(WorldLight {
+                id: node.id.clone(),
+                kind: WorldLightKind::RectArea,
+                position: eval_scene_vec3(&node.position, time_norm, time_sec, [0.0; 3])?,
+                direction: eval_scene_vec3(&node.direction, time_norm, time_sec, [0.0, -1.0, 0.0])?,
+                color: scene_light_color(&node.color)?,
+                intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
+                range: 10.0,
+                inner_cone_degrees: 0.0,
+                outer_cone_degrees: 0.0,
+                width: eval_scene_number(&node.width, time_norm, time_sec)?.max(0.001),
+                height: eval_scene_number(&node.height, time_norm, time_sec)?.max(0.001),
+                cast_shadow: false,
+                shadow_strength: 0.0,
+            }),
+            Scene3DNode::AmbientOcclusion(node) => {
+                lighting.ao_intensity =
+                    eval_scene_number(&node.intensity, time_norm, time_sec)?.clamp(0.0, 2.0);
+                lighting.ao_radius =
+                    eval_scene_number(&node.radius, time_norm, time_sec)?.max(0.001);
+            }
+            Scene3DNode::ContactShadow(node) => {
+                lighting.contact_shadow_intensity =
+                    eval_scene_number(&node.intensity, time_norm, time_sec)?.clamp(0.0, 1.0);
+                lighting.contact_shadow_distance =
+                    eval_scene_number(&node.distance, time_norm, time_sec)?.max(0.001);
+                lighting.contact_shadow_softness =
+                    eval_scene_number(&node.softness, time_norm, time_sec)?.clamp(0.0, 1.0);
+            }
+            Scene3DNode::ColorManagement(node) => {
+                lighting.color_management = WorldColorManagement {
+                    tone_mapping: node.tone_mapping.clone(),
+                    exposure: eval_scene_number(&node.exposure, time_norm, time_sec)?.max(0.0),
+                    white_balance_kelvin: eval_scene_number(
+                        &node.white_balance,
+                        time_norm,
+                        time_sec,
+                    )?
+                    .clamp(1000.0, 40000.0),
+                    contrast: eval_scene_number(&node.contrast, time_norm, time_sec)?
+                        .clamp(0.0, 3.0),
+                };
+            }
+            _ => {}
+        }
+    }
+    lighting.lights.truncate(4);
+    Ok(lighting)
+}
+
+/// Convert an authored sRGB light color to linear RGB for the PBR shader.
+fn scene_light_color(value: &str) -> Result<[f32; 3], MotionLoomSceneRenderError> {
+    let bgra = parse_color(value)?;
+    Ok([
+        (bgra[2] as f32 / 255.0).powf(2.2),
+        (bgra[1] as f32 / 255.0).powf(2.2),
+        (bgra[0] as f32 / 255.0).powf(2.2),
+    ])
+}
 
 #[allow(dead_code)]
 pub async fn render_scene_graph_to_video(
@@ -2191,6 +2521,8 @@ struct SceneFrameRenderer {
     gpu_text_raster_cache: HashMap<u64, CachedGpuTextRaster>,
     gpu_layer3d_texture_cache: HashMap<u64, CachedGpuLayer3dTexture>,
     scene_material_texture_cache: HashMap<u64, Arc<crate::world::render::GpuWorldTexture>>,
+    rigid_body_timeline_cache:
+        HashMap<u64, Arc<Vec<Vec<crate::simulation::rigid::RigidBody3DOutput>>>>,
     animation_source_signature: u64,
     compiled_animation_graph: Option<Arc<GraphScript>>,
     compiled_animation_has_dynamic_channels: bool,
@@ -2218,7 +2550,7 @@ struct SceneFrameRenderer {
     scene_precomposes: HashMap<String, RgbaImage>,
     scene_masks: HashMap<String, MaskNode>,
     scene_material_sources: HashMap<String, SceneRootNode>,
-    model_asset_sources: HashMap<String, String>,
+    model_asset_sources: HashMap<String, GraphAssetSource>,
     image_asset_sources: HashMap<String, String>,
     /// Named local-space GLB node positions used by Environment anchors and
     /// surfaces. One inspection per asset is retained across preview frames.
@@ -2252,6 +2584,7 @@ const GPU_PATH_GEOMETRY_CACHE_LIMIT: usize = 100_000;
 const RETAINED_GPU_SHAPE_SCENE_CACHE_LIMIT: usize = 8;
 const RETAINED_GPU_TRANSFORM_SCENE_CACHE_LIMIT: usize = 64;
 const GPU_TEXT_RASTER_CACHE_LIMIT: usize = 256;
+const RIGID_BODY_TIMELINE_CACHE_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RetainedGpuShapeSceneKey {
@@ -2636,6 +2969,19 @@ fn scene_apply_action_to_world(apply: &crate::scene::dsl::ApplyActionNode) -> Wo
         sync_group: apply.sync_group.clone(),
         sync_marker: apply.sync_marker.clone(),
     }
+}
+
+fn scene_apply_action_is_active(
+    apply: &crate::scene::dsl::ApplyActionNode,
+    actor_id: &str,
+    time_sec: f32,
+    graph_duration_ms: u64,
+) -> bool {
+    let start = apply.at_ms as f32 / 1000.0;
+    let duration = apply.duration_ms.unwrap_or(graph_duration_ms) as f32 / 1000.0;
+    // `loop` repeats the source clip inside the authored ApplyAction window;
+    // it must not turn a finite scheduled layer into an infinite one.
+    apply.target == actor_id && time_sec >= start && time_sec <= start + duration.max(0.0)
 }
 
 struct RetainedGpuTransformFrame {
@@ -3221,21 +3567,76 @@ fn load_environment_node_positions(_source: &str) -> HashMap<String, [f32; 3]> {
     HashMap::new()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn load_environment_bounds(source: &str) -> Option<([f32; 3], [f32; 3])> {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        return None;
+fn load_environment_bounds(
+    source: &str,
+    resolver: &dyn AssetResolver,
+) -> Option<([f32; 3], [f32; 3])> {
+    // Browser hosts preload GLB bytes into MemoryAssetResolver. Read the
+    // bounds from those exact bytes so Environment geometry, Surface/Anchor
+    // declarations and Camera3D references all use the same normalization.
+    // Previously wasm32 returned None here, leaving the visible model
+    // normalized while semantic coordinates stayed in raw asset space.
+    let hint_key = format!("__motionloom_environment_bounds__:{source}");
+    if let Ok(AssetSource::Bytes(bytes)) = resolver.resolve(&hint_key)
+        && bytes.len() == 24
+    {
+        let mut values = [0.0_f32; 6];
+        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+            values[index] = f32::from_le_bytes(chunk.try_into().ok()?);
+        }
+        return Some((
+            [values[0], values[1], values[2]],
+            [values[3], values[4], values[5]],
+        ));
     }
-    let resolved = resolve_local_scene_asset_path(source);
-    let report = crate::world::inspect_glb_environment_path(resolved).ok()?;
-    Some((report.bounds_min, report.bounds_max))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn load_environment_bounds(_source: &str) -> Option<([f32; 3], [f32; 3])> {
-    // Browser hosts can run motionloom_inspect_glb_environment_json while
-    // preloading the asset. Explicit offsets remain valid without inspection.
-    None
+    match resolver.resolve(source) {
+        Ok(AssetSource::Bytes(bytes)) => {
+            // Environment inspection applies the GLB node hierarchy before
+            // reporting bounds. `GlbMeshData::bounds_*` alone is only
+            // primitive-local and diverges for assets with a transformed
+            // root (mv_spartan.glb is one such asset).
+            // Only compute transformed bounds here. Running the full semantic
+            // surface inspector would scan and cluster a large environment a
+            // second time during browser cold start.
+            let mesh =
+                crate::world::parse_glb_mesh_data(std::path::Path::new(source), &bytes).ok()?;
+            let matrices = crate::world::model_inspection::world_matrices(&mesh.nodes);
+            crate::world::model_inspection::transformed_environment_bounds(&mesh, &matrices)
+                .or(Some((mesh.bounds_min, mesh.bounds_max)))
+        }
+        Ok(AssetSource::Path(path)) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let resolved = if path.is_absolute() {
+                    path
+                } else {
+                    resolve_local_scene_asset_path(path.to_string_lossy().as_ref())
+                };
+                let report = crate::world::inspect_glb_environment_path(resolved).ok()?;
+                Some((report.bounds_min, report.bounds_max))
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = path;
+                None
+            }
+        }
+        Ok(AssetSource::Url(_)) | Err(_) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if source.starts_with("http://") || source.starts_with("https://") {
+                    return None;
+                }
+                let resolved = resolve_local_scene_asset_path(source);
+                let report = crate::world::inspect_glb_environment_path(resolved).ok()?;
+                Some((report.bounds_min, report.bounds_max))
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                None
+            }
+        }
+    }
 }
 
 fn load_environment_triangles(
@@ -3306,10 +3707,74 @@ struct SceneEnvironmentTriangle {
     normal: [f32; 3],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct HumanoidCollisionSphere {
     center: [f32; 3],
     radius: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HumanoidColliderProfile {
+    Standing,
+    Crouched,
+    Airborne,
+    Rolling,
+    Prone,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KinematicControllerConfig {
+    profile: HumanoidColliderProfile,
+    safe_margin: f32,
+    floor_snap: f32,
+    max_step_height: f32,
+    max_slides: u32,
+    sweep_step: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HumanoidGroundProbe {
+    hit_height: Option<f32>,
+    sole_height: f32,
+    gap: Option<f32>,
+    correction: [f32; 3],
+    grounded: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct HumanoidContactCandidate {
+    target_correction: [f32; 3],
+    correction: [f32; 3],
+    activation: f32,
+    supports: Vec<String>,
+}
+
+/// One frame has one authoritative root owner. Intermediate candidates remain
+/// observable for diagnostics, but only final_root is written to the actor.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct HumanoidRootSolveState {
+    authored_root: [f32; 3],
+    motion_root: [f32; 3],
+    ground_candidate: Option<[f32; 3]>,
+    contact_candidate: Option<[f32; 3]>,
+    collision_resolved_root: [f32; 3],
+    final_root: [f32; 3],
+    contact_activation: f32,
+    supports: Vec<String>,
+    grounded: bool,
+    grounded_reason: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct KinematicControllerReport {
+    previous_root: [f32; 3],
+    desired_root: [f32; 3],
+    resolved_root: [f32; 3],
+    correction: [f32; 3],
+    contacts: usize,
+    sweep_substeps: u32,
+    grounded: bool,
+    ground_probe: HumanoidGroundProbe,
 }
 
 #[derive(Debug)]
@@ -3345,6 +3810,13 @@ impl EnvironmentTriangleSpatialIndex {
                 normal: rotate_scene_surface_normal(triangle.normal, model_rotation),
             })
             .collect::<Vec<_>>();
+        Self::from_scene_triangles(triangles)
+    }
+
+    /// Builds the same spatial index from already resolved scene-space
+    /// primitives, which keeps semantic colliders independent of render mesh
+    /// tessellation.
+    fn from_scene_triangles(triangles: Vec<SceneEnvironmentTriangle>) -> Self {
         let mut min_x = f32::INFINITY;
         let mut max_x = f32::NEG_INFINITY;
         let mut min_z = f32::INFINITY;
@@ -3439,6 +3911,351 @@ impl EnvironmentTriangleSpatialIndex {
     }
 }
 
+fn push_surface_quad(
+    triangles: &mut Vec<SceneEnvironmentTriangle>,
+    points: [[f32; 3]; 4],
+    normal: [f32; 3],
+) {
+    triangles.push(SceneEnvironmentTriangle {
+        points: [points[0], points[1], points[2]],
+        normal,
+    });
+    triangles.push(SceneEnvironmentTriangle {
+        points: [points[0], points[2], points[3]],
+        normal,
+    });
+}
+
+fn semantic_plane_triangles(surface: &ResolvedSceneSurface) -> Vec<SceneEnvironmentTriangle> {
+    let min = surface.bounds_min;
+    let max = surface.bounds_max;
+    let mut triangles = Vec::with_capacity(2);
+    push_surface_quad(
+        &mut triangles,
+        [
+            [min[0], surface.height, min[2]],
+            [max[0], surface.height, min[2]],
+            [max[0], surface.height, max[2]],
+            [min[0], surface.height, max[2]],
+        ],
+        surface.normal,
+    );
+    triangles
+}
+
+fn semantic_box_triangles(surface: &ResolvedSceneSurface) -> Vec<SceneEnvironmentTriangle> {
+    let min = surface.bounds_min;
+    let max = surface.bounds_max;
+    let mut triangles = Vec::with_capacity(12);
+    // Six deterministic quads provide a stable coarse obstacle without
+    // exposing the character controller to overlapping render triangles.
+    push_surface_quad(
+        &mut triangles,
+        [
+            [min[0], max[1], min[2]],
+            [max[0], max[1], min[2]],
+            [max[0], max[1], max[2]],
+            [min[0], max[1], max[2]],
+        ],
+        [0.0, 1.0, 0.0],
+    );
+    push_surface_quad(
+        &mut triangles,
+        [
+            [min[0], min[1], max[2]],
+            [max[0], min[1], max[2]],
+            [max[0], min[1], min[2]],
+            [min[0], min[1], min[2]],
+        ],
+        [0.0, -1.0, 0.0],
+    );
+    push_surface_quad(
+        &mut triangles,
+        [
+            [min[0], min[1], max[2]],
+            [min[0], max[1], max[2]],
+            [max[0], max[1], max[2]],
+            [max[0], min[1], max[2]],
+        ],
+        [0.0, 0.0, 1.0],
+    );
+    push_surface_quad(
+        &mut triangles,
+        [
+            [max[0], min[1], min[2]],
+            [max[0], max[1], min[2]],
+            [min[0], max[1], min[2]],
+            [min[0], min[1], min[2]],
+        ],
+        [0.0, 0.0, -1.0],
+    );
+    push_surface_quad(
+        &mut triangles,
+        [
+            [max[0], min[1], max[2]],
+            [max[0], max[1], max[2]],
+            [max[0], max[1], min[2]],
+            [max[0], min[1], min[2]],
+        ],
+        [1.0, 0.0, 0.0],
+    );
+    push_surface_quad(
+        &mut triangles,
+        [
+            [min[0], min[1], min[2]],
+            [min[0], max[1], min[2]],
+            [min[0], max[1], max[2]],
+            [min[0], min[1], max[2]],
+        ],
+        [-1.0, 0.0, 0.0],
+    );
+    triangles
+}
+
+fn resolved_primitive_collider_shape(asset: &PrimitiveAssetNode) -> PrimitiveColliderShape {
+    if asset.collision.collider == PrimitiveColliderShape::Auto {
+        match asset.geometry {
+            PrimitiveGeometry::Box { .. } => PrimitiveColliderShape::Box,
+            PrimitiveGeometry::Sphere { .. } => PrimitiveColliderShape::Sphere,
+            PrimitiveGeometry::Plane { .. } => PrimitiveColliderShape::Plane,
+            PrimitiveGeometry::Cylinder { .. } => PrimitiveColliderShape::Cylinder,
+            PrimitiveGeometry::Cone { .. } => PrimitiveColliderShape::Cone,
+            PrimitiveGeometry::Wedge { .. } => PrimitiveColliderShape::Convex,
+        }
+    } else {
+        asset.collision.collider
+    }
+}
+
+fn primitive_collision_geometry(asset: &PrimitiveAssetNode) -> PrimitiveGeometry {
+    let collision = &asset.collision;
+    let (minimum, maximum) = crate::world::primitive::primitive_bounds(&asset.geometry);
+    let dimensions = std::array::from_fn::<_, 3, _>(|axis| maximum[axis] - minimum[axis]);
+    let shape = resolved_primitive_collider_shape(asset);
+    let sized = |axis: usize, fallback: f32| {
+        collision
+            .size
+            .as_ref()
+            .and_then(|size| size.get(axis))
+            .copied()
+            .unwrap_or(fallback)
+            + collision.margin * 2.0
+    };
+    match shape {
+        PrimitiveColliderShape::Box => PrimitiveGeometry::Box {
+            size: [
+                sized(0, dimensions[0]),
+                sized(1, dimensions[1]),
+                sized(2, dimensions[2]),
+            ],
+        },
+        PrimitiveColliderShape::Sphere => PrimitiveGeometry::Sphere {
+            radius: collision
+                .radius
+                .unwrap_or(dimensions.into_iter().fold(0.0, f32::max) * 0.5)
+                + collision.margin,
+            segments: 16,
+            rings: 8,
+        },
+        PrimitiveColliderShape::Plane => PrimitiveGeometry::Plane {
+            size: [sized(0, dimensions[0]), sized(1, dimensions[2])],
+            segments: 1,
+        },
+        PrimitiveColliderShape::Cylinder => PrimitiveGeometry::Cylinder {
+            radius: collision
+                .radius
+                .unwrap_or(dimensions[0].max(dimensions[2]) * 0.5)
+                + collision.margin,
+            height: collision.height.unwrap_or(dimensions[1]) + collision.margin * 2.0,
+            segments: 16,
+        },
+        PrimitiveColliderShape::Cone => PrimitiveGeometry::Cone {
+            radius: collision
+                .radius
+                .unwrap_or(dimensions[0].max(dimensions[2]) * 0.5)
+                + collision.margin,
+            height: collision.height.unwrap_or(dimensions[1]) + collision.margin * 2.0,
+            segments: 16,
+        },
+        PrimitiveColliderShape::Convex | PrimitiveColliderShape::Mesh => asset.geometry.clone(),
+        PrimitiveColliderShape::Auto => unreachable!("auto collider shape is resolved above"),
+    }
+}
+
+fn primitive_collision_mesh_scale(asset: &PrimitiveAssetNode) -> [f32; 3] {
+    if matches!(
+        resolved_primitive_collider_shape(asset),
+        PrimitiveColliderShape::Convex | PrimitiveColliderShape::Mesh
+    ) {
+        let (minimum, maximum) = crate::world::primitive::primitive_bounds(&asset.geometry);
+        std::array::from_fn(|axis| {
+            let dimension = (maximum[axis] - minimum[axis]).abs().max(1.0e-6);
+            let target = asset
+                .collision
+                .size
+                .as_ref()
+                .and_then(|size| size.get(axis))
+                .copied()
+                .unwrap_or(dimension)
+                + asset.collision.margin * 2.0;
+            target / dimension
+        })
+    } else {
+        [1.0; 3]
+    }
+}
+
+fn primitive_rigid_collider_spec(
+    asset: &PrimitiveAssetNode,
+    instance_scale: f32,
+) -> (crate::simulation::model::RigidBodyShape, [f32; 3]) {
+    let shape = match resolved_primitive_collider_shape(asset) {
+        PrimitiveColliderShape::Box | PrimitiveColliderShape::Plane => {
+            crate::simulation::model::RigidBodyShape::Box
+        }
+        PrimitiveColliderShape::Sphere => crate::simulation::model::RigidBodyShape::Sphere,
+        PrimitiveColliderShape::Cylinder => crate::simulation::model::RigidBodyShape::Cylinder,
+        PrimitiveColliderShape::Cone | PrimitiveColliderShape::Convex => {
+            crate::simulation::model::RigidBodyShape::ConvexHull
+        }
+        PrimitiveColliderShape::Mesh => crate::simulation::model::RigidBodyShape::Mesh,
+        PrimitiveColliderShape::Auto => unreachable!("auto collider shape is resolved above"),
+    };
+    let geometry = primitive_collision_geometry(asset);
+    let (minimum, maximum) = crate::world::primitive::primitive_bounds(&geometry);
+    let mesh_scale = primitive_collision_mesh_scale(asset);
+    let size = std::array::from_fn(|axis| {
+        (maximum[axis] - minimum[axis]).abs()
+            * mesh_scale[axis]
+            * asset.collision.scale[axis]
+            * instance_scale
+    });
+    (shape, size)
+}
+
+fn rotate_scene_point(mut point: [f32; 3], rotation: [f32; 3]) -> [f32; 3] {
+    let [pitch, yaw, roll] = rotation.map(f32::to_radians);
+    let y = point[1] * pitch.cos() - point[2] * pitch.sin();
+    let z = point[1] * pitch.sin() + point[2] * pitch.cos();
+    point[1] = y;
+    point[2] = z;
+    let x = point[0] * yaw.cos() + point[2] * yaw.sin();
+    let z = -point[0] * yaw.sin() + point[2] * yaw.cos();
+    point[0] = x;
+    point[2] = z;
+    let x = point[0] * roll.cos() - point[1] * roll.sin();
+    let y = point[0] * roll.sin() + point[1] * roll.cos();
+    [x, y, point[2]]
+}
+
+fn primitive_collision_triangles(
+    asset: &PrimitiveAssetNode,
+    model_position: [f32; 3],
+    model_rotation: [f32; 3],
+    model_scale: f32,
+) -> Vec<SceneEnvironmentTriangle> {
+    if asset.collision.mode != PrimitiveCollisionMode::Solid {
+        return Vec::new();
+    }
+    let collider = PrimitiveAssetNode {
+        id: format!("{}::collider", asset.id),
+        geometry: primitive_collision_geometry(asset),
+        color: [1.0; 4],
+        material: None,
+        material_definition: None,
+        bevel_radius: 0.0,
+        bevel_segments: 0,
+        material_seed: None,
+        collision: Default::default(),
+    };
+    let mesh = crate::world::primitive::generate_primitive_mesh(&collider);
+    let mesh_scale = primitive_collision_mesh_scale(asset);
+    let transform_point = |point: [f32; 3]| {
+        let scaled = std::array::from_fn(|axis| {
+            point[axis] * mesh_scale[axis] * asset.collision.scale[axis]
+        });
+        let local = add_scene_vec3(
+            rotate_scene_point(scaled, asset.collision.rotation),
+            asset.collision.offset,
+        );
+        let model_local = rotate_scene_point(
+            local.map(|component| component * model_scale),
+            model_rotation,
+        );
+        add_scene_vec3(model_local, model_position)
+    };
+    mesh.triangles
+        .iter()
+        .filter_map(|triangle| {
+            let points = triangle.indices.map(|index| {
+                mesh.positions
+                    .get(index as usize)
+                    .copied()
+                    .map(transform_point)
+            });
+            let [Some(a), Some(b), Some(c)] = points else {
+                return None;
+            };
+            let ab = sub_scene_vec3(b, a);
+            let ac = sub_scene_vec3(c, a);
+            let normal = normalize_scene_vec3([
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ]);
+            Some(SceneEnvironmentTriangle {
+                points: [a, b, c],
+                normal,
+            })
+        })
+        .collect()
+}
+
+fn triangle_overlaps_surface(
+    triangle: &SceneEnvironmentTriangle,
+    surface: &ResolvedSceneSurface,
+    require_walkable: bool,
+) -> bool {
+    let centroid = [
+        (triangle.points[0][0] + triangle.points[1][0] + triangle.points[2][0]) / 3.0,
+        (triangle.points[0][1] + triangle.points[1][1] + triangle.points[2][1]) / 3.0,
+        (triangle.points[0][2] + triangle.points[1][2] + triangle.points[2][2]) / 3.0,
+    ];
+    let padding = 0.02;
+    let inside = (0..3).all(|axis| {
+        centroid[axis] >= surface.bounds_min[axis] - padding
+            && centroid[axis] <= surface.bounds_max[axis] + padding
+    });
+    let aligned = dot_scene_vec3(triangle.normal, surface.normal) >= 0.55;
+    inside && (!require_walkable || aligned)
+}
+
+fn semantic_surface_triangles(
+    surface: &ResolvedSceneSurface,
+    collider: &str,
+    full_mesh: Option<&EnvironmentTriangleSpatialIndex>,
+) -> Vec<SceneEnvironmentTriangle> {
+    match collider {
+        "box" => semantic_box_triangles(surface),
+        "mesh" | "heightfield" => {
+            let mut filtered = full_mesh
+                .into_iter()
+                .flat_map(|index| index.triangles.iter().copied())
+                .filter(|triangle| {
+                    triangle_overlaps_surface(triangle, surface, collider == "heightfield")
+                })
+                .collect::<Vec<_>>();
+            // An authored semantic surface remains usable when a host cannot
+            // preload the source mesh or the inspected bounds select no face.
+            if filtered.is_empty() {
+                filtered = semantic_plane_triangles(surface);
+            }
+            filtered
+        }
+        _ => semantic_plane_triangles(surface),
+    }
+}
+
 fn spatial_cell(value: f32, min: f32, size: f32) -> usize {
     ((((value - min) / size).floor() as isize).clamp(0, ENVIRONMENT_SPATIAL_GRID_SIZE as isize - 1))
         as usize
@@ -3497,6 +4314,111 @@ fn raycast_environment_height(
         }
     }
     hit
+}
+
+fn triangle_xz_bounds(triangle: &SceneEnvironmentTriangle) -> ([f32; 2], [f32; 2]) {
+    let minimum = [
+        triangle
+            .points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::INFINITY, f32::min),
+        triangle
+            .points
+            .iter()
+            .map(|point| point[2])
+            .fold(f32::INFINITY, f32::min),
+    ];
+    let maximum = [
+        triangle
+            .points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::NEG_INFINITY, f32::max),
+        triangle
+            .points
+            .iter()
+            .map(|point| point[2])
+            .fold(f32::NEG_INFINITY, f32::max),
+    ];
+    (minimum, maximum)
+}
+
+fn support_triangles_touch(
+    a: &SceneEnvironmentTriangle,
+    b: &SceneEnvironmentTriangle,
+    padding: f32,
+) -> bool {
+    let (a_min, a_max) = triangle_xz_bounds(a);
+    let (b_min, b_max) = triangle_xz_bounds(b);
+    a_min[0] <= b_max[0] + padding
+        && a_max[0] + padding >= b_min[0]
+        && a_min[1] <= b_max[1] + padding
+        && a_max[1] + padding >= b_min[1]
+}
+
+fn triangle_height_at_xz(triangle: &SceneEnvironmentTriangle, x: f32, z: f32) -> Option<f32> {
+    let [p0, p1, p2] = triangle.points;
+    let denominator = (p1[2] - p2[2]) * (p0[0] - p2[0]) + (p2[0] - p1[0]) * (p0[2] - p2[2]);
+    if denominator.abs() <= 1.0e-7 {
+        return None;
+    }
+    let a = ((p1[2] - p2[2]) * (x - p2[0]) + (p2[0] - p1[0]) * (z - p2[2])) / denominator;
+    let b = ((p2[2] - p0[2]) * (x - p2[0]) + (p0[0] - p2[0]) * (z - p2[2])) / denominator;
+    let c = 1.0 - a - b;
+    (a >= -0.0001 && b >= -0.0001 && c >= -0.0001).then_some(a * p0[1] + b * p1[1] + c * p2[1])
+}
+
+/// Resolve support from collider connectivity instead of retained frame state.
+/// This keeps seeks deterministic while preventing an overhead platform from
+/// winning merely because it is the highest surface at the queried X/Z.
+fn reachable_environment_height(
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    x: f32,
+    z: f32,
+    max_step_height: f32,
+    padding: f32,
+) -> Option<f32> {
+    let supports = environments
+        .iter()
+        .flat_map(|environment| environment.triangles.iter().copied())
+        .filter(|triangle| triangle.normal[1] >= 0.45)
+        .collect::<Vec<_>>();
+    let heights = supports
+        .iter()
+        .map(|triangle| triangle.points.iter().map(|point| point[1]).sum::<f32>() / 3.0)
+        .collect::<Vec<_>>();
+    let lowest = heights.iter().copied().min_by(f32::total_cmp)?;
+    let mut reachable = heights
+        .iter()
+        .map(|height| (*height - lowest).abs() <= padding.max(0.01))
+        .collect::<Vec<_>>();
+    loop {
+        let mut changed = false;
+        for candidate in 0..supports.len() {
+            if reachable[candidate] {
+                continue;
+            }
+            let connected = supports.iter().enumerate().any(|(current, support)| {
+                reachable[current]
+                    && (heights[candidate] - heights[current]).abs() <= max_step_height + padding
+                    && support_triangles_touch(support, &supports[candidate], padding)
+            });
+            if connected {
+                reachable[candidate] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    supports
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| reachable[*index])
+        .filter_map(|(_, triangle)| triangle_height_at_xz(triangle, x, z))
+        .max_by(f32::total_cmp)
 }
 
 fn closest_point_on_triangle(point: [f32; 3], triangle: [[f32; 3]; 3]) -> [f32; 3] {
@@ -3566,44 +4488,222 @@ fn length_scene_vec3(value: [f32; 3]) -> f32 {
     dot_scene_vec3(value, value).sqrt()
 }
 
+fn normalize_scene_vec3(value: [f32; 3]) -> [f32; 3] {
+    let length = length_scene_vec3(value);
+    if length <= 1.0e-6 {
+        [0.0, 1.0, 0.0]
+    } else {
+        scale_scene_vec3(value, 1.0 / length)
+    }
+}
+
+fn action_marker_time_sec(
+    action: Option<&crate::scene::dsl::ActionNode>,
+    role: &str,
+    fallback: f32,
+    duration_sec: f32,
+) -> f32 {
+    action
+        .and_then(|action| {
+            action.markers.iter().find(|marker| {
+                marker.id.eq_ignore_ascii_case(role)
+                    || marker
+                        .role
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(role))
+            })
+        })
+        .map(|marker| marker.time_ms as f32 / 1000.0)
+        .unwrap_or(fallback)
+        .clamp(0.0, duration_sec.max(0.0))
+}
+
+fn match_target_action_position(
+    base_position: [f32; 3],
+    apply: &crate::scene::dsl::ApplyActionNode,
+    action: Option<&crate::scene::dsl::ActionNode>,
+    anchors: &HashMap<String, [f32; 3]>,
+    time_sec: f32,
+    graph_duration_ms: u64,
+) -> [f32; 3] {
+    if apply.root_motion.as_deref() != Some("match_target")
+        || (apply.destination.is_none()
+            && apply.takeoff.is_none()
+            && apply.contact.is_none()
+            && apply.landing.is_none())
+    {
+        return base_position;
+    }
+    let duration_sec = apply
+        .duration_ms
+        .or_else(|| action.map(|action| action.duration_ms).filter(|ms| *ms > 0))
+        .unwrap_or(graph_duration_ms) as f32
+        / 1000.0;
+    let local_sec = (time_sec - apply.at_ms as f32 / 1000.0).clamp(0.0, duration_sec.max(0.0));
+    let takeoff_t = action_marker_time_sec(action, "takeoff", 0.0, duration_sec);
+    let contact_t = action_marker_time_sec(action, "contact", duration_sec * 0.5, duration_sec);
+    let landing_t = action_marker_time_sec(action, "landing", duration_sec, duration_sec);
+    let takeoff = apply
+        .takeoff
+        .as_deref()
+        .and_then(|id| anchors.get(id).copied())
+        .unwrap_or(base_position);
+    let contact = apply
+        .contact
+        .as_deref()
+        .and_then(|id| anchors.get(id).copied());
+    let landing = apply
+        .landing
+        .as_deref()
+        .or(apply.destination.as_deref())
+        .and_then(|id| anchors.get(id).copied())
+        .or(contact)
+        .unwrap_or(takeoff);
+    let interpolate = |from: [f32; 3], to: [f32; 3], t: f32| {
+        // Smooth segment endpoints keep velocity finite at semantic markers
+        // while still landing exactly on every authored anchor.
+        let t = t.clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * eased)
+    };
+    if local_sec <= takeoff_t && takeoff_t > f32::EPSILON {
+        interpolate(base_position, takeoff, local_sec / takeoff_t)
+    } else if let Some(contact) = contact
+        && local_sec <= contact_t
+        && contact_t > takeoff_t
+    {
+        interpolate(
+            takeoff,
+            contact,
+            (local_sec - takeoff_t) / (contact_t - takeoff_t),
+        )
+    } else if let Some(contact) = contact
+        && landing_t > contact_t
+    {
+        interpolate(
+            contact,
+            landing,
+            (local_sec - contact_t) / (landing_t - contact_t),
+        )
+    } else {
+        interpolate(
+            base_position,
+            landing,
+            if duration_sec <= f32::EPSILON {
+                1.0
+            } else {
+                local_sec / duration_sec
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+fn action_collider_profile(
+    apply: Option<&crate::scene::dsl::ApplyActionNode>,
+    action: Option<&crate::scene::dsl::ActionNode>,
+    time_sec: f32,
+    graph_duration_ms: u64,
+) -> HumanoidColliderProfile {
+    action_collider_profile_with_frame(apply, action, None, time_sec, graph_duration_ms)
+}
+
+fn action_collider_profile_with_frame(
+    apply: Option<&crate::scene::dsl::ApplyActionNode>,
+    action: Option<&crate::scene::dsl::ActionNode>,
+    frame: Option<&crate::world::render::Scene3DHumanoidFrame>,
+    time_sec: f32,
+    graph_duration_ms: u64,
+) -> HumanoidColliderProfile {
+    let Some(apply) = apply else {
+        return HumanoidColliderProfile::Standing;
+    };
+    match apply.collider_profile.as_deref().unwrap_or("auto") {
+        "standing" | "stand" => return HumanoidColliderProfile::Standing,
+        "crouched" | "crouch" => return HumanoidColliderProfile::Crouched,
+        "airborne" | "air" => return HumanoidColliderProfile::Airborne,
+        "rolling" | "roll" | "vault" => return HumanoidColliderProfile::Rolling,
+        "prone" => return HumanoidColliderProfile::Prone,
+        _ => {}
+    }
+    let duration_sec = apply
+        .duration_ms
+        .or_else(|| action.map(|action| action.duration_ms).filter(|ms| *ms > 0))
+        .unwrap_or(graph_duration_ms) as f32
+        / 1000.0;
+    let local = (time_sec - apply.at_ms as f32 / 1000.0).max(0.0);
+    let takeoff = action_marker_time_sec(action, "takeoff", duration_sec * 0.22, duration_sec);
+    let contact = action_marker_time_sec(action, "contact", duration_sec * 0.5, duration_sec);
+    let landing = action_marker_time_sec(action, "landing", duration_sec * 0.82, duration_sec);
+    if apply.takeoff.is_some() && local >= takeoff && local < contact {
+        HumanoidColliderProfile::Airborne
+    } else if apply.contact.is_some() && local >= contact && local < landing {
+        HumanoidColliderProfile::Rolling
+    } else if apply.landing.is_some() && local >= landing && local < duration_sec {
+        HumanoidColliderProfile::Crouched
+    } else if let (Some(action), Some(frame)) = (action, frame) {
+        let phase = frame
+            .action_phases
+            .get(&apply.action)
+            .copied()
+            .unwrap_or(0.0);
+        let explicit_knee_support = action.contacts.iter().any(|contact| {
+            matches!(contact.effector.as_str(), "knee_l" | "knee_r")
+                && action_contact_phase_envelope(contact.from, contact.to, phase) > 0.0
+        });
+        let foot_height = ["foot_l", "toe_l", "foot_r", "toe_r"]
+            .into_iter()
+            .filter_map(|bone| frame.joints.get(bone).map(|point| point[1]))
+            .min_by(f32::total_cmp);
+        let compact_pose = foot_height.is_some_and(|floor| {
+            let hips = frame.joints.get("hips").map(|point| point[1]);
+            let head = frame.joints.get("head").map(|point| point[1]);
+            hips.is_some_and(|hips| hips - floor < frame.actor_scale * 0.35)
+                || head.is_some_and(|head| head - floor < frame.actor_scale * 0.78)
+        });
+        if explicit_knee_support || compact_pose {
+            HumanoidColliderProfile::Crouched
+        } else {
+            HumanoidColliderProfile::Standing
+        }
+    } else {
+        HumanoidColliderProfile::Standing
+    }
+}
+
+fn humanoid_collision_spheres_for_profile(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    profile: HumanoidColliderProfile,
+    root: [f32; 3],
+) -> Vec<HumanoidCollisionSphere> {
+    let scale = frame.actor_scale.max(0.05);
+    // CharacterController/CharacterBody-style collision is owned by the
+    // actor root, never by the sampled animation pose. Rebuilding capsules
+    // from hips/chest/head made an otherwise stationary root inherit every
+    // sway and flip in the imported clip, so adjacent frames could choose
+    // opposite environment triangles and visibly jump left/right.
+    let profile_spheres: &[(f32, f32)] = match profile {
+        HumanoidColliderProfile::Standing | HumanoidColliderProfile::Airborne => {
+            &[(0.18, 0.15), (0.48, 0.17), (0.78, 0.14)]
+        }
+        HumanoidColliderProfile::Crouched => &[(0.18, 0.18), (0.43, 0.20), (0.65, 0.16)],
+        HumanoidColliderProfile::Rolling => &[(0.34, 0.32)],
+        HumanoidColliderProfile::Prone => &[(0.16, 0.20), (0.38, 0.22)],
+    };
+    profile_spheres
+        .iter()
+        .map(|(height, radius)| HumanoidCollisionSphere {
+            center: [root[0], root[1] + scale * height, root[2]],
+            radius: (scale * radius).max(0.015),
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn humanoid_collision_spheres(
     frame: &crate::world::render::Scene3DHumanoidFrame,
 ) -> Vec<HumanoidCollisionSphere> {
-    let scale = frame.actor_scale.max(0.05);
-    let capsules = [
-        ("hips", "chest", 0.15),
-        ("chest", "head", 0.13),
-        ("upper_arm_l", "forearm_l", 0.075),
-        ("forearm_l", "hand_l", 0.06),
-        ("upper_arm_r", "forearm_r", 0.075),
-        ("forearm_r", "hand_r", 0.06),
-        ("upper_leg_l", "lower_leg_l", 0.10),
-        ("lower_leg_l", "foot_l", 0.075),
-        ("upper_leg_r", "lower_leg_r", 0.10),
-        ("lower_leg_r", "foot_r", 0.075),
-    ];
-    let mut spheres = Vec::with_capacity(capsules.len() * 3);
-    for (start, end, radius_scale) in capsules {
-        let (Some(start), Some(end)) = (frame.joints.get(start), frame.joints.get(end)) else {
-            continue;
-        };
-        for t in [0.12_f32, 0.5, 0.88] {
-            spheres.push(HumanoidCollisionSphere {
-                center: std::array::from_fn(|axis| start[axis] + (end[axis] - start[axis]) * t),
-                radius: (scale * radius_scale).max(0.015),
-            });
-        }
-    }
-    if spheres.is_empty() {
-        let root = frame.joints.get("hips").copied().unwrap_or([0.0; 3]);
-        for (height, radius) in [(0.22, 0.13), (0.48, 0.16), (0.74, 0.11)] {
-            spheres.push(HumanoidCollisionSphere {
-                center: [root[0], root[1] + scale * height, root[2]],
-                radius: scale * radius,
-            });
-        }
-    }
-    spheres
+    humanoid_collision_spheres_for_profile(frame, HumanoidColliderProfile::Standing, [0.0; 3])
 }
 
 fn sphere_environment_push(
@@ -3637,48 +4737,216 @@ fn sphere_environment_push(
     best.map(|(push, _)| push)
 }
 
+fn deepest_humanoid_push(
+    spheres: &[HumanoidCollisionSphere],
+    translation: [f32; 3],
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    safe_margin: f32,
+) -> Option<[f32; 3]> {
+    let mut best = None::<([f32; 3], f32)>;
+    for sphere in spheres {
+        let center = add_scene_vec3(sphere.center, translation);
+        for environment in environments {
+            let Some(push) =
+                sphere_environment_push(environment, center, sphere.radius + safe_margin.max(0.0))
+            else {
+                continue;
+            };
+            let length = length_scene_vec3(push);
+            if best.is_none_or(|(_, current)| length > current) {
+                best = Some((push, length));
+            }
+        }
+    }
+    best.map(|(push, _)| push)
+}
+
+fn depenetrate_humanoid(
+    spheres: &[HumanoidCollisionSphere],
+    mut translation: [f32; 3],
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    config: KinematicControllerConfig,
+) -> ([f32; 3], usize) {
+    let mut contacts = 0;
+    for _ in 0..config.max_slides.max(1) {
+        let Some(push) =
+            deepest_humanoid_push(spheres, translation, environments, config.safe_margin)
+        else {
+            break;
+        };
+        if length_scene_vec3(push) <= 1.0e-6 {
+            break;
+        }
+        translation = add_scene_vec3(translation, push);
+        contacts += 1;
+    }
+    (translation, contacts)
+}
+
+fn probe_humanoid_ground(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    root: [f32; 3],
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    snap_distance: f32,
+    safe_margin: f32,
+) -> HumanoidGroundProbe {
+    let sole_height = root[1] + frame.rig_metrics.sole_offset;
+    let hit_height = environments
+        .iter()
+        .filter_map(|environment| raycast_environment_height(environment, root[0], root[2], None))
+        .filter(|height| {
+            // Reject roofs far above the actor while still allowing a small
+            // depenetration when the calibrated sole begins below the floor.
+            *height <= sole_height + snap_distance.max(safe_margin) + safe_margin
+        })
+        .max_by(f32::total_cmp);
+    let gap = hit_height.map(|height| sole_height - height);
+    let grounded =
+        gap.is_some_and(|gap| gap >= -safe_margin.max(0.001) && gap <= snap_distance.max(0.0));
+    HumanoidGroundProbe {
+        hit_height,
+        sole_height,
+        gap,
+        correction: if grounded {
+            [0.0, -gap.unwrap_or(0.0), 0.0]
+        } else {
+            [0.0; 3]
+        },
+        grounded,
+    }
+}
+
+/// Move a stable humanoid body from the previous authored root to the desired
+/// root using fixed substeps, conservative contact search and tangent sliding.
+/// The solve uses no retained frame state, so frame N renders identically when
+/// requested sequentially, after a seek, or during export.
+fn resolve_humanoid_kinematic_controller(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    previous_root: [f32; 3],
+    desired_root: [f32; 3],
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    config: KinematicControllerConfig,
+) -> KinematicControllerReport {
+    let mut previous_root = previous_root;
+    let mut desired_root = desired_root;
+    if config.max_step_height > 0.0 && config.profile != HumanoidColliderProfile::Airborne {
+        let previous_sole = previous_root[1] + frame.rig_metrics.sole_offset;
+        let current_floor = reachable_environment_height(
+            environments,
+            previous_root[0],
+            previous_root[2],
+            config.max_step_height,
+            config.safe_margin * 2.0,
+        );
+        if let Some(current_floor) = current_floor {
+            let desired_floor = reachable_environment_height(
+                environments,
+                desired_root[0],
+                desired_root[2],
+                config.max_step_height,
+                config.safe_margin * 2.0,
+            );
+            if let Some(desired_floor) = desired_floor
+                && (desired_floor - current_floor).abs()
+                    <= config.max_step_height + config.safe_margin
+            {
+                // A step is traversed as lift-then-advance. Both sweep
+                // endpoints are lifted to the new support plane so the body
+                // cannot be rejected by the vertical riser before floor snap.
+                previous_root[1] += desired_floor - previous_sole;
+                let desired_sole = desired_root[1] + frame.rig_metrics.sole_offset;
+                desired_root[1] += desired_floor - desired_sole;
+            }
+        }
+    }
+    let spheres = humanoid_collision_spheres_for_profile(frame, config.profile, desired_root);
+    let desired_motion = sub_scene_vec3(desired_root, previous_root);
+    let motion_length = length_scene_vec3(desired_motion);
+    let substeps = ((motion_length / config.sweep_step.max(0.005)).ceil() as u32).clamp(1, 32);
+    let step = scale_scene_vec3(desired_motion, 1.0 / substeps as f32);
+    // Spheres are rooted at desired_root, so translation zero represents the
+    // desired character-controller body and previous_root is relative to it.
+    let mut translation = sub_scene_vec3(previous_root, desired_root);
+    let (resolved_start, mut contacts) =
+        depenetrate_humanoid(&spheres, translation, environments, config);
+    translation = resolved_start;
+
+    for _ in 0..substeps {
+        let start = translation;
+        let target = add_scene_vec3(start, step);
+        if deepest_humanoid_push(&spheres, target, environments, config.safe_margin).is_none() {
+            translation = target;
+            continue;
+        }
+
+        // Find the earliest non-overlapping portion of this deterministic
+        // substep, then project the remainder onto the contact tangent.
+        let mut low = 0.0_f32;
+        let mut high = 1.0_f32;
+        for _ in 0..8 {
+            let mid = (low + high) * 0.5;
+            let probe = add_scene_vec3(start, scale_scene_vec3(step, mid));
+            if deepest_humanoid_push(&spheres, probe, environments, config.safe_margin).is_some() {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        translation = add_scene_vec3(start, scale_scene_vec3(step, low));
+        let probe = add_scene_vec3(start, scale_scene_vec3(step, high));
+        if let Some(push) = deepest_humanoid_push(&spheres, probe, environments, config.safe_margin)
+        {
+            contacts += 1;
+            let normal = if length_scene_vec3(push) > 1.0e-6 {
+                scale_scene_vec3(push, 1.0 / length_scene_vec3(push))
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            let remainder = scale_scene_vec3(step, 1.0 - low);
+            let into_surface = dot_scene_vec3(remainder, normal).min(0.0);
+            let slide = sub_scene_vec3(remainder, scale_scene_vec3(normal, into_surface));
+            let (slid, slide_contacts) = depenetrate_humanoid(
+                &spheres,
+                add_scene_vec3(translation, slide),
+                environments,
+                config,
+            );
+            translation = slid;
+            contacts += slide_contacts;
+        }
+    }
+
+    let mut ground_probe = HumanoidGroundProbe::default();
+    if config.floor_snap > 0.0 && config.profile != HumanoidColliderProfile::Airborne {
+        let root_before_snap = add_scene_vec3(desired_root, translation);
+        ground_probe = probe_humanoid_ground(
+            frame,
+            root_before_snap,
+            environments,
+            config.floor_snap,
+            config.safe_margin,
+        );
+        if ground_probe.grounded {
+            translation = add_scene_vec3(translation, ground_probe.correction);
+        }
+    }
+
+    let resolved_root = add_scene_vec3(desired_root, translation);
+    KinematicControllerReport {
+        previous_root,
+        desired_root,
+        resolved_root,
+        correction: translation,
+        contacts,
+        sweep_substeps: substeps,
+        grounded: ground_probe.grounded,
+        ground_probe,
+    }
+}
+
 /// Resolve an animated humanoid against retained environment meshes using a
 /// fixed iteration count. The bounded solve is deterministic across preview,
 /// export and random-access frame rendering.
-fn resolve_humanoid_kinematic_translation(
-    frame: &crate::world::render::Scene3DHumanoidFrame,
-    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
-) -> [f32; 3] {
-    let spheres = humanoid_collision_spheres(frame);
-    let mut correction = [0.0_f32; 3];
-    for _ in 0..8 {
-        let mut best = None::<([f32; 3], f32)>;
-        for sphere in &spheres {
-            let center = add_scene_vec3(sphere.center, correction);
-            for environment in environments {
-                let Some(push) =
-                    sphere_environment_push(environment, center, sphere.radius + 0.008)
-                else {
-                    continue;
-                };
-                let length = length_scene_vec3(push);
-                if best.is_none_or(|(_, current)| length > current) {
-                    best = Some((push, length));
-                }
-            }
-        }
-        let Some((push, length)) = best else {
-            break;
-        };
-        if length <= 1.0e-5 {
-            break;
-        }
-        correction = add_scene_vec3(correction, push);
-        let max_correction = frame.actor_scale.max(0.05) * 0.65;
-        let correction_length = length_scene_vec3(correction);
-        if correction_length > max_correction {
-            correction = scale_scene_vec3(correction, max_correction / correction_length);
-            break;
-        }
-    }
-    correction
-}
-
 fn humanoid_effector_contact_target(
     point: [f32; 3],
     radius: f32,
@@ -3695,6 +4963,212 @@ fn humanoid_effector_contact_target(
         }
     }
     best.map(|(target, _)| target)
+}
+
+fn canonical_action_contact_effector(effector: &str) -> Option<&'static str> {
+    match effector {
+        "knee_l" => Some("lower_leg_l"),
+        "knee_r" => Some("lower_leg_r"),
+        "elbow_l" => Some("forearm_l"),
+        "elbow_r" => Some("forearm_r"),
+        "foot_l" => Some("foot_l"),
+        "foot_r" => Some("foot_r"),
+        "hand_l" => Some("hand_l"),
+        "hand_r" => Some("hand_r"),
+        _ => None,
+    }
+}
+
+fn action_contact_effector_radius(effector: &str, actor_scale: f32) -> f32 {
+    let scale = actor_scale.max(0.05);
+    match effector {
+        "knee_l" | "knee_r" => scale * 0.032,
+        "foot_l" | "foot_r" => scale * 0.018,
+        "elbow_l" | "elbow_r" => scale * 0.026,
+        "hand_l" | "hand_r" => scale * 0.018,
+        _ => 0.0,
+    }
+}
+
+fn smoothstep01(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+/// Contact intervals are inclusive semantic locks. A short deterministic
+/// feather inside each boundary avoids a one-frame root pop while retaining
+/// full weight throughout the authored contact plateau.
+fn action_contact_phase_envelope(from: f32, to: f32, phase: f32) -> f32 {
+    if phase < from || phase > to || to <= from {
+        return 0.0;
+    }
+    let feather = ((to - from) * 0.2).min(0.035).max(0.001);
+    let entering = smoothstep01((phase - from) / feather);
+    let leaving = smoothstep01((to - phase) / feather);
+    entering.min(leaving)
+}
+
+#[derive(Clone, Debug)]
+struct HumanoidContactSample {
+    correction: [f32; 3],
+    authored_weight: f32,
+    envelope: f32,
+    support: String,
+}
+
+fn combine_humanoid_contact_samples(
+    samples: &[HumanoidContactSample],
+    max_correction: f32,
+) -> HumanoidContactCandidate {
+    let mut target_sum = [0.0_f32; 3];
+    let mut target_weight = 0.0_f32;
+    let mut inactive_product = 1.0_f32;
+    let mut supports = Vec::new();
+    for sample in samples {
+        let active_weight = (sample.authored_weight * sample.envelope).clamp(0.0, 1.0);
+        if active_weight <= f32::EPSILON {
+            continue;
+        }
+        target_sum = add_scene_vec3(
+            target_sum,
+            scale_scene_vec3(sample.correction, active_weight),
+        );
+        target_weight += active_weight;
+        inactive_product *= 1.0 - active_weight;
+        supports.push(sample.support.clone());
+    }
+    if target_weight <= f32::EPSILON {
+        return HumanoidContactCandidate::default();
+    }
+    let mut target_correction = scale_scene_vec3(target_sum, 1.0 / target_weight);
+    let target_length = length_scene_vec3(target_correction);
+    if target_length > max_correction.max(0.0) {
+        target_correction = scale_scene_vec3(
+            target_correction,
+            max_correction.max(0.0) / target_length.max(1.0e-6),
+        );
+    }
+    let activation = (1.0 - inactive_product).clamp(0.0, 1.0);
+    HumanoidContactCandidate {
+        target_correction,
+        correction: scale_scene_vec3(target_correction, activation),
+        activation,
+        supports,
+    }
+}
+
+fn automatic_humanoid_supports(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    motion_root: [f32; 3],
+    grounded_root: [f32; 3],
+    profile: HumanoidColliderProfile,
+    surface: &ResolvedSceneSurface,
+    environment: Option<&EnvironmentTriangleSpatialIndex>,
+) -> Vec<String> {
+    let candidates: &[&str] = match profile {
+        HumanoidColliderProfile::Standing | HumanoidColliderProfile::Airborne => {
+            &["foot_l", "foot_r"]
+        }
+        HumanoidColliderProfile::Crouched => &["foot_l", "foot_r", "lower_leg_l", "lower_leg_r"],
+        HumanoidColliderProfile::Rolling | HumanoidColliderProfile::Prone => &[
+            "foot_l",
+            "foot_r",
+            "lower_leg_l",
+            "lower_leg_r",
+            "hand_l",
+            "hand_r",
+        ],
+    };
+    let root_delta = sub_scene_vec3(grounded_root, motion_root);
+    let threshold = (frame.actor_scale * 0.075).max(0.025);
+    candidates
+        .iter()
+        .filter_map(|bone| {
+            let point = add_scene_vec3(*frame.joints.get(*bone)?, root_delta);
+            let target = scene_surface_contact_target(surface, environment, point, 0.0);
+            (length_scene_vec3(sub_scene_vec3(target, point)) <= threshold)
+                .then(|| (*bone).to_string())
+        })
+        .collect()
+}
+
+fn solve_humanoid_root_frame(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    authored_root: [f32; 3],
+    motion_root: [f32; 3],
+    previous_motion_root: [f32; 3],
+    previous_sweep_root: Option<[f32; 3]>,
+    ground_candidate: Option<[f32; 3]>,
+    contact: &HumanoidContactCandidate,
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    config: KinematicControllerConfig,
+) -> (HumanoidRootSolveState, KinematicControllerReport) {
+    let grounded_base = ground_candidate.unwrap_or(motion_root);
+    let contact_target = add_scene_vec3(motion_root, contact.target_correction);
+    let pre_collision_root = std::array::from_fn(|axis| {
+        grounded_base[axis] + (contact_target[axis] - grounded_base[axis]) * contact.activation
+    });
+    // Vertical grounding is an absolute per-frame query. Only horizontal
+    // authored motion needs the previous frame for conservative wall sweeps.
+    let previous_root = previous_sweep_root.unwrap_or([
+        previous_motion_root[0],
+        pre_collision_root[1],
+        previous_motion_root[2],
+    ]);
+    let collision = resolve_humanoid_kinematic_controller(
+        frame,
+        previous_root,
+        pre_collision_root,
+        environments,
+        config,
+    );
+    let grounded_reason = if contact.activation > f32::EPSILON {
+        "action_contact"
+    } else if ground_candidate.is_some() {
+        "semantic_ground"
+    } else if collision.grounded {
+        "floor_probe"
+    } else {
+        "none"
+    };
+    let state = HumanoidRootSolveState {
+        authored_root,
+        motion_root,
+        ground_candidate,
+        contact_candidate: (contact.activation > f32::EPSILON).then_some(contact_target),
+        collision_resolved_root: collision.resolved_root,
+        final_root: collision.resolved_root,
+        contact_activation: contact.activation,
+        supports: contact.supports.clone(),
+        grounded: ground_candidate.is_some() || collision.grounded,
+        grounded_reason,
+    };
+    (state, collision)
+}
+
+fn scene_surface_contact_target(
+    surface: &ResolvedSceneSurface,
+    environment: Option<&EnvironmentTriangleSpatialIndex>,
+    point: [f32; 3],
+    offset: f32,
+) -> [f32; 3] {
+    let height = environment
+        .and_then(|environment| {
+            raycast_environment_height(environment, point[0], point[2], Some(surface))
+        })
+        .unwrap_or_else(|| {
+            let normal_y = surface.normal[1];
+            if normal_y.abs() <= 1.0e-5 {
+                surface.height
+            } else {
+                surface.centroid[1]
+                    - (surface.normal[0] * (point[0] - surface.centroid[0])
+                        + surface.normal[2] * (point[2] - surface.centroid[2]))
+                        / normal_y
+            }
+        });
+    let base = [point[0], height, point[2]];
+    add_scene_vec3(base, scale_scene_vec3(surface.normal, offset))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3809,6 +5283,86 @@ fn resolve_scene_3d_reference(
     anchors.get(id).copied().or_else(|| models.get(id).copied())
 }
 
+fn is_scene_canonical_humanoid_bone(value: &str) -> bool {
+    matches!(
+        value,
+        "hips"
+            | "spine"
+            | "chest"
+            | "neck"
+            | "head"
+            | "shoulder_l"
+            | "upper_arm_l"
+            | "forearm_l"
+            | "hand_l"
+            | "shoulder_r"
+            | "upper_arm_r"
+            | "forearm_r"
+            | "hand_r"
+            | "upper_leg_l"
+            | "lower_leg_l"
+            | "foot_l"
+            | "toe_l"
+            | "upper_leg_r"
+            | "lower_leg_r"
+            | "foot_r"
+            | "toe_r"
+    )
+}
+
+fn scene_camera_to_world_camera(
+    node: &SceneCamera3DNode,
+    anchors: &HashMap<String, [f32; 3]>,
+    models: &HashMap<String, [f32; 3]>,
+    time_norm: f32,
+    time_sec: f32,
+) -> Result<WorldCamera, MotionLoomSceneRenderError> {
+    let position = if let Some(value) = resolve_scene_3d_reference(&node.position, anchors, models)
+    {
+        value
+    } else {
+        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 6.0])?
+    };
+    let target = if let Some(value) = resolve_scene_3d_reference(&node.target, anchors, models) {
+        value
+    } else {
+        eval_scene_vec3(&node.target, time_norm, time_sec, [0.0, 0.0, 0.0])?
+    };
+    let delta = sub_scene_vec3(position, target);
+    let horizontal = (delta[0] * delta[0] + delta[2] * delta[2]).sqrt();
+    let distance = length_scene_vec3(delta).max(0.05);
+    let authored_up = if node.horizon_lock {
+        [0.0, 1.0, 0.0]
+    } else {
+        eval_scene_vec3(&node.up, time_norm, time_sec, [0.0, 1.0, 0.0])?
+    };
+    Ok(WorldCamera {
+        id: node.id.clone(),
+        control: WorldCameraControl::Orbit,
+        projection: WorldCameraProjection::Perspective,
+        target: None,
+        x: "0".to_string(),
+        y: "0".to_string(),
+        z: "0".to_string(),
+        target_x: target[0].to_string(),
+        target_y: target[1].to_string(),
+        target_z: target[2].to_string(),
+        yaw: delta[0].atan2(delta[2]).to_degrees().to_string(),
+        pitch: delta[1]
+            .atan2(horizontal.max(0.0001))
+            .to_degrees()
+            .to_string(),
+        roll: eval_scene_number(&node.roll, time_norm, time_sec)?.to_string(),
+        up_x: authored_up[0].to_string(),
+        up_y: authored_up[1].to_string(),
+        up_z: authored_up[2].to_string(),
+        distance: distance.to_string(),
+        zoom: "1".to_string(),
+        fov: eval_scene_number(&node.fov, time_norm, time_sec)?.to_string(),
+        orthographic_scale: None,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedSceneSurface {
     height: f32,
@@ -3816,6 +5370,105 @@ struct ResolvedSceneSurface {
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
     normal: [f32; 3],
+}
+
+fn scene_surface_contains_xz(surface: &ResolvedSceneSurface, point: [f32; 3]) -> bool {
+    let epsilon = 1.0e-4;
+    point[0] >= surface.bounds_min[0] - epsilon
+        && point[0] <= surface.bounds_max[0] + epsilon
+        && point[2] >= surface.bounds_min[2] - epsilon
+        && point[2] <= surface.bounds_max[2] + epsilon
+}
+
+fn parse_scene_fixed_step(value: &str) -> Option<f32> {
+    let value = value
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim()
+        .trim_end_matches('s')
+        .trim();
+    let parsed = if let Some((numerator, denominator)) = value.split_once('/') {
+        numerator.trim().parse::<f32>().ok()? / denominator.trim().parse::<f32>().ok()?
+    } else {
+        value.parse::<f32>().ok()?
+    };
+    parsed
+        .is_finite()
+        .then_some(parsed.clamp(1.0 / 1000.0, 1.0 / 15.0))
+}
+
+fn rigid_body_timeline_cache_key(
+    graph_signature: u64,
+    inputs: &[crate::simulation::rigid::RigidBody3DInput<'_>],
+    frame_count: u32,
+    fps: f32,
+    fixed_step: f32,
+    iterations: u32,
+    gravity: [f32; 3],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    graph_signature.hash(&mut hasher);
+    frame_count.hash(&mut hasher);
+    fps.to_bits().hash(&mut hasher);
+    fixed_step.to_bits().hash(&mut hasher);
+    iterations.hash(&mut hasher);
+    gravity.map(f32::to_bits).hash(&mut hasher);
+    for input in inputs {
+        format!("{:?}", input.node).hash(&mut hasher);
+        input.position.map(f32::to_bits).hash(&mut hasher);
+        input.rotation.map(f32::to_bits).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn rigid_body_timeline_can_bake(composite: &CompositeGroupConfig) -> bool {
+    let gravity_is_static = composite
+        .physics
+        .as_ref()
+        .is_none_or(|physics| serde_json::from_str::<[f32; 3]>(physics.gravity.trim()).is_ok());
+    gravity_is_static
+        && composite.nodes_3d.iter().all(|node| match node {
+            Scene3DNode::RigidBody(body)
+                if body.body_type == crate::simulation::model::RigidBodyType::Dynamic =>
+            {
+                composite.nodes_3d.iter().any(|candidate| match candidate {
+                    Scene3DNode::Model(model) if model.id.as_deref() == Some(&body.target) => {
+                        serde_json::from_str::<[f32; 3]>(model.position.trim()).is_ok()
+                            && serde_json::from_str::<[f32; 3]>(model.rotation.trim()).is_ok()
+                            && model.position_x.is_none()
+                            && model.position_y.is_none()
+                            && model.position_z.is_none()
+                            && model.rotation_x.is_none()
+                            && model.rotation_y.is_none()
+                            && model.rotation_z.is_none()
+                    }
+                    _ => false,
+                })
+            }
+            _ => true,
+        })
+}
+
+/// Deterministic semi-implicit fixed-step gravity. It depends only on authored
+/// time, so export, scrubbing and out-of-order frame requests produce the same
+/// transform without retaining a hidden previous-frame simulation state.
+fn deterministic_gravity_displacement(
+    gravity: [f32; 3],
+    time_sec: f32,
+    fixed_step: f32,
+) -> [f32; 3] {
+    let time_sec = time_sec.max(0.0);
+    let fixed_step = fixed_step.clamp(1.0 / 1000.0, 1.0 / 15.0);
+    let steps = (time_sec / fixed_step).floor();
+    let remainder = time_sec - steps * fixed_step;
+    let stepped_factor = fixed_step * fixed_step * steps * (steps + 1.0) * 0.5;
+    let velocity_after_steps = gravity.map(|axis| axis * fixed_step * steps);
+    std::array::from_fn(|axis| {
+        gravity[axis] * stepped_factor
+            + velocity_after_steps[axis] * remainder
+            + gravity[axis] * remainder * remainder * 0.5
+    })
 }
 
 fn environment_asset_point_to_scene(
@@ -3903,6 +5556,7 @@ impl SceneFrameRenderer {
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
             scene_material_texture_cache: HashMap::new(),
+            rigid_body_timeline_cache: HashMap::new(),
             animation_source_signature: 0,
             compiled_animation_graph: None,
             compiled_animation_has_dynamic_channels: false,
@@ -3955,10 +5609,11 @@ impl SceneFrameRenderer {
     }
 
     fn environment_bounds(&mut self, source: &str) -> Option<([f32; 3], [f32; 3])> {
+        let resolver = Arc::clone(&self.asset_resolver);
         *self
             .environment_bounds_cache
             .entry(source.to_string())
-            .or_insert_with(|| load_environment_bounds(source))
+            .or_insert_with(|| load_environment_bounds(source, resolver.as_ref()))
     }
 
     fn environment_triangles(
@@ -4029,6 +5684,7 @@ impl SceneFrameRenderer {
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
             scene_material_texture_cache: HashMap::new(),
+            rigid_body_timeline_cache: HashMap::new(),
             animation_source_signature: 0,
             compiled_animation_graph: None,
             compiled_animation_has_dynamic_channels: false,
@@ -4712,6 +6368,7 @@ impl SceneFrameRenderer {
             self.gpu_text_raster_cache.clear();
             self.gpu_layer3d_texture_cache.clear();
             self.scene_material_texture_cache.clear();
+            self.rigid_body_timeline_cache.clear();
             self.prepared_graph_signature = graph_signature;
         }
         self.gradient_defs.clear();
@@ -4734,11 +6391,13 @@ impl SceneFrameRenderer {
             match asset.kind {
                 GraphAssetKind::Model => {
                     self.model_asset_sources
-                        .insert(asset.id.clone(), asset.src.clone());
+                        .insert(asset.id.clone(), asset.source.clone());
                 }
                 GraphAssetKind::Image => {
-                    self.image_asset_sources
-                        .insert(asset.id.clone(), asset.src.clone());
+                    if let Some(src) = asset.external_src() {
+                        self.image_asset_sources
+                            .insert(asset.id.clone(), src.to_string());
+                    }
                 }
                 GraphAssetKind::Video | GraphAssetKind::Audio | GraphAssetKind::Animation => {}
             }
@@ -4843,11 +6502,13 @@ impl SceneFrameRenderer {
             match asset.kind {
                 GraphAssetKind::Model => {
                     self.model_asset_sources
-                        .insert(asset.id.clone(), asset.src.clone());
+                        .insert(asset.id.clone(), asset.source.clone());
                 }
                 GraphAssetKind::Image => {
-                    self.image_asset_sources
-                        .insert(asset.id.clone(), asset.src.clone());
+                    if let Some(src) = asset.external_src() {
+                        self.image_asset_sources
+                            .insert(asset.id.clone(), src.to_string());
+                    }
                 }
                 GraphAssetKind::Video | GraphAssetKind::Audio | GraphAssetKind::Animation => {}
             }
@@ -7482,9 +9143,15 @@ impl SceneFrameRenderer {
         time_norm: f32,
         time_sec: f32,
     ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+        // Expand universal volume instances before the established 3D bridge
+        // resolves anchors, surfaces, lighting, and ordinary Model actors.
+        let mut expanded_composite = composite.clone();
+        expanded_composite.nodes_3d = expand_scene_volume_repeats(composite, time_norm, time_sec)?;
+        let composite = &expanded_composite;
         self.ensure_gpu_compositor_size(canvas_size.0.max(1), canvas_size.1.max(1))
             .await?;
         let mut camera = WorldCamera::default();
+        let mut active_scene_camera = None;
         let mut actors = Vec::new();
         let mut material_overrides = Vec::new();
         let mut world_model_profiles = self
@@ -7518,43 +9185,90 @@ impl SceneFrameRenderer {
             if let Scene3DNode::Model(model) = node
                 && let Some(id) = model.id.as_ref()
             {
-                let position = if model.position.trim().starts_with('@') {
+                let mut position = if model.position.trim().starts_with('@') {
                     [0.0, 0.0, 0.0]
                 } else {
                     eval_scene_vec3(&model.position, time_norm, time_sec, [0.0, 0.0, 0.0])?
                 };
-                let rotation =
+                if let Some(value) = &model.position_x {
+                    position[0] = eval_scene_number(value, time_norm, time_sec)?;
+                }
+                if let Some(value) = &model.position_y {
+                    position[1] = eval_scene_number(value, time_norm, time_sec)?;
+                }
+                if let Some(value) = &model.position_z {
+                    position[2] = eval_scene_number(value, time_norm, time_sec)?;
+                }
+                let mut rotation =
                     eval_scene_vec3(&model.rotation, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                if let Some(value) = &model.rotation_x {
+                    rotation[0] = eval_scene_number(value, time_norm, time_sec)?;
+                }
+                if let Some(value) = &model.rotation_y {
+                    rotation[1] = eval_scene_number(value, time_norm, time_sec)?;
+                }
+                if let Some(value) = &model.rotation_z {
+                    rotation[2] = eval_scene_number(value, time_norm, time_sec)?;
+                }
                 model_positions.insert(id.clone(), position);
                 model_rotations.insert(id.clone(), rotation);
                 let authored_scale = eval_scene_number(&model.scale, time_norm, time_sec)?;
-                let unit_scale = if model.environment {
-                    eval_scene_number(&model.unit_scale, time_norm, time_sec)?
-                } else {
-                    1.0
-                };
+                let unit_scale = eval_scene_number(&model.unit_scale, time_norm, time_sec)?;
                 let effective_scale = authored_scale * unit_scale;
                 model_scales.insert(id.clone(), effective_scale);
                 if model.environment {
-                    let source = self
-                        .model_asset_sources
-                        .get(&model.asset)
-                        .cloned()
-                        .unwrap_or_else(|| model.asset.clone());
-                    let environment_bounds = self.environment_bounds(&source);
+                    let source = model
+                        .primitive
+                        .clone()
+                        .map(GraphAssetSource::Primitive)
+                        .or_else(|| self.model_asset_sources.get(&model.asset).cloned())
+                        .unwrap_or_else(|| GraphAssetSource::External {
+                            src: model.asset.clone(),
+                        });
+                    let environment_bounds = match &source {
+                        GraphAssetSource::External { src } => self.environment_bounds(src),
+                        GraphAssetSource::Primitive(asset) => {
+                            Some(crate::world::primitive::primitive_bounds(&asset.geometry))
+                        }
+                        GraphAssetSource::Compound(_) => None,
+                    };
                     model_environment_bounds.insert(id.clone(), environment_bounds);
-                    model_node_positions
-                        .insert(id.clone(), self.environment_node_positions(&source).clone());
-                    model_environment_triangles.insert(
+                    model_node_positions.insert(
                         id.clone(),
-                        self.environment_spatial_index(
-                            &source,
-                            environment_bounds,
-                            position,
-                            rotation,
-                            effective_scale,
-                        ),
+                        match &source {
+                            GraphAssetSource::External { src } => {
+                                self.environment_node_positions(src).clone()
+                            }
+                            GraphAssetSource::Primitive(_) => HashMap::new(),
+                            GraphAssetSource::Compound(_) => HashMap::new(),
+                        },
                     );
+                    let semantic_collision = model
+                        .collision
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("surfaces"));
+                    let needs_source_triangles = !semantic_collision
+                        || model.surfaces.iter().any(|surface| {
+                            surface.collision
+                                && matches!(
+                                    surface.collider.as_deref(),
+                                    Some("mesh" | "heightfield")
+                                )
+                        });
+                    if needs_source_triangles {
+                        if let GraphAssetSource::External { src } = &source {
+                            model_environment_triangles.insert(
+                                id.clone(),
+                                self.environment_spatial_index(
+                                    src,
+                                    environment_bounds,
+                                    position,
+                                    rotation,
+                                    effective_scale,
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -7764,18 +9478,232 @@ impl SceneFrameRenderer {
             }
         }
 
-        let environment_light_intensity = composite
+        // Rigid-body sampling is opt-in and therefore adds no work to existing
+        // 3D islands. Dynamic bodies own their target Model transform, while
+        // static and kinematic bodies only participate as colliders.
+        let rigid_body_nodes = composite
             .nodes_3d
             .iter()
             .filter_map(|node| match node {
-                Scene3DNode::EnvironmentLight(light) => {
-                    eval_scene_number(&light.intensity, time_norm, time_sec).ok()
-                }
+                Scene3DNode::RigidBody(body) => Some(body),
                 _ => None,
             })
-            .next()
-            .unwrap_or(1.0)
-            .max(0.0);
+            .collect::<Vec<_>>();
+        let rigid_body_transforms = if rigid_body_nodes.is_empty() {
+            HashMap::new()
+        } else {
+            let inputs = rigid_body_nodes
+                .iter()
+                .map(|body| crate::simulation::rigid::RigidBody3DInput {
+                    node: body,
+                    position: model_positions
+                        .get(&body.target)
+                        .copied()
+                        .unwrap_or([0.0; 3]),
+                    rotation: model_rotations
+                        .get(&body.target)
+                        .copied()
+                        .unwrap_or([0.0; 3]),
+                    auto_collider_shape: composite
+                        .nodes_3d
+                        .iter()
+                        .find_map(|node| {
+                            let Scene3DNode::Model(model) = node else {
+                                return None;
+                            };
+                            (model.id.as_deref() == Some(body.target.as_str())).then_some(model)
+                        })
+                        .and_then(|model| {
+                            let primitive = model.primitive.as_ref().or_else(|| {
+                                self.model_asset_sources
+                                    .get(&model.asset)
+                                    .and_then(|source| match source {
+                                        GraphAssetSource::Primitive(asset) => Some(asset),
+                                        GraphAssetSource::External { .. }
+                                        | GraphAssetSource::Compound(_) => None,
+                                    })
+                            })?;
+                            if primitive.collision.mode == PrimitiveCollisionMode::Solid {
+                                return Some(primitive_rigid_collider_spec(primitive, 1.0).0);
+                            }
+                            Some(match &primitive.geometry {
+                                crate::dsl::PrimitiveGeometry::Box { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Box
+                                }
+                                crate::dsl::PrimitiveGeometry::Sphere { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Sphere
+                                }
+                                crate::dsl::PrimitiveGeometry::Cylinder { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Cylinder
+                                }
+                                crate::dsl::PrimitiveGeometry::Cone { .. }
+                                | crate::dsl::PrimitiveGeometry::Wedge { .. } => {
+                                    crate::simulation::model::RigidBodyShape::ConvexHull
+                                }
+                                crate::dsl::PrimitiveGeometry::Plane { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Box
+                                }
+                            })
+                        }),
+                    auto_collider_size: composite
+                        .nodes_3d
+                        .iter()
+                        .find_map(|node| {
+                            let Scene3DNode::Model(model) = node else {
+                                return None;
+                            };
+                            (model.id.as_deref() == Some(body.target.as_str())).then_some(model)
+                        })
+                        .and_then(|model| {
+                            let source = model
+                                .primitive
+                                .clone()
+                                .map(GraphAssetSource::Primitive)
+                                .or_else(|| self.model_asset_sources.get(&model.asset).cloned())
+                                .unwrap_or_else(|| GraphAssetSource::External {
+                                    src: model.asset.clone(),
+                                });
+                            if let GraphAssetSource::Primitive(asset) = &source
+                                && asset.collision.mode == PrimitiveCollisionMode::Solid
+                            {
+                                let scale = model_scales.get(&body.target).copied().unwrap_or(1.0);
+                                return Some(primitive_rigid_collider_spec(asset, scale).1);
+                            }
+                            let (minimum, maximum) = match &source {
+                                GraphAssetSource::External { src } => {
+                                    self.environment_bounds(src)?
+                                }
+                                GraphAssetSource::Primitive(asset) => {
+                                    crate::world::primitive::primitive_bounds(&asset.geometry)
+                                }
+                                GraphAssetSource::Compound(_) => return None,
+                            };
+                            let dimensions =
+                                std::array::from_fn(|axis| (maximum[axis] - minimum[axis]).abs());
+                            let scale = model_scales.get(&body.target).copied().unwrap_or(1.0);
+                            let factor =
+                                if model.scale_mode.eq_ignore_ascii_case("normalize_height") {
+                                    scale / dimensions[1].max(1.0e-4)
+                                } else {
+                                    scale
+                                };
+                            Some(dimensions.map(|value| value * factor))
+                        }),
+                })
+                .collect::<Vec<_>>();
+            let fixed_step = composite
+                .physics
+                .as_ref()
+                .and_then(|physics| parse_scene_fixed_step(&physics.fixed_step))
+                .unwrap_or(1.0 / 120.0);
+            let iterations = composite
+                .physics
+                .as_ref()
+                .map_or(4, |physics| physics.iterations);
+            let gravity = composite
+                .physics
+                .as_ref()
+                .map(|physics| {
+                    eval_scene_vec3(&physics.gravity, time_norm, time_sec, [0.0, -9.81, 0.0])
+                })
+                .transpose()?
+                .unwrap_or([0.0, -9.81, 0.0]);
+            let frame_count = (((duration_ms as f32 / 1000.0) * fps).ceil() as u32)
+                .saturating_add(1)
+                .max(frame.saturating_add(1));
+            let outputs = if frame_count <= 36_001 && rigid_body_timeline_can_bake(composite) {
+                let cache_key = rigid_body_timeline_cache_key(
+                    self.prepared_graph_signature,
+                    &inputs,
+                    frame_count,
+                    fps,
+                    fixed_step,
+                    iterations,
+                    gravity,
+                );
+                if !self.rigid_body_timeline_cache.contains_key(&cache_key) {
+                    if self.rigid_body_timeline_cache.len() >= RIGID_BODY_TIMELINE_CACHE_LIMIT {
+                        self.rigid_body_timeline_cache.clear();
+                    }
+                    let timeline = crate::simulation::rigid::bake_rigid_bodies_3d(
+                        &inputs,
+                        frame_count,
+                        fps,
+                        fixed_step,
+                        iterations,
+                        gravity,
+                    );
+                    self.rigid_body_timeline_cache
+                        .insert(cache_key, Arc::new(timeline));
+                }
+                self.rigid_body_timeline_cache
+                    .get(&cache_key)
+                    .and_then(|timeline| timeline.get(frame as usize))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                crate::simulation::rigid::sample_rigid_bodies_3d(
+                    &inputs, time_sec, fixed_step, iterations, gravity,
+                )
+            };
+            let physics_debug = composite.nodes_3d.iter().find_map(|node| {
+                let Scene3DNode::Debug(debug) = node else {
+                    return None;
+                };
+                (debug.colliders || debug.contacts || debug.sweep || debug.corrections)
+                    .then_some(debug)
+            });
+            if let Some(debug) = physics_debug
+                && (frame == 0 || frame % 30 == 0)
+            {
+                eprintln!(
+                    "MotionLoom PhysicsDebug: frame={frame} colliders={} contacts={} sweep={} corrections={} | {} body(s)",
+                    debug.colliders,
+                    debug.contacts,
+                    debug.sweep,
+                    debug.corrections,
+                    rigid_body_nodes.len()
+                );
+                for (body, output) in rigid_body_nodes.iter().zip(&outputs) {
+                    eprintln!(
+                        "  body {}: target={} authority={:?} shape={:?} colliderSize={:?} position={:?} velocity={:?} angularVelocity={:?} sleeping={}",
+                        body.id,
+                        body.target,
+                        body.body_type,
+                        body.shape,
+                        output.collider_size,
+                        output.position,
+                        output.linear_velocity,
+                        output.angular_velocity,
+                        output.sleeping
+                    );
+                }
+                if debug.contacts {
+                    for contact in
+                        crate::simulation::rigid::rigid_body_3d_contact_summaries(&inputs, &outputs)
+                    {
+                        eprintln!(
+                            "  contact {} <-> {}: points={} maximumPenetration={:.6}",
+                            rigid_body_nodes[contact.a].id,
+                            rigid_body_nodes[contact.b].id,
+                            contact.points,
+                            contact.maximum_penetration
+                        );
+                    }
+                }
+            }
+            rigid_body_nodes
+                .iter()
+                .zip(outputs)
+                .filter(|(body, _)| {
+                    body.body_type == crate::simulation::model::RigidBodyType::Dynamic
+                })
+                .map(|(body, output)| (body.target.clone(), output))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let world_lighting =
+            scene_world_lighting(composite, &self.image_asset_sources, time_norm, time_sec)?;
 
         for node in &composite.nodes_3d {
             match node {
@@ -7787,82 +9715,53 @@ impl SceneFrameRenderer {
                     {
                         continue;
                     }
-                    let position = if let Some(value) =
-                        resolve_scene_3d_reference(&node.position, &anchors, &model_positions)
-                    {
-                        value
-                    } else {
-                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 6.0])?
-                    };
-                    let target = if let Some(value) =
-                        resolve_scene_3d_reference(&node.target, &anchors, &model_positions)
-                    {
-                        value
-                    } else {
-                        eval_scene_vec3(&node.target, time_norm, time_sec, [0.0, 0.0, 0.0])?
-                    };
-                    let dx = position[0] - target[0];
-                    let dy = position[1] - target[1];
-                    let dz = position[2] - target[2];
-                    let horizontal = (dx * dx + dz * dz).sqrt();
-                    let distance = (horizontal * horizontal + dy * dy).sqrt().max(0.05);
-                    let yaw = dx.atan2(dz).to_degrees();
-                    let pitch = dy.atan2(horizontal.max(0.0001)).to_degrees();
-                    let authored_up = if node.horizon_lock {
-                        [0.0, 1.0, 0.0]
-                    } else {
-                        eval_scene_vec3(&node.up, time_norm, time_sec, [0.0, 1.0, 0.0])?
-                    };
-                    camera = WorldCamera {
-                        id: node.id.clone(),
-                        control: WorldCameraControl::Orbit,
-                        projection: WorldCameraProjection::Perspective,
-                        target: None,
-                        x: "0".to_string(),
-                        y: "0".to_string(),
-                        z: "0".to_string(),
-                        target_x: target[0].to_string(),
-                        target_y: target[1].to_string(),
-                        target_z: target[2].to_string(),
-                        yaw: yaw.to_string(),
-                        pitch: pitch.to_string(),
-                        roll: eval_scene_number(&node.roll, time_norm, time_sec)?.to_string(),
-                        up_x: authored_up[0].to_string(),
-                        up_y: authored_up[1].to_string(),
-                        up_z: authored_up[2].to_string(),
-                        distance: distance.to_string(),
-                        zoom: "1".to_string(),
-                        fov: eval_scene_number(&node.fov, time_norm, time_sec)?.to_string(),
-                        orthographic_scale: None,
-                    };
+                    active_scene_camera = Some(node.clone());
                 }
-                Scene3DNode::EnvironmentLight(_) => {
-                    // GLB embedded materials already use the established World
-                    // lighting shader. The typed light remains in compiler data
-                    // for the dedicated IBL pass added by the material bridge.
-                }
+                Scene3DNode::EnvironmentLight(_)
+                | Scene3DNode::DirectionalLight(_)
+                | Scene3DNode::PointLight(_)
+                | Scene3DNode::SpotLight(_)
+                | Scene3DNode::RectAreaLight(_)
+                | Scene3DNode::AmbientOcclusion(_)
+                | Scene3DNode::ContactShadow(_)
+                | Scene3DNode::ColorManagement(_)
+                | Scene3DNode::VolumeRepeat(_) => {}
                 Scene3DNode::Model(node) => {
                     let actor_id = node
                         .id
                         .clone()
                         .unwrap_or_else(|| format!("model_{}", actors.len()));
-                    let authored_src = self
-                        .model_asset_sources
-                        .get(&node.asset)
-                        .cloned()
-                        .unwrap_or_else(|| node.asset.clone());
+                    let authored_source = node
+                        .primitive
+                        .clone()
+                        .map(GraphAssetSource::Primitive)
+                        .or_else(|| self.model_asset_sources.get(&node.asset).cloned())
+                        .unwrap_or_else(|| GraphAssetSource::External {
+                            src: node.asset.clone(),
+                        });
+                    let compound = match &authored_source {
+                        GraphAssetSource::Compound(asset) => Some(asset.clone()),
+                        GraphAssetSource::External { .. } | GraphAssetSource::Primitive(_) => None,
+                    };
                     // Scene-authored model and environment paths are relative
                     // to the MotionLoom document, not to the legacy World
                     // renderer's sample-asset directory. Resolve them before
                     // crossing the internal Scene3D bridge. HTTP(S) sources
                     // remain unchanged because canonicalization simply fails
                     // and falls back to the original URL string.
-                    let src = {
-                        let resolved = resolve_local_scene_asset_path(&authored_src);
-                        std::fs::canonicalize(&resolved)
-                            .unwrap_or(resolved)
-                            .to_string_lossy()
-                            .into_owned()
+                    let (src, primitive) = match authored_source {
+                        GraphAssetSource::External { src } => {
+                            let resolved = resolve_local_scene_asset_path(&src);
+                            (
+                                std::fs::canonicalize(&resolved)
+                                    .unwrap_or(resolved)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                None,
+                            )
+                        }
+                        GraphAssetSource::Primitive(asset) => (asset.id.clone(), Some(asset)),
+                        GraphAssetSource::Compound(asset) => (asset.id.clone(), None),
                     };
                     let mut position = node
                         .id
@@ -7884,6 +9783,7 @@ impl SceneFrameRenderer {
                     }
                     let mut rotation =
                         eval_scene_vec3(&node.rotation, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    let mut rotation_quaternion = None;
                     if let Some(value) = &node.rotation_x {
                         rotation[0] = eval_scene_number(value, time_norm, time_sec)?;
                     }
@@ -7893,12 +9793,84 @@ impl SceneFrameRenderer {
                     if let Some(value) = &node.rotation_z {
                         rotation[2] = eval_scene_number(value, time_norm, time_sec)?;
                     }
+                    if let Some(physics) = rigid_body_transforms.get(&actor_id) {
+                        position = physics.position;
+                        rotation = physics.rotation;
+                        rotation_quaternion = Some(physics.orientation);
+                    }
+                    if let Some(compound) = compound {
+                        let actor_scale = model_scales
+                            .get(&actor_id)
+                            .copied()
+                            .unwrap_or(eval_scene_number(&node.scale, time_norm, time_sec)?);
+                        let exposure =
+                            eval_scene_number(&node.exposure, time_norm, time_sec)?.to_string();
+                        for instance in compound.instances {
+                            let Some(mut primitive) = self
+                                .model_asset_sources
+                                .get(&instance.asset)
+                                .and_then(|source| match source {
+                                    GraphAssetSource::Primitive(asset) => Some(asset.clone()),
+                                    GraphAssetSource::External { .. }
+                                    | GraphAssetSource::Compound(_) => None,
+                                })
+                            else {
+                                continue;
+                            };
+                            primitive.material_seed = instance.material_seed.or_else(|| {
+                                compound.material_seed.map(|seed| {
+                                    // FNV-1a keeps per-instance texture variation stable across hosts.
+                                    instance.id.bytes().fold(
+                                        seed ^ 0xcbf29ce484222325,
+                                        |hash, byte| {
+                                            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+                                        },
+                                    )
+                                })
+                            });
+                            let local = rotate_scene_point(
+                                instance.position.map(|value| value * actor_scale),
+                                rotation,
+                            );
+                            let child_position = add_scene_vec3(position, local);
+                            let child_rotation: [f32; 3] = std::array::from_fn(|axis| {
+                                rotation[axis] + instance.rotation[axis]
+                            });
+                            actors.push(WorldActor {
+                                id: format!("{actor_id}::{}", instance.id),
+                                model: primitive.id.clone(),
+                                primitive: Some(primitive),
+                                path_style: WorldPathStyle::Relative,
+                                hide_meshes: Vec::new(),
+                                hide_materials: Vec::new(),
+                                camera_hidden_bones: Vec::new(),
+                                profile: None,
+                                rig: None,
+                                retarget: None,
+                                x: child_position[0].to_string(),
+                                y: child_position[1].to_string(),
+                                z: child_position[2].to_string(),
+                                yaw: child_rotation[1].to_string(),
+                                pitch: child_rotation[0].to_string(),
+                                roll: child_rotation[2].to_string(),
+                                rotation_quaternion: None,
+                                scale: (actor_scale * instance.scale).to_string(),
+                                scale_mode: "none".to_string(),
+                                opacity: "1".to_string(),
+                                material: Some(WorldMaterial {
+                                    style: WorldMaterialStyle::Pbr,
+                                    outline: false,
+                                    outline_width: "0".to_string(),
+                                    exposure: exposure.clone(),
+                                }),
+                                play: None,
+                                plays: Vec::new(),
+                            });
+                        }
+                        continue;
+                    }
                     let active_apply = self.prepared_scene_apply_actions.iter().find(|apply| {
-                        let start = apply.at_ms as f32 / 1000.0;
-                        let duration = apply.duration_ms.unwrap_or(duration_ms) as f32 / 1000.0;
-                        apply.target == actor_id
-                            && time_sec >= start
-                            && (apply.r#loop || time_sec <= start + duration.max(0.0))
+                        scene_apply_action_is_active(apply, &actor_id, time_sec, duration_ms)
                     });
                     if let Some(apply) = active_apply.filter(|apply| {
                         apply.target == actor_id
@@ -7908,85 +9880,26 @@ impl SceneFrameRenderer {
                                 || apply.contact.is_some()
                                 || apply.landing.is_some())
                     }) {
-                        let start_sec = apply.at_ms as f32 / 1000.0;
                         let action = self
                             .prepared_scene_actions
                             .iter()
                             .find(|action| action.id == apply.action);
-                        let duration_sec = apply
-                            .duration_ms
-                            .or_else(|| {
-                                action.map(|action| action.duration_ms).filter(|ms| *ms > 0)
-                            })
-                            .unwrap_or(duration_ms)
-                            as f32
-                            / 1000.0;
-                        let local_sec = (time_sec - start_sec).clamp(0.0, duration_sec.max(0.0));
-                        let marker_time = |role: &str, fallback: f32| {
-                            action
-                                .and_then(|action| {
-                                    action.markers.iter().find(|marker| {
-                                        marker.id.eq_ignore_ascii_case(role)
-                                            || marker.role.as_deref().is_some_and(|value| {
-                                                value.eq_ignore_ascii_case(role)
-                                            })
-                                    })
-                                })
-                                .map(|marker| marker.time_ms as f32 / 1000.0)
-                                .unwrap_or(fallback)
-                                .clamp(0.0, duration_sec.max(0.0))
-                        };
-                        let takeoff_t = marker_time("takeoff", 0.0);
-                        let contact_t = marker_time("contact", duration_sec * 0.5);
-                        let landing_t = marker_time("landing", duration_sec);
-                        let takeoff = apply
-                            .takeoff
-                            .as_deref()
-                            .and_then(|id| anchors.get(id).copied())
-                            .unwrap_or(position);
-                        let contact = apply
-                            .contact
-                            .as_deref()
-                            .and_then(|id| anchors.get(id).copied());
-                        let landing = apply
-                            .landing
-                            .as_deref()
-                            .or(apply.destination.as_deref())
-                            .and_then(|id| anchors.get(id).copied())
-                            .or(contact)
-                            .unwrap_or(takeoff);
-                        let interpolate = |from: [f32; 3], to: [f32; 3], t: f32| {
-                            std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * t)
-                        };
-                        position = if local_sec <= takeoff_t && takeoff_t > f32::EPSILON {
-                            interpolate(position, takeoff, local_sec / takeoff_t)
-                        } else if let Some(contact) = contact
-                            && local_sec <= contact_t
-                            && contact_t > takeoff_t
-                        {
-                            interpolate(
-                                takeoff,
-                                contact,
-                                (local_sec - takeoff_t) / (contact_t - takeoff_t),
-                            )
-                        } else if let Some(contact) = contact
-                            && landing_t > contact_t
-                        {
-                            interpolate(
-                                contact,
-                                landing,
-                                ((local_sec - contact_t) / (landing_t - contact_t)).clamp(0.0, 1.0),
-                            )
-                        } else {
-                            let progress = if duration_sec <= f32::EPSILON {
-                                1.0
-                            } else {
-                                (local_sec / duration_sec).clamp(0.0, 1.0)
-                            };
-                            interpolate(position, landing, progress)
-                        };
+                        position = match_target_action_position(
+                            position,
+                            apply,
+                            action,
+                            &anchors,
+                            time_sec,
+                            duration_ms,
+                        );
                     }
                     if let Some((ground_height, ground_offset)) = active_apply.and_then(|apply| {
+                        if apply.contact_correction.as_deref() == Some("auto") {
+                            // Semantic Action contacts own the root height for
+                            // this ApplyAction. Legacy ground snapping remains
+                            // unchanged for every script without the opt-in.
+                            return None;
+                        }
                         let ground = apply.ground.as_deref()?;
                         let surface = surfaces.get(ground)?;
                         let mut height = surface.height;
@@ -8164,9 +10077,11 @@ impl SceneFrameRenderer {
                     actors.push(WorldActor {
                         id: actor_id,
                         model: src,
+                        primitive,
                         path_style: WorldPathStyle::Relative,
                         hide_meshes: Vec::new(),
                         hide_materials: Vec::new(),
+                        camera_hidden_bones: Vec::new(),
                         profile: inferred_profile,
                         rig: node.rig.clone(),
                         retarget: node.retarget.clone(),
@@ -8176,14 +10091,15 @@ impl SceneFrameRenderer {
                         yaw: rotation[1].to_string(),
                         pitch: rotation[0].to_string(),
                         roll: rotation[2].to_string(),
+                        rotation_quaternion,
                         scale: actor_scale.to_string(),
+                        scale_mode: node.scale_mode.clone(),
                         opacity: "1".to_string(),
                         material: Some(WorldMaterial {
                             style: WorldMaterialStyle::Pbr,
                             outline: false,
                             outline_width: "0".to_string(),
-                            exposure: (eval_scene_number(&node.exposure, time_norm, time_sec)?
-                                * environment_light_intensity)
+                            exposure: eval_scene_number(&node.exposure, time_norm, time_sec)?
                                 .to_string(),
                         }),
                         play: node.play.as_ref().map(|play| WorldPlay {
@@ -8210,7 +10126,7 @@ impl SceneFrameRenderer {
                             .collect(),
                     });
                 }
-                Scene3DNode::Anchor(_) => {}
+                Scene3DNode::Anchor(_) | Scene3DNode::RigidBody(_) => {}
                 Scene3DNode::Debug(debug) => {
                     if frame == 0 {
                         eprintln!(
@@ -8295,7 +10211,7 @@ impl SceneFrameRenderer {
                         // otherwise a portable relative action path is looked
                         // up under the crate's old world example directory.
                         src: {
-                            let resolved = resolve_local_scene_asset_path(&asset.src);
+                            let resolved = resolve_local_scene_asset_path(asset.external_src()?);
                             std::fs::canonicalize(&resolved)
                                 .unwrap_or(resolved)
                                 .to_string_lossy()
@@ -8324,13 +10240,133 @@ impl SceneFrameRenderer {
                     weight: constraint.weight.clone(),
                 })
                 .collect(),
+            lighting: world_lighting,
             present: WorldPresent { from: world_id },
         };
-        let collision_environments = model_environment_triangles
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let kinematic_actors = composite
+
+        // EnvironmentDebug.corrections enables one shared root trace for
+        // Action contacts and the later kinematic controller. Keeping this
+        // opt-in avoids per-frame logging in normal preview and export.
+        let debug_collision = composite.nodes_3d.iter().find_map(|node| {
+            let Scene3DNode::Debug(debug) = node else {
+                return None;
+            };
+            Some((
+                debug.colliders,
+                debug.contacts,
+                debug.sweep,
+                debug.corrections,
+            ))
+        });
+        let debug_root_trace = debug_collision.is_some_and(|flags| flags.3);
+
+        let world_asset_root = crate::scene::resource::default_world_asset_root();
+        let mut collision_environments = Vec::<Arc<EnvironmentTriangleSpatialIndex>>::new();
+        for node in &composite.nodes_3d {
+            let Scene3DNode::Model(model) = node else {
+                continue;
+            };
+            let Some(model_id) = model.id.as_deref() else {
+                continue;
+            };
+            if let Some(GraphAssetSource::Compound(compound)) =
+                self.model_asset_sources.get(&model.asset)
+            {
+                let parent_position = model_positions.get(model_id).copied().unwrap_or([0.0; 3]);
+                let parent_rotation = model_rotations.get(model_id).copied().unwrap_or([0.0; 3]);
+                let parent_scale = model_scales.get(model_id).copied().unwrap_or(1.0);
+                let mut triangles = Vec::new();
+                for instance in &compound.instances {
+                    let Some(primitive) = self.model_asset_sources.get(&instance.asset).and_then(
+                        |source| match source {
+                            GraphAssetSource::Primitive(asset) => Some(asset),
+                            GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => {
+                                None
+                            }
+                        },
+                    ) else {
+                        continue;
+                    };
+                    let local = rotate_scene_point(
+                        instance.position.map(|value| value * parent_scale),
+                        parent_rotation,
+                    );
+                    let position = add_scene_vec3(parent_position, local);
+                    let rotation =
+                        std::array::from_fn(|axis| parent_rotation[axis] + instance.rotation[axis]);
+                    triangles.extend(primitive_collision_triangles(
+                        primitive,
+                        position,
+                        rotation,
+                        parent_scale * instance.scale,
+                    ));
+                }
+                if !triangles.is_empty() {
+                    collision_environments.push(Arc::new(
+                        EnvironmentTriangleSpatialIndex::from_scene_triangles(triangles),
+                    ));
+                }
+            }
+            let primitive = model.primitive.as_ref().or_else(|| {
+                self.model_asset_sources
+                    .get(&model.asset)
+                    .and_then(|source| match source {
+                        GraphAssetSource::Primitive(asset) => Some(asset),
+                        GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => None,
+                    })
+            });
+            if let Some(primitive) = primitive
+                && primitive.collision.mode == PrimitiveCollisionMode::Solid
+            {
+                let triangles = primitive_collision_triangles(
+                    primitive,
+                    model_positions.get(model_id).copied().unwrap_or([0.0; 3]),
+                    model_rotations.get(model_id).copied().unwrap_or([0.0; 3]),
+                    model_scales.get(model_id).copied().unwrap_or(1.0),
+                );
+                if !triangles.is_empty() {
+                    collision_environments.push(Arc::new(
+                        EnvironmentTriangleSpatialIndex::from_scene_triangles(triangles),
+                    ));
+                }
+            }
+            if !model.environment
+                || !model
+                    .collision
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("surfaces"))
+            {
+                // Preserve the complete render-mesh collision path for every
+                // existing Environment that has not opted into semantic mode.
+                if let Some(index) = model_environment_triangles.get(model_id) {
+                    collision_environments.push(Arc::clone(index));
+                }
+                continue;
+            }
+            let full_mesh = model_environment_triangles.get(model_id).map(Arc::as_ref);
+            let mut semantic_triangles = Vec::<SceneEnvironmentTriangle>::new();
+            for surface in model.surfaces.iter().filter(|surface| surface.collision) {
+                let Some(resolved) = surfaces.get(&surface.id) else {
+                    continue;
+                };
+                let default_collider = if surface.kind == "ground" {
+                    "plane"
+                } else {
+                    "box"
+                };
+                semantic_triangles.extend(semantic_surface_triangles(
+                    resolved,
+                    surface.collider.as_deref().unwrap_or(default_collider),
+                    full_mesh,
+                ));
+            }
+            if !semantic_triangles.is_empty() {
+                collision_environments.push(Arc::new(
+                    EnvironmentTriangleSpatialIndex::from_scene_triangles(semantic_triangles),
+                ));
+            }
+        }
+        let mut root_solve_actors = composite
             .nodes_3d
             .iter()
             .filter_map(|node| {
@@ -8346,11 +10382,17 @@ impl SceneFrameRenderer {
                 .flatten()
             })
             .collect::<Vec<_>>();
-        let world_asset_root = crate::scene::resource::default_world_asset_root();
-        for actor_id in kinematic_actors {
-            if collision_environments.is_empty() {
-                continue;
-            }
+        // Contact correction may be used without an explicit collision
+        // attribute. Include those actors in the same root-owner pass.
+        root_solve_actors.extend(
+            self.prepared_scene_apply_actions
+                .iter()
+                .filter(|apply| apply.contact_correction.as_deref() == Some("auto"))
+                .map(|apply| apply.target.clone()),
+        );
+        root_solve_actors.sort();
+        root_solve_actors.dedup();
+        for actor_id in root_solve_actors {
             let sampled = self
                 .scene_3d_renderer
                 .sample_humanoid_frame(&world_graph, &actor_id, frame, &world_asset_root)
@@ -8359,24 +10401,357 @@ impl SceneFrameRenderer {
                         "Scene 3D kinematic collider could not sample humanoid '{actor_id}': {err}"
                     ),
                 })?;
-            let correction =
-                resolve_humanoid_kinematic_translation(&sampled, &collision_environments);
-            if length_scene_vec3(correction) > 1.0e-6
-                && let Some(actor) = world_graph
-                    .worlds
-                    .first_mut()
-                    .and_then(|world| world.actors.iter_mut().find(|actor| actor.id == actor_id))
+            let active_apply = self.prepared_scene_apply_actions.iter().find(|apply| {
+                scene_apply_action_is_active(apply, &actor_id, time_sec, duration_ms)
+            });
+            let active_action = active_apply.and_then(|apply| {
+                self.prepared_scene_actions
+                    .iter()
+                    .find(|action| action.id == apply.action)
+            });
+            let actor_model = composite.nodes_3d.iter().find_map(|node| {
+                let Scene3DNode::Model(model) = node else {
+                    return None;
+                };
+                (model.id.as_deref() == Some(actor_id.as_str())).then_some(model)
+            });
+            let mut motion_root = world_graph
+                .worlds
+                .first()
+                .and_then(|world| world.actors.iter().find(|actor| actor.id == actor_id))
+                .map(|actor| {
+                    [
+                        actor.x.parse::<f32>().unwrap_or(0.0),
+                        actor.y.parse::<f32>().unwrap_or(0.0),
+                        actor.z.parse::<f32>().unwrap_or(0.0),
+                    ]
+                })
+                .unwrap_or([0.0; 3]);
+            let previous_time_sec = (time_sec - 1.0 / fps.max(1.0)).max(0.0);
+            let authored_start = composite
+                .nodes_3d
+                .iter()
+                .find_map(|node| {
+                    let Scene3DNode::Model(model) = node else {
+                        return None;
+                    };
+                    (model.id.as_deref() == Some(actor_id.as_str())).then(|| {
+                        if let Some(anchor) = model.position.trim().strip_prefix('@') {
+                            anchors.get(anchor).copied().unwrap_or(motion_root)
+                        } else {
+                            eval_scene_vec3(
+                                &model.position,
+                                time_norm,
+                                previous_time_sec,
+                                motion_root,
+                            )
+                            .unwrap_or(motion_root)
+                        }
+                    })
+                })
+                .unwrap_or(motion_root);
+            let mut previous_motion_root = active_apply.map_or(motion_root, |apply| {
+                let previous_path = match_target_action_position(
+                    authored_start,
+                    apply,
+                    active_action,
+                    &anchors,
+                    previous_time_sec,
+                    duration_ms,
+                );
+                let current_path = match_target_action_position(
+                    authored_start,
+                    apply,
+                    active_action,
+                    &anchors,
+                    time_sec,
+                    duration_ms,
+                );
+                // Preserve grounding and other authored offsets already
+                // applied to desired_root while reconstructing only the prior
+                // frame's motion-warp delta.
+                add_scene_vec3(motion_root, sub_scene_vec3(previous_path, current_path))
+            });
+            let gravity_physics = actor_model
+                .filter(|model| {
+                    model
+                        .gravity
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("scene"))
+                })
+                .and(composite.physics.as_ref());
+            let mut gravity_ground_candidate = None;
+            let mut gravity_previous_sweep_root = None;
+            if let Some(physics) = gravity_physics {
+                let gravity =
+                    eval_scene_vec3(&physics.gravity, time_norm, time_sec, [0.0, -9.81, 0.0])?;
+                let fixed_step = parse_scene_fixed_step(&physics.fixed_step).ok_or_else(|| {
+                    MotionLoomSceneRenderError::InvalidExpression {
+                        expr: physics.fixed_step.clone(),
+                        message: "Physics.fixedStep must be seconds or a fraction such as 1/120s"
+                            .to_string(),
+                    }
+                })?;
+                // An active Action makes this a kinematic animated character:
+                // the authored root path owns deliberate jumps, rolls and
+                // landings, while Physics still rejects floor penetration.
+                // Applying graph-time ballistic displacement on top would
+                // accumulate gravity for several seconds and flatten every
+                // authored jump arc. Models without an active Action retain
+                // deterministic free fall from their authored start height.
+                if active_apply.is_none() {
+                    motion_root = add_scene_vec3(
+                        motion_root,
+                        deterministic_gravity_displacement(gravity, time_sec, fixed_step),
+                    );
+                    previous_motion_root = add_scene_vec3(
+                        previous_motion_root,
+                        deterministic_gravity_displacement(gravity, previous_time_sec, fixed_step),
+                    );
+                }
+                gravity_previous_sweep_root = Some(previous_motion_root);
+                if let Some(surface_id) = actor_model.and_then(|model| model.ground.as_deref())
+                    && let Some(surface) = surfaces.get(surface_id)
+                    && scene_surface_contains_xz(surface, motion_root)
+                    && gravity[1] < 0.0
+                {
+                    let environment = surface_models
+                        .get(surface_id)
+                        .and_then(|model_id| model_environment_triangles.get(model_id))
+                        .map(Arc::as_ref);
+                    let sole = [
+                        motion_root[0],
+                        motion_root[1] + sampled.rig_metrics.sole_offset,
+                        motion_root[2],
+                    ];
+                    let target = scene_surface_contact_target(surface, environment, sole, 0.0);
+                    if sole[1] <= target[1] {
+                        motion_root = add_scene_vec3(motion_root, sub_scene_vec3(target, sole));
+                        gravity_ground_candidate = Some(motion_root);
+                    }
+                    if let Some(previous_root) = gravity_previous_sweep_root.as_mut()
+                        && scene_surface_contains_xz(surface, *previous_root)
+                    {
+                        let previous_sole = [
+                            previous_root[0],
+                            previous_root[1] + sampled.rig_metrics.sole_offset,
+                            previous_root[2],
+                        ];
+                        let previous_target =
+                            scene_surface_contact_target(surface, environment, previous_sole, 0.0);
+                        if previous_sole[1] <= previous_target[1] {
+                            *previous_root = add_scene_vec3(
+                                *previous_root,
+                                sub_scene_vec3(previous_target, previous_sole),
+                            );
+                        }
+                    }
+                }
+            }
+            let profile = action_collider_profile_with_frame(
+                active_apply,
+                active_action,
+                Some(&sampled),
+                time_sec,
+                duration_ms,
+            );
+            let config = KinematicControllerConfig {
+                profile,
+                safe_margin: active_apply
+                    .and_then(|apply| {
+                        eval_scene_number(&apply.safe_margin, time_norm, time_sec).ok()
+                    })
+                    .unwrap_or(0.008)
+                    .clamp(0.0, sampled.actor_scale.max(0.05) * 0.25),
+                floor_snap: active_apply
+                    .and_then(|apply| {
+                        eval_scene_number(&apply.floor_snap, time_norm, time_sec).ok()
+                    })
+                    .unwrap_or(0.08)
+                    .max(0.0),
+                max_step_height: (sampled.actor_scale * 0.38).max(0.12),
+                max_slides: active_apply
+                    .map(|apply| apply.max_slides)
+                    .or_else(|| gravity_physics.map(|physics| physics.iterations))
+                    .unwrap_or(4),
+                sweep_step: active_apply
+                    .and_then(|apply| {
+                        eval_scene_number(&apply.sweep_step, time_norm, time_sec).ok()
+                    })
+                    .unwrap_or(0.04)
+                    .max(0.005),
+            };
+            let contact_auto = active_apply
+                .is_some_and(|apply| apply.contact_correction.as_deref() == Some("auto"));
+            let contact_phase =
+                active_apply.and_then(|apply| sampled.action_phases.get(&apply.action).copied());
+            let ground_binding = active_apply.and_then(|apply| {
+                let surface_id = apply.ground.as_deref()?;
+                let surface = surfaces.get(surface_id)?;
+                let environment = surface_models
+                    .get(surface_id)
+                    .and_then(|model_id| model_environment_triangles.get(model_id))
+                    .map(Arc::as_ref);
+                Some((apply, surface, environment))
+            });
+            let ground_candidate =
+                if contact_auto && profile != HumanoidColliderProfile::Airborne {
+                    ground_binding.map(|(apply, surface, environment)| {
+                        let ground_offset =
+                            eval_scene_number(&apply.ground_offset, time_norm, time_sec)
+                                .unwrap_or(0.0);
+                        let sole = [
+                            motion_root[0],
+                            motion_root[1] + sampled.rig_metrics.sole_offset,
+                            motion_root[2],
+                        ];
+                        let target =
+                            scene_surface_contact_target(surface, environment, sole, ground_offset);
+                        add_scene_vec3(motion_root, sub_scene_vec3(target, sole))
+                    })
+                } else {
+                    None
+                }
+                .or(gravity_ground_candidate);
+            let mut contact_samples = Vec::<HumanoidContactSample>::new();
+            if contact_auto
+                && let (Some(action), Some(phase), Some((_, surface, environment))) =
+                    (active_action, contact_phase, ground_binding)
             {
-                let x = actor.x.parse::<f32>().unwrap_or(0.0) + correction[0];
-                let y = actor.y.parse::<f32>().unwrap_or(0.0) + correction[1];
-                let z = actor.z.parse::<f32>().unwrap_or(0.0) + correction[2];
-                actor.x = x.to_string();
-                actor.y = y.to_string();
-                actor.z = z.to_string();
+                for contact in &action.contacts {
+                    if contact.target != "ground" {
+                        continue;
+                    }
+                    let envelope = action_contact_phase_envelope(contact.from, contact.to, phase);
+                    let authored_weight =
+                        eval_scene_number(&contact.weight, time_norm, time_sec)?.clamp(0.0, 1.0);
+                    let Some(canonical) = canonical_action_contact_effector(&contact.effector)
+                    else {
+                        continue;
+                    };
+                    let Some(point) = sampled.joints.get(canonical).copied() else {
+                        continue;
+                    };
+                    let target = scene_surface_contact_target(
+                        surface,
+                        environment,
+                        point,
+                        action_contact_effector_radius(&contact.effector, sampled.actor_scale),
+                    );
+                    let correction = sub_scene_vec3(target, point);
+                    if debug_root_trace {
+                        eprintln!(
+                            "MotionLoom RootTrace stage=contact_effector actor={} action={} frame={} time={:.6} phase={:.6} contact={} effector={} point={:?} target={:?} delta={:?} envelope={:.6} authored_weight={:.6}",
+                            actor_id,
+                            active_apply
+                                .map(|value| value.action.as_str())
+                                .unwrap_or("none"),
+                            frame,
+                            time_sec,
+                            phase,
+                            contact.id,
+                            canonical,
+                            point,
+                            target,
+                            correction,
+                            envelope,
+                            authored_weight,
+                        );
+                    }
+                    contact_samples.push(HumanoidContactSample {
+                        correction,
+                        authored_weight,
+                        envelope,
+                        support: contact.effector.clone(),
+                    });
+                }
+            }
+            let mut contact = combine_humanoid_contact_samples(
+                &contact_samples,
+                (sampled.actor_scale * 1.25).max(0.1),
+            );
+            if let (Some(grounded_root), Some((_, surface, environment))) =
+                (ground_candidate, ground_binding)
+            {
+                contact.supports.extend(automatic_humanoid_supports(
+                    &sampled,
+                    motion_root,
+                    grounded_root,
+                    profile,
+                    surface,
+                    environment,
+                ));
+                contact.supports.sort();
+                contact.supports.dedup();
+            }
+            let (mut root_state, report) = solve_humanoid_root_frame(
+                &sampled,
+                authored_start,
+                motion_root,
+                previous_motion_root,
+                gravity_previous_sweep_root,
+                ground_candidate,
+                &contact,
+                &collision_environments,
+                config,
+            );
+            if gravity_ground_candidate.is_some() && root_state.contact_activation <= f32::EPSILON {
+                root_state.grounded_reason = "gravity_floor";
+            }
+            if let Some(actor) = world_graph
+                .worlds
+                .first_mut()
+                .and_then(|world| world.actors.iter_mut().find(|actor| actor.id == actor_id))
+            {
+                actor.x = root_state.final_root[0].to_string();
+                actor.y = root_state.final_root[1].to_string();
+                actor.z = root_state.final_root[2].to_string();
+            }
+            if debug_collision.is_some_and(|flags| flags.0 || flags.1 || flags.2 || flags.3) {
+                eprintln!(
+                    "MotionLoom KinematicReport actor={actor_id} frame={frame} profile={profile:?} previous={:?} desired={:?} resolved={:?} correction={:?} contacts={} substeps={} grounded={} sole_offset={:.6} ground_hit={:?} ground_gap={:?} supports={:?} reason={}",
+                    report.previous_root,
+                    report.desired_root,
+                    report.resolved_root,
+                    report.correction,
+                    report.contacts,
+                    report.sweep_substeps,
+                    report.grounded,
+                    sampled.rig_metrics.sole_offset,
+                    report.ground_probe.hit_height,
+                    report.ground_probe.gap,
+                    root_state.supports,
+                    root_state.grounded_reason,
+                );
+            }
+            if debug_root_trace {
+                eprintln!(
+                    "MotionLoom RootTrace stage=final actor={} action={} frame={} time={:.6} profile={:?} authored_root={:?} motion_root={:?} ground_candidate={:?} contact_candidate={:?} contact_activation={:.6} collision_root={:?} final_root={:?} sole_offset={:.6} ground_hit={:?} ground_gap={:?} supports={:?} grounded={} reason={}",
+                    actor_id,
+                    active_apply
+                        .map(|apply| apply.action.as_str())
+                        .unwrap_or("none"),
+                    frame,
+                    time_sec,
+                    profile,
+                    root_state.authored_root,
+                    root_state.motion_root,
+                    root_state.ground_candidate,
+                    root_state.contact_candidate,
+                    root_state.contact_activation,
+                    root_state.collision_resolved_root,
+                    root_state.final_root,
+                    sampled.rig_metrics.sole_offset,
+                    report.ground_probe.hit_height,
+                    report.ground_probe.gap,
+                    root_state.supports,
+                    root_state.grounded,
+                    root_state.grounded_reason,
+                );
             }
 
-            // Re-sample after root correction, then keep hands and feet outside
-            // the environment with the established two-bone IK solver.
+            // Re-sample after root correction, then keep exposed humanoid
+            // effectors outside the environment with pose-only two-bone IK.
             let corrected = self
                 .scene_3d_renderer
                 .sample_humanoid_frame(&world_graph, &actor_id, frame, &world_asset_root)
@@ -8385,24 +10760,85 @@ impl SceneFrameRenderer {
                         "Scene 3D contact IK could not sample humanoid '{actor_id}': {err}"
                     ),
                 })?;
-            let contact_ik_enabled = self.prepared_scene_apply_actions.iter().any(|apply| {
-                let start = apply.at_ms as f32 / 1000.0;
-                let duration = apply.duration_ms.unwrap_or(duration_ms) as f32 / 1000.0;
-                apply.target == actor_id
-                    && time_sec >= start
-                    && (apply.r#loop || time_sec <= start + duration.max(0.0))
-                    && apply
-                        .foot_lock
-                        .as_deref()
-                        .is_some_and(|value| matches!(value, "auto" | "true" | "on"))
-            });
-            if contact_ik_enabled {
-                for (bone, radius_scale) in [
-                    ("foot_l", 0.065_f32),
-                    ("foot_r", 0.065),
-                    ("hand_l", 0.05),
-                    ("hand_r", 0.05),
-                ] {
+            let contact_ik_enabled = active_apply.is_some_and(|apply| {
+                apply
+                    .foot_lock
+                    .as_deref()
+                    .is_some_and(|value| matches!(value, "auto" | "true" | "on"))
+            }) && profile != HumanoidColliderProfile::Airborne;
+            if contact_auto
+                && let (Some(action), Some(phase), Some((_, surface, environment))) =
+                    (active_action, contact_phase, ground_binding)
+            {
+                let max_residual = (corrected.actor_scale * 0.12).max(0.025);
+                for contact_node in &action.contacts {
+                    if !matches!(
+                        contact_node.effector.as_str(),
+                        "foot_l" | "foot_r" | "hand_l" | "hand_r"
+                    ) || contact_node.target != "ground"
+                    {
+                        continue;
+                    }
+                    let envelope =
+                        action_contact_phase_envelope(contact_node.from, contact_node.to, phase);
+                    let authored_weight =
+                        eval_scene_number(&contact_node.weight, time_norm, time_sec)?
+                            .clamp(0.0, 1.0);
+                    let weight = authored_weight * envelope;
+                    let Some(canonical) = canonical_action_contact_effector(&contact_node.effector)
+                    else {
+                        continue;
+                    };
+                    let Some(point) = corrected.joints.get(canonical).copied() else {
+                        continue;
+                    };
+                    let target = scene_surface_contact_target(
+                        surface,
+                        environment,
+                        point,
+                        action_contact_effector_radius(
+                            &contact_node.effector,
+                            corrected.actor_scale,
+                        ),
+                    );
+                    if weight <= f32::EPSILON
+                        || length_scene_vec3(sub_scene_vec3(target, point)) > max_residual
+                    {
+                        continue;
+                    }
+                    world_graph.constraints.push(WorldConstraint {
+                        constraint_type: "position".to_string(),
+                        source: format!("{actor_id}.{canonical}"),
+                        target: String::new(),
+                        target_point: Some(target),
+                        at_ms: 0,
+                        duration_ms,
+                        solver: "two_bone_ik".to_string(),
+                        weight: weight.to_string(),
+                    });
+                }
+            }
+            if contact_ik_enabled || profile == HumanoidColliderProfile::Rolling {
+                // A limb chain may have only one active two-bone endpoint.
+                // Solving both a knee and a foot (or elbow and hand) on the
+                // same frame makes the second constraint undo the first and
+                // can flip the limb between adjacent animation samples.
+                let effectors: &[(&str, f32, f32)] = if profile == HumanoidColliderProfile::Rolling
+                {
+                    &[
+                        ("head", 0.10, 0.98),
+                        ("foot_l", 0.065, 0.94),
+                        ("foot_r", 0.065, 0.94),
+                        ("hand_l", 0.05, 0.90),
+                        ("hand_r", 0.05, 0.90),
+                    ]
+                } else {
+                    // The contact query activates only for actual sphere
+                    // overlap, so standing walk cycles keep their authored
+                    // pose until a foot would visibly enter a solid collider.
+                    &[("foot_l", 0.065, 0.94), ("foot_r", 0.065, 0.94)]
+                };
+                for &(bone, radius_scale, weight) in effectors {
                     let Some(point) = corrected.joints.get(bone).copied() else {
                         continue;
                     };
@@ -8421,9 +10857,97 @@ impl SceneFrameRenderer {
                         at_ms: 0,
                         duration_ms,
                         solver: "two_bone_ik".to_string(),
-                        weight: "0.92".to_string(),
+                        weight: weight.to_string(),
                     });
                 }
+            }
+        }
+
+        if let Some(scene_camera) = active_scene_camera.as_ref() {
+            for selector in &scene_camera.hidden_bones {
+                if let Some(actor) = world_graph.worlds.first_mut().and_then(|world| {
+                    world
+                        .actors
+                        .iter_mut()
+                        .find(|actor| actor.id == selector.model)
+                }) && !actor.camera_hidden_bones.contains(&selector.bone)
+                {
+                    actor.camera_hidden_bones.push(selector.bone.clone());
+                }
+            }
+
+            // Cameras are resolved after collision and contact IK so an Anchor
+            // attached to an animated humanoid bone observes the final pose,
+            // not the authored root position sampled before constraints.
+            let mut corrected_models = HashMap::<String, [f32; 3]>::new();
+            if let Some(world) = world_graph.worlds.first() {
+                for actor in &world.actors {
+                    corrected_models.insert(
+                        actor.id.clone(),
+                        [
+                            actor.x.parse().unwrap_or(0.0),
+                            actor.y.parse().unwrap_or(0.0),
+                            actor.z.parse().unwrap_or(0.0),
+                        ],
+                    );
+                }
+            }
+            let mut resolved_anchors = anchors.clone();
+            let mut sampled_humanoids = HashMap::new();
+            for node in &composite.nodes_3d {
+                let Scene3DNode::Anchor(anchor) = node else {
+                    continue;
+                };
+                let Some(mut base) = corrected_models.get(&anchor.relative_to).copied() else {
+                    continue;
+                };
+                if let Some(bone) = anchor.node.as_deref()
+                    && is_scene_canonical_humanoid_bone(bone)
+                {
+                    if !sampled_humanoids.contains_key(&anchor.relative_to) {
+                        let sampled = self
+                            .scene_3d_renderer
+                            .sample_humanoid_frame(
+                                &world_graph,
+                                &anchor.relative_to,
+                                frame,
+                                &world_asset_root,
+                            )
+                            .map_err(|err| MotionLoomSceneRenderError::GpuRender {
+                                message: format!(
+                                    "Camera3D Anchor '{}' could not sample humanoid '{}': {err}",
+                                    anchor.id, anchor.relative_to
+                                ),
+                            })?;
+                        sampled_humanoids.insert(anchor.relative_to.clone(), sampled);
+                    }
+                    let sampled = &sampled_humanoids[&anchor.relative_to];
+                    if let Some(position) = sampled.joints.get(bone).copied() {
+                        base = position;
+                    }
+                }
+                let mut offset =
+                    eval_scene_vec3(&anchor.offset, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                if anchor.space == "local" {
+                    offset = rotate_scene_point(
+                        offset,
+                        model_rotations
+                            .get(&anchor.relative_to)
+                            .copied()
+                            .unwrap_or([0.0; 3]),
+                    );
+                }
+                resolved_anchors.insert(anchor.id.clone(), add_scene_vec3(base, offset));
+            }
+            camera = scene_camera_to_world_camera(
+                scene_camera,
+                &resolved_anchors,
+                &corrected_models,
+                time_norm,
+                time_sec,
+            )?;
+            if let Some(world) = world_graph.worlds.first_mut() {
+                world.camera = camera;
             }
         }
         let frame = self
@@ -17223,6 +19747,7 @@ fn scene_bool(value: &str) -> bool {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    use crate::asset::MemoryAssetResolver;
     use crate::parse_graph_script;
     use crate::scene::drawable::{
         GpuSceneNativeAssets, GpuScenePrimitive, GpuSceneTextureLayer, GpuSceneTextureSource,
@@ -17239,17 +19764,156 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        EnvironmentTriangleSpatialIndex, MotionLoomSceneRenderError, ResolvedSceneSurface,
+        EnvironmentTriangleSpatialIndex, HumanoidColliderProfile, HumanoidContactSample,
+        KinematicControllerConfig, MotionLoomSceneRenderError, ResolvedSceneSurface,
         SceneFrameRenderer, ScenePlatformPreviewSurface, ScenePreviewBackend,
         ScenePreviewPixelFormat, ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderError,
-        SceneRenderProfile, SceneRenderer, apply_animation_targets_at_frame,
-        collect_material_binding_scene_ids, eval_text_box_padding, eval_text_font_weight,
-        eval_text_render_scale, eval_text_tracking_em, global_process_liveness,
+        SceneRenderProfile, SceneRenderer, action_collider_profile, action_contact_phase_envelope,
+        apply_animation_targets_at_frame, collect_material_binding_scene_ids,
+        combine_humanoid_contact_samples, deterministic_gravity_displacement,
+        eval_text_box_padding, eval_text_font_weight, eval_text_render_scale,
+        eval_text_tracking_em, expand_scene_volume_repeats, global_process_liveness,
         graph_logical_render_size, graph_output_size, graph_requires_scene_resource,
+        humanoid_collision_spheres, humanoid_collision_spheres_for_profile,
+        load_environment_bounds, match_target_action_position, parse_scene_fixed_step,
+        primitive_collision_triangles, primitive_rigid_collider_spec, probe_humanoid_ground,
         raycast_environment_height, render_size_root_transform,
-        resolve_humanoid_kinematic_translation, scene_material_texture_cache_key,
-        scene_nodes_for_present, validate_scene_graph,
+        resolve_humanoid_kinematic_controller, scene_apply_action_is_active,
+        scene_material_texture_cache_key, scene_nodes_for_present, scene_surface_contains_xz,
+        semantic_box_triangles, semantic_surface_triangles, solve_humanoid_root_frame,
+        validate_scene_graph,
     };
+
+    #[test]
+    fn volume_repeat_replay_is_stable_and_moves_in_world_space() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="drop" shape="cylinder" radius="0.01" height="0.4" />
+  </Assets>
+  <Scene id="rain">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <CompositeGroup id="volume" space="3d">
+      <Repeat id="drops" mode="volume" count="4" seed="9"
+              boundsMin={[-1,0,-1]} boundsMax={[1,4,1]}
+              velocity={[0,-8,0]} lifetime="0.5s" phase="even" respawn="wrap">
+        <Model asset="drop" castShadow="false" receiveShadow="false" />
+      </Repeat>
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="rain" />
+</Graph>
+"##,
+        )
+        .expect("3D volume Repeat should parse");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("expected composite group");
+        };
+        let composite = group.composite.as_ref().expect("3D composite config");
+        let first = expand_scene_volume_repeats(composite, 0.0, 0.125).expect("expand repeat");
+        let replay = expand_scene_volume_repeats(composite, 0.0, 0.125).expect("replay repeat");
+        let later = expand_scene_volume_repeats(composite, 0.0, 0.2).expect("advance repeat");
+        assert_eq!(first, replay);
+        assert_eq!(first.len(), 4);
+        assert_ne!(first, later);
+        assert!(
+            first
+                .iter()
+                .all(|node| matches!(node, Scene3DNode::Model(_)))
+        );
+    }
+
+    #[test]
+    fn looping_scene_apply_action_still_expires_at_authored_duration() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="3s" size={[640,360]}>
+  <Assets>
+    <AnimationAsset id="clips" src="character.glb" />
+  </Assets>
+  <Action id="idle" source="clips" clip="Idle" />
+  <ApplyAction target="actor" action="idle" at="0.5s" duration="1s" loop="true" />
+  <Scene id="test_scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="3s">
+          <Layer>
+            <Rect x="0" y="0" width="640" height="360" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="test_scene" />
+</Graph>
+"##,
+        )
+        .expect("finite looping ApplyAction should parse");
+        let apply = &graph.apply_actions[0];
+        assert!(!scene_apply_action_is_active(apply, "actor", 0.49, 3_000));
+        assert!(scene_apply_action_is_active(apply, "actor", 0.5, 3_000));
+        assert!(scene_apply_action_is_active(apply, "actor", 1.5, 3_000));
+        assert!(!scene_apply_action_is_active(apply, "actor", 1.51, 3_000));
+    }
+
+    #[test]
+    fn gravity_is_deterministic_for_absolute_time_and_fractional_fixed_step() {
+        let step = parse_scene_fixed_step("1/120s").expect("fractional fixed step");
+        assert!((step - 1.0 / 120.0).abs() < 1.0e-6);
+        let first = deterministic_gravity_displacement([0.0, -9.81, 0.0], 0.75, step);
+        let unrelated = deterministic_gravity_displacement([0.0, -9.81, 0.0], 1.25, step);
+        let repeated = deterministic_gravity_displacement([0.0, -9.81, 0.0], 0.75, step);
+        assert_eq!(first, repeated);
+        assert!(unrelated[1] < first[1]);
+    }
+
+    #[test]
+    fn finite_surface_rejects_points_beyond_its_box_footprint() {
+        let floor = ResolvedSceneSurface {
+            height: 0.0,
+            centroid: [0.0, 0.0, 0.0],
+            bounds_min: [-2.0, -0.2, -3.0],
+            bounds_max: [2.0, 0.0, 3.0],
+            normal: [0.0, 1.0, 0.0],
+        };
+        assert!(scene_surface_contains_xz(&floor, [1.99, 10.0, -2.99]));
+        assert!(!scene_surface_contains_xz(&floor, [2.1, -10.0, 0.0]));
+        assert!(!scene_surface_contains_xz(&floor, [0.0, 0.0, 3.1]));
+    }
+
+    #[test]
+    fn environment_bounds_prefers_precomputed_transformed_hint() {
+        let resolver = MemoryAssetResolver::new();
+        let expected = ([-12.5_f32, -0.25, -3.75], [11.0_f32, 10.5, 4.75]);
+        let mut payload = Vec::with_capacity(24);
+        for value in expected.0.into_iter().chain(expected.1) {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        resolver.insert(
+            "__motionloom_environment_bounds__:ship.glb".to_string(),
+            payload,
+        );
+
+        assert_eq!(
+            load_environment_bounds("ship.glb", &resolver),
+            Some(expected)
+        );
+    }
 
     #[test]
     fn global_process_liveness_skips_scene_scoped_effect_passes() {
@@ -17344,6 +20008,46 @@ mod tests {
     }
 
     #[test]
+    fn semantic_surface_plane_uses_only_authored_bounds() {
+        let surface = ResolvedSceneSurface {
+            height: 1.25,
+            centroid: [0.0, 1.25, 0.0],
+            bounds_min: [-3.0, 1.2, -2.0],
+            bounds_max: [4.0, 1.3, 5.0],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let triangles = semantic_surface_triangles(&surface, "plane", None);
+        assert_eq!(triangles.len(), 2);
+        let index = EnvironmentTriangleSpatialIndex::from_scene_triangles(triangles);
+        assert_eq!(
+            raycast_environment_height(&index, 0.0, 0.0, Some(&surface)),
+            Some(1.25)
+        );
+        assert_eq!(
+            raycast_environment_height(&index, 8.0, 0.0, Some(&surface)),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_surface_box_is_a_coarse_closed_obstacle() {
+        let surface = ResolvedSceneSurface {
+            height: 1.0,
+            centroid: [0.0, 0.5, 0.0],
+            bounds_min: [-1.0, 0.0, -2.0],
+            bounds_max: [1.0, 1.0, 2.0],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let triangles = semantic_surface_triangles(&surface, "box", None);
+        assert_eq!(triangles.len(), 12);
+        let index = EnvironmentTriangleSpatialIndex::from_scene_triangles(triangles);
+        assert_eq!(
+            raycast_environment_height(&index, 0.0, 0.0, Some(&surface)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn kinematic_humanoid_capsules_resolve_above_walkable_mesh() {
         let triangles = [
             crate::world::model_inspection::EnvironmentWalkableTriangle {
@@ -17365,14 +20069,540 @@ mod tests {
                 ("head".to_string(), [0.0, 0.28, 0.0]),
             ]),
             actor_scale: 1.0,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
         };
-        let correction = resolve_humanoid_kinematic_translation(&frame, &[environment]);
+        let correction = resolve_humanoid_kinematic_controller(
+            &frame,
+            [0.0, -0.12, 0.0],
+            [0.0, -0.12, 0.0],
+            &[environment],
+            KinematicControllerConfig {
+                profile: HumanoidColliderProfile::Standing,
+                safe_margin: 0.008,
+                floor_snap: 0.0,
+                max_step_height: 0.0,
+                max_slides: 8,
+                sweep_step: 0.04,
+            },
+        )
+        .correction;
         assert!(
             correction[1] > 0.08,
             "expected upward correction: {correction:?}"
         );
         assert!(correction[0].abs() < 0.001);
         assert!(correction[2].abs() < 0.001);
+    }
+
+    #[test]
+    fn action_contact_phase_envelope_is_deterministic_and_bounded() {
+        assert_eq!(action_contact_phase_envelope(0.18, 0.72, 0.1), 0.0);
+        assert_eq!(action_contact_phase_envelope(0.18, 0.72, 0.8), 0.0);
+        assert!(action_contact_phase_envelope(0.18, 0.72, 0.2) > 0.0);
+        assert_eq!(action_contact_phase_envelope(0.18, 0.72, 0.4), 1.0);
+        assert_eq!(
+            action_contact_phase_envelope(0.18, 0.72, 0.4),
+            action_contact_phase_envelope(0.18, 0.72, 0.4)
+        );
+    }
+
+    #[test]
+    fn contact_envelope_scales_single_contact_instead_of_cancelling_out() {
+        let contact = combine_humanoid_contact_samples(
+            &[HumanoidContactSample {
+                correction: [0.0, -1.0, 0.0],
+                authored_weight: 1.0,
+                envelope: 0.16,
+                support: "knee_l".to_string(),
+            }],
+            2.0,
+        );
+        assert!((contact.activation - 0.16).abs() < 1.0e-6);
+        assert_eq!(contact.target_correction, [0.0, -1.0, 0.0]);
+        assert!((contact.correction[1] + 0.16).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn calibrated_ground_probe_uses_bind_pose_sole_offset() {
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            &[
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], [-2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+            ],
+            None,
+            [0.0; 3],
+            [0.0; 3],
+            1.0,
+        ));
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::new(),
+            actor_scale: 1.0,
+            rig_metrics: crate::world::render::Scene3DHumanoidRigMetrics {
+                sole_offset: 0.02,
+                ..Default::default()
+            },
+            action_phases: HashMap::new(),
+        };
+        let probe = probe_humanoid_ground(&frame, [0.0, 0.05, 0.0], &[environment], 0.08, 0.008);
+        assert!(probe.grounded);
+        assert!((probe.gap.unwrap_or_default() - 0.07).abs() < 1.0e-6);
+        assert!((probe.correction[1] + 0.07).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn unified_root_owner_feathers_s72_contact_boundary() {
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::new(),
+            actor_scale: 1.35,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let config = KinematicControllerConfig {
+            profile: HumanoidColliderProfile::Crouched,
+            safe_margin: 0.008,
+            floor_snap: 0.0,
+            max_step_height: 0.0,
+            max_slides: 4,
+            sweep_step: 0.04,
+        };
+        let solve = |phase| {
+            let contact = combine_humanoid_contact_samples(
+                &[HumanoidContactSample {
+                    correction: [0.0, -1.436, 0.0],
+                    authored_weight: 1.0,
+                    envelope: action_contact_phase_envelope(0.18, 0.72, phase),
+                    support: "knee_l".to_string(),
+                }],
+                1.35 * 1.25,
+            );
+            solve_humanoid_root_frame(
+                &frame,
+                [0.0, 0.78, 0.0],
+                [0.0, 0.78, 0.0],
+                [0.0, 0.78, 0.0],
+                None,
+                Some([0.0, 0.0, 0.0]),
+                &contact,
+                &[],
+                config,
+            )
+            .0
+            .final_root
+        };
+        let before = solve(16.0 / 90.0);
+        let entered = solve(17.0 / 90.0);
+        assert!(before[1].abs() < 1.0e-6);
+        assert!((entered[1] - before[1]).abs() < 0.25);
+        assert!(entered[1] < before[1]);
+    }
+
+    #[test]
+    fn kinematic_root_collider_ignores_animated_limb_swing() {
+        let base = HashMap::from([
+            ("hips".to_string(), [0.0, 0.5, 0.0]),
+            ("chest".to_string(), [0.0, 0.9, 0.0]),
+            ("head".to_string(), [0.0, 1.25, 0.0]),
+            ("upper_arm_l".to_string(), [-0.2, 0.9, 0.0]),
+            ("forearm_l".to_string(), [-0.5, 0.75, 0.0]),
+            ("hand_l".to_string(), [-0.7, 0.62, 0.0]),
+            ("upper_arm_r".to_string(), [0.2, 0.9, 0.0]),
+            ("forearm_r".to_string(), [0.5, 0.75, 0.0]),
+            ("hand_r".to_string(), [0.7, 0.62, 0.0]),
+            ("upper_leg_l".to_string(), [-0.12, 0.46, 0.0]),
+            ("lower_leg_l".to_string(), [-0.12, 0.24, 0.0]),
+            ("foot_l".to_string(), [-0.12, 0.04, 0.08]),
+            ("upper_leg_r".to_string(), [0.12, 0.46, 0.0]),
+            ("lower_leg_r".to_string(), [0.12, 0.24, 0.0]),
+            ("foot_r".to_string(), [0.12, 0.04, 0.08]),
+        ]);
+        let mut swung = base.clone();
+        swung.insert("forearm_l".to_string(), [-1.4, 0.2, 0.5]);
+        swung.insert("hand_l".to_string(), [-1.8, 0.05, 0.8]);
+        swung.insert("lower_leg_r".to_string(), [1.1, 0.2, -0.6]);
+        swung.insert("foot_r".to_string(), [1.5, 0.04, -0.9]);
+
+        let base_spheres =
+            humanoid_collision_spheres(&crate::world::render::Scene3DHumanoidFrame {
+                joints: base,
+                actor_scale: 1.0,
+                rig_metrics: Default::default(),
+                action_phases: HashMap::new(),
+            });
+        let swung_spheres =
+            humanoid_collision_spheres(&crate::world::render::Scene3DHumanoidFrame {
+                joints: swung,
+                actor_scale: 1.0,
+                rig_metrics: Default::default(),
+                action_phases: HashMap::new(),
+            });
+
+        assert_eq!(base_spheres.len(), 3);
+        assert_eq!(base_spheres, swung_spheres);
+    }
+
+    #[test]
+    fn kinematic_root_collider_ignores_animated_torso_sway() {
+        let base = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::from([
+                ("hips".to_string(), [1.0, 0.48, 2.0]),
+                ("chest".to_string(), [1.0, 0.86, 2.0]),
+                ("head".to_string(), [1.0, 1.2, 2.0]),
+            ]),
+            actor_scale: 1.0,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let swayed = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::from([
+                ("hips".to_string(), [0.62, 0.55, 2.18]),
+                ("chest".to_string(), [1.42, 0.74, 1.77]),
+                ("head".to_string(), [0.71, 1.38, 2.32]),
+            ]),
+            actor_scale: 1.0,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let root = [1.0, 0.0, 2.0];
+        assert_eq!(
+            humanoid_collision_spheres_for_profile(&base, HumanoidColliderProfile::Standing, root,),
+            humanoid_collision_spheres_for_profile(
+                &swayed,
+                HumanoidColliderProfile::Standing,
+                root,
+            )
+        );
+    }
+
+    #[test]
+    fn swept_kinematic_controller_stops_before_vertical_wall() {
+        let floor = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            &[
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], [-2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[0.5, 0.0, -2.0], [0.5, 2.0, 2.0], [0.5, 2.0, -2.0]],
+                    normal: [-1.0, 0.0, 0.0],
+                },
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[0.5, 0.0, -2.0], [0.5, 0.0, 2.0], [0.5, 2.0, 2.0]],
+                    normal: [-1.0, 0.0, 0.0],
+                },
+            ],
+            None,
+            [0.0; 3],
+            [0.0; 3],
+            1.0,
+        ));
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::from([
+                ("hips".to_string(), [0.8, 0.52, 0.0]),
+                ("chest".to_string(), [0.8, 0.92, 0.0]),
+                ("head".to_string(), [0.8, 1.28, 0.0]),
+            ]),
+            actor_scale: 1.0,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let config = KinematicControllerConfig {
+            profile: HumanoidColliderProfile::Standing,
+            safe_margin: 0.008,
+            floor_snap: 0.08,
+            max_step_height: 0.0,
+            max_slides: 4,
+            sweep_step: 0.04,
+        };
+        let report = resolve_humanoid_kinematic_controller(
+            &frame,
+            [0.0, 0.0, 0.0],
+            [0.8, 0.0, 0.0],
+            &[floor],
+            config,
+        );
+        assert!(report.resolved_root[0] < 0.5);
+        assert!(report.contacts > 0);
+    }
+
+    #[test]
+    fn kinematic_controller_steps_onto_reachable_solid_top() {
+        let floor = ResolvedSceneSurface {
+            height: 0.0,
+            centroid: [0.0, -0.05, 0.0],
+            bounds_min: [-2.0, -0.1, -2.0],
+            bounds_max: [2.0, 0.0, 2.0],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let step = ResolvedSceneSurface {
+            height: 0.32,
+            centroid: [0.0, 0.16, 0.0],
+            bounds_min: [-1.0, 0.0, -0.5],
+            bounds_max: [1.0, 0.32, 0.5],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let mut triangles = semantic_box_triangles(&floor);
+        triangles.extend(semantic_box_triangles(&step));
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::from_scene_triangles(
+            triangles,
+        ));
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::new(),
+            actor_scale: 1.0,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let report = resolve_humanoid_kinematic_controller(
+            &frame,
+            [0.0, 0.0, 0.8],
+            [0.0, 0.0, 0.4],
+            &[environment],
+            KinematicControllerConfig {
+                profile: HumanoidColliderProfile::Standing,
+                safe_margin: 0.008,
+                floor_snap: 0.08,
+                max_step_height: 0.4,
+                max_slides: 4,
+                sweep_step: 0.04,
+            },
+        );
+        assert!((report.resolved_root[1] - 0.32).abs() < 0.02, "{report:?}");
+        assert!((report.resolved_root[2] - 0.4).abs() < 0.03, "{report:?}");
+    }
+
+    #[test]
+    fn random_access_controller_recovers_connected_mid_stair_height() {
+        let ground = ResolvedSceneSurface {
+            height: 0.0,
+            centroid: [0.0, -0.05, 0.0],
+            bounds_min: [-3.0, -0.1, -3.0],
+            bounds_max: [3.0, 0.0, 6.0],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let mut triangles = semantic_box_triangles(&ground);
+        for index in 0..6 {
+            let top = 0.32 * (index + 1) as f32;
+            let center_z = 3.8 - index as f32 * 0.75;
+            triangles.extend(semantic_box_triangles(&ResolvedSceneSurface {
+                height: top,
+                centroid: [0.0, top - 0.16, center_z],
+                bounds_min: [-2.2, 0.0, center_z - 0.45],
+                bounds_max: [2.2, top, center_z + 0.45],
+                normal: [0.0, 1.0, 0.0],
+            }));
+        }
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::from_scene_triangles(
+            triangles,
+        ));
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::new(),
+            actor_scale: 1.8,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let report = resolve_humanoid_kinematic_controller(
+            &frame,
+            [-0.15, 0.03, 0.15],
+            [-0.15, 0.03, 0.07],
+            &[environment],
+            KinematicControllerConfig {
+                profile: HumanoidColliderProfile::Standing,
+                safe_margin: 0.008,
+                floor_snap: 0.08,
+                max_step_height: 0.684,
+                max_slides: 4,
+                sweep_step: 0.04,
+            },
+        );
+        assert!((report.resolved_root[1] - 1.92).abs() < 0.02, "{report:?}");
+    }
+
+    #[test]
+    fn explicit_box_collider_is_independent_from_sphere_visual_bounds() {
+        let asset = crate::dsl::PrimitiveAssetNode {
+            id: "visual_sphere".to_string(),
+            geometry: crate::dsl::PrimitiveGeometry::Sphere {
+                radius: 0.25,
+                segments: 8,
+                rings: 4,
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: crate::dsl::PrimitiveCollisionNode {
+                mode: crate::dsl::PrimitiveCollisionMode::Solid,
+                collider: crate::dsl::PrimitiveColliderShape::Box,
+                size: Some(vec![2.0, 4.0, 6.0]),
+                ..Default::default()
+            },
+        };
+        let triangles = primitive_collision_triangles(&asset, [1.0, 2.0, 3.0], [0.0; 3], 1.0);
+        let minimum = std::array::from_fn::<_, 3, _>(|axis| {
+            triangles
+                .iter()
+                .flat_map(|triangle| triangle.points)
+                .map(|point| point[axis])
+                .fold(f32::INFINITY, f32::min)
+        });
+        let maximum = std::array::from_fn::<_, 3, _>(|axis| {
+            triangles
+                .iter()
+                .flat_map(|triangle| triangle.points)
+                .map(|point| point[axis])
+                .fold(f32::NEG_INFINITY, f32::max)
+        });
+        assert_eq!(minimum, [0.0, 0.0, 0.0]);
+        assert_eq!(maximum, [2.0, 4.0, 6.0]);
+        assert_eq!(
+            primitive_rigid_collider_spec(&asset, 1.0),
+            (
+                crate::simulation::model::RigidBodyShape::Box,
+                [2.0, 4.0, 6.0]
+            )
+        );
+    }
+
+    #[test]
+    fn kinematic_controller_is_random_access_deterministic() {
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            &[
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], [-2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+            ],
+            None,
+            [0.0; 3],
+            [0.0; 3],
+            1.0,
+        ));
+        let frame = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::from([
+                ("hips".to_string(), [0.4, 0.47, 0.2]),
+                ("chest".to_string(), [0.4, 0.87, 0.2]),
+                ("head".to_string(), [0.4, 1.22, 0.2]),
+            ]),
+            actor_scale: 1.0,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::new(),
+        };
+        let config = KinematicControllerConfig {
+            profile: HumanoidColliderProfile::Standing,
+            safe_margin: 0.008,
+            floor_snap: 0.08,
+            max_step_height: 0.0,
+            max_slides: 4,
+            sweep_step: 0.04,
+        };
+        let a = resolve_humanoid_kinematic_controller(
+            &frame,
+            [0.35, 0.0, 0.2],
+            [0.4, 0.0, 0.2],
+            &[Arc::clone(&environment)],
+            config,
+        );
+        let b = resolve_humanoid_kinematic_controller(
+            &frame,
+            [0.35, 0.0, 0.2],
+            [0.4, 0.0, 0.2],
+            &[environment],
+            config,
+        );
+        assert_eq!(a.resolved_root, b.resolved_root);
+        assert_eq!(a.correction, b.correction);
+        assert_eq!(a.contacts, b.contacts);
+    }
+
+    #[test]
+    fn action_markers_drive_motion_warp_and_auto_profile() {
+        let action = crate::scene::dsl::ActionNode {
+            id: "vault".to_string(),
+            source: Some("clip".to_string()),
+            clip: None,
+            source_profile: None,
+            skeleton: Some("humanoid_v1".to_string()),
+            duration_ms: 3_000,
+            poses: Vec::new(),
+            iks: Vec::new(),
+            markers: vec![
+                crate::scene::dsl::ActionMarkerNode {
+                    id: "takeoff".to_string(),
+                    time_ms: 600,
+                    role: Some("takeoff".to_string()),
+                },
+                crate::scene::dsl::ActionMarkerNode {
+                    id: "contact".to_string(),
+                    time_ms: 1_400,
+                    role: Some("contact".to_string()),
+                },
+                crate::scene::dsl::ActionMarkerNode {
+                    id: "landing".to_string(),
+                    time_ms: 2_300,
+                    role: Some("landing".to_string()),
+                },
+            ],
+            contacts: Vec::new(),
+        };
+        let apply = crate::scene::dsl::ApplyActionNode {
+            target: "hero".to_string(),
+            action: "vault".to_string(),
+            at_ms: 0,
+            r#loop: false,
+            weight: "1".to_string(),
+            speed: "1".to_string(),
+            blend_in: "0".to_string(),
+            blend_out: "0".to_string(),
+            mode: "override".to_string(),
+            mask: Vec::new(),
+            duration_ms: Some(3_000),
+            root_motion: Some("match_target".to_string()),
+            destination: Some("landing".to_string()),
+            takeoff: Some("takeoff".to_string()),
+            contact: Some("contact".to_string()),
+            landing: Some("landing".to_string()),
+            face: None,
+            sync_group: None,
+            sync_marker: None,
+            ground: None,
+            contact_correction: None,
+            ground_offset: "0".to_string(),
+            foot_lock: Some("auto".to_string()),
+            collider_profile: Some("auto".to_string()),
+            safe_margin: "0.008".to_string(),
+            floor_snap: "0.08".to_string(),
+            max_slides: 4,
+            sweep_step: "0.04".to_string(),
+        };
+        let anchors = HashMap::from([
+            ("takeoff".to_string(), [0.0, 0.0, 0.0]),
+            ("contact".to_string(), [1.0, 0.7, 0.0]),
+            ("landing".to_string(), [2.0, 0.0, 0.0]),
+        ]);
+        assert_eq!(
+            match_target_action_position([0.0; 3], &apply, Some(&action), &anchors, 1.4, 3_000),
+            [1.0, 0.7, 0.0]
+        );
+        assert_eq!(
+            action_collider_profile(Some(&apply), Some(&action), 1.5, 3_000),
+            HumanoidColliderProfile::Rolling
+        );
     }
 
     fn max_rgb(image: &image::RgbaImage) -> u8 {
@@ -17390,14 +20620,15 @@ mod tests {
     #[test]
     fn scene_active_camera_animation_selects_existing_camera_ids() {
         let graph = parse_graph_script(
-            r#"<Graph fps={30} duration="2s" size={[640,360]}>
+            r#"<Graph fps={30} duration="3s" size={[640,360]}>
   <Scene id="main">
     <Timeline>
       <Track space="3d">
-        <Sequence duration="2s">
+        <Sequence duration="3s">
           <CompositeGroup id="stage" space="3d" depth="true">
             <Camera3D id="wide" position={[0,1,8]} target={[0,1,0]} />
             <Camera3D id="close" position={[0,1,3]} target={[0,1,0]} />
+            <Camera3D id="detail" position={[0,1,1]} target={[0,1,0]} />
           </CompositeGroup>
         </Sequence>
       </Track>
@@ -17406,6 +20637,7 @@ mod tests {
   <AnimationTarget node="main" property="activeCamera">
     <Key time="0s" value="wide" />
     <Key time="1s" value="close" />
+    <Key time="2s" value="detail" />
   </AnimationTarget>
   <Present from="main" />
 </Graph>"#,
@@ -22665,6 +25897,50 @@ mod tests {
                 return;
             }
             Err(err) => panic!("unexpected mixed Scene GPU render error: {err}"),
+        };
+
+        assert_eq!(gpu_texture.width, 64);
+        assert_eq!(gpu_texture.height, 48);
+        assert_eq!(gpu_texture.format, wgpu::TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn primitive_asset_3d_island_stays_on_shared_gpu_texture_path() {
+        let mut renderer = pollster::block_on(SceneRenderer::new(SceneRenderProfile::Gpu)).unwrap();
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[64,48]}>
+  <Assets>
+    <PrimitiveAsset id="test_sphere" shape="sphere" radius="0.75"
+                    segments="12" rings="6" color="#FF6B6B" />
+  </Assets>
+  <Background color="#080C16" />
+  <Scene id="primitive_scene">
+    <Timeline>
+      <Track id="three_d" space="3d">
+        <Sequence from="0s" duration="1s">
+          <CompositeGroup id="island" space="3d" depth="true" format="rgba16f">
+            <Camera3D position={[0,0,4]} target={[0,0,0]} />
+            <Model id="sphere" asset="test_sphere" />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="primitive_scene" />
+</Graph>
+"##,
+        )
+        .expect("typed primitive Scene graph parse");
+
+        let gpu_texture = match pollster::block_on(renderer.render_frame_to_wgpu_texture(&graph, 0))
+        {
+            Ok(texture) => texture,
+            Err(SceneRenderError::GpuRender { message }) => {
+                skip_gpu_texture_test(message);
+                return;
+            }
+            Err(err) => panic!("unexpected typed primitive GPU render error: {err}"),
         };
 
         assert_eq!(gpu_texture.width, 64);

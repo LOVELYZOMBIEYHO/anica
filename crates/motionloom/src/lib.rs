@@ -125,9 +125,10 @@ pub use asset::{AssetResolver, AssetSource, MemoryAssetResolver, PathAssetResolv
 pub use authoring::{
     AuthoringDiagnostic, AuthoringDiagnosticSeverity, AuthoringStatus, AuthoringSuggestion,
     AuthoringSummary, EffectiveGraphSummary, MotionLoomAuthoringReport, MotionLoomShowcaseSchema,
-    ShowcaseAttributeSchema, ShowcaseTagSchema, analyze_motionloom_script,
-    analyze_motionloom_script_for_target, motionloom_analyze_script_for_target_json,
-    motionloom_analyze_script_json, motionloom_showcase_schema_json,
+    PrimitiveAuthoringSummary, ShowcaseAttributeSchema, ShowcaseTagSchema,
+    ShowcaseTagVariantSchema, analyze_motionloom_script, analyze_motionloom_script_for_target,
+    motionloom_analyze_script_for_target_json, motionloom_analyze_script_json,
+    motionloom_dsl_schema_json, motionloom_showcase_schema_json,
 };
 pub use compat::{
     GpuCompatibilityIssue, GpuCompatibilityReport, GpuCompatibilitySeverity,
@@ -141,18 +142,20 @@ pub use render_graph::{
 
 pub use common::keyframe::ScalarKeyframe;
 pub use dsl::{
-    ActionBoneNode, ActionNode, ActionPoseNode, AnimationKeyNode, AnimationTargetNode,
-    ApplyActionNode, BackgroundNode, GraphAssetKind, GraphAssetNode, GraphScript, ImageNode,
-    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
-    ModelProfileRetargetMapNode, ModelProfileRetargetNode, ProcessDefinitionNode, SkeletonBoneNode,
-    SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode, SkeletonLandmarkNode,
-    SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode,
-    is_graph_script, parse_graph_script,
+    ActionBoneNode, ActionContactNode, ActionNode, ActionPoseNode, AnimationKeyNode,
+    AnimationTargetNode, ApplyActionNode, BackgroundNode, GraphAssetKind, GraphAssetNode,
+    GraphAssetSource, GraphScript, ImageNode, ModelProfileBoneAxisMapNode,
+    ModelProfileBoneAxisNode, ModelProfileNode, ModelProfileRetargetMapNode,
+    ModelProfileRetargetNode, PrimitiveAssetNode, PrimitiveGeometry, ProcessDefinitionNode,
+    SkeletonBoneNode, SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode,
+    SkeletonLandmarkNode, SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode,
+    SvgNode, is_graph_script, parse_graph_script,
 };
 pub use error::{GraphParseError, MotionLoomError, RootGraphError, RuntimeCompileError};
 pub use preview::{
     WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewEngineError, WgpuPreviewFrame,
-    WgpuPreviewGraphCache, WgpuPreviewPreloadReport, WgpuPreviewQuality,
+    WgpuPreviewGraphCache, WgpuPreviewPreloadProgress, WgpuPreviewPreloadReport,
+    WgpuPreviewPreloadSession, WgpuPreviewQuality,
 };
 pub use preview_protocol::{
     PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,

@@ -1,6 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
-use motionloom::{SceneRenderProfile, render_motionloom_document_to_video_with_progress};
+use motionloom::{
+    SceneRenderProfile, render_motionloom_document_to_video_with_progress, set_scene_asset_roots,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args().nth(1).expect("expected MotionLoom file path");
@@ -18,6 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "tools/runtime/current/macos/ffmpeg/bin/ffmpeg".to_string());
 
     let script = fs::read_to_string(&path)?;
+    if let Some(parent) = PathBuf::from(&path).parent() {
+        set_scene_asset_roots(vec![parent.to_path_buf()]);
+    }
     pollster::block_on(render_motionloom_document_to_video_with_progress(
         &ffmpeg,
         &script,

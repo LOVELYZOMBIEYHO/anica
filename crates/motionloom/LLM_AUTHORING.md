@@ -44,8 +44,11 @@ animation properties, and asset kinds demonstrated by that example.
 
 The per-showcase schema is a learning aid, not the complete engine schema. An
 attribute absent from one showcase is not necessarily unsupported globally.
-Query the engine capability APIs when introducing syntax not demonstrated by
-the selected examples.
+Call `motionloom_dsl_schema_json()` when introducing syntax not demonstrated
+by the selected examples. Browser agents use the WASM export with the same
+name; native agents use the Rust API. It returns the complete registered tag
+and attribute catalog, validation coverage, expression support, and
+AnimationTarget capability without requiring a JSON-authored MotionLoom file.
 
 **Output:** the relevant demonstrated syntax plus any engine capabilities that
 must be queried separately.
@@ -252,6 +255,239 @@ in browser and Desktop hosts. Browser hosts preload URL bytes; native hosts
 fetch and cache them. Prefer a self-contained `.glb`, and do not rewrite a
 portable URL to a machine-specific absolute path.
 
+Use `PrimitiveAsset` for reusable engine-generated geometry. It is an asset
+resource and only enters the Scene through `Model`:
+
+```xml
+<Assets>
+  <ImageAsset id="stone_color" src="stone.jpg" colorSpace="srgb" />
+  <MaterialAsset id="stone" shading="pbr" baseColorTexture="stone_color"
+                 metallic="0" roughness="0.84" mapping="triplanar"
+                 textureScale={[0.3,0.3]} variationAmount={[0.2,0.15]} />
+  <PrimitiveAsset id="ball" shape="sphere" radius="0.5"
+                  segments="32" color="#50E3E6" />
+  <PrimitiveAsset id="ground" shape="plane" size={[12,8]}
+                  color="#131B2E" collision="solid" />
+  <PrimitiveAsset id="stone_step" shape="box" size={[4,0.3,0.9]}
+                  material="stone" bevelRadius="0.025" bevelSegments="3"
+                  collision="solid" collider="box" />
+  <PrimitiveAsset id="trigger" shape="sphere" radius="1"
+                  collision="sensor" collider="box" colliderSize={[2,2,2]} />
+  <CompoundAsset id="two_steps">
+    <Instance id="lower" asset="ground" position={[0,0,0]} />
+    <Instance id="upper" asset="ground" position={[0,0.3,-1]} scale="0.8" />
+  </CompoundAsset>
+</Assets>
+
+<Model id="ball_model" asset="ball" position={[0,4,0]} />
+<RigidBody id="ball_body" target="ball_model" dimension="3d"
+           type="dynamic" shape="auto" mass="1" />
+```
+
+V1 shapes are `box`, `sphere`, `plane`, `cylinder`, `cone`, and `wedge`.
+Dimensions must be positive, tessellation attributes accept 3 through 256,
+and colors use `#RRGGBB` or `#RRGGBBAA`. Dynamic planes are invalid; use a
+static plane or a thin box. The removed `motionloom:box` source shorthand is
+not accepted.
+
+Primitive collision defaults to `collision="none"`. Use `solid` for blocking
+geometry or `sensor` for non-blocking contact metadata. When collision is enabled,
+`collider` defaults to `auto` and follows the visual shape; an explicit `box`,
+`sphere`, `plane`, `cylinder`, `cone`, `convex`, or `mesh` may intentionally
+differ from it. Collider dimensions can be overridden with `colliderSize`,
+`colliderRadius`, `colliderHeight`, `colliderScale`, `colliderOffset`,
+`colliderRotation`, and `colliderMargin`. `CompoundAsset` V1 composes only
+`PrimitiveAsset` instances, preserving each child's visual and collision data.
+Use `MaterialAsset`, not Scene-local `Defs/Material` or `MaterialBinding`, for
+physical primitive surfaces. Supported PBR slots are `baseColorTexture`,
+`metallicRoughnessTexture`, `normalTexture`, `occlusionTexture`, and
+`emissiveTexture`; every slot references an `ImageAsset`. `mapping` accepts
+`uv`, `box`, or `triplanar`. Box `bevelRadius`/`bevelSegments` affect only the
+render mesh. Optional `materialSeed` on a primitive, compound, or instance
+changes UV sampling deterministically and never changes geometry or collision.
+It also does not create another texture or mesh resource: instance seeds are
+shader parameters, while geometry, decoded ImageAsset pixels, and GPU textures
+remain shared. Prefer one ImageAsset/MaterialAsset reused by many instances;
+duplicating image declarations with different source strings prevents source
+identity sharing.
+
+For architectural glass, water, or transparent plastic, prefer physical
+transmission over lowering base-colour alpha:
+
+```xml
+<MaterialAsset id="glass" shading="pbr" baseColor="#E8F7FA"
+  roughness="0.08" specular="1" transmission="0.94" ior="1.52"
+  thickness="0.012" attenuationColor="#B7DDE2" attenuationDistance="6"
+  depthWrite="auto" doubleSided="true" />
+```
+
+Keep `depthWrite="auto"` unless a specialist effect deliberately owns depth.
+The renderer draws opaque/mask geometry first, then sorts blend/transmissive
+surfaces far-to-near without depth writes. `sortPriority` is an integer expert
+override for unavoidable overlapping transparent meshes. Material transmission
+and PrimitiveAsset collision remain independent.
+
+### Cinematic 3D lighting and HDRI/IBL
+
+Keep lighting inside the same `CompositeGroup space="3d"` as the camera and
+models. `EnvironmentLight` accepts an `ImageAsset` containing Radiance `.hdr`,
+OpenEXR `.exr`, or an LDR image. HDR/EXR inputs remain linear and are uploaded
+as a floating-point mip chain; LDR inputs are converted from display gamma.
+
+```xml
+<Assets>
+  <ImageAsset id="courtyard_hdri" src="assets/courtyard.hdr" />
+</Assets>
+
+<CompositeGroup id="lit_stage" space="3d" depth="true" format="rgba16f">
+  <EnvironmentLight id="ibl" asset="courtyard_hdri"
+                    mapping="equirectangular" rotationY="25"
+                    intensity="1" visible="true"
+                    backgroundIntensity="0.7" backgroundBlur="0.1"
+                    diffuseIntensity="0.85" specularIntensity="1.25" />
+  <DirectionalLight id="sun" direction={[-0.4,-1,-0.3]}
+                    color="#FFE3BC" intensity="3.5"
+                    castShadow="true" shadowStrength="0.9" />
+  <PointLight id="lamp" position={[2,2,1]}
+              color="#FF8A58" intensity="18" range="8" />
+  <SpotLight id="rim" position={[-2,3,-1]} direction={[0.5,-0.7,0.5]}
+             color="#78D4FF" intensity="24" range="10"
+             innerCone="18" outerCone="34" />
+  <RectAreaLight id="softbox" position={[0,4,3]}
+                 direction={[0,-0.8,-0.6]} intensity="8"
+                 width="3" height="2" />
+  <AmbientOcclusion id="ao" intensity="0.65" radius="1.2" />
+  <ContactShadow id="contact" intensity="0.8"
+                 distance="0.35" softness="0.6" />
+  <ColorManagement id="grade" toneMapping="aces" exposure="1"
+                   whiteBalance="5600" contrast="1.06" />
+  <Camera3D position={[6,4,8]} target={[0,1,0]} fov="38" />
+  <Model asset="hero" castShadow="true" receiveShadow="true" />
+</CompositeGroup>
+```
+
+`backgroundIntensity` changes only the visible environment;
+`diffuseIntensity` and `specularIntensity` control IBL on materials. Rough
+surfaces automatically sample blurrier environment mip levels. The first
+shadow-casting authored light supplies the primary filtered shadow map; do not
+mark every light as a shadow caster merely because it is bright.
+
+Use `toneMapping="aces"` for cinematic HDR output, `reinhard` for a softer
+technical preview, and `none` only when the host owns the final HDR transform.
+Lighting and grading values such as `rotationY`, `intensity`, `exposure`,
+`whiteBalance`, and `contrast` are registered `AnimationTarget` channels.
+Query the animation property schema before writing keys rather than inventing
+properties.
+
+### Deterministic humanoid traversal
+
+For a simple finite flat stage, declare a procedural box Surface and opt a
+kinematic humanoid into Scene gravity:
+
+```xml
+<CompositeGroup id="stage" space="3d" depth="true">
+  <Physics gravity={[0,-9.81,0]} fixedStep="1/120s" iterations="4" />
+  <Surface id="floor" kind="ground" collider="box"
+           center={[0,-0.1,0]} size={[20,0.2,20]} color="#202838" />
+  <Model id="hero" asset="hero_asset" profile="hero_profile"
+         position={[0,5,0]} collision="kinematic"
+         gravity="scene" ground="floor" />
+</CompositeGroup>
+```
+
+The Surface is both visible GPU geometry and finite collision geometry. Gravity
+is evaluated from absolute time with a fixed step, so frame 60 is identical
+whether frames 0–59 were rendered first or not. A character outside the
+Surface's X/Z bounds continues falling. Omit `<Physics>` and Model `gravity` to
+retain existing authored placement exactly.
+
+### Unified rigid bodies
+
+Use only `<RigidBody>`. Both `dimension` and `type` are required; the removed
+`RigidBody2D` spelling is invalid and must not be generated.
+
+For 3D Models, `scaleMode="none"` is the default and preserves the glTF local
+origin and authored units. Use this for rigid bodies so the visible mesh and
+collider share one Transform3D. Only write `scaleMode="normalize_height"` for
+characters or imported product models whose `scale` intentionally means a
+target world height and whose origin should be bottom-centred.
+
+```xml
+<!-- A 2D body binds to a Group in a Layer. -->
+<RigidBody id="card_body" target="card"
+           dimension="2d" type="dynamic" shape="box"
+           size={[180,96]} velocity={[80,0]} gravity={[0,180]} />
+
+<!-- A 3D body binds to a Model in the same CompositeGroup. -->
+<Physics gravity={[0,-9.81,0]} fixedStep="1/120s" iterations="4" />
+<RigidBody id="crate_body" target="crate"
+           dimension="3d" type="dynamic" shape="box"
+           size={[1,1,1]} mass="2" friction="0.6"
+           rollingFriction="0.08" restitution="0.2"
+           restitutionThreshold="0.5" sleep="true"
+           sleepLinearThreshold="0.015"
+           sleepAngularThreshold="0.025" sleepTime="0.5" />
+```
+
+`static` bodies do not move, `dynamic` bodies integrate gravity and collide,
+and `kinematic` bodies follow authored transforms while acting as colliders.
+Use `size` for box/auto/convex proxy dimensions, `radius` for sphere/capsule,
+and `height` for capsule/cylinder. 2D vectors contain two numbers; 3D vectors
+contain three. A dynamic concave `shape="mesh"` is rejected; use
+`shape="convexHull"` or a compound set of simple bodies.
+
+`gravity` on a 2D body is local to that body. A 3D body must not declare
+`gravity`; all 3D bodies use the containing Scene's `<Physics gravity>`.
+This prevents LLM-authored objects in one Scene from silently using different
+world forces.
+
+For 3D bodies, `friction` resists sliding while `rollingFriction` removes
+residual angular motion at supported contacts. `restitutionThreshold` disables
+bounce below the specified impact speed. Sleeping requires both linear speed
+below `sleepLinearThreshold` and angular speed below `sleepAngularThreshold`
+for the full `sleepTime`; do not use `sleep="false"` for ordinary props that
+should eventually rest.
+
+Do not animate a dynamic body's Model transform and expect both systems to own
+it: physics owns the dynamic transform. Animate a kinematic body when authored
+motion must drive collision. Existing documents without `<RigidBody>` retain
+the previous renderer fast path.
+
+Use `<PhysicsDebug colliders="true" contacts="true" sweep="true"
+corrections="true" />` while diagnosing a Scene. It is the physics-focused
+alias of EnvironmentDebug and does not change simulation results.
+
+Use `collision="kinematic"` on a humanoid `<Model>` when it must move across a
+mesh environment. This is a deterministic character controller rather than a
+rigid-body simulation: it sweeps one stable body collider, slides at contacts,
+snaps to walkable floors, and applies pose-only IK to head, feet, and hands.
+
+For a vault, roll, jump, or climb, put semantic markers on the executable
+`Action` and align them to environment anchors through `ApplyAction`:
+
+```xml
+<Action id="vault" source="vault_clip" sourceProfile="mixamo_humanoid"
+        skeleton="humanoid_v1" duration="3s">
+  <Marker id="takeoff" role="takeoff" time="0.6s" />
+  <Marker id="contact" role="contact" time="1.4s" />
+  <Marker id="landing" role="landing" time="2.3s" />
+</Action>
+
+<ApplyAction target="hero" action="vault" duration="3s"
+             rootMotion="match_target"
+             takeoff="takeoff_anchor" contact="contact_anchor"
+             landing="landing_anchor" destination="landing_anchor"
+             colliderProfile="auto" footLock="auto" />
+```
+
+`colliderProfile="auto"` selects standing, airborne, rolling, and crouched
+shapes from marker time. Advanced scripts may explicitly choose `standing`,
+`crouched`, `airborne`, `rolling`, or `prone`; optional `safeMargin`,
+`floorSnap`, `maxSlides`, and `sweepStep` tune the controller without changing
+the old defaults. Use `<EnvironmentDebug colliders="true" contacts="true"
+sweep="true" corrections="true" />` only while diagnosing a scene because it
+emits a structured per-frame kinematic report.
+
 ### Semantic GLB environments
 
 Use `<Environment>` when a static GLB is the stage rather than a character or
@@ -262,9 +498,10 @@ coordinates:
 ```xml
 <CompositeGroup id="stage" space="3d" depth="true">
   <Environment id="roof" asset="roof_asset" static="true"
-               collision="mesh" up="+Y" forward="+Z"
+               collision="surfaces" up="+Y" forward="+Z"
                unitScale="1" scaleMode="normalize_height" scale="8">
     <Surface id="roof_floor" kind="ground" space="asset"
+             collision="true" collider="plane"
              normal={[0,1,0]} centroid={[0,2.4,0]}
              boundsMin={[-4,2.35,-3]} boundsMax={[4,2.45,3]} />
     <Anchor id="takeoff" surface="roof_floor" uv={[0.2,0.5]}
@@ -296,13 +533,22 @@ coordinates:
 
 `Model collision="kinematic"` enables the deterministic Scene character
 controller. MotionLoom samples the current retargeted humanoid pose, auto-fits
-capsules to torso and limb chains, resolves them against every
-`Environment collision="mesh"`, then applies contact correction to hands and
-feet through two-bone IK when the active action uses `footLock="auto"`. The
+the selected humanoid collider profile, resolves it against the enabled
+Environment collision geometry, then applies contact correction when the
+active action uses `footLock="auto"`. The
 solve uses a fixed iteration count, so preview, export and random-access frame
 rendering agree. Omit `collision` (or use `none`) to preserve the original
 animation exactly. Kinematic collision prevents penetration; it does not add
 ragdoll dynamics, forces, bounce, cloth, or rigid-body simulation.
+
+Use `Environment collision="surfaces"` for detailed or scanned render assets.
+Only nested surfaces with `collision="true"` participate. `collider="plane"`
+creates a finite ground plane from the authored bounds; `collider="box"`
+creates a coarse closed obstacle. `heightfield` and `mesh` filter source
+triangles to the selected Surface bounds, with a plane fallback when no source
+triangle is available. This keeps visual tessellation separate from stable
+character collision. Existing `collision="mesh"` retains its original full-GLB
+behavior for collision-ready assets.
 
 Inspect an unfamiliar GLB before writing surfaces or cameras. Native tools can
 call `inspect_glb_environment_path()` or the `inspect_glb_environment` example;
@@ -345,6 +591,31 @@ Scene anchors. The renderer follows the marker timing, preserves airborne
 height between takeoff and landing, and resumes surface grounding after
 landing. Existing Actions without markers and destination-only ApplyAction
 remain valid.
+
+For a reusable kneel, plant, brace, or hand-contact interval, declare
+normalized clip-phase contacts inside the executable `Action`, then bind the
+semantic `ground` target to a concrete Scene `Surface` at application time:
+
+```xml
+<Action id="repair_kneel" source="character_clips" clip="Fixing_Kneeling">
+  <Contact id="left_knee_contact" effector="knee_l" target="ground"
+           from="18%" to="72%" mode="lock" weight="1" />
+  <Contact id="right_foot_contact" effector="foot_r" target="ground"
+           from="16%" to="76%" mode="lock" weight="0.9" />
+</Action>
+
+<ApplyAction target="technician" action="repair_kneel"
+             ground="ship_deck" contactCorrection="auto" />
+```
+
+Contact percentages refer to the imported GLB clip's normalized time, not the
+Graph or ApplyAction duration. `contactCorrection="auto"` is opt-in and
+requires both a `ground` Surface binding and at least one `<Contact />` on the
+referenced Action. The deterministic solver corrects the actor root first,
+then applies only small residual two-bone IK adjustments to distal hands and
+feet. Knee and elbow contacts use root correction because they are middle
+joints, not two-bone IK endpoints. Actions without contacts retain their
+existing behavior.
 
 `Track space="world"` is a valid 2D Scene coordinate mode.
 
@@ -545,6 +816,26 @@ than introducing a second camera-sequence grammar:
 switch exactly at key times; position, target, and FOV animation continue to
 use the normal `Camera3D` properties.
 
+For a first-person shot, keep the complete actor and attach camera Anchors to
+its canonical `head` bone. `hiddenBones` is camera-local, so a later camera
+automatically sees the complete character again:
+
+```xml
+<Anchor id="eyes" relativeTo="hero" node="head"
+        offset={[0,0.03,0.1]} space="local" />
+<Anchor id="look" relativeTo="hero" node="head"
+        offset={[0,-0.25,2.0]} space="local" />
+<Camera3D id="first_person" position="@eyes" target="@look"
+          hiddenBones={["hero:head"]} fov="60" />
+<Camera3D id="third_person" position={[4,3,6]} target="@eyes" fov="38" />
+```
+
+Each selector is `model_id:canonical_bone`. The selected bone and its skinned
+descendants are omitted only from that camera's view passes. The actor pose,
+collision, animation, other cameras, and shadow-casting geometry are unchanged.
+Prefer this over deleting the GLB or globally hiding a mesh when the timeline
+will return to third-person or close-up coverage.
+
 ## Canonical Process Structure
 
 ```xml
@@ -732,6 +1023,26 @@ Use deterministic scatter when repeated artwork should not form a linear grid:
 - `seed` makes all generated instance transforms reproducible.
 - `Variants.seed` controls choices and `Vary` independently from the Repeat
   seed used for scatter placement.
+
+For deterministic world-space precipitation or atmosphere, reuse `Repeat`
+inside a 3D CompositeGroup:
+
+```xml
+<Repeat id="snow" mode="volume" count="96" seed="42"
+        boundsMin={[-8,0,-8]} boundsMax={[8,10,8]}
+        velocity={[0,-2,0.2]} lifetime="4s"
+        phase="random" respawn="random" scaleRange={[0.7,1.3]}>
+  <Model asset="snowflake" castShadow="false" receiveShadow="false" />
+</Repeat>
+```
+
+- `mode="volume"` only works in `CompositeGroup space="3d"`.
+- It accepts exactly one self-closing `Model` template.
+- `count` and `seed` are literal integers; bounds, velocity, lifetime, phase,
+  respawn, and scale range control a seed-stable 3D lifecycle.
+- Use separate outdoor bounds to exclude sheltered areas. Do not restore a
+  dense screen-space overlay as a substitute for world depth.
+- Existing 2D Repeat distribution and variation syntax is unchanged.
 
 ## Declarative Scene Layout
 

@@ -47,6 +47,17 @@ scene/process composition graphs.
 Use this when the caller expects a scene/composition graph and wants typed
 control over rendering.
 
+`GraphAssetSource`, `MaterialAssetNode`, `PrimitiveAssetNode`, `PrimitiveGeometry`,
+`PrimitiveCollisionNode`, and `CompoundAssetNode` expose the typed asset
+representation used by generated geometry. External GLB, individual
+primitives, and compound primitive assets remain distinct through parsing and
+asset resolution. A resolved PrimitiveAsset retains its referenced PBR
+MaterialAsset so native and WASM world renderers consume the same self-contained
+material definition after CompoundAsset expansion.
+`MaterialAssetNode` also carries transmissive PBR controls (`transmission`,
+`ior`, optical `thickness`, attenuation, depth-write policy, and sort priority)
+without coupling the visual material to PrimitiveAsset collision.
+
 ### `parse_process_graph_script`
 
 ```rust
@@ -174,6 +185,22 @@ render_scene_graph_to_video_with_progress(
 Exports an already parsed scene/composition graph to video.
 
 Use this when the caller already knows the graph is scene/composition content.
+
+## Scene 3D Lighting Contract
+
+The public Scene DSL owns 3D lighting; hosts do not need to construct or expose
+legacy World implementation types. A `CompositeGroup space="3d"` accepts:
+
+- `EnvironmentLight` for equirectangular HDR/EXR/LDR backgrounds and IBL
+- `DirectionalLight`, `PointLight`, `SpotLight`, and `RectAreaLight`
+- `AmbientOcclusion` and `ContactShadow`
+- `ColorManagement` with `aces`, `reinhard`, or `none` tone mapping
+
+The renderer caches decoded environments across frames, uploads linear
+RGBA16F mip levels, and evaluates animated light values per frame. The same
+contract is used by `SceneRenderer`, GPU-texture rendering, native export, and
+WASM WebGPU rendering. Existing scenes with no authored light retain the
+legacy studio-light fallback.
 
 ## Process / Layer FX APIs
 
@@ -333,6 +360,27 @@ both high-level preview-surface rendering and caller-owned target-texture
 rendering. Window creation, event loops, keyboard controls, and final
 presentation remain the responsibility of the host.
 
+Interactive hosts can preload incrementally instead of blocking the event loop
+for every representative frame:
+
+```rust
+let mut session = WgpuPreviewEngine::begin_preload_graph_resources(&graph);
+while !session.is_finished() {
+    let progress = engine
+        .preload_graph_resources_step(&graph, &mut session)
+        .await?;
+    present_loading_progress(progress.completed_frames, progress.total_frames);
+}
+let report = session.report();
+```
+
+The existing `preload_graph_resources` convenience method remains available
+and runs the same bounded session to completion. `Scene3DFrameProfile` exposes
+texture decode time/count, decoded bytes, cache hits, retained GPU texture
+resources, asset resolution, geometry preparation, and submission timings.
+Hosts should use these counters to distinguish Cargo compilation, cold asset
+preparation, and steady-state frame cost.
+
 ### Preview host protocol
 
 ```rust
@@ -416,6 +464,14 @@ tooling that needs to inspect or generate UI-editable scene graphs:
   cross-model two-bone `Constraint`, and discrete Scene `activeCamera`
   switching. These features lower into the existing Scene 3D renderer and do
   not restore the removed public `<World>` authoring root.
+- `Camera3D.hiddenBones` accepts typed `model_id:canonical_bone` selectors for
+  first-person coverage. Selecting the canonical `hips` root hides the whole
+  actor color pass for that camera while preserving its shadow pass.
+  Visibility is local to the selected camera's beauty
+  and CPU view passes; the actor remains complete for animation, collision,
+  other cameras, and shadow casting. A camera `Anchor node="head"` samples the
+  final animated, collision-corrected humanoid pose, allowing one actor to
+  remain continuous across first-person, third-person, and close-up cuts.
 - Static GLB stages use the additive `Environment` specialization of `Model`,
   with a declared coordinate profile and nested semantic `Surface` and `Anchor`
   nodes. Surfaces can carry asset-space centroid/bounds/normal evidence; anchors
@@ -473,6 +529,12 @@ status, source-addressed errors and warnings, effective graph facts, and
 recommended repairs. Invalid authored DSL is represented by
 `status: "unrenderable"` rather than a thrown WASM exception.
 
+Use `motionloom_dsl_schema_json()` to retrieve the complete registered DSL
+catalog before generation. Its `requiredAttributes` field makes mandatory
+contracts such as `RigidBody.id`, `target`, `dimension`, and `type` explicit.
+Use `motionloom_showcase_schema_json(script)` only for the smaller syntax slice
+demonstrated by one example.
+
 `motionloom_showcase_schema_json` serves a separate purpose: it extracts the
 language slice demonstrated by one example for dataset learning and generates
 the `schema.json` stored beside that showcase's `main.motionloom`.
@@ -494,6 +556,13 @@ Rust types and functions whose names contain `World` are legacy compatibility
 APIs for Anica internal tools and design/debug surfaces. They are not a current
 DSL authoring surface: `<World>` is invalid. New integrations should parse a
 unified `<Scene>` and place true-3D content in a `space="3d"` track.
+
+`Model.scaleMode` defaults to `none`: rendering, physics and picking preserve
+the same glTF origin and authored units. `normalize_height` is explicit.
+Dynamic RigidBody transforms are physics-owned; a transform AnimationTarget on
+the same Model is an authoring error. The deterministic backend uses quaternion
+orientation, resolved Collider3D data, multi-point manifolds, swept CCD,
+rotational impulses, rolling friction and fixed-step island sleeping.
 
 ## Recommended API Choice
 

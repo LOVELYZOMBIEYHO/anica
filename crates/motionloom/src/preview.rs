@@ -131,6 +131,36 @@ pub struct WgpuPreviewPreloadReport {
     pub asset_declarations: usize,
 }
 
+/// Incremental preload state owned by an interactive host.
+#[derive(Clone, Debug)]
+pub struct WgpuPreviewPreloadSession {
+    sampled_frames: Vec<u32>,
+    next_frame: usize,
+    asset_declarations: usize,
+}
+
+/// Progress emitted after one representative frame has been warmed.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WgpuPreviewPreloadProgress {
+    pub completed_frames: usize,
+    pub total_frames: usize,
+    pub warmed_frame: Option<u32>,
+    pub finished: bool,
+}
+
+impl WgpuPreviewPreloadSession {
+    pub fn is_finished(&self) -> bool {
+        self.next_frame >= self.sampled_frames.len()
+    }
+
+    pub fn report(&self) -> WgpuPreviewPreloadReport {
+        WgpuPreviewPreloadReport {
+            sampled_frames: self.sampled_frames.clone(),
+            asset_declarations: self.asset_declarations,
+        }
+    }
+}
+
 /// Opt-in frame-budget controller for interactive preview hosts.
 ///
 /// It only recommends an existing preview quality; it never mutates a graph or
@@ -390,9 +420,16 @@ impl WgpuPreviewEngine {
         &mut self,
         graph: &GraphScript,
     ) -> Result<WgpuPreviewPreloadReport, WgpuPreviewEngineError> {
-        let Some(renderer) = self.gpu_renderer.as_mut() else {
-            return Err(WgpuPreviewEngineError::NoRenderer);
-        };
+        let mut session = Self::begin_preload_graph_resources(graph);
+        while !session.is_finished() {
+            self.preload_graph_resources_step(graph, &mut session)
+                .await?;
+        }
+        Ok(session.report())
+    }
+
+    /// Build a bounded representative-frame list without touching GPU state.
+    pub fn begin_preload_graph_resources(graph: &GraphScript) -> WgpuPreviewPreloadSession {
         let fps = graph.fps.max(1.0);
         let total_frames = (((graph.duration_ms as f32 / 1000.0) * fps).ceil() as u32).max(1);
         let mut sampled_frames = vec![0];
@@ -416,15 +453,36 @@ impl WgpuPreviewEngine {
         if sampled_frames.len() > 16 {
             sampled_frames.truncate(16);
         }
-        for frame in sampled_frames.iter().copied() {
+        WgpuPreviewPreloadSession {
+            sampled_frames,
+            next_frame: 0,
+            asset_declarations: graph.assets.len(),
+        }
+    }
+
+    /// Warm at most one representative frame so native hosts can return to
+    /// their event loop and paint progress between expensive cold resources.
+    pub async fn preload_graph_resources_step(
+        &mut self,
+        graph: &GraphScript,
+        session: &mut WgpuPreviewPreloadSession,
+    ) -> Result<WgpuPreviewPreloadProgress, WgpuPreviewEngineError> {
+        let Some(renderer) = self.gpu_renderer.as_mut() else {
+            return Err(WgpuPreviewEngineError::NoRenderer);
+        };
+        let warmed_frame = session.sampled_frames.get(session.next_frame).copied();
+        if let Some(frame) = warmed_frame {
             renderer
                 .render_frame_to_wgpu_texture(graph, frame)
                 .await
                 .map_err(WgpuPreviewEngineError::Render)?;
+            session.next_frame += 1;
         }
-        Ok(WgpuPreviewPreloadReport {
-            sampled_frames,
-            asset_declarations: graph.assets.len(),
+        Ok(WgpuPreviewPreloadProgress {
+            completed_frames: session.next_frame,
+            total_frames: session.sampled_frames.len(),
+            warmed_frame,
+            finished: session.is_finished(),
         })
     }
 
@@ -760,6 +818,8 @@ mod tests {
             &mut sampled_frames,
         );
         assert!(sampled_frames.contains(&168));
+        let session = WgpuPreviewEngine::begin_preload_graph_resources(&graph);
+        assert_eq!(session.report().sampled_frames, vec![0, 168]);
     }
 
     #[test]

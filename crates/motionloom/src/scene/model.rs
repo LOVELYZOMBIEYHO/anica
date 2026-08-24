@@ -924,10 +924,37 @@ pub struct CompositeGroupConfig {
     /// Optional id of the Camera3D selected by a discrete AnimationTarget.
     #[serde(default)]
     pub active_camera: Option<String>,
+    /// Optional deterministic physics settings for this 3D island. Absence
+    /// preserves the pre-physics Scene behavior exactly.
+    #[serde(default)]
+    pub physics: Option<ScenePhysicsConfig>,
     /// True-3D declarations are retained as typed compiler data. They lower to
     /// a 3D render island in the unified render-pass DAG.
     #[serde(default)]
     pub nodes_3d: Vec<Scene3DNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScenePhysicsConfig {
+    #[serde(default = "default_scene_physics_gravity")]
+    pub gravity: String,
+    #[serde(default = "default_scene_physics_fixed_step")]
+    pub fixed_step: String,
+    #[serde(default = "default_scene_physics_iterations")]
+    pub iterations: u32,
+}
+
+fn default_scene_physics_gravity() -> String {
+    "[0,-9.81,0]".to_string()
+}
+
+fn default_scene_physics_fixed_step() -> String {
+    "0.008333333".to_string()
+}
+
+fn default_scene_physics_iterations() -> u32 {
+    4
 }
 
 fn default_scene_composite_format() -> String {
@@ -939,9 +966,37 @@ fn default_scene_composite_format() -> String {
 pub enum Scene3DNode {
     Camera(SceneCamera3DNode),
     EnvironmentLight(SceneEnvironmentLightNode),
+    DirectionalLight(SceneDirectionalLightNode),
+    PointLight(ScenePointLightNode),
+    SpotLight(SceneSpotLightNode),
+    RectAreaLight(SceneRectAreaLightNode),
+    AmbientOcclusion(SceneAmbientOcclusionNode),
+    ContactShadow(SceneContactShadowNode),
+    ColorManagement(SceneColorManagementNode),
+    VolumeRepeat(SceneVolumeRepeat3DNode),
     Model(SceneModel3DNode),
+    RigidBody(crate::simulation::model::RigidBodyNode),
     Anchor(SceneAnchor3DNode),
     Debug(SceneEnvironmentDebugNode),
+}
+
+/// Deterministic world-space instances authored with the existing Repeat tag.
+/// The template remains a regular Model so rain, snow, dust, and debris share
+/// one lifecycle without introducing effect-specific scene tags.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneVolumeRepeat3DNode {
+    pub id: Option<String>,
+    pub count: u32,
+    pub seed: u32,
+    pub bounds_min: String,
+    pub bounds_max: String,
+    pub velocity: String,
+    pub lifetime: String,
+    pub phase: String,
+    pub respawn: String,
+    pub scale_range: String,
+    pub template: SceneModel3DNode,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -959,6 +1014,14 @@ pub struct SceneEnvironmentDebugNode {
     pub action_path: bool,
     #[serde(default = "default_scene_bool_true")]
     pub cameras: bool,
+    #[serde(default)]
+    pub colliders: bool,
+    #[serde(default)]
+    pub contacts: bool,
+    #[serde(default)]
+    pub sweep: bool,
+    #[serde(default)]
+    pub corrections: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1005,6 +1068,13 @@ pub struct SceneSurface3DNode {
     pub bounds_min: Option<String>,
     #[serde(default)]
     pub bounds_max: Option<String>,
+    /// Opts this semantic surface into Environment collision="surfaces".
+    #[serde(default)]
+    pub collision: bool,
+    /// Optional collision representation. Ground defaults to plane; obstacle
+    /// and wall surfaces default to box when this value is omitted.
+    #[serde(default)]
+    pub collider: Option<String>,
 }
 
 fn default_scene_surface_kind() -> String {
@@ -1032,6 +1102,17 @@ pub struct SceneCamera3DNode {
     pub roll: String,
     #[serde(default)]
     pub horizon_lock: bool,
+    /// Camera-local bone exclusions affect view passes without mutating the
+    /// actor pose or its shadow-casting geometry.
+    #[serde(default)]
+    pub hidden_bones: Vec<SceneCameraHiddenBoneNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneCameraHiddenBoneNode {
+    pub model: String,
+    pub bone: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1040,6 +1121,172 @@ pub struct SceneEnvironmentLightNode {
     pub id: Option<String>,
     pub asset: String,
     pub intensity: String,
+    #[serde(default = "default_scene_environment_mapping")]
+    pub mapping: String,
+    #[serde(default = "default_scene_zero")]
+    pub rotation_y: String,
+    #[serde(default = "default_scene_bool_true")]
+    pub visible: bool,
+    #[serde(default = "default_scene_one")]
+    pub background_intensity: String,
+    #[serde(default = "default_scene_zero")]
+    pub background_blur: String,
+    #[serde(default = "default_scene_one")]
+    pub diffuse_intensity: String,
+    #[serde(default = "default_scene_one")]
+    pub specular_intensity: String,
+}
+
+fn default_scene_environment_mapping() -> String {
+    "equirectangular".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneDirectionalLightNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_light_direction")]
+    pub direction: String,
+    #[serde(default = "default_scene_light_color")]
+    pub color: String,
+    #[serde(default = "default_scene_one")]
+    pub intensity: String,
+    #[serde(default = "default_scene_bool_true")]
+    pub cast_shadow: bool,
+    #[serde(default = "default_scene_shadow_strength")]
+    pub shadow_strength: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScenePointLightNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_zero_vec3")]
+    pub position: String,
+    #[serde(default = "default_scene_light_color")]
+    pub color: String,
+    #[serde(default = "default_scene_one")]
+    pub intensity: String,
+    #[serde(default = "default_scene_light_range")]
+    pub range: String,
+    #[serde(default)]
+    pub cast_shadow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneSpotLightNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_zero_vec3")]
+    pub position: String,
+    #[serde(default = "default_scene_light_direction")]
+    pub direction: String,
+    #[serde(default = "default_scene_light_color")]
+    pub color: String,
+    #[serde(default = "default_scene_one")]
+    pub intensity: String,
+    #[serde(default = "default_scene_light_range")]
+    pub range: String,
+    #[serde(default = "default_scene_spot_inner")]
+    pub inner_cone: String,
+    #[serde(default = "default_scene_spot_outer")]
+    pub outer_cone: String,
+    #[serde(default)]
+    pub cast_shadow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneRectAreaLightNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_zero_vec3")]
+    pub position: String,
+    #[serde(default = "default_scene_light_direction")]
+    pub direction: String,
+    #[serde(default = "default_scene_light_color")]
+    pub color: String,
+    #[serde(default = "default_scene_one")]
+    pub intensity: String,
+    #[serde(default = "default_scene_area_size")]
+    pub width: String,
+    #[serde(default = "default_scene_area_size")]
+    pub height: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneAmbientOcclusionNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_one")]
+    pub intensity: String,
+    #[serde(default = "default_scene_ao_radius")]
+    pub radius: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneContactShadowNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_shadow_strength")]
+    pub intensity: String,
+    #[serde(default = "default_scene_contact_distance")]
+    pub distance: String,
+    #[serde(default = "default_scene_contact_softness")]
+    pub softness: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneColorManagementNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_tone_mapping")]
+    pub tone_mapping: String,
+    #[serde(default = "default_scene_one")]
+    pub exposure: String,
+    #[serde(default = "default_scene_white_balance")]
+    pub white_balance: String,
+    #[serde(default = "default_scene_one")]
+    pub contrast: String,
+}
+
+fn default_scene_zero_vec3() -> String {
+    "[0,0,0]".to_string()
+}
+fn default_scene_light_direction() -> String {
+    "[-0.4,-1,-0.35]".to_string()
+}
+fn default_scene_light_color() -> String {
+    "#FFFFFF".to_string()
+}
+fn default_scene_light_range() -> String {
+    "10".to_string()
+}
+fn default_scene_spot_inner() -> String {
+    "22".to_string()
+}
+fn default_scene_spot_outer() -> String {
+    "35".to_string()
+}
+fn default_scene_area_size() -> String {
+    "2".to_string()
+}
+fn default_scene_shadow_strength() -> String {
+    "0.8".to_string()
+}
+fn default_scene_ao_radius() -> String {
+    "1".to_string()
+}
+fn default_scene_contact_distance() -> String {
+    "0.25".to_string()
+}
+fn default_scene_contact_softness() -> String {
+    "0.5".to_string()
+}
+fn default_scene_tone_mapping() -> String {
+    "aces".to_string()
+}
+fn default_scene_white_balance() -> String {
+    "6500".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1047,6 +1294,9 @@ pub struct SceneEnvironmentLightNode {
 pub struct SceneModel3DNode {
     pub id: Option<String>,
     pub asset: String,
+    /// Private typed geometry used when Surface lowers through the Model path.
+    #[serde(default)]
+    pub primitive: Option<crate::dsl::PrimitiveAssetNode>,
     /// Optional canonical humanoid profile used to resolve Action bone ids.
     #[serde(default)]
     pub profile: Option<String>,
@@ -1080,6 +1330,13 @@ pub struct SceneModel3DNode {
     pub r#static: bool,
     #[serde(default)]
     pub collision: Option<String>,
+    /// `scene` opts this model into the enclosing Physics gravity vector.
+    /// Missing/`none` keeps all existing authored placement semantics.
+    #[serde(default)]
+    pub gravity: Option<String>,
+    /// Optional finite Surface used as the deterministic landing target.
+    #[serde(default)]
+    pub ground: Option<String>,
     /// Coordinate declaration for environment assets. Defaults match glTF.
     #[serde(default = "default_scene_environment_up")]
     pub up: String,
@@ -1124,7 +1381,7 @@ fn default_scene_environment_forward() -> String {
 }
 
 fn default_scene_environment_scale_mode() -> String {
-    "normalize_height".to_string()
+    "none".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

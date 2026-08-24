@@ -538,7 +538,7 @@ fn normalize3(value: [f32; 3]) -> Option<[f32; 3]> {
     (length > 0.000001).then(|| scale3(value, 1.0 / length))
 }
 
-fn transformed_environment_bounds(
+pub(crate) fn transformed_environment_bounds(
     mesh: &GlbMeshData,
     matrices: &[[f32; 16]],
 ) -> Option<([f32; 3], [f32; 3])> {
@@ -1708,7 +1708,7 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn world_matrices(nodes: &[GlbNodeData]) -> Vec<[f32; 16]> {
+pub(crate) fn world_matrices(nodes: &[GlbNodeData]) -> Vec<[f32; 16]> {
     world_matrices_from_locals(nodes, &node_local_matrices(nodes))
 }
 

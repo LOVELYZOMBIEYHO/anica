@@ -107,6 +107,20 @@ pub struct EffectiveGraphSummary {
     pub animation_targets: usize,
     pub process_passes: usize,
     pub present_from: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primitives: Vec<PrimitiveAuthoringSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveAuthoringSummary {
+    pub id: String,
+    pub shape: String,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+    pub triangles: usize,
+    pub estimated_gpu_bytes: usize,
+    pub inferred_auto_collider: String,
 }
 
 /// One attribute observed in a showcase, enriched with known engine capability data.
@@ -135,7 +149,20 @@ pub struct ShowcaseTagSchema {
     pub occurrences: usize,
     pub recognized: bool,
     pub validation_coverage: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_attributes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, ShowcaseTagVariantSchema>,
     pub attributes: Vec<ShowcaseAttributeSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShowcaseTagVariantSchema {
+    pub required: Vec<String>,
+    pub optional: Vec<String>,
 }
 
 /// Per-showcase schema used by an LLM to learn the syntax actually present in an example.
@@ -306,6 +333,76 @@ pub fn motionloom_showcase_schema_json(script: &str) -> String {
         .expect("MotionLoom showcase schemas are serializable")
 }
 
+/// Serialize the complete registered tag/attribute capability catalog.
+pub fn motionloom_dsl_schema_json() -> String {
+    let tags = KNOWN_TAGS
+        .iter()
+        .filter_map(|name| {
+            let capability = tag_capability(name)?;
+            let attributes = capability
+                .attributes
+                .iter()
+                .map(|attribute_name| {
+                    let descriptor = crate::scene::animation::animation_property_descriptor(
+                        canonical_attribute_name(attribute_name),
+                    );
+                    ShowcaseAttributeSchema {
+                        name: (*attribute_name).to_string(),
+                        occurrences: 0,
+                        examples: Vec::new(),
+                        recognized: true,
+                        canonical_name: Some(canonical_attribute_name(attribute_name).to_string())
+                            .filter(|canonical| canonical != attribute_name),
+                        value_type: descriptor.map(|descriptor| {
+                            format!("{:?}", descriptor.value_type).to_ascii_lowercase()
+                        }),
+                        supports_inline_expression: supports_inline_expression(
+                            name,
+                            attribute_name,
+                        ),
+                        supports_animation_target: Some(descriptor.is_some()),
+                    }
+                })
+                .collect();
+            Some(ShowcaseTagSchema {
+                tag: (*name).to_string(),
+                occurrences: 0,
+                recognized: true,
+                validation_coverage: if capability.open_attributes {
+                    "open".to_string()
+                } else {
+                    "strict".to_string()
+                },
+                required_attributes: required_attributes(name),
+                discriminator: (name == &"PrimitiveAsset").then(|| "shape".to_string()),
+                variants: tag_variants(name),
+                attributes,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&MotionLoomShowcaseSchema {
+        schema_version: SCHEMA_VERSION.to_string(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        root_tag: Some("Graph".to_string()),
+        tags,
+        animation_properties: crate::scene::animation::ANIMATION_PROPERTY_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.path.to_string())
+            .collect(),
+        asset_kinds: vec![
+            "video".to_string(),
+            "image".to_string(),
+            "model".to_string(),
+            "audio".to_string(),
+            "animation".to_string(),
+            "primitive".to_string(),
+            "compound".to_string(),
+            "material".to_string(),
+        ],
+    })
+    .expect("MotionLoom DSL schemas are serializable")
+}
+
 fn lexical_diagnostics(tags: &[ScannedTag]) -> Vec<AuthoringDiagnostic> {
     let mut diagnostics = Vec::new();
     for tag in tags {
@@ -469,18 +566,135 @@ fn append_semantic_diagnostics(
     tags: &[ScannedTag],
     diagnostics: &mut Vec<AuthoringDiagnostic>,
 ) {
-    // EnvironmentLight now feeds the existing Scene 3D PBR exposure bridge.
-    // HDR image sampling is host/backend-dependent, but intensity is no longer
-    // silently ignored and therefore must not be reported as a no-op.
+    // Scene lighting nodes are validated by the parser and feed the retained
+    // PBR renderer, so the authoring report must not classify them as no-ops.
 
     let surface_ids = tags
         .iter()
         .filter(|tag| tag.name == "Surface")
         .filter_map(|tag| attribute_value(tag, "id"))
         .collect::<BTreeSet<_>>();
+
+    // Explicit transparent depth writes are legal for specialist effects but
+    // commonly recreate the exact hidden-character failure that auto avoids.
+    for material in graph
+        .material_assets
+        .iter()
+        .filter(|material| material.transmission > 0.001 && material.depth_write == "true")
+    {
+        diagnostics.push(AuthoringDiagnostic {
+            severity: AuthoringDiagnosticSeverity::Warning,
+            code: "TRANSMISSIVE_DEPTH_WRITE_ENABLED".to_string(),
+            phase: "material-validation".to_string(),
+            line: find_tag_line(tags, "MaterialAsset", Some(&material.id)),
+            column: 1,
+            tag: Some("MaterialAsset".to_string()),
+            node_id: Some(material.id.clone()),
+            attribute: Some("depthWrite".to_string()),
+            authored_value: Some("true".to_string()),
+            effective_value: Some("true".to_string()),
+            message: "A transmissive material explicitly writes depth.".to_string(),
+            effect: "Glass can hide characters or opaque geometry rendered behind it.".to_string(),
+            suggestions: vec![AuthoringSuggestion {
+                kind: "replace-attribute".to_string(),
+                message:
+                    "Use depthWrite=\"auto\" unless the material owns a deliberate depth prepass."
+                        .to_string(),
+                replacement: Some("auto".to_string()),
+                attribute: Some("depthWrite".to_string()),
+                confidence: Some(0.98),
+            }],
+        });
+    }
+
+    // Primitive diagnostics expose costly tessellation and unsafe plane physics with repairs.
+    for asset in graph.assets.iter().filter_map(|asset| asset.primitive()) {
+        let tessellation = match &asset.geometry {
+            crate::dsl::PrimitiveGeometry::Sphere {
+                segments, rings, ..
+            } => (*segments).max(*rings),
+            crate::dsl::PrimitiveGeometry::Plane { segments, .. }
+            | crate::dsl::PrimitiveGeometry::Cylinder { segments, .. }
+            | crate::dsl::PrimitiveGeometry::Cone { segments, .. } => *segments,
+            _ => 0,
+        };
+        if tessellation > 128 {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Warning,
+                code: "PRIMITIVE_HIGH_TESSELLATION".to_string(),
+                phase: "asset-validation".to_string(),
+                line: find_tag_line(tags, "PrimitiveAsset", Some(&asset.id)),
+                column: 1,
+                tag: Some("PrimitiveAsset".to_string()),
+                node_id: Some(asset.id.clone()),
+                attribute: Some("segments".to_string()),
+                authored_value: Some(tessellation.to_string()),
+                effective_value: Some(tessellation.to_string()),
+                message: "Primitive tessellation is valid but unusually high.".to_string(),
+                effect: "CPU generation time, GPU memory, and draw upload cost increase sharply."
+                    .to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "reduce-tessellation".to_string(),
+                    message: "Use 32-64 segments unless a close camera requires more.".to_string(),
+                    replacement: Some("64".to_string()),
+                    attribute: Some("segments".to_string()),
+                    confidence: Some(0.9),
+                }],
+            });
+        }
+    }
+    let model_assets = tags
+        .iter()
+        .filter(|tag| tag.name == "Model")
+        .filter_map(|tag| Some((attribute_value(tag, "id")?, attribute_value(tag, "asset")?)))
+        .collect::<BTreeMap<_, _>>();
+    for body in tags.iter().filter(|tag| {
+        tag.name == "RigidBody" && attribute_value(tag, "type").as_deref() == Some("dynamic")
+    }) {
+        let Some(target) = attribute_value(body, "target") else {
+            continue;
+        };
+        let Some(asset_id) = model_assets.get(&target) else {
+            continue;
+        };
+        let dynamic_plane = graph.assets.iter().any(|asset| {
+            asset.id == *asset_id
+                && asset.primitive().is_some_and(|primitive| {
+                    matches!(
+                        &primitive.geometry,
+                        crate::dsl::PrimitiveGeometry::Plane { .. }
+                    )
+                })
+        });
+        if dynamic_plane {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Error,
+                code: "DYNAMIC_PRIMITIVE_PLANE".to_string(),
+                phase: "physics-validation".to_string(),
+                line: body.line,
+                column: body.column,
+                tag: Some("RigidBody".to_string()),
+                node_id: Some(target),
+                attribute: Some("type".to_string()),
+                authored_value: Some("dynamic".to_string()),
+                effective_value: None,
+                message: "A plane primitive can only use a static RigidBody.".to_string(),
+                effect: "A zero-thickness dynamic plane has no unambiguous collision volume."
+                    .to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "replace-attribute".to_string(),
+                    message: "Set type=\"static\", or use a thin box for a moving body."
+                        .to_string(),
+                    replacement: Some("static".to_string()),
+                    attribute: Some("type".to_string()),
+                    confidence: Some(1.0),
+                }],
+            });
+        }
+    }
     for tag in tags.iter().filter(|tag| tag.name == "Environment") {
         if let Some(collision) = attribute_value(tag, "collision")
-            && !matches!(collision.as_str(), "mesh" | "none" | "bounds")
+            && !matches!(collision.as_str(), "mesh" | "surfaces" | "none" | "bounds")
         {
             diagnostics.push(AuthoringDiagnostic {
                 severity: AuthoringDiagnosticSeverity::Warning,
@@ -493,13 +707,14 @@ fn append_semantic_diagnostics(
                 attribute: Some("collision".to_string()),
                 authored_value: Some(collision),
                 effective_value: Some("none".to_string()),
-                message: "Environment collision must be mesh, bounds, or none.".to_string(),
+                message: "Environment collision must be mesh, surfaces, bounds, or none."
+                    .to_string(),
                 effect: "Grounding and obstacle queries may not use this Environment.".to_string(),
                 suggestions: vec![AuthoringSuggestion {
                     kind: "replace-attribute".to_string(),
-                    message: "Use collision=\"mesh\" for authored environment surfaces."
+                    message: "Use collision=\"surfaces\" for stable semantic collision or collision=\"mesh\" for the complete render mesh."
                         .to_string(),
-                    replacement: Some("mesh".to_string()),
+                    replacement: Some("surfaces".to_string()),
                     attribute: Some("collision".to_string()),
                     confidence: Some(0.98),
                 }],
@@ -573,6 +788,131 @@ fn append_semantic_diagnostics(
             });
         }
     }
+    for tag in tags.iter().filter(|tag| tag.name == "ApplyAction") {
+        if let Some(profile) = attribute_value(tag, "colliderProfile")
+            .or_else(|| attribute_value(tag, "collider_profile"))
+            && !matches!(
+                profile.as_str(),
+                "auto"
+                    | "standing"
+                    | "stand"
+                    | "crouched"
+                    | "crouch"
+                    | "airborne"
+                    | "air"
+                    | "rolling"
+                    | "roll"
+                    | "vault"
+                    | "prone"
+            )
+        {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Warning,
+                code: "ACTION_COLLIDER_PROFILE_UNKNOWN".to_string(),
+                phase: "kinematic-collision".to_string(),
+                line: tag.line,
+                column: tag.column,
+                tag: Some("ApplyAction".to_string()),
+                node_id: attribute_value(tag, "target"),
+                attribute: Some("colliderProfile".to_string()),
+                authored_value: Some(profile),
+                effective_value: Some("auto".to_string()),
+                message: "Unknown humanoid collider profile.".to_string(),
+                effect: "The controller falls back to marker-driven auto profiling.".to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "replace-attribute".to_string(),
+                    message: "Use auto, standing, crouched, airborne, rolling, or prone."
+                        .to_string(),
+                    replacement: Some("auto".to_string()),
+                    attribute: Some("colliderProfile".to_string()),
+                    confidence: Some(0.99),
+                }],
+            });
+        }
+        let has_traversal_anchor = ["takeoff", "contact", "landing"]
+            .iter()
+            .any(|name| attribute_value(tag, name).is_some());
+        if has_traversal_anchor
+            && attribute_value(tag, "rootMotion").as_deref() != Some("match_target")
+        {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Warning,
+                code: "ACTION_TRAVERSAL_REQUIRES_MOTION_WARP".to_string(),
+                phase: "motion-warping".to_string(),
+                line: tag.line,
+                column: tag.column,
+                tag: Some("ApplyAction".to_string()),
+                node_id: attribute_value(tag, "target"),
+                attribute: Some("rootMotion".to_string()),
+                authored_value: attribute_value(tag, "rootMotion"),
+                effective_value: None,
+                message: "Traversal anchors are present but rootMotion is not match_target."
+                    .to_string(),
+                effect: "Takeoff, contact and landing anchors will not drive the actor root."
+                    .to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "replace-attribute".to_string(),
+                    message: "Set rootMotion=\"match_target\" for marker-aligned traversal."
+                        .to_string(),
+                    replacement: Some("match_target".to_string()),
+                    attribute: Some("rootMotion".to_string()),
+                    confidence: Some(0.99),
+                }],
+            });
+        }
+    }
+
+    let dynamic_targets = tags
+        .iter()
+        .filter(|tag| tag.name == "RigidBody")
+        .filter(|tag| attribute_value(tag, "type").as_deref() == Some("dynamic"))
+        .filter_map(|tag| attribute_value(tag, "target"))
+        .collect::<BTreeSet<_>>();
+    for tag in tags.iter().filter(|tag| tag.name == "AnimationTarget") {
+        let Some(node) = attribute_value(tag, "node") else {
+            continue;
+        };
+        let Some(property) = attribute_value(tag, "property") else {
+            continue;
+        };
+        let transform_channel = matches!(
+            property.as_str(),
+            "position"
+                | "positionX"
+                | "positionY"
+                | "positionZ"
+                | "rotation"
+                | "rotationX"
+                | "rotationY"
+                | "rotationZ"
+                | "scale"
+        );
+        if dynamic_targets.contains(&node) && transform_channel {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Error,
+                code: "DYNAMIC_BODY_TRANSFORM_AUTHORITY_CONFLICT".to_string(),
+                phase: "physics-authority".to_string(),
+                line: tag.line,
+                column: tag.column,
+                tag: Some("AnimationTarget".to_string()),
+                node_id: Some(node),
+                attribute: Some("property".to_string()),
+                authored_value: Some(property),
+                effective_value: Some("RigidBody(type=dynamic)".to_string()),
+                message: "A dynamic RigidBody exclusively owns its Model transform.".to_string(),
+                effect: "Animation and physics cannot write different transforms in one frame."
+                    .to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "choose-transform-authority".to_string(),
+                    message: "Remove the transform AnimationTarget, or use type=\"kinematic\" when animation must own motion."
+                        .to_string(),
+                    replacement: Some("kinematic".to_string()),
+                    attribute: Some("type".to_string()),
+                    confidence: Some(1.0),
+                }],
+            });
+        }
+    }
 
     // Video and audio declarations are valid assets but do not yet create playable Scene nodes.
     for asset in &graph.assets {
@@ -591,7 +931,7 @@ fn append_semantic_diagnostics(
                 tag: Some(kind.to_string()),
                 node_id: Some(asset.id.clone()),
                 attribute: Some("src".to_string()),
-                authored_value: Some(asset.src.clone()),
+                authored_value: asset.external_src().map(str::to_string),
                 effective_value: None,
                 message: format!(
                     "{kind} '{}' is registered but has no native Scene playback node.",
@@ -819,6 +1159,34 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
         animation_targets: graph.animation_targets.len(),
         process_passes: graph.passes.len(),
         present_from: graph.present.from.clone(),
+        primitives: graph
+            .assets
+            .iter()
+            .filter_map(|asset| asset.primitive())
+            .map(|asset| {
+                let (bounds_min, bounds_max) =
+                    crate::world::primitive::primitive_bounds(&asset.geometry);
+                let triangles = asset.geometry.triangle_count();
+                PrimitiveAuthoringSummary {
+                    id: asset.id.clone(),
+                    shape: asset.geometry.shape_name().to_string(),
+                    bounds_min,
+                    bounds_max,
+                    triangles,
+                    estimated_gpu_bytes: triangles * 3 * (3 + 3 + 2) * size_of::<f32>()
+                        + triangles * 3 * size_of::<u32>(),
+                    inferred_auto_collider: match &asset.geometry {
+                        crate::dsl::PrimitiveGeometry::Box { .. } => "box",
+                        crate::dsl::PrimitiveGeometry::Sphere { .. } => "sphere",
+                        crate::dsl::PrimitiveGeometry::Cylinder { .. } => "cylinder",
+                        crate::dsl::PrimitiveGeometry::Cone { .. }
+                        | crate::dsl::PrimitiveGeometry::Wedge { .. } => "convex_hull",
+                        crate::dsl::PrimitiveGeometry::Plane { .. } => "static_plane",
+                    }
+                    .to_string(),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -876,6 +1244,9 @@ fn build_showcase_schema(
             })
             .collect();
         tag_schemas.push(ShowcaseTagSchema {
+            required_attributes: required_attributes(&name),
+            discriminator: (name == "PrimitiveAsset").then(|| "shape".to_string()),
+            variants: tag_variants(&name),
             tag: name,
             occurrences: occurrences.len(),
             recognized: capability.is_some(),
@@ -905,16 +1276,103 @@ fn build_showcase_schema(
             .unwrap_or_default(),
         asset_kinds: graph
             .map(|graph| {
-                graph
+                let mut kinds = graph
                     .assets
                     .iter()
-                    .map(|asset| format!("{:?}", asset.kind).to_ascii_lowercase())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
+                    .map(|asset| {
+                        if asset.primitive().is_some() {
+                            "primitive".to_string()
+                        } else if asset.compound().is_some() {
+                            "compound".to_string()
+                        } else {
+                            format!("{:?}", asset.kind).to_ascii_lowercase()
+                        }
+                    })
+                    .collect::<BTreeSet<_>>();
+                if !graph.material_assets.is_empty() {
+                    kinds.insert("material".to_string());
+                }
+                kinds.into_iter().collect()
             })
             .unwrap_or_default(),
     }
+}
+
+fn required_attributes(tag: &str) -> Vec<String> {
+    let attributes: &[&str] = match tag {
+        "Graph" => &["fps", "duration", "size"],
+        "RigidBody" => &["id", "target", "dimension", "type"],
+        "PrimitiveAsset" => &["id", "shape"],
+        "CompoundAsset" => &["id"],
+        "MaterialAsset" => &["id"],
+        "Instance" => &["asset"],
+        _ => &[],
+    };
+    attributes
+        .into_iter()
+        .map(|attribute| (*attribute).to_string())
+        .collect()
+}
+
+fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
+    if tag != "PrimitiveAsset" {
+        return BTreeMap::new();
+    }
+    [
+        ("box", vec!["id", "shape", "size"], vec!["color"]),
+        (
+            "sphere",
+            vec!["id", "shape", "radius"],
+            vec!["segments", "rings", "color"],
+        ),
+        (
+            "plane",
+            vec!["id", "shape", "size"],
+            vec!["segments", "color"],
+        ),
+        (
+            "cylinder",
+            vec!["id", "shape", "radius", "height"],
+            vec!["segments", "color"],
+        ),
+        (
+            "cone",
+            vec!["id", "shape", "radius", "height"],
+            vec!["segments", "color"],
+        ),
+        ("wedge", vec!["id", "shape", "size"], vec!["color"]),
+    ]
+    .into_iter()
+    .map(|(shape, required, mut optional)| {
+        optional.extend([
+            "material",
+            "bevelRadius",
+            "bevelSegments",
+            "materialSeed",
+            "collision",
+            "collider",
+            "colliderSize",
+            "colliderRadius",
+            "colliderHeight",
+            "colliderScale",
+            "colliderOffset",
+            "colliderRotation",
+            "colliderMargin",
+            "collisionGroup",
+            "collisionMask",
+            "friction",
+            "restitution",
+            "density",
+        ]);
+        (
+            shape.to_string(),
+            ShowcaseTagVariantSchema {
+                required: required.into_iter().map(str::to_string).collect(),
+                optional: optional.into_iter().map(str::to_string).collect(),
+            },
+        )
+    })
+    .collect()
 }
 
 fn supports_inline_expression(tag: &str, attribute: &str) -> Option<bool> {
@@ -924,7 +1382,7 @@ fn supports_inline_expression(tag: &str, attribute: &str) -> Option<bool> {
             | "SpringChain"
             | "DistanceConstraint"
             | "Hinge"
-            | "RigidBody2D"
+            | "RigidBody"
             | "Cloth"
             | "HairStrandField"
     ) && matches!(
@@ -1318,6 +1776,75 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             strict(&["id", "src", "decoder", "colorSpace", "color_space"])
         }
         "AnimationAsset" => strict(&["id", "src"]),
+        "MaterialAsset" => strict(&[
+            "id",
+            "shading",
+            "baseColor",
+            "baseColorTexture",
+            "metallic",
+            "roughness",
+            "metallicRoughnessTexture",
+            "normalTexture",
+            "normalScale",
+            "occlusionTexture",
+            "occlusionStrength",
+            "emissive",
+            "emissiveTexture",
+            "emissiveStrength",
+            "specular",
+            "doubleSided",
+            "alphaMode",
+            "alphaCutoff",
+            "transmission",
+            "ior",
+            "thickness",
+            "attenuationColor",
+            "attenuationDistance",
+            "depthWrite",
+            "sortPriority",
+            "mapping",
+            "textureScale",
+            "textureOffset",
+            "textureRotation",
+            "variationAmount",
+        ]),
+        "PrimitiveAsset" => strict(&[
+            "id",
+            "shape",
+            "size",
+            "radius",
+            "height",
+            "segments",
+            "rings",
+            "color",
+            "material",
+            "bevelRadius",
+            "bevelSegments",
+            "materialSeed",
+            "collision",
+            "collider",
+            "colliderSize",
+            "colliderRadius",
+            "colliderHeight",
+            "colliderScale",
+            "colliderOffset",
+            "colliderRotation",
+            "colliderMargin",
+            "collisionGroup",
+            "collisionMask",
+            "friction",
+            "restitution",
+            "density",
+        ]),
+        "CompoundAsset" => strict(&["id", "materialSeed"]),
+        "Instance" => strict(&[
+            "id",
+            "asset",
+            "position",
+            "rotation",
+            "scale",
+            "materialSeed",
+        ]),
         "Background" => strict(&["id", "color"]),
         "Scene" => strict(&["id", "size"]),
         "Track" => strict(&[
@@ -1341,6 +1868,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "depth",
             "format",
         ]),
+        "Physics" => strict(&["gravity", "fixedStep", "fixed_step", "iterations"]),
         "Camera3D" => strict(&[
             "id",
             "position",
@@ -1350,6 +1878,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "roll",
             "horizonLock",
             "horizon_lock",
+            "hiddenBones",
         ]),
         "Anchor" => strict(&[
             "id",
@@ -1361,14 +1890,87 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "surface",
             "uv",
         ]),
-        "EnvironmentLight" => strict(&["id", "asset", "intensity"]),
-        "EnvironmentDebug" => strict(&[
+        "EnvironmentLight" => strict(&[
+            "id",
+            "asset",
+            "intensity",
+            "mapping",
+            "rotationY",
+            "rotation_y",
+            "visible",
+            "backgroundIntensity",
+            "background_intensity",
+            "backgroundBlur",
+            "background_blur",
+            "diffuseIntensity",
+            "diffuse_intensity",
+            "specularIntensity",
+            "specular_intensity",
+        ]),
+        "DirectionalLight" => strict(&[
+            "id",
+            "direction",
+            "color",
+            "intensity",
+            "castShadow",
+            "cast_shadow",
+            "shadowStrength",
+            "shadow_strength",
+        ]),
+        "PointLight" => strict(&[
+            "id",
+            "position",
+            "color",
+            "intensity",
+            "range",
+            "castShadow",
+            "cast_shadow",
+        ]),
+        "SpotLight" => strict(&[
+            "id",
+            "position",
+            "direction",
+            "color",
+            "intensity",
+            "range",
+            "innerCone",
+            "inner_cone",
+            "outerCone",
+            "outer_cone",
+            "castShadow",
+            "cast_shadow",
+        ]),
+        "RectAreaLight" => strict(&[
+            "id",
+            "position",
+            "direction",
+            "color",
+            "intensity",
+            "width",
+            "height",
+        ]),
+        "AmbientOcclusion" => strict(&["id", "intensity", "radius"]),
+        "ContactShadow" => strict(&["id", "intensity", "distance", "softness"]),
+        "ColorManagement" => strict(&[
+            "id",
+            "toneMapping",
+            "tone_mapping",
+            "exposure",
+            "whiteBalance",
+            "white_balance",
+            "contrast",
+        ]),
+        "EnvironmentDebug" | "PhysicsDebug" => strict(&[
             "axes",
             "bounds",
             "surfaces",
             "anchors",
             "actionPath",
             "cameras",
+            "colliders",
+            "contacts",
+            "sweep",
+            "corrections",
         ]),
         "Model" | "ModelLayer" | "Environment" => strict(&[
             "id",
@@ -1394,6 +1996,8 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "exposure",
             "static",
             "collision",
+            "gravity",
+            "ground",
             "castShadow",
             "receiveShadow",
             "up",
@@ -1415,6 +2019,11 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "boundsMax",
             "bounds_min",
             "bounds_max",
+            "collision",
+            "collider",
+            "center",
+            "size",
+            "color",
         ]),
         "MaterialBinding" => strict(&["material", "definition", "texture"]),
         "Play" => strict(&[
@@ -1477,7 +2086,31 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "DynamicCurve" => strict(&["id", "target", "simulation"]),
         "DistanceConstraint" => strict(&["id", "a", "b", "distance", "stiffness"]),
         "Hinge" => strict(&["id", "a", "b", "anchor", "stiffness"]),
-        "RigidBody2D" => strict(&["id", "target", "mass", "velocity", "angularVelocity"]),
+        "RigidBody" => strict(&[
+            "id",
+            "target",
+            "dimension",
+            "type",
+            "shape",
+            "size",
+            "radius",
+            "height",
+            "mass",
+            "velocity",
+            "angularVelocity",
+            "gravity",
+            "friction",
+            "rollingFriction",
+            "restitution",
+            "restitutionThreshold",
+            "linearDamping",
+            "angularDamping",
+            "continuousCollision",
+            "sleep",
+            "sleepLinearThreshold",
+            "sleepAngularThreshold",
+            "sleepTime",
+        ]),
         "Cloth" => strict(&[
             "id",
             "target",
@@ -1619,6 +2252,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         ]),
         "Pose" => strict(&["t", "label"]),
         "Marker" => strict(&["id", "time", "t", "role"]),
+        "Contact" => strict(&["id", "effector", "target", "from", "to", "mode", "weight"]),
         "Bone" => open(&[
             "id",
             "parent",
@@ -1685,10 +2319,22 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "syncMarker",
             "sync_marker",
             "ground",
+            "contactCorrection",
+            "contact_correction",
             "groundOffset",
             "ground_offset",
             "footLock",
             "foot_lock",
+            "colliderProfile",
+            "collider_profile",
+            "safeMargin",
+            "safe_margin",
+            "floorSnap",
+            "floor_snap",
+            "maxSlides",
+            "max_slides",
+            "sweepStep",
+            "sweep_step",
         ]),
         "ModelProfile" => strict(&["id", "kind", "model", "preset"]),
         "Retarget" => strict(&["preset"]),
@@ -2240,9 +2886,19 @@ const REPEAT_ATTRIBUTES: &[&str] = &[
     "opacityStep",
     "opacity_step",
     "seed",
+    "mode",
     "distribution",
     "bounds",
+    "boundsMin",
+    "boundsMax",
+    "bounds_min",
+    "bounds_max",
+    "velocity",
+    "lifetime",
+    "phase",
+    "respawn",
     "scaleRange",
+    "scale_range",
     "rotationRange",
     "opacityRange",
 ];
@@ -2269,6 +2925,10 @@ const KNOWN_TAGS: &[&str] = &[
     "VideoAsset",
     "ImageAsset",
     "ModelAsset",
+    "MaterialAsset",
+    "PrimitiveAsset",
+    "CompoundAsset",
+    "Instance",
     "AudioAsset",
     "AnimationAsset",
     "Background",
@@ -2281,11 +2941,20 @@ const KNOWN_TAGS: &[&str] = &[
     "Layer3D",
     "Group",
     "CompositeGroup",
+    "Physics",
     "Camera3D",
     "Anchor",
     "EnvironmentLight",
+    "DirectionalLight",
+    "PointLight",
+    "SpotLight",
+    "RectAreaLight",
+    "AmbientOcclusion",
+    "ContactShadow",
+    "ColorManagement",
     "Environment",
     "EnvironmentDebug",
+    "PhysicsDebug",
     "Surface",
     "Model",
     "ModelLayer",
@@ -2316,7 +2985,7 @@ const KNOWN_TAGS: &[&str] = &[
     "DynamicCurve",
     "DistanceConstraint",
     "Hinge",
-    "RigidBody2D",
+    "RigidBody",
     "Cloth",
     "HairStrandField",
     "CacheBake",
@@ -2356,6 +3025,7 @@ const KNOWN_TAGS: &[&str] = &[
     "Action",
     "Pose",
     "Marker",
+    "Contact",
     "Bone",
     "IK",
     "ApplyAction",
@@ -2478,6 +3148,11 @@ const ALL_KNOWN_ATTRIBUTES: &[&str] = &[
     "lifetime",
     "velocity",
     "gravity",
+    "ground",
+    "center",
+    "fixedStep",
+    "fixed_step",
+    "iterations",
     "kind",
     "effect",
     "kernel",
@@ -2520,7 +3195,10 @@ const ALL_KNOWN_ATTRIBUTES: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthoringStatus, motionloom_analyze_script_json, motionloom_showcase_schema_json};
+    use super::{
+        AuthoringStatus, motionloom_analyze_script_json, motionloom_dsl_schema_json,
+        motionloom_showcase_schema_json,
+    };
 
     #[test]
     fn report_exposes_ignored_attributes_and_llm_repair_suggestions() {
@@ -2597,6 +3275,98 @@ mod tests {
     }
 
     #[test]
+    fn complete_schema_exposes_unified_rigid_body_contract() {
+        let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
+        let rigid_body = value["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["tag"] == "RigidBody")
+            .expect("RigidBody schema");
+        let attributes = rigid_body["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "dimension",
+            "type",
+            "shape",
+            "size",
+            "mass",
+            "rollingFriction",
+            "restitutionThreshold",
+            "sleepLinearThreshold",
+            "sleepAngularThreshold",
+            "sleepTime",
+        ] {
+            assert!(
+                attributes.contains(&required),
+                "missing {required}: {rigid_body:#}"
+            );
+        }
+        assert_eq!(
+            rigid_body["requiredAttributes"],
+            serde_json::json!(["id", "target", "dimension", "type"])
+        );
+        let physics_debug = value["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["tag"] == "PhysicsDebug")
+            .expect("PhysicsDebug schema");
+        let debug_attributes = physics_debug["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        for required in ["colliders", "contacts", "sweep", "corrections"] {
+            assert!(debug_attributes.contains(&required));
+        }
+    }
+
+    #[test]
+    fn dynamic_body_rejects_competing_transform_animation() {
+        let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ModelAsset id="cube_asset" src="cube.glb" />
+  </Assets>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup id="stage" space="3d" depth="true">
+              <Physics gravity={[0,-9.81,0]} fixedStep="1/120s" iterations="8" />
+              <Model id="cube" asset="cube_asset" position={[0,2,0]} />
+              <RigidBody id="cube_body" target="cube" dimension="3d" type="dynamic" />
+              <PhysicsDebug colliders="true" contacts="true" sweep="true" corrections="true" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="cube" property="positionY">
+    <Key time="0s" value="2" /><Key time="1s" value="4" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"##;
+        let value: serde_json::Value =
+            serde_json::from_str(&motionloom_analyze_script_json(script)).unwrap();
+        assert!(
+            value["diagnostics"].as_array().unwrap().iter().any(|item| {
+                item["code"] == "DYNAMIC_BODY_TRANSFORM_AUTHORITY_CONFLICT"
+                    && item["nodeId"] == "cube"
+                    && item["suggestions"][0]["replacement"] == "kinematic"
+            }),
+            "{value:#}"
+        );
+    }
+
+    #[test]
     fn clean_script_has_clean_status() {
         let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
   <Scene id="main">
@@ -2661,5 +3431,81 @@ mod tests {
                     && diagnostic.line == 4
                     && diagnostic.node_id.as_deref() == Some("broken"))
         );
+    }
+
+    #[test]
+    fn primitive_schema_and_report_expose_conditional_geometry_contract() {
+        let schema: serde_json::Value =
+            serde_json::from_str(&super::motionloom_dsl_schema_json()).unwrap();
+        let primitive = schema["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tag| tag["tag"] == "PrimitiveAsset")
+            .expect("PrimitiveAsset schema");
+        assert_eq!(primitive["discriminator"], "shape");
+        assert_eq!(primitive["variants"]["sphere"]["required"][2], "radius");
+
+        let script = r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="ground" shape="plane" size={[8,8]} color="#202838" />
+  </Assets>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Physics gravity={[0,-9.81,0]} fixedStep="1/120s" iterations="4" />
+              <Model id="ground_model" asset="ground" />
+              <RigidBody id="ground_body" target="ground_model" dimension="3d" type="dynamic" shape="auto" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##;
+        let report = super::analyze_motionloom_script(script);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "DYNAMIC_PRIMITIVE_PLANE"
+                    && diagnostic.suggestions[0].replacement.as_deref() == Some("static")
+            }),
+            "{report:#?}"
+        );
+        let primitive = &report.effective_graph.as_ref().unwrap().primitives[0];
+        assert_eq!(primitive.shape, "plane");
+        assert_eq!(primitive.bounds_min, [-4.0, 0.0, -4.0]);
+        assert_eq!(primitive.inferred_auto_collider, "static_plane");
+    }
+
+    #[test]
+    fn transmissive_depth_write_override_has_actionable_warning() {
+        let script = r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <MaterialAsset id="glass" transmission="0.9" depthWrite="true" />
+    <PrimitiveAsset id="pane" shape="plane" size={[2,2]} segments="3" material="glass" />
+  </Assets>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="64" height="64" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##;
+        let report = super::analyze_motionloom_script(script);
+        assert_eq!(report.status, AuthoringStatus::NeedsReview);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "TRANSMISSIVE_DEPTH_WRITE_ENABLED"
+                && diagnostic.suggestions[0].replacement.as_deref() == Some("auto")
+        }));
     }
 }

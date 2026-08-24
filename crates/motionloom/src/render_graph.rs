@@ -316,11 +316,9 @@ impl<'a> DagBuilder<'a> {
                 RenderPassSpace::parse(&composite.space),
                 composite.composite_order.unwrap_or(inherited_order),
                 composite.format.as_str(),
-                if composite
-                    .nodes_3d
-                    .iter()
-                    .any(|node| matches!(node, Scene3DNode::Model(_)))
-                {
+                if composite.nodes_3d.iter().any(|node| {
+                    matches!(node, Scene3DNode::Model(_) | Scene3DNode::VolumeRepeat(_))
+                }) {
                     RenderPassDagKind::ThreeDIsland
                 } else {
                     RenderPassDagKind::CompositeGroup
@@ -340,11 +338,13 @@ impl<'a> DagBuilder<'a> {
             for node in &composite.nodes_3d {
                 match node {
                     Scene3DNode::Model(model) => {
-                        self.validate_asset_reference(
-                            &model.asset,
-                            GraphAssetKind::Model,
-                            "Model",
-                        )?;
+                        if model.primitive.is_none() {
+                            self.validate_asset_reference(
+                                &model.asset,
+                                GraphAssetKind::Model,
+                                "Model",
+                            )?;
+                        }
                         for binding in &model.material_bindings {
                             if let Some(texture) = &binding.texture
                                 && let Some(scene_id) = scene_reference(texture)
@@ -358,12 +358,29 @@ impl<'a> DagBuilder<'a> {
                             }
                         }
                     }
+                    Scene3DNode::VolumeRepeat(repeat) => {
+                        self.validate_asset_reference(
+                            &repeat.template.asset,
+                            GraphAssetKind::Model,
+                            "Repeat Model",
+                        )?;
+                    }
                     Scene3DNode::EnvironmentLight(light) => self.validate_asset_reference(
                         &light.asset,
                         GraphAssetKind::Image,
                         "EnvironmentLight",
                     )?,
-                    Scene3DNode::Camera(_) | Scene3DNode::Anchor(_) | Scene3DNode::Debug(_) => {}
+                    Scene3DNode::Camera(_)
+                    | Scene3DNode::DirectionalLight(_)
+                    | Scene3DNode::PointLight(_)
+                    | Scene3DNode::SpotLight(_)
+                    | Scene3DNode::RectAreaLight(_)
+                    | Scene3DNode::AmbientOcclusion(_)
+                    | Scene3DNode::ContactShadow(_)
+                    | Scene3DNode::ColorManagement(_)
+                    | Scene3DNode::Anchor(_)
+                    | Scene3DNode::RigidBody(_)
+                    | Scene3DNode::Debug(_) => {}
                 }
             }
         }

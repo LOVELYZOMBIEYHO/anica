@@ -3,6 +3,7 @@ pub mod error;
 pub mod gltf_loader;
 pub mod model;
 pub mod model_inspection;
+pub mod primitive;
 pub mod render;
 
 pub use dsl::{is_world_graph_script, parse_world_graph_script};
@@ -13,7 +14,8 @@ pub use gltf_loader::{
 pub use model::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldApplyAction,
     WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera,
-    WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldGraph, WorldMaterial,
+    WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldColorManagement,
+    WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind, WorldLighting, WorldMaterial,
     WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldPresent,
     WorldProfileRetarget, WorldRetarget, WorldRetargetMap, WorldSpritePlayback, WorldTime,
 };

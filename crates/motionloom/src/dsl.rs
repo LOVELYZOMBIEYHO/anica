@@ -2,6 +2,8 @@
 // =========================================
 // crates/motionloom/src/dsl.rs
 
+use std::collections::HashMap;
+
 pub use crate::error::GraphParseError;
 pub use crate::process::model::{
     AlphaMode, BlendMode, BufferElemType, BufferNode, BufferUsage, ColorSpace, EffectNode,
@@ -11,8 +13,8 @@ pub use crate::process::model::{
     SampleAddress, SampleConfig, SampleFilter, StoreOp, TexNode, TexUsage, TextureFormat,
 };
 pub use crate::scene::dsl::{
-    ActionBoneNode, ActionNode, ActionPoseNode, ApplyActionNode, BackgroundNode, ImageNode,
-    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
+    ActionBoneNode, ActionContactNode, ActionNode, ActionPoseNode, ApplyActionNode, BackgroundNode,
+    ImageNode, ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
     ModelProfileRetargetMapNode, ModelProfileRetargetNode, SkeletonBoneNode,
     SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode, SkeletonLandmarkNode,
     SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode,
@@ -53,6 +55,9 @@ pub struct GraphScript {
     /// External files shared by every Scene and Process in the Graph.
     #[serde(default)]
     pub assets: Vec<GraphAssetNode>,
+    /// Reusable physically based materials referenced by typed geometry assets.
+    #[serde(default)]
+    pub material_assets: Vec<MaterialAssetNode>,
     pub inputs: Vec<InputNode>,
     pub textures: Vec<TexNode>,
     pub buffers: Vec<BufferNode>,
@@ -100,7 +105,7 @@ pub struct GraphScript {
 pub struct GraphAssetNode {
     pub id: String,
     pub kind: GraphAssetKind,
-    pub src: String,
+    pub source: GraphAssetSource,
     #[serde(default)]
     pub decoder: Option<String>,
     #[serde(default)]
@@ -111,6 +116,279 @@ pub struct GraphAssetNode {
     /// Optional named clip selected from a multi-animation GLB.
     #[serde(default)]
     pub clip: Option<String>,
+}
+
+/// A Graph asset is either externally resolved data or typed engine geometry.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum GraphAssetSource {
+    External { src: String },
+    Primitive(PrimitiveAssetNode),
+    Compound(CompoundAssetNode),
+}
+
+impl GraphAssetNode {
+    pub fn external_src(&self) -> Option<&str> {
+        match &self.source {
+            GraphAssetSource::External { src } => Some(src),
+            GraphAssetSource::Primitive(_) | GraphAssetSource::Compound(_) => None,
+        }
+    }
+
+    pub fn primitive(&self) -> Option<&PrimitiveAssetNode> {
+        match &self.source {
+            GraphAssetSource::Primitive(asset) => Some(asset),
+            GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => None,
+        }
+    }
+
+    pub fn compound(&self) -> Option<&CompoundAssetNode> {
+        match &self.source {
+            GraphAssetSource::Compound(asset) => Some(asset),
+            GraphAssetSource::External { .. } | GraphAssetSource::Primitive(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompoundAssetNode {
+    pub id: String,
+    #[serde(default)]
+    pub material_seed: Option<u64>,
+    pub instances: Vec<CompoundAssetInstanceNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompoundAssetInstanceNode {
+    pub id: String,
+    pub asset: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub scale: f32,
+    #[serde(default)]
+    pub material_seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveAssetNode {
+    pub id: String,
+    pub geometry: PrimitiveGeometry,
+    pub color: [f32; 4],
+    /// Optional stable id plus its resolved definition keep materials reusable
+    /// while allowing the world renderer to consume a self-contained asset.
+    #[serde(default)]
+    pub material: Option<String>,
+    #[serde(default)]
+    pub material_definition: Option<MaterialAssetNode>,
+    #[serde(default)]
+    pub bevel_radius: f32,
+    #[serde(default)]
+    pub bevel_segments: u32,
+    #[serde(default)]
+    pub material_seed: Option<u64>,
+    #[serde(default)]
+    pub collision: PrimitiveCollisionNode,
+}
+
+/// A first-class PBR material reuses the glTF renderer without pretending that
+/// a screen-space Scene texture is a physical 3D surface.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialAssetNode {
+    pub id: String,
+    pub shading: String,
+    pub base_color: [f32; 4],
+    pub base_color_texture: Option<String>,
+    pub metallic_roughness_texture: Option<String>,
+    pub normal_texture: Option<String>,
+    pub occlusion_texture: Option<String>,
+    pub emissive_texture: Option<String>,
+    /// Resolved image sources are intentionally retained beside public ids so
+    /// generated primitives remain renderable after CompoundAsset expansion.
+    #[serde(default)]
+    pub base_color_texture_src: Option<String>,
+    #[serde(default)]
+    pub metallic_roughness_texture_src: Option<String>,
+    #[serde(default)]
+    pub normal_texture_src: Option<String>,
+    #[serde(default)]
+    pub occlusion_texture_src: Option<String>,
+    #[serde(default)]
+    pub emissive_texture_src: Option<String>,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub normal_scale: f32,
+    pub occlusion_strength: f32,
+    pub emissive: [f32; 3],
+    pub emissive_strength: f32,
+    pub specular: f32,
+    pub double_sided: bool,
+    pub alpha_mode: String,
+    pub alpha_cutoff: f32,
+    /// Transmission models a solid surface that passes light; it is distinct
+    /// from alpha coverage used by decals, smoke, and fades.
+    #[serde(default)]
+    pub transmission: f32,
+    #[serde(default = "default_material_ior")]
+    pub ior: f32,
+    #[serde(default)]
+    pub thickness: f32,
+    #[serde(default = "default_material_attenuation_color")]
+    pub attenuation_color: [f32; 3],
+    #[serde(default = "default_material_attenuation_distance")]
+    pub attenuation_distance: f32,
+    #[serde(default = "default_material_depth_write")]
+    pub depth_write: String,
+    #[serde(default)]
+    pub sort_priority: i32,
+    pub mapping: String,
+    pub texture_scale: [f32; 2],
+    pub texture_offset: [f32; 2],
+    pub texture_rotation: f32,
+    pub variation_amount: [f32; 2],
+}
+
+fn default_material_ior() -> f32 {
+    1.5
+}
+
+fn default_material_attenuation_color() -> [f32; 3] {
+    [1.0; 3]
+}
+
+fn default_material_attenuation_distance() -> f32 {
+    1_000_000.0
+}
+
+fn default_material_depth_write() -> String {
+    "auto".to_string()
+}
+
+/// Asset-owned collision data stays reusable across every primitive instance.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PrimitiveCollisionNode {
+    pub mode: PrimitiveCollisionMode,
+    pub collider: PrimitiveColliderShape,
+    pub size: Option<Vec<f32>>,
+    pub radius: Option<f32>,
+    pub height: Option<f32>,
+    pub scale: [f32; 3],
+    pub offset: [f32; 3],
+    pub rotation: [f32; 3],
+    pub margin: f32,
+    pub friction: f32,
+    pub restitution: f32,
+    pub density: f32,
+    pub group: u32,
+    pub mask: u32,
+}
+
+impl Default for PrimitiveCollisionNode {
+    fn default() -> Self {
+        Self {
+            mode: PrimitiveCollisionMode::None,
+            collider: PrimitiveColliderShape::Auto,
+            size: None,
+            radius: None,
+            height: None,
+            scale: [1.0; 3],
+            offset: [0.0; 3],
+            rotation: [0.0; 3],
+            margin: 0.0,
+            friction: 0.5,
+            restitution: 0.0,
+            density: 1.0,
+            group: 1,
+            mask: u32::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimitiveCollisionMode {
+    None,
+    Solid,
+    Sensor,
+}
+
+impl PrimitiveCollisionMode {
+    pub fn participates(self) -> bool {
+        self != Self::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimitiveColliderShape {
+    Auto,
+    Box,
+    Sphere,
+    Plane,
+    Cylinder,
+    Cone,
+    Convex,
+    Mesh,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "shape")]
+pub enum PrimitiveGeometry {
+    Box {
+        size: [f32; 3],
+    },
+    Sphere {
+        radius: f32,
+        segments: u32,
+        rings: u32,
+    },
+    Plane {
+        size: [f32; 2],
+        segments: u32,
+    },
+    Cylinder {
+        radius: f32,
+        height: f32,
+        segments: u32,
+    },
+    Cone {
+        radius: f32,
+        height: f32,
+        segments: u32,
+    },
+    Wedge {
+        size: [f32; 3],
+    },
+}
+
+impl PrimitiveGeometry {
+    pub fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Box { .. } => "box",
+            Self::Sphere { .. } => "sphere",
+            Self::Plane { .. } => "plane",
+            Self::Cylinder { .. } => "cylinder",
+            Self::Cone { .. } => "cone",
+            Self::Wedge { .. } => "wedge",
+        }
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        match self {
+            Self::Box { .. } => 12,
+            Self::Sphere {
+                segments, rings, ..
+            } => (*segments * *rings * 2) as usize,
+            Self::Plane { segments, .. } => (*segments * *segments * 2) as usize,
+            Self::Cylinder { segments, .. } => (*segments * 4) as usize,
+            Self::Cone { segments, .. } => (*segments * 2) as usize,
+            Self::Wedge { .. } => 8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -557,6 +835,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
 
     let mut inputs = Vec::<InputNode>::new();
     let mut assets = Vec::<GraphAssetNode>::new();
+    let mut material_assets = Vec::<MaterialAssetNode>::new();
     let mut textures = Vec::<TexNode>::new();
     let mut buffers = Vec::<BufferNode>::new();
     let mut backgrounds = Vec::<BackgroundNode>::new();
@@ -600,8 +879,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         }
 
         if starts_open_tag(line, "Assets") {
-            let (mut parsed_assets, end_ix) = parse_assets_block(&lines, i)?;
+            let (mut parsed_assets, mut parsed_materials, end_ix) = parse_assets_block(&lines, i)?;
             assets.append(&mut parsed_assets);
+            material_assets.append(&mut parsed_materials);
             i = end_ix + 1;
             continue;
         }
@@ -937,6 +1217,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
 
     lower_parametric_component_uses(&mut scene_nodes, &mut scenes)?;
     resolve_lowered_puppet_targets(&mut scene_nodes, &mut scenes)?;
+    resolve_primitive_material_assets(&mut assets, &material_assets, graph_start_ix + 1)?;
 
     validate_graph(
         fps,
@@ -967,7 +1248,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
 
     let graph = GraphScript {
         raw_script: Some(input.to_string()),
-        id,
+        id: id.clone(),
         version,
         fps,
         apply,
@@ -976,6 +1257,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         size,
         render_size,
         assets,
+        material_assets,
         inputs,
         textures,
         buffers,
@@ -1234,6 +1516,11 @@ fn validate_graph(
     }
     validate_scene_model_profile_refs(scenes, scene_nodes, &model_profile_ids, line)?;
     validate_scene_camera_structure(scenes, scene_nodes, line)?;
+    let mut dynamic_rigid_body_targets = HashSet::new();
+    for scene in scenes {
+        collect_dynamic_rigid_body_targets(&scene.children, &mut dynamic_rigid_body_targets);
+    }
+    collect_dynamic_rigid_body_targets(scene_nodes, &mut dynamic_rigid_body_targets);
 
     let mut skeleton_ids = HashSet::<String>::new();
     for skeleton in skeletons {
@@ -1324,8 +1611,82 @@ fn validate_graph(
                 ),
             });
         }
+        let mut contact_ids = HashSet::<String>::new();
+        for contact in &action.contacts {
+            if !contact_ids.insert(contact.id.clone()) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Duplicate Contact id '{}' in Action {}.",
+                        contact.id, action.id
+                    ),
+                });
+            }
+            if !matches!(
+                contact.effector.as_str(),
+                "knee_l"
+                    | "knee_r"
+                    | "foot_l"
+                    | "foot_r"
+                    | "hand_l"
+                    | "hand_r"
+                    | "elbow_l"
+                    | "elbow_r"
+            ) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Action {} Contact '{}' uses unsupported canonical effector '{}'. Use knee_l, knee_r, foot_l, foot_r, hand_l, hand_r, elbow_l, or elbow_r.",
+                        action.id, contact.id, contact.effector
+                    ),
+                });
+            }
+            if contact.target != "ground" {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Action {} Contact '{}' target must currently be ground, got: {}.",
+                        action.id, contact.id, contact.target
+                    ),
+                });
+            }
+            if contact.mode != "lock" {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Action {} Contact '{}' mode must currently be lock, got: {}.",
+                        action.id, contact.id, contact.mode
+                    ),
+                });
+            }
+            let weight = contact.weight.parse::<f32>().map_err(|_| GraphParseError {
+                line,
+                message: format!(
+                    "Action {} Contact '{}' weight must be a number in 0..1, got: {}.",
+                    action.id, contact.id, contact.weight
+                ),
+            })?;
+            if !(0.0..=1.0).contains(&weight) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Action {} Contact '{}' weight must be inside 0..1, got: {}.",
+                        action.id, contact.id, contact.weight
+                    ),
+                });
+            }
+        }
     }
     for apply_action in apply_actions {
+        if dynamic_rigid_body_targets.contains(&apply_action.target) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ApplyAction target '{}' is controlled by a dynamic RigidBody. Use type=\"kinematic\" for authored action motion, or remove ApplyAction so physics owns the transform.",
+                    apply_action.target
+                ),
+            });
+        }
         if !action_ids.contains(&apply_action.action) {
             if animation_assets.contains_key(apply_action.action.as_str()) {
                 return Err(GraphParseError {
@@ -1351,6 +1712,41 @@ fn validate_graph(
                 line,
                 message: format!(
                     "ApplyAction rootMotion must be none, clip, in_place, or match_target, got: {root_motion}"
+                ),
+            });
+        }
+        if let Some(contact_correction) = apply_action.contact_correction.as_deref()
+            && !matches!(contact_correction, "none" | "auto")
+        {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ApplyAction contactCorrection must be none or auto, got: {contact_correction}"
+                ),
+            });
+        }
+        if apply_action.contact_correction.as_deref() == Some("auto")
+            && apply_action.ground.is_none()
+        {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ApplyAction target '{}' uses contactCorrection=auto but has no ground Surface binding.",
+                    apply_action.target
+                ),
+            });
+        }
+        if apply_action.contact_correction.as_deref() == Some("auto")
+            && actions
+                .iter()
+                .find(|action| action.id == apply_action.action)
+                .is_some_and(|action| action.contacts.is_empty())
+        {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ApplyAction target '{}' uses contactCorrection=auto, but Action '{}' has no <Contact /> declarations.",
+                    apply_action.target, apply_action.action
                 ),
             });
         }
@@ -1406,11 +1802,22 @@ fn validate_graph(
                     .to_string(),
             });
         };
-        if !matches!(source_bone, "hand_l" | "hand_r" | "foot_l" | "foot_r") {
+        if !matches!(
+            source_bone,
+            "head"
+                | "forearm_l"
+                | "forearm_r"
+                | "hand_l"
+                | "hand_r"
+                | "lower_leg_l"
+                | "lower_leg_r"
+                | "foot_l"
+                | "foot_r"
+        ) {
             return Err(GraphParseError {
                 line,
                 message: format!(
-                    "Scene Constraint two_bone_ik source must end in hand_l, hand_r, foot_l, or foot_r, got: {source_bone}"
+                    "Scene Constraint two_bone_ik source must end in a supported humanoid head, elbow, hand, knee, or foot effector, got: {source_bone}"
                 ),
             });
         }
@@ -1535,6 +1942,40 @@ fn validate_graph(
     Ok(())
 }
 
+fn collect_dynamic_rigid_body_targets(nodes: &[SceneNode], targets: &mut HashSet<String>) {
+    for node in nodes {
+        match node {
+            SceneNode::Simulation(crate::simulation::model::SimulationBindingNode::RigidBody(
+                body,
+            )) if body.body_type == crate::simulation::model::RigidBodyType::Dynamic => {
+                targets.insert(body.target.clone());
+            }
+            SceneNode::Group(group) => {
+                if let Some(composite) = &group.composite {
+                    for node in &composite.nodes_3d {
+                        if let crate::scene::model::Scene3DNode::RigidBody(body) = node
+                            && body.body_type == crate::simulation::model::RigidBodyType::Dynamic
+                        {
+                            targets.insert(body.target.clone());
+                        }
+                    }
+                }
+                collect_dynamic_rigid_body_targets(&group.children, targets);
+            }
+            SceneNode::Timeline(node) => {
+                collect_dynamic_rigid_body_targets(&node.children, targets)
+            }
+            SceneNode::Track(node) => collect_dynamic_rigid_body_targets(&node.children, targets),
+            SceneNode::Sequence(node) => {
+                collect_dynamic_rigid_body_targets(&node.children, targets)
+            }
+            SceneNode::Layer(node) => collect_dynamic_rigid_body_targets(&node.children, targets),
+            SceneNode::Part(node) => collect_dynamic_rigid_body_targets(&node.children, targets),
+            _ => {}
+        }
+    }
+}
+
 fn parse_process_resource_alias(
     lines: &[&str],
     start: usize,
@@ -1576,10 +2017,11 @@ fn parse_process_resource_alias(
 fn parse_assets_block(
     lines: &[&str],
     start: usize,
-) -> Result<(Vec<GraphAssetNode>, usize), GraphParseError> {
+) -> Result<(Vec<GraphAssetNode>, Vec<MaterialAssetNode>, usize), GraphParseError> {
     let (_open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Assets")?;
     let mut assets = Vec::new();
+    let mut materials = Vec::new();
     let mut i = open_end_ix + 1;
     while i < close_ix {
         let line = lines[i].trim();
@@ -1589,6 +2031,12 @@ fn parse_assets_block(
             || line.starts_with("<!--")
         {
             i += 1;
+            continue;
+        }
+        if starts_open_tag(line, "MaterialAsset") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            materials.push(parse_material_asset(&tag, i + 1)?);
+            i = end_ix + 1;
             continue;
         }
         let (kind, tag_name) = if starts_open_tag(line, "VideoAsset") {
@@ -1601,14 +2049,32 @@ fn parse_assets_block(
             (GraphAssetKind::Audio, "AudioAsset")
         } else if starts_open_tag(line, "AnimationAsset") {
             (GraphAssetKind::Animation, "AnimationAsset")
+        } else if starts_open_tag(line, "PrimitiveAsset") {
+            (GraphAssetKind::Model, "PrimitiveAsset")
+        } else if starts_open_tag(line, "CompoundAsset") {
+            (GraphAssetKind::Model, "CompoundAsset")
         } else {
             return Err(GraphParseError {
                 line: i + 1,
                 message: format!(
-                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
+                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <PrimitiveAsset>, <CompoundAsset>, <MaterialAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
                 ),
             });
         };
+        if tag_name == "CompoundAsset" {
+            let (compound, end_ix) = parse_compound_asset(lines, i)?;
+            assets.push(GraphAssetNode {
+                id: compound.id.clone(),
+                kind,
+                source: GraphAssetSource::Compound(compound),
+                decoder: None,
+                color_space: None,
+                profile: None,
+                clip: None,
+            });
+            i = end_ix + 1;
+            continue;
+        }
         let (tag, end_ix) = collect_self_closing_block(lines, i)?;
         if !starts_open_tag(tag.trim(), tag_name) {
             return Err(GraphParseError {
@@ -1625,10 +2091,23 @@ fn parse_assets_block(
                     .to_string(),
             });
         }
+        let id = strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string();
+        let source = if tag_name == "PrimitiveAsset" {
+            GraphAssetSource::Primitive(parse_primitive_asset(&tag, &id, i + 1)?)
+        } else {
+            let src = strip_wrappers(&required_attr_value(&tag, "src", i + 1)?).to_string();
+            if src.starts_with("motionloom:box:") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "motionloom:box shorthand has been removed. Declare <PrimitiveAsset shape=\"box\" size={...} color=\"...\" />.".to_string(),
+                });
+            }
+            GraphAssetSource::External { src }
+        };
         assets.push(GraphAssetNode {
-            id: strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string(),
+            id,
             kind,
-            src: strip_wrappers(&required_attr_value(&tag, "src", i + 1)?).to_string(),
+            source,
             decoder: attr_value(&tag, "decoder").map(|v| strip_wrappers(&v).to_string()),
             color_space: attr_value(&tag, "colorSpace")
                 .or_else(|| attr_value(&tag, "color_space"))
@@ -1640,7 +2119,11 @@ fn parse_assets_block(
     }
     let mut ids = HashSet::new();
     for asset in &assets {
-        if asset.id.trim().is_empty() || asset.src.trim().is_empty() {
+        if asset.id.trim().is_empty()
+            || asset
+                .external_src()
+                .is_some_and(|src| src.trim().is_empty())
+        {
             return Err(GraphParseError {
                 line: start + 1,
                 message: "Asset id and src must not be empty.".to_string(),
@@ -1653,7 +2136,1024 @@ fn parse_assets_block(
             });
         }
     }
-    Ok((assets, close_ix))
+    for asset in &assets {
+        let Some(compound) = asset.compound() else {
+            continue;
+        };
+        for instance in &compound.instances {
+            let Some(referenced) = assets.iter().find(|asset| asset.id == instance.asset) else {
+                return Err(GraphParseError {
+                    line: start + 1,
+                    message: format!(
+                        "CompoundAsset \"{}\" Instance \"{}\" references unknown asset \"{}\".",
+                        compound.id, instance.id, instance.asset
+                    ),
+                });
+            };
+            if referenced.primitive().is_none() {
+                return Err(GraphParseError {
+                    line: start + 1,
+                    message: format!(
+                        "CompoundAsset \"{}\" Instance \"{}\" must reference a PrimitiveAsset in V1.",
+                        compound.id, instance.id
+                    ),
+                });
+            }
+        }
+    }
+    let mut material_ids = HashSet::new();
+    if let Some(duplicate) = materials
+        .iter()
+        .find(|material| !material_ids.insert(material.id.clone()))
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("Duplicate MaterialAsset id: {}", duplicate.id),
+        });
+    }
+    Ok((assets, materials, close_ix))
+}
+
+fn parse_compound_asset(
+    lines: &[&str],
+    start: usize,
+) -> Result<(CompoundAssetNode, usize), GraphParseError> {
+    let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    if is_self_closing_tag(&open_tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "CompoundAsset must contain at least one <Instance />.".to_string(),
+        });
+    }
+    let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
+    let material_seed = parse_optional_primitive_u64(&open_tag, "materialSeed", &id, start + 1)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "CompoundAsset")?;
+    let mut instances = Vec::new();
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "Instance") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "CompoundAsset \"{id}\" only accepts self-closing <Instance /> children."
+                ),
+            });
+        }
+        let (tag, end_ix) = collect_self_closing_block(lines, index)?;
+        let instance_id = attr_value(&tag, "id")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(|| format!("instance_{}", instances.len() + 1));
+        let asset = strip_wrappers(&required_attr_value(&tag, "asset", index + 1)?).to_string();
+        let position =
+            parse_optional_primitive_vec::<3>(&tag, "position", &instance_id, index + 1, false)?
+                .unwrap_or([0.0; 3]);
+        let rotation =
+            parse_optional_primitive_vec::<3>(&tag, "rotation", &instance_id, index + 1, false)?
+                .unwrap_or([0.0; 3]);
+        let scale =
+            parse_optional_positive_primitive_number(&tag, "scale", &instance_id, index + 1)?
+                .unwrap_or(1.0);
+        let material_seed =
+            parse_optional_primitive_u64(&tag, "materialSeed", &instance_id, index + 1)?;
+        instances.push(CompoundAssetInstanceNode {
+            id: instance_id,
+            asset,
+            position,
+            rotation,
+            scale,
+            material_seed,
+        });
+        index = end_ix + 1;
+    }
+    if instances.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("CompoundAsset \"{id}\" must contain at least one Instance."),
+        });
+    }
+    let mut ids = HashSet::new();
+    if let Some(duplicate) = instances
+        .iter()
+        .find(|instance| !ids.insert(instance.id.clone()))
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "CompoundAsset \"{id}\" has duplicate Instance id \"{}\".",
+                duplicate.id
+            ),
+        });
+    }
+    Ok((
+        CompoundAssetNode {
+            id,
+            material_seed,
+            instances,
+        },
+        close_ix,
+    ))
+}
+
+fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, GraphParseError> {
+    const ALLOWED: &[&str] = &[
+        "id",
+        "shading",
+        "baseColor",
+        "baseColorTexture",
+        "metallic",
+        "roughness",
+        "metallicRoughnessTexture",
+        "normalTexture",
+        "normalScale",
+        "occlusionTexture",
+        "occlusionStrength",
+        "emissive",
+        "emissiveTexture",
+        "emissiveStrength",
+        "specular",
+        "doubleSided",
+        "alphaMode",
+        "alphaCutoff",
+        "transmission",
+        "ior",
+        "thickness",
+        "attenuationColor",
+        "attenuationDistance",
+        "depthWrite",
+        "sortPriority",
+        "mapping",
+        "textureScale",
+        "textureOffset",
+        "textureRotation",
+        "variationAmount",
+    ];
+    let id = strip_wrappers(&required_attr_value(tag, "id", line)?).to_string();
+    for attribute in tag_attribute_names(tag) {
+        if !ALLOWED.contains(&attribute.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("MaterialAsset \"{id}\" does not support \"{attribute}\"."),
+            });
+        }
+    }
+    let shading = attr_value(tag, "shading")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "pbr".to_string());
+    if shading != "pbr" {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "MaterialAsset \"{id}\" shading=\"{shading}\" is invalid. V1 supports pbr."
+            ),
+        });
+    }
+    let scalar = |attribute: &str, default: f32, min: f32, max: f32| {
+        let Some(raw) = attr_value(tag, attribute) else {
+            return Ok(default);
+        };
+        let value = strip_wrappers(&raw)
+            .parse::<f32>()
+            .map_err(|_| GraphParseError {
+                line,
+                message: format!("MaterialAsset \"{id}\" {attribute} must be a finite number."),
+            })?;
+        if !value.is_finite() || !(min..=max).contains(&value) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "MaterialAsset \"{id}\" {attribute} must be from {min} through {max}."
+                ),
+            });
+        }
+        Ok(value)
+    };
+    let texture_ref = |attribute: &str| {
+        attr_value(tag, attribute).map(|value| strip_wrappers(&value).to_string())
+    };
+    let base_color = attr_value(tag, "baseColor")
+        .map(|value| parse_primitive_color(&value, &id, line))
+        .transpose()?
+        .unwrap_or([1.0; 4]);
+    let emissive_rgba = attr_value(tag, "emissive")
+        .map(|value| parse_primitive_color(&value, &id, line))
+        .transpose()?
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let attenuation_rgba = attr_value(tag, "attenuationColor")
+        .map(|value| parse_primitive_color(&value, &id, line))
+        .transpose()?
+        .unwrap_or([1.0; 4]);
+    let mapping = attr_value(tag, "mapping")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "uv".to_string());
+    if !matches!(mapping.as_str(), "uv" | "box" | "triplanar") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "MaterialAsset \"{id}\" mapping=\"{mapping}\" is invalid. Use uv, box, or triplanar."
+            ),
+        });
+    }
+    let alpha_mode = attr_value(tag, "alphaMode")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "opaque".to_string());
+    if !matches!(alpha_mode.as_str(), "opaque" | "mask" | "blend") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "MaterialAsset \"{id}\" alphaMode=\"{alpha_mode}\" is invalid. Use opaque, mask, or blend."
+            ),
+        });
+    }
+    let depth_write = attr_value(tag, "depthWrite")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(default_material_depth_write);
+    if !matches!(depth_write.as_str(), "auto" | "true" | "false") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "MaterialAsset \"{id}\" depthWrite=\"{depth_write}\" is invalid. Use auto, true, or false."
+            ),
+        });
+    }
+    let sort_priority = attr_value(tag, "sortPriority")
+        .map(|value| {
+            strip_wrappers(&value)
+                .parse::<i32>()
+                .map_err(|_| GraphParseError {
+                    line,
+                    message: format!(
+                        "MaterialAsset \"{id}\" sortPriority must be an integer from -32768 through 32767."
+                    ),
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if !(-32768..=32767).contains(&sort_priority) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "MaterialAsset \"{id}\" sortPriority must be an integer from -32768 through 32767."
+            ),
+        });
+    }
+    let texture_scale = parse_optional_primitive_vec::<2>(tag, "textureScale", &id, line, true)?
+        .unwrap_or([1.0; 2]);
+    let texture_offset = parse_optional_primitive_vec::<2>(tag, "textureOffset", &id, line, false)?
+        .unwrap_or([0.0; 2]);
+    let variation_amount =
+        parse_optional_primitive_vec::<2>(tag, "variationAmount", &id, line, false)?
+            .unwrap_or([0.0; 2]);
+    if variation_amount.iter().any(|value| *value < 0.0) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "MaterialAsset \"{id}\" variationAmount values must be equal to or greater than zero."
+            ),
+        });
+    }
+    let double_sided = attr_value(tag, "doubleSided")
+        .map(|value| parse_bool(&value, line, "MaterialAsset.doubleSided"))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(MaterialAssetNode {
+        id: id.clone(),
+        shading,
+        base_color,
+        base_color_texture: texture_ref("baseColorTexture"),
+        metallic_roughness_texture: texture_ref("metallicRoughnessTexture"),
+        normal_texture: texture_ref("normalTexture"),
+        occlusion_texture: texture_ref("occlusionTexture"),
+        emissive_texture: texture_ref("emissiveTexture"),
+        base_color_texture_src: None,
+        metallic_roughness_texture_src: None,
+        normal_texture_src: None,
+        occlusion_texture_src: None,
+        emissive_texture_src: None,
+        metallic: scalar("metallic", 0.0, 0.0, 1.0)?,
+        roughness: scalar("roughness", 0.82, 0.04, 1.0)?,
+        normal_scale: scalar("normalScale", 1.0, 0.0, 4.0)?,
+        occlusion_strength: scalar("occlusionStrength", 1.0, 0.0, 1.0)?,
+        emissive: [emissive_rgba[0], emissive_rgba[1], emissive_rgba[2]],
+        emissive_strength: scalar("emissiveStrength", 1.0, 0.0, 64.0)?,
+        specular: scalar("specular", 1.0, 0.0, 2.0)?,
+        double_sided,
+        alpha_mode,
+        alpha_cutoff: scalar("alphaCutoff", 0.5, 0.0, 1.0)?,
+        transmission: scalar("transmission", 0.0, 0.0, 1.0)?,
+        ior: scalar("ior", 1.5, 1.0, 3.0)?,
+        thickness: scalar("thickness", 0.0, 0.0, 1000.0)?,
+        attenuation_color: [
+            attenuation_rgba[0],
+            attenuation_rgba[1],
+            attenuation_rgba[2],
+        ],
+        attenuation_distance: scalar(
+            "attenuationDistance",
+            default_material_attenuation_distance(),
+            0.0001,
+            1_000_000.0,
+        )?,
+        depth_write,
+        sort_priority,
+        mapping,
+        texture_scale,
+        texture_offset,
+        texture_rotation: scalar("textureRotation", 0.0, -3600.0, 3600.0)?,
+        variation_amount,
+    })
+}
+
+fn resolve_primitive_material_assets(
+    assets: &mut [GraphAssetNode],
+    materials: &[MaterialAssetNode],
+    line: usize,
+) -> Result<(), GraphParseError> {
+    let mut material_ids = HashSet::new();
+    for material in materials {
+        if !material_ids.insert(material.id.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate MaterialAsset id: {}", material.id),
+            });
+        }
+    }
+    let image_sources = assets
+        .iter()
+        .filter(|asset| asset.kind == GraphAssetKind::Image)
+        .filter_map(|asset| asset.external_src().map(|src| (asset.id.as_str(), src)))
+        .collect::<HashMap<_, _>>();
+    let resolve_texture = |material: &MaterialAssetNode,
+                           slot: &str,
+                           reference: &Option<String>|
+     -> Result<Option<String>, GraphParseError> {
+        let Some(reference) = reference.as_deref() else {
+            return Ok(None);
+        };
+        image_sources
+            .get(reference)
+            .map(|src| Some((*src).to_string()))
+            .ok_or_else(|| GraphParseError {
+                line,
+                message: format!(
+                    "MaterialAsset \"{}\" {slot} references unknown ImageAsset \"{reference}\".",
+                    material.id
+                ),
+            })
+    };
+    let mut resolved_materials = HashMap::new();
+    for material in materials {
+        let mut resolved = material.clone();
+        resolved.base_color_texture_src =
+            resolve_texture(material, "baseColorTexture", &material.base_color_texture)?;
+        resolved.metallic_roughness_texture_src = resolve_texture(
+            material,
+            "metallicRoughnessTexture",
+            &material.metallic_roughness_texture,
+        )?;
+        resolved.normal_texture_src =
+            resolve_texture(material, "normalTexture", &material.normal_texture)?;
+        resolved.occlusion_texture_src =
+            resolve_texture(material, "occlusionTexture", &material.occlusion_texture)?;
+        resolved.emissive_texture_src =
+            resolve_texture(material, "emissiveTexture", &material.emissive_texture)?;
+        resolved_materials.insert(material.id.as_str(), resolved);
+    }
+    for asset in assets {
+        let GraphAssetSource::Primitive(primitive) = &mut asset.source else {
+            continue;
+        };
+        let Some(material_id) = primitive.material.as_deref() else {
+            continue;
+        };
+        primitive.material_definition = resolved_materials.get(material_id).cloned();
+        if primitive.material_definition.is_none() {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{}\" references unknown MaterialAsset \"{material_id}\".",
+                    primitive.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_primitive_asset(
+    tag: &str,
+    id: &str,
+    line: usize,
+) -> Result<PrimitiveAssetNode, GraphParseError> {
+    let shape = strip_wrappers(&required_attr_value(tag, "shape", line)?).to_ascii_lowercase();
+    let mut allowed = match shape.as_str() {
+        "box" | "wedge" => vec!["id", "shape", "size", "color"],
+        "sphere" => vec!["id", "shape", "radius", "segments", "rings", "color"],
+        "plane" => vec!["id", "shape", "size", "segments", "color"],
+        "cylinder" | "cone" => {
+            vec!["id", "shape", "radius", "height", "segments", "color"]
+        }
+        _ => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, plane, cylinder, cone, or wedge."
+                ),
+            });
+        }
+    };
+    allowed.extend([
+        "material",
+        "bevelRadius",
+        "bevelSegments",
+        "materialSeed",
+        "collision",
+        "collider",
+        "colliderSize",
+        "colliderRadius",
+        "colliderHeight",
+        "colliderScale",
+        "colliderOffset",
+        "colliderRotation",
+        "colliderMargin",
+        "collisionGroup",
+        "collisionMask",
+        "friction",
+        "restitution",
+        "density",
+    ]);
+    for attribute in tag_attribute_names(tag) {
+        if !allowed.contains(&attribute.as_str()) {
+            let guidance = match shape.as_str() {
+                "sphere" => "Use radius=\"...\" and optional segments/rings.",
+                "box" | "wedge" | "plane" => "Use size={...}.",
+                "cylinder" | "cone" => "Use radius=\"...\", height=\"...\", and optional segments.",
+                _ => unreachable!(),
+            };
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" with shape=\"{shape}\" does not support \"{attribute}\". {guidance}"
+                ),
+            });
+        }
+    }
+    let geometry = match shape.as_str() {
+        "box" => PrimitiveGeometry::Box {
+            size: parse_primitive_vec::<3>(tag, "size", id, line)?,
+        },
+        "wedge" => PrimitiveGeometry::Wedge {
+            size: parse_primitive_vec::<3>(tag, "size", id, line)?,
+        },
+        "plane" => PrimitiveGeometry::Plane {
+            size: parse_primitive_vec::<2>(tag, "size", id, line)?,
+            segments: parse_primitive_segments(tag, "segments", 1, id, line)?,
+        },
+        "sphere" => {
+            let segments = parse_primitive_segments(tag, "segments", 32, id, line)?;
+            PrimitiveGeometry::Sphere {
+                radius: parse_positive_primitive_number(tag, "radius", id, line)?,
+                segments,
+                rings: parse_primitive_segments(tag, "rings", segments / 2, id, line)?,
+            }
+        }
+        "cylinder" => PrimitiveGeometry::Cylinder {
+            radius: parse_positive_primitive_number(tag, "radius", id, line)?,
+            height: parse_positive_primitive_number(tag, "height", id, line)?,
+            segments: parse_primitive_segments(tag, "segments", 32, id, line)?,
+        },
+        "cone" => PrimitiveGeometry::Cone {
+            radius: parse_positive_primitive_number(tag, "radius", id, line)?,
+            height: parse_positive_primitive_number(tag, "height", id, line)?,
+            segments: parse_primitive_segments(tag, "segments", 32, id, line)?,
+        },
+        _ => unreachable!(),
+    };
+    let color = attr_value(tag, "color")
+        .map(|value| parse_primitive_color(&value, id, line))
+        .transpose()?
+        .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    let material = attr_value(tag, "material").map(|value| strip_wrappers(&value).to_string());
+    let bevel_radius =
+        parse_optional_nonnegative_primitive_number(tag, "bevelRadius", id, line)?.unwrap_or(0.0);
+    let bevel_segments = parse_optional_primitive_u32(tag, "bevelSegments", id, line)?
+        .unwrap_or(if bevel_radius > 0.0 { 3 } else { 0 });
+    if bevel_radius > 0.0 && shape != "box" {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" bevel is currently supported for shape=\"box\" only."
+            ),
+        });
+    }
+    if bevel_radius > 0.0 && !(1..=8).contains(&bevel_segments) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" bevelSegments must be from 1 through 8 when bevelRadius is greater than zero."
+            ),
+        });
+    }
+    if let PrimitiveGeometry::Box { size } = &geometry
+        && bevel_radius * 2.0 >= size.iter().copied().fold(f32::INFINITY, f32::min)
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" bevelRadius must be less than half the smallest box dimension."
+            ),
+        });
+    }
+    let material_seed = parse_optional_primitive_u64(tag, "materialSeed", id, line)?;
+    let collision = parse_primitive_collision(tag, id, &geometry, line)?;
+    Ok(PrimitiveAssetNode {
+        id: id.to_string(),
+        geometry,
+        color,
+        material,
+        material_definition: None,
+        bevel_radius,
+        bevel_segments,
+        material_seed,
+        collision,
+    })
+}
+
+fn parse_primitive_collision(
+    tag: &str,
+    id: &str,
+    geometry: &PrimitiveGeometry,
+    line: usize,
+) -> Result<PrimitiveCollisionNode, GraphParseError> {
+    let mode = match attr_value(tag, "collision")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("none")
+    {
+        "none" => PrimitiveCollisionMode::None,
+        "solid" => PrimitiveCollisionMode::Solid,
+        "sensor" => PrimitiveCollisionMode::Sensor,
+        other => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" collision=\"{other}\" is invalid. Use none, solid, or sensor."
+                ),
+            });
+        }
+    };
+    let collider = match attr_value(tag, "collider")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("auto")
+    {
+        "auto" => PrimitiveColliderShape::Auto,
+        "box" => PrimitiveColliderShape::Box,
+        "sphere" => PrimitiveColliderShape::Sphere,
+        "plane" => PrimitiveColliderShape::Plane,
+        "cylinder" => PrimitiveColliderShape::Cylinder,
+        "cone" => PrimitiveColliderShape::Cone,
+        "convex" => PrimitiveColliderShape::Convex,
+        "mesh" => PrimitiveColliderShape::Mesh,
+        other => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" collider=\"{other}\" is invalid. Use auto, box, sphere, plane, cylinder, cone, convex, or mesh."
+                ),
+            });
+        }
+    };
+    let collision_configuration_present = [
+        "collider",
+        "colliderSize",
+        "colliderRadius",
+        "colliderHeight",
+        "colliderScale",
+        "colliderOffset",
+        "colliderRotation",
+        "colliderMargin",
+        "collisionGroup",
+        "collisionMask",
+        "friction",
+        "restitution",
+        "density",
+    ]
+    .iter()
+    .any(|attribute| attr_value(tag, attribute).is_some());
+    if mode == PrimitiveCollisionMode::None && collision_configuration_present {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" has collision=\"none\" but also declares collider settings. Remove those settings or use collision=\"solid\" or \"sensor\"."
+            ),
+        });
+    }
+
+    let effective_shape = if collider == PrimitiveColliderShape::Auto {
+        match geometry {
+            PrimitiveGeometry::Box { .. } => PrimitiveColliderShape::Box,
+            PrimitiveGeometry::Sphere { .. } => PrimitiveColliderShape::Sphere,
+            PrimitiveGeometry::Plane { .. } => PrimitiveColliderShape::Plane,
+            PrimitiveGeometry::Cylinder { .. } => PrimitiveColliderShape::Cylinder,
+            PrimitiveGeometry::Cone { .. } => PrimitiveColliderShape::Cone,
+            PrimitiveGeometry::Wedge { .. } => PrimitiveColliderShape::Convex,
+        }
+    } else {
+        collider
+    };
+    let size = attr_value(tag, "colliderSize")
+        .map(|raw| match effective_shape {
+            PrimitiveColliderShape::Plane => {
+                parse_positive_primitive_vec_value::<2>(&raw, "colliderSize", id, line)
+                    .map(|value| value.to_vec())
+            }
+            PrimitiveColliderShape::Box
+            | PrimitiveColliderShape::Convex
+            | PrimitiveColliderShape::Mesh => {
+                parse_positive_primitive_vec_value::<3>(&raw, "colliderSize", id, line)
+                    .map(|value| value.to_vec())
+            }
+            _ => Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" colliderSize is only valid for box, plane, convex, or mesh colliders."
+                ),
+            }),
+        })
+        .transpose()?;
+    let radius = parse_optional_positive_primitive_number(tag, "colliderRadius", id, line)?;
+    if radius.is_some()
+        && !matches!(
+            effective_shape,
+            PrimitiveColliderShape::Sphere
+                | PrimitiveColliderShape::Cylinder
+                | PrimitiveColliderShape::Cone
+        )
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" colliderRadius requires a sphere, cylinder, or cone collider."
+            ),
+        });
+    }
+    let height = parse_optional_positive_primitive_number(tag, "colliderHeight", id, line)?;
+    if height.is_some()
+        && !matches!(
+            effective_shape,
+            PrimitiveColliderShape::Cylinder | PrimitiveColliderShape::Cone
+        )
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" colliderHeight requires a cylinder or cone collider."
+            ),
+        });
+    }
+    let scale = parse_optional_primitive_vec::<3>(tag, "colliderScale", id, line, true)?
+        .unwrap_or([1.0; 3]);
+    let offset = parse_optional_primitive_vec::<3>(tag, "colliderOffset", id, line, false)?
+        .unwrap_or([0.0; 3]);
+    let rotation = parse_optional_primitive_vec::<3>(tag, "colliderRotation", id, line, false)?
+        .unwrap_or([0.0; 3]);
+    let margin = parse_optional_nonnegative_primitive_number(tag, "colliderMargin", id, line)?
+        .unwrap_or(0.0);
+    let friction =
+        parse_optional_nonnegative_primitive_number(tag, "friction", id, line)?.unwrap_or(0.5);
+    let restitution =
+        parse_optional_nonnegative_primitive_number(tag, "restitution", id, line)?.unwrap_or(0.0);
+    if restitution > 1.0 {
+        return Err(GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{id}\" restitution must be from zero through one."),
+        });
+    }
+    let density =
+        parse_optional_positive_primitive_number(tag, "density", id, line)?.unwrap_or(1.0);
+    let group = parse_optional_primitive_u32(tag, "collisionGroup", id, line)?.unwrap_or(1);
+    let mask = parse_optional_primitive_u32(tag, "collisionMask", id, line)?.unwrap_or(u32::MAX);
+    Ok(PrimitiveCollisionNode {
+        mode,
+        collider,
+        size,
+        radius,
+        height,
+        scale,
+        offset,
+        rotation,
+        margin,
+        friction,
+        restitution,
+        density,
+        group,
+        mask,
+    })
+}
+
+fn parse_positive_primitive_number(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<f32, GraphParseError> {
+    let raw = required_attr_value(tag, attribute, line)?;
+    let value = strip_wrappers(&raw)
+        .parse::<f32>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be a finite number greater than zero."
+            ),
+        })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be a finite number greater than zero."
+            ),
+        });
+    }
+    Ok(value)
+}
+
+fn parse_primitive_vec<const N: usize>(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<[f32; N], GraphParseError> {
+    let raw = required_attr_value(tag, attribute, line)?;
+    parse_primitive_vec_value(&raw, attribute, id, line, true)
+}
+
+fn parse_positive_primitive_vec_value<const N: usize>(
+    raw: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<[f32; N], GraphParseError> {
+    parse_primitive_vec_value(raw, attribute, id, line, true)
+}
+
+fn parse_optional_primitive_vec<const N: usize>(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+    positive: bool,
+) -> Result<Option<[f32; N]>, GraphParseError> {
+    attr_value(tag, attribute)
+        .map(|raw| parse_primitive_vec_value(&raw, attribute, id, line, positive))
+        .transpose()
+}
+
+fn parse_primitive_vec_value<const N: usize>(
+    raw: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+    positive: bool,
+) -> Result<[f32; N], GraphParseError> {
+    let value = strip_wrappers(&raw).trim();
+    let value = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    let parts = value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != N {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must contain exactly {N} finite numbers."
+            ),
+        });
+    }
+    let mut out = [0.0; N];
+    for (index, part) in parts.iter().enumerate() {
+        out[index] = part.parse::<f32>().map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must contain exactly {N} finite numbers."
+            ),
+        })?;
+        if !out[index].is_finite() || (positive && out[index] <= 0.0) {
+            return Err(GraphParseError {
+                line,
+                message: if positive {
+                    format!(
+                        "PrimitiveAsset \"{id}\" {attribute} values must be finite and greater than zero."
+                    )
+                } else {
+                    format!("PrimitiveAsset \"{id}\" {attribute} values must be finite.")
+                },
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_optional_positive_primitive_number(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<Option<f32>, GraphParseError> {
+    let Some(raw) = attr_value(tag, attribute) else {
+        return Ok(None);
+    };
+    let value = strip_wrappers(&raw)
+        .parse::<f32>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be a finite number greater than zero."
+            ),
+        })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be a finite number greater than zero."
+            ),
+        });
+    }
+    Ok(Some(value))
+}
+
+fn parse_optional_nonnegative_primitive_number(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<Option<f32>, GraphParseError> {
+    let Some(raw) = attr_value(tag, attribute) else {
+        return Ok(None);
+    };
+    let value = strip_wrappers(&raw)
+        .parse::<f32>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be a finite number equal to or greater than zero."
+            ),
+        })?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be a finite number equal to or greater than zero."
+            ),
+        });
+    }
+    Ok(Some(value))
+}
+
+fn parse_optional_primitive_u32(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<Option<u32>, GraphParseError> {
+    let Some(raw) = attr_value(tag, attribute) else {
+        return Ok(None);
+    };
+    strip_wrappers(&raw)
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{id}\" {attribute} must be an unsigned integer."),
+        })
+}
+
+fn parse_optional_primitive_u64(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<Option<u64>, GraphParseError> {
+    let Some(raw) = attr_value(tag, attribute) else {
+        return Ok(None);
+    };
+    strip_wrappers(&raw)
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!("Asset \"{id}\" {attribute} must be an unsigned integer."),
+        })
+}
+
+fn parse_primitive_segments(
+    tag: &str,
+    attribute: &str,
+    default: u32,
+    id: &str,
+    line: usize,
+) -> Result<u32, GraphParseError> {
+    let Some(raw) = attr_value(tag, attribute) else {
+        return Ok(default);
+    };
+    let value = strip_wrappers(&raw)
+        .parse::<u32>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" {attribute} must be an integer from 3 through 256."
+            ),
+        })?;
+    if !(3..=256).contains(&value) {
+        return Err(GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{id}\" {attribute} must be from 3 through 256."),
+        });
+    }
+    Ok(value)
+}
+
+fn parse_primitive_color(raw: &str, id: &str, line: usize) -> Result<[f32; 4], GraphParseError> {
+    let hex = strip_wrappers(raw).trim().strip_prefix('#').unwrap_or("");
+    if !matches!(hex.len(), 6 | 8) || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{id}\" color must use #RRGGBB or #RRGGBBAA."),
+        });
+    }
+    let channel = |offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap() as f32 / 255.0;
+    Ok([
+        channel(0),
+        channel(2),
+        channel(4),
+        if hex.len() == 8 { channel(6) } else { 1.0 },
+    ])
+}
+
+fn tag_attribute_names(tag: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = tag.as_bytes();
+    let mut index = tag.find(char::is_whitespace).unwrap_or(tag.len());
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || matches!(bytes[index], b'/' | b'>') {
+            break;
+        }
+        let start = index;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-'))
+        {
+            index += 1;
+        }
+        if start == index {
+            index += 1;
+            continue;
+        }
+        names.push(tag[start..index].to_string());
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] == b'=' {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] == b'"' {
+            index += 1;
+            while index < bytes.len() && bytes[index] != b'"' {
+                index += 1;
+            }
+            index = (index + 1).min(bytes.len());
+        } else if index < bytes.len() && bytes[index] == b'{' {
+            let mut depth = 1;
+            index += 1;
+            while index < bytes.len() && depth > 0 {
+                match bytes[index] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+        } else {
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'>'
+            {
+                index += 1;
+            }
+        }
+    }
+    names
 }
 
 fn parse_scene_constraint_node(
@@ -3270,9 +4770,10 @@ pub(crate) fn strip_wrappers(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorSpace, GraphApplyScope, GraphAssetKind, GraphParseError, InputType, PassCache,
-        PassKind, PassRole, PassTransitionClips, PassTransitionEasing, PassTransitionFallback,
-        PassTransitionMode, Quality, ResourceRef, SceneNode, TextureFormat, is_graph_script,
+        ColorSpace, GraphApplyScope, GraphAssetKind, GraphAssetSource, GraphParseError, InputType,
+        PassCache, PassKind, PassRole, PassTransitionClips, PassTransitionEasing,
+        PassTransitionFallback, PassTransitionMode, PrimitiveColliderShape, PrimitiveCollisionMode,
+        PrimitiveGeometry, Quality, ResourceRef, SceneNode, TextureFormat, is_graph_script,
         parse_graph_script,
     };
     use crate::scene::model::Scene3DNode;
@@ -4023,6 +5524,64 @@ Font note: this is not a structured XML comment.
     }
 
     #[test]
+    fn graph_parser_retains_deterministic_3d_volume_repeat() -> Result<(), GraphParseError> {
+        let script = r##"
+<Graph fps={30} duration="1s" size={[128,128]}>
+  <Assets>
+    <PrimitiveAsset id="drop" shape="cylinder" radius="0.01" height="0.4" />
+  </Assets>
+  <Scene id="rain_scene">
+    <Timeline>
+      <Track space="3d" z="0">
+        <Sequence duration="1s">
+          <CompositeGroup id="rain" space="3d">
+            <Camera3D position={[0,1,4]} target={[0,1,0]} />
+            <Repeat id="rain_volume" mode="volume" count="12" seed="77"
+                    boundsMin={[-2,0,-2]} boundsMax={[2,4,2]}
+                    velocity={[-0.2,-8,0.1]} lifetime="0.6s"
+                    phase="random" respawn="random" scaleRange={[0.8,1.2]}>
+              <Model asset="drop" castShadow="false" receiveShadow="false" />
+            </Repeat>
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="rain_scene" />
+</Graph>
+"##;
+        let first = parse_graph_script(script)?;
+        let second = parse_graph_script(script)?;
+        assert_eq!(first.scenes, second.scenes);
+        let SceneNode::Timeline(timeline) = &first.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("expected 3D CompositeGroup");
+        };
+        let repeat = group
+            .composite
+            .as_ref()
+            .and_then(|composite| {
+                composite.nodes_3d.iter().find_map(|node| match node {
+                    Scene3DNode::VolumeRepeat(repeat) => Some(repeat),
+                    _ => None,
+                })
+            })
+            .expect("volume Repeat retained as typed 3D data");
+        assert_eq!(repeat.count, 12);
+        assert_eq!(repeat.seed, 77);
+        assert_eq!(repeat.template.asset, "drop");
+        Ok(())
+    }
+
+    #[test]
     fn graph_parser_lowers_declarative_grid_layout() -> Result<(), GraphParseError> {
         let script = r##"
 <Graph fps={30} duration="1s" size={[320,240]}>
@@ -4309,7 +5868,9 @@ Font note: this is not a structured XML comment.
     <Timeline>
       <Track id="main" z="0">
         <Sequence duration="1s">
-          <Layer />
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
         </Sequence>
       </Track>
     </Timeline>
@@ -5452,7 +7013,8 @@ Font note: this is not a structured XML comment.
         <Sequence duration="2s">
           <Layer>
             <CompositeGroup id="island" space="3d" depth="true">
-              <Camera3D position={[0,1,6]} target={[0,1,0]} />
+              <Camera3D position={[0,1,6]} target={[0,1,0]}
+                        hiddenBones={["girl:head"]} />
               <Model id="girl" asset="girl_asset" profile="girl_profile">
                 <Play clip="Idle" loop="true" speed="1" blendIn="0.2s" mask="upper_body" />
                 <Play clip="Walk" loop="true" speed="1.1" weight="0.35" mask="lower_body" />
@@ -5515,14 +7077,59 @@ Font note: this is not a structured XML comment.
         );
         assert_eq!(model.plays.len(), 1);
         assert_eq!(model.plays[0].clip.as_deref(), Some("Walk"));
+        let camera = group
+            .composite
+            .as_ref()
+            .and_then(|composite| {
+                composite.nodes_3d.iter().find_map(|node| match node {
+                    Scene3DNode::Camera(camera) => Some(camera),
+                    _ => None,
+                })
+            })
+            .expect("3D camera");
+        assert_eq!(camera.hidden_bones.len(), 1);
+        assert_eq!(camera.hidden_bones[0].model, "girl");
+        assert_eq!(camera.hidden_bones[0].bone, "head");
         Ok(())
+    }
+
+    #[test]
+    fn graph_parser_rejects_invalid_camera_hidden_bone_selectors() {
+        let script = r#"
+<Graph fps={30} duration="1s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="actor_asset" src="actor.glb" />
+  </Assets>
+  <Scene id="scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Model id="actor" asset="actor_asset" />
+              <Camera3D position={[0,1,4]} target={[0,1,0]}
+                        hiddenBones={["actor:not_a_canonical_bone"]} />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scene" />
+</Graph>
+"#;
+        let error = parse_graph_script(script).expect_err("invalid canonical bone must fail");
+        assert!(
+            error.message.contains("canonical humanoid bone"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn graph_parser_accepts_external_actions_anchors_constraints_and_camera_switches()
     -> Result<(), GraphParseError> {
         let graph = parse_graph_script(
-            r#"
+            r##"
 <Graph fps={30} duration="6s" size={[1920,1080]}>
   <Assets>
     <ModelAsset id="model_a" src="character-a.glb" />
@@ -5562,6 +7169,8 @@ Font note: this is not a structured XML comment.
                rootMotion="match_target" destination="character_a_contact"
                takeoff="character_a_start" contact="character_a_contact"
                landing="character_a_contact"
+               colliderProfile="auto" safeMargin="0.01" floorSnap="0.09"
+               maxSlides="6" sweepStep="0.03"
                face="character_b" syncGroup="contact_01" syncMarker="contact" />
   <Constraint kind="position" source="character_a.hand_r"
               target="character_b.shoulder_r" from="3.58s" to="4.05s"
@@ -5572,7 +7181,7 @@ Font note: this is not a structured XML comment.
   </AnimationTarget>
   <Present from="FightScene" />
 </Graph>
-"#,
+"##,
         )?;
         assert_eq!(graph.assets[2].kind, GraphAssetKind::Animation);
         assert_eq!(graph.assets[2].id, "sneak_walk_source");
@@ -5608,6 +7217,14 @@ Font note: this is not a structured XML comment.
             graph.apply_actions[0].landing.as_deref(),
             Some("character_a_contact")
         );
+        assert_eq!(
+            graph.apply_actions[0].collider_profile.as_deref(),
+            Some("auto")
+        );
+        assert_eq!(graph.apply_actions[0].safe_margin, "0.01");
+        assert_eq!(graph.apply_actions[0].floor_snap, "0.09");
+        assert_eq!(graph.apply_actions[0].max_slides, 6);
+        assert_eq!(graph.apply_actions[0].sweep_step, "0.03");
         assert_eq!(graph.scene_constraints[0].duration_ms, 470);
         assert_eq!(graph.animation_targets[0].property, "activeCamera");
         let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
@@ -5660,6 +7277,286 @@ Font note: this is not a structured XML comment.
     }
 
     #[test]
+    fn graph_parser_rejects_apply_action_on_dynamic_rigid_body() {
+        let error = parse_graph_script(
+            r#"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ModelAsset id="hero_asset" src="hero.glb" />
+  </Assets>
+  <Action id="idle" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="hips" y="0" />
+    </Pose>
+  </Action>
+  <ApplyAction target="hero" action="idle" />
+  <Scene id="RigidScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <Physics gravity={[0,-9.81,0]} />
+              <Model id="hero" asset="hero_asset" position={[0,2,0]} />
+              <RigidBody id="hero_body" target="hero" dimension="3d"
+                         type="dynamic" shape="capsule" radius="0.3" height="1.2" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="RigidScene" />
+</Graph>
+"#,
+        )
+        .expect_err("dynamic physics and ApplyAction cannot own the same transform");
+        assert!(
+            error.message.contains("controlled by a dynamic RigidBody"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn graph_parser_accepts_action_contacts_and_auto_contact_correction() {
+        let graph = parse_graph_script(
+            r#"
+<Graph fps={30} duration="3s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="character" src="character.glb" />
+    <ModelAsset id="deck" src="deck.glb" />
+    <AnimationAsset id="clips" src="character.glb" />
+  </Assets>
+  <Action id="repair_kneel" source="clips" clip="Fixing_Kneeling">
+    <Contact id="left_knee_contact" effector="knee_l" target="ground"
+             from="18%" to="72%" mode="lock" weight="1" />
+    <Contact id="right_foot_contact" effector="foot_r" target="ground"
+             from="0.16" to="0.76" mode="lock" weight="0.9" />
+  </Action>
+  <ApplyAction target="technician" action="repair_kneel"
+               ground="ship_deck" contactCorrection="auto" />
+  <Scene id="ContactScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="3s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <Environment id="ship" asset="deck" collision="surfaces">
+                <Surface id="ship_deck" kind="ground" collision="true"
+                         height="0" boundsMin={[-2,-0.1,-2]} boundsMax={[2,0.1,2]} />
+              </Environment>
+              <Model id="technician" asset="character" position={[0,0,0]} />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="ContactScene" />
+</Graph>
+"#,
+        )
+        .expect("Action Contact metadata should parse");
+        assert_eq!(graph.actions[0].contacts.len(), 2);
+        assert!((graph.actions[0].contacts[0].from - 0.18).abs() < 0.0001);
+        assert!((graph.actions[0].contacts[1].to - 0.76).abs() < 0.0001);
+        assert_eq!(
+            graph.apply_actions[0].contact_correction.as_deref(),
+            Some("auto")
+        );
+        assert_eq!(graph.apply_actions[0].ground.as_deref(), Some("ship_deck"));
+    }
+
+    #[test]
+    fn graph_parser_accepts_finite_physics_surface_and_scene_gravity() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="2s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="character" src="character.glb" />
+  </Assets>
+  <Scene id="PhysicsScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="2s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <Physics gravity={[0,-9.81,0]} fixedStep="1/120s" iterations="4" />
+              <Surface id="floor" kind="ground" collider="box"
+                       center={[0,-0.1,0]} size={[20,0.2,20]} color="#202838" />
+              <Model id="actor" asset="character" position={[0,5,0]}
+                     collision="kinematic" gravity="scene" ground="floor" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="PhysicsScene" />
+</Graph>
+"##,
+        )
+        .expect("finite Scene physics floor should parse");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("composite group");
+        };
+        let composite = group.composite.as_ref().expect("3D composite config");
+        assert_eq!(composite.physics.as_ref().unwrap().fixed_step, "1/120s");
+        assert_eq!(composite.nodes_3d.len(), 2);
+        let generated_floor = composite
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Model(model) if model.environment => Some(model),
+                _ => None,
+            })
+            .expect("procedural floor model");
+        assert!(matches!(
+            generated_floor.primitive.as_ref().map(|asset| &asset.geometry),
+            Some(PrimitiveGeometry::Box { size }) if *size == [20.0, 0.2, 20.0]
+        ));
+        assert_eq!(generated_floor.scale, "1");
+        let actor = composite
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Model(model) if model.id.as_deref() == Some("actor") => Some(model),
+                _ => None,
+            })
+            .expect("falling actor");
+        assert_eq!(actor.gravity.as_deref(), Some("scene"));
+        assert_eq!(actor.ground.as_deref(), Some("floor"));
+    }
+
+    #[test]
+    fn graph_parser_accepts_complete_scene_3d_lighting_stack() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="2s" size={[640,360]}>
+  <Assets>
+    <ImageAsset id="studio_hdri" src="studio.hdr" />
+    <ModelAsset id="hero_asset" src="hero.glb" />
+  </Assets>
+  <Scene id="LightingScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="2s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+        <EnvironmentLight id="ibl" asset="studio_hdri" intensity="1.2"
+          rotationY="35" visible="true" backgroundIntensity="0.6"
+          backgroundBlur="0.2" diffuseIntensity="0.8" specularIntensity="1.4" />
+        <DirectionalLight id="sun" direction={[-0.4,-1,-0.3]}
+          color="#FFF1DB" intensity="3.5" castShadow="true" shadowStrength="0.85" />
+        <PointLight id="practical" position={[2,2,1]} color="#78C8FF"
+          intensity="18" range="8" />
+        <SpotLight id="rim" position={[-2,3,2]} direction={[0,-1,-0.5]}
+          intensity="24" range="10" innerCone="18" outerCone="32" />
+        <RectAreaLight id="softbox" position={[0,3,2]} direction={[0,-1,-0.4]}
+          intensity="8" width="3" height="2" />
+        <AmbientOcclusion id="ao" intensity="0.7" radius="1.2" />
+        <ContactShadow id="contact" intensity="0.8" distance="0.3" softness="0.6" />
+        <ColorManagement id="grade" toneMapping="aces" exposure="1.1"
+          whiteBalance="5800" contrast="1.08" />
+        <Camera3D position={[0,1.4,5]} target={[0,1,0]} fov="38" />
+        <Model id="hero" asset="hero_asset" material="pbr" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="LightingScene" />
+</Graph>
+"##,
+        )
+        .expect("complete Scene 3D lighting stack should parse");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("group");
+        };
+        let composite = group.composite.as_ref().expect("3D composite");
+        assert_eq!(composite.nodes_3d.len(), 10);
+        assert!(matches!(
+            composite.nodes_3d[0],
+            Scene3DNode::EnvironmentLight(_)
+        ));
+        assert!(matches!(
+            composite.nodes_3d[1],
+            Scene3DNode::DirectionalLight(_)
+        ));
+        assert!(matches!(
+            composite.nodes_3d[7],
+            Scene3DNode::ColorManagement(_)
+        ));
+    }
+
+    #[test]
+    fn graph_parser_rejects_auto_contact_correction_without_action_contacts() {
+        let error = parse_graph_script(
+            r#"
+<Graph fps={30} duration="1s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="character" src="character.glb" />
+    <AnimationAsset id="clips" src="character.glb" />
+  </Assets>
+  <Action id="idle" source="clips" clip="Idle" />
+  <ApplyAction target="actor" action="idle" ground="floor"
+               contactCorrection="auto" />
+  <Scene id="ContactScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <Environment id="stage" asset="character" collision="surfaces">
+                <Surface id="floor" kind="ground" collision="true"
+                         height="0" boundsMin={[-2,-0.1,-2]} boundsMax={[2,0.1,2]} />
+              </Environment>
+              <Model id="actor" asset="character" position={[0,0,0]} />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="ContactScene" />
+</Graph>
+"#,
+        )
+        .expect_err("auto contact correction must require Contact metadata");
+        assert!(
+            error.message.contains("has no <Contact /> declarations"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
     fn graph_parser_accepts_semantic_environment_surfaces_and_node_anchors() {
         let graph = parse_graph_script(
             r#"
@@ -5674,12 +7571,13 @@ Font note: this is not a structured XML comment.
         <Sequence duration="3s">
           <Layer>
             <CompositeGroup id="island" space="3d" depth="true">
-              <Environment id="roof" asset="roof_asset" collision="mesh"
+              <Environment id="roof" asset="roof_asset" collision="surfaces"
                            up="+Y" forward="+X" unitScale="0.01"
                            scaleMode="normalize_height">
                 <Surface id="roof_floor" kind="ground" space="asset" height="2.4"
                          normal={[0,1,0]} centroid={[0,2.4,0]}
-                         boundsMin={[-4,2.35,-3]} boundsMax={[4,2.45,3]} />
+                         boundsMin={[-4,2.35,-3]} boundsMax={[4,2.45,3]}
+                         collision="true" collider="plane" />
                 <Anchor id="takeoff" surface="roof_floor" uv={[0.2,0.5]}
                         offset={[0,0,0]} />
                 <Anchor id="landing" surface="roof_floor" uv={[0.8,0.5]}
@@ -5731,6 +7629,8 @@ Font note: this is not a structured XML comment.
         assert_eq!(environment.unit_scale, "0.01");
         assert_eq!(environment.surfaces[0].id, "roof_floor");
         assert_eq!(environment.surfaces[0].space, "asset");
+        assert!(environment.surfaces[0].collision);
+        assert_eq!(environment.surfaces[0].collider.as_deref(), Some("plane"));
         assert_eq!(
             environment.surfaces[0].centroid.as_deref(),
             Some("[0,2.4,0]")
@@ -5749,5 +7649,467 @@ Font note: this is not a structured XML comment.
                 .iter()
                 .any(|node| matches!(node, Scene3DNode::Debug(_)))
         );
+    }
+
+    #[test]
+    fn graph_parser_preserves_legacy_environment_mesh_collision() {
+        let graph = parse_graph_script(
+            r#"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ModelAsset id="set" src="set.glb" />
+  </Assets>
+  <Scene id="Legacy">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Environment id="set_model" asset="set" collision="mesh">
+                <Surface id="floor" kind="ground" height="0" />
+              </Environment>
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="Legacy" />
+</Graph>
+"#,
+        )
+        .expect("legacy mesh collision remains parseable");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("group");
+        };
+        let environment = group
+            .composite
+            .as_ref()
+            .expect("composite")
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Model(model) if model.environment => Some(model),
+                _ => None,
+            })
+            .expect("environment");
+        assert_eq!(environment.collision.as_deref(), Some("mesh"));
+        assert!(!environment.surfaces[0].collision);
+        assert!(environment.surfaces[0].collider.is_none());
+    }
+
+    #[test]
+    fn scene_model_defaults_to_authored_scale_and_accepts_physics_debug() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <PrimitiveAsset id="box" shape="box" size={[2,3,4]} color="#FFFFFF" />
+  </Assets>
+  <Scene id="Main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Model id="box_model" asset="box" />
+              <PhysicsDebug colliders="true" contacts="true" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="Main" />
+</Graph>
+"##,
+        )
+        .expect("authored-scale model and PhysicsDebug");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("group");
+        };
+        let composite = group.composite.as_ref().expect("composite");
+        let model = composite
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Model(model) => Some(model),
+                _ => None,
+            })
+            .expect("model");
+        assert_eq!(model.scale_mode, "none");
+        assert!(composite.nodes_3d.iter().any(|node| matches!(
+            node,
+            Scene3DNode::Debug(debug) if debug.colliders && debug.contacts
+        )));
+    }
+
+    #[test]
+    fn primitive_assets_parse_all_v1_shapes() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <PrimitiveAsset id="box" shape="box" size={[1,2,3]} color="#FF000080" />
+    <PrimitiveAsset id="sphere" shape="sphere" radius="0.5" segments="32" rings="12" />
+    <PrimitiveAsset id="plane" shape="plane" size={[8,6]} segments="4" />
+    <PrimitiveAsset id="cylinder" shape="cylinder" radius="1" height="2" />
+    <PrimitiveAsset id="cone" shape="cone" radius="1" height="2" segments="16" />
+    <PrimitiveAsset id="wedge" shape="wedge" size={[4,1,3]} />
+  </Assets>
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>
+"##,
+        )
+        .expect("all V1 primitive shapes should parse");
+        assert_eq!(graph.assets.len(), 6);
+        assert!(matches!(
+            graph.assets[0].source,
+            GraphAssetSource::Primitive(_)
+        ));
+        let sphere = graph.assets[1].primitive().expect("typed sphere");
+        assert!(matches!(
+            sphere.geometry,
+            PrimitiveGeometry::Sphere {
+                segments: 32,
+                rings: 12,
+                ..
+            }
+        ));
+        assert_eq!(sphere.collision.mode, PrimitiveCollisionMode::None);
+        assert_eq!(sphere.collision.collider, PrimitiveColliderShape::Auto);
+    }
+
+    #[test]
+    fn primitive_asset_resolves_first_class_pbr_material_and_visual_bevel() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ImageAsset id="stone_color" src="stone.jpg" colorSpace="srgb" />
+    <MaterialAsset id="stone" shading="pbr" baseColor="#D8D3CA"
+      baseColorTexture="stone_color" metallic="0" roughness="0.84"
+      specular="0.28" mapping="triplanar" textureScale={[2.4,2.4]}
+      variationAmount={[0.2,0.15]} />
+    <PrimitiveAsset id="step" shape="box" size={[4.4,0.32,0.9]}
+      material="stone" bevelRadius="0.025" bevelSegments="3"
+      materialSeed="76" collision="solid" collider="box" />
+  </Assets>
+  <Scene id="Main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="Main" />
+</Graph>
+"##,
+        )
+        .expect("typed PBR material should resolve into a beveled primitive");
+        assert_eq!(graph.material_assets.len(), 1);
+        let primitive = graph
+            .assets
+            .iter()
+            .find_map(|asset| asset.primitive())
+            .unwrap();
+        assert_eq!(primitive.material.as_deref(), Some("stone"));
+        assert_eq!(primitive.bevel_radius, 0.025);
+        assert_eq!(primitive.bevel_segments, 3);
+        assert_eq!(primitive.material_seed, Some(76));
+        let material = primitive.material_definition.as_ref().unwrap();
+        assert_eq!(
+            material.base_color_texture_src.as_deref(),
+            Some("stone.jpg")
+        );
+        assert_eq!(material.mapping, "triplanar");
+        assert_eq!(primitive.collision.collider, PrimitiveColliderShape::Box);
+    }
+
+    #[test]
+    fn primitive_material_parses_transmissive_glass_without_changing_collision() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <MaterialAsset id="glass" shading="pbr" baseColor="#E8F7FA"
+      roughness="0.08" specular="1" transmission="0.94" ior="1.52"
+      thickness="0.012" attenuationColor="#B7DDE2" attenuationDistance="6"
+      depthWrite="auto" sortPriority="3" doubleSided="true" />
+    <PrimitiveAsset id="pane" shape="box" size={[0.012,2.35,3.8]}
+      material="glass" collision="none" />
+  </Assets>
+  <Scene id="Main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="Main" />
+</Graph>
+"##,
+        )
+        .expect("transmissive glass should parse through the existing MaterialAsset tag");
+        let material = &graph.material_assets[0];
+        assert_eq!(material.transmission, 0.94);
+        assert_eq!(material.ior, 1.52);
+        assert_eq!(material.thickness, 0.012);
+        assert_eq!(material.attenuation_distance, 6.0);
+        assert_eq!(material.depth_write, "auto");
+        assert_eq!(material.sort_priority, 3);
+        assert_eq!(
+            graph.assets[0].primitive().unwrap().collision.mode,
+            PrimitiveCollisionMode::None
+        );
+    }
+
+    #[test]
+    fn primitive_material_rejects_invalid_transmission_depth_write() {
+        let error = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <MaterialAsset id="glass" transmission="0.8" depthWrite="sometimes" />
+  </Assets>
+  <Scene id="Main">
+    <Timeline />
+  </Scene>
+  <Present from="Main" />
+</Graph>
+"##,
+        )
+        .expect_err("invalid depth write policy must fail clearly");
+        assert!(error.message.contains("Use auto, true, or false"));
+    }
+
+    #[test]
+    fn primitive_material_rejects_unknown_image_asset() {
+        let error = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <MaterialAsset id="stone" baseColorTexture="missing" />
+    <PrimitiveAsset id="step" shape="box" size={[1,1,1]} material="stone" />
+  </Assets>
+  <Scene id="Main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="Main" />
+</Graph>
+"##,
+        )
+        .expect_err("unknown PBR texture asset must fail clearly");
+        assert!(error.message.contains("unknown ImageAsset \"missing\""));
+    }
+
+    #[test]
+    fn primitive_collision_defaults_to_auto_and_allows_visual_collider_mismatch() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <PrimitiveAsset id="auto_box" shape="box" size={[1,2,3]} collision="solid" />
+    <PrimitiveAsset id="sphere_with_box" shape="sphere" radius="1" collision="solid" collider="box" colliderSize={[2,3,4]} colliderOffset={[0,0.5,0]} />
+  </Assets>
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>
+"##,
+        )
+        .expect("universal primitive collision should parse");
+        let auto = graph.assets[0]
+            .primitive()
+            .expect("auto collider primitive");
+        assert_eq!(auto.collision.mode, PrimitiveCollisionMode::Solid);
+        assert_eq!(auto.collision.collider, PrimitiveColliderShape::Auto);
+        let mismatched = graph.assets[1]
+            .primitive()
+            .expect("mismatched visual and collider primitive");
+        assert_eq!(mismatched.collision.collider, PrimitiveColliderShape::Box);
+        assert_eq!(
+            mismatched.collision.size.as_deref(),
+            Some(&[2.0, 3.0, 4.0][..])
+        );
+        assert_eq!(mismatched.collision.offset, [0.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn primitive_collision_rejects_settings_when_disabled_and_shape_specific_mistakes() {
+        let disabled = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <PrimitiveAsset id="x" shape="sphere" radius="1" collider="box" />
+  </Assets>
+  <Background id="canvas" color="#000000" />
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect_err("disabled collision cannot carry collider settings");
+        assert!(disabled.message.contains("collision=\"none\""));
+
+        let wrong_size = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <PrimitiveAsset id="x" shape="sphere" radius="1" collision="solid" colliderRadius="1" colliderSize={[1,1,1]} />
+  </Assets>
+  <Background id="canvas" color="#000000" />
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect_err("sphere collider cannot use colliderSize");
+        assert!(wrong_size.message.contains("colliderSize is only valid"));
+    }
+
+    #[test]
+    fn compound_asset_composes_primitive_instances_and_rejects_external_children() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <PrimitiveAsset id="step" shape="box" size={[2,0.2,0.5]} collision="solid" />
+    <CompoundAsset id="stairs">
+      <Instance id="low" asset="step" position={[0,0.1,0]} />
+      <Instance id="high" asset="step" position={[0,0.3,-0.5]} scale="1" />
+    </CompoundAsset>
+  </Assets>
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect("compound primitive asset should parse");
+        let compound = graph.assets[1].compound().expect("typed compound asset");
+        assert_eq!(compound.instances.len(), 2);
+        assert_eq!(compound.instances[1].position, [0.0, 0.3, -0.5]);
+
+        let invalid = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <ModelAsset id="external" src="model.glb" />
+    <CompoundAsset id="invalid">
+      <Instance asset="external" />
+    </CompoundAsset>
+  </Assets>
+  <Background id="canvas" color="#000000" />
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect_err("compound V1 must reference primitives");
+        assert!(invalid.message.contains("must reference a PrimitiveAsset"));
+    }
+
+    #[test]
+    fn primitive_assets_reject_shape_attribute_conflicts_and_bad_values() {
+        let conflict = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <PrimitiveAsset id="x" shape="sphere" size={[1,1,1]} />
+  </Assets>
+  <Background id="canvas" color="#000000" />
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect_err("sphere size must be rejected");
+        assert!(
+            conflict.message.contains("does not support \"size\""),
+            "{conflict:?}"
+        );
+
+        let invalid = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <PrimitiveAsset id="x" shape="cone" radius="0" height="2" segments="300" />
+  </Assets>
+  <Background id="canvas" color="#000000" />
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect_err("invalid primitive values must be rejected");
+        assert!(invalid.message.contains("greater than zero") || invalid.message.contains("256"));
+    }
+
+    #[test]
+    fn removed_procedural_box_shorthand_has_migration_error() {
+        let error = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[1,1]}>
+  <Assets>
+    <ModelAsset id="x" src="motionloom:box:1:1:1:FFFFFF" />
+  </Assets>
+  <Background id="canvas" color="#000000" />
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect_err("removed shorthand must fail");
+        assert!(error.message.contains("shorthand has been removed"));
     }
 }

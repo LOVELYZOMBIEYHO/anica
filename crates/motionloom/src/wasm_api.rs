@@ -12,6 +12,7 @@ use crate::asset::MemoryAssetResolver;
 use crate::authoring::{
     motionloom_analyze_script_for_target_json as analyze_script_for_target_json,
     motionloom_analyze_script_json as analyze_script_json,
+    motionloom_dsl_schema_json as dsl_schema_json,
     motionloom_showcase_schema_json as showcase_schema_json,
 };
 use crate::dsl::{GraphScript, is_graph_script, parse_graph_script};
@@ -189,6 +190,12 @@ pub fn motionloom_parse_summary(script: &str) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn motionloom_animation_property_schema_json() -> String {
     animation_property_schema_json()
+}
+
+/// Return the complete machine-readable MotionLoom DSL capability catalog.
+#[wasm_bindgen]
+pub fn motionloom_dsl_schema_json() -> String {
+    dsl_schema_json()
 }
 
 /// Analyze one DSL revision and return parse, semantic, compatibility, and repair diagnostics.
@@ -444,6 +451,27 @@ pub struct WasmSceneRenderer {
     renderer: Option<SceneRenderer>,
 }
 
+/// Compact browser-side environment metadata cache input. Hosts can inspect a
+/// remote GLB once while preloading it, then provide the transformed bounds to
+/// the renderer before the first presented frame needs semantic coordinates.
+fn register_wasm_environment_bounds_asset(
+    resolver: &MemoryAssetResolver,
+    name: &str,
+    bytes: &[u8],
+) {
+    let Ok(mesh) = crate::world::parse_glb_mesh_data(std::path::Path::new(name), bytes) else {
+        return;
+    };
+    let matrices = crate::world::model_inspection::world_matrices(&mesh.nodes);
+    let bounds = crate::world::model_inspection::transformed_environment_bounds(&mesh, &matrices)
+        .unwrap_or((mesh.bounds_min, mesh.bounds_max));
+    let mut payload = Vec::with_capacity(24);
+    for value in bounds.0.into_iter().chain(bounds.1) {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    resolver.insert(format!("__motionloom_environment_bounds__:{name}"), payload);
+}
+
 #[wasm_bindgen]
 impl WasmSceneRenderer {
     /// Parse `script` and prepare a renderer.
@@ -486,6 +514,13 @@ impl WasmSceneRenderer {
     /// nodes (e.g. `"logo.png"`). The `bytes` argument is the raw file content.
     pub fn add_asset(&mut self, name: &str, bytes: &[u8]) {
         self.resolver.insert(name.to_string(), bytes.to_vec());
+    }
+
+    /// Register transformed GLB bounds alongside an already preloaded asset.
+    /// This is optional and non-breaking; renderers fall back to inspecting
+    /// the asset bytes when the hint is absent.
+    pub fn add_environment_bounds(&mut self, name: &str, bytes: &[u8]) {
+        register_wasm_environment_bounds_asset(self.resolver.as_ref(), name, bytes);
     }
 
     /// Register an in-memory font for this renderer only.

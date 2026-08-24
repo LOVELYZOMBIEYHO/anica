@@ -3,6 +3,7 @@
 // crates/motionloom/src/world/gltf_loader.rs
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use draco_gltf::{
@@ -117,6 +118,13 @@ pub struct GlbMaterialData {
     pub specular_color_factor: [f32; 3],
     pub alpha_mode: GlbAlphaMode,
     pub alpha_cutoff: f32,
+    pub transmission_factor: f32,
+    pub ior: f32,
+    pub thickness_factor: f32,
+    pub attenuation_color: [f32; 3],
+    pub attenuation_distance: f32,
+    pub depth_write: GlbDepthWriteMode,
+    pub sort_priority: i32,
     pub double_sided: bool,
     pub unlit: bool,
     pub specular_glossiness: bool,
@@ -140,6 +148,13 @@ impl Default for GlbMaterialData {
             specular_color_factor: [1.0, 1.0, 1.0],
             alpha_mode: GlbAlphaMode::Opaque,
             alpha_cutoff: 0.5,
+            transmission_factor: 0.0,
+            ior: 1.5,
+            thickness_factor: 0.0,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: 1_000_000.0,
+            depth_write: GlbDepthWriteMode::Auto,
+            sort_priority: 0,
             double_sided: false,
             unlit: false,
             specular_glossiness: false,
@@ -154,11 +169,22 @@ pub enum GlbAlphaMode {
     Blend,
 }
 
+/// Auto follows material semantics while explicit modes remain available for
+/// advanced effects that deliberately manage their own occlusion behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlbDepthWriteMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlbTextureData {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    /// Decoded pixels are immutable and intentionally shared by retained
+    /// primitive/material resources that reference the same ImageAsset.
+    pub rgba: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1015,7 +1041,7 @@ fn read_image_node(
     Ok(Some(GlbTextureData {
         width,
         height,
-        rgba: decoded.into_raw(),
+        rgba: Arc::new(decoded.into_raw()),
     }))
 }
 
@@ -1124,6 +1150,45 @@ fn read_materials(chunks: &GlbChunks) -> Vec<GlbMaterialData> {
                                     color.get(axis).and_then(Value::as_f64).unwrap_or(1.0) as f32;
                             }
                         }
+                    }
+                    if let Some(transmission) = material
+                        .get("extensions")
+                        .and_then(|extensions| extensions.get("KHR_materials_transmission"))
+                    {
+                        out.transmission_factor = transmission
+                            .get("transmissionFactor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0)
+                            as f32;
+                    }
+                    out.ior = material
+                        .get("extensions")
+                        .and_then(|extensions| extensions.get("KHR_materials_ior"))
+                        .and_then(|extension| extension.get("ior"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.5) as f32;
+                    if let Some(volume) = material
+                        .get("extensions")
+                        .and_then(|extensions| extensions.get("KHR_materials_volume"))
+                    {
+                        out.thickness_factor = volume
+                            .get("thicknessFactor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0) as f32;
+                        if let Some(color) =
+                            volume.get("attenuationColor").and_then(Value::as_array)
+                        {
+                            for axis in 0..3 {
+                                out.attenuation_color[axis] =
+                                    color.get(axis).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                            }
+                        }
+                        out.attenuation_distance = volume
+                            .get("attenuationDistance")
+                            .and_then(Value::as_f64)
+                            .filter(|distance| distance.is_finite() && *distance > 0.0)
+                            .unwrap_or(1_000_000.0)
+                            as f32;
                     }
                     out.alpha_mode = match material
                         .get("alphaMode")
@@ -2095,6 +2160,13 @@ mod tests {
                         "KHR_materials_specular": {
                             "specularFactor": 0.8,
                             "specularColorFactor": [0.9, 0.85, 0.75]
+                        },
+                        "KHR_materials_transmission": { "transmissionFactor": 0.94 },
+                        "KHR_materials_ior": { "ior": 1.52 },
+                        "KHR_materials_volume": {
+                            "thicknessFactor": 0.012,
+                            "attenuationColor": [0.72, 0.87, 0.89],
+                            "attenuationDistance": 6.0
                         }
                     }
                 }]
@@ -2115,5 +2187,10 @@ mod tests {
         assert_eq!(material.emissive_strength, 2.5);
         assert_eq!(material.specular_factor, 0.8);
         assert_eq!(material.specular_color_factor, [0.9, 0.85, 0.75]);
+        assert_eq!(material.transmission_factor, 0.94);
+        assert_eq!(material.ior, 1.52);
+        assert_eq!(material.thickness_factor, 0.012);
+        assert_eq!(material.attenuation_color, [0.72, 0.87, 0.89]);
+        assert_eq!(material.attenuation_distance, 6.0);
     }
 }

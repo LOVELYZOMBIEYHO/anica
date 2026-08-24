@@ -20,7 +20,7 @@ pub enum SimulationBindingNode {
     DynamicCurve(DynamicCurveNode),
     DistanceConstraint(DistanceConstraintNode),
     Hinge(HingeNode),
-    RigidBody2D(RigidBody2DNode),
+    RigidBody(RigidBodyNode),
     ParticleEmitter(ParticleEmitterNode),
     Cloth(ClothNode),
     HairStrandField(HairStrandFieldNode),
@@ -126,12 +126,83 @@ pub struct HingeNode {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RigidBody2DNode {
+pub struct RigidBodyNode {
     pub id: String,
     pub target: String,
+    pub dimension: RigidBodyDimension,
+    pub body_type: RigidBodyType,
+    pub shape: RigidBodyShape,
+    pub size: RigidBodyColliderSize,
+    pub radius: f32,
+    pub height: f32,
     pub mass: f32,
-    pub velocity: [f32; 2],
-    pub angular_velocity: f32,
+    pub velocity: RigidBodyLinearVelocity,
+    pub angular_velocity: RigidBodyAngularVelocity,
+    pub gravity: RigidBodyLinearVelocity,
+    pub friction: f32,
+    pub rolling_friction: f32,
+    pub restitution: f32,
+    pub restitution_threshold: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub continuous_collision: bool,
+    pub sleep: bool,
+    pub sleep_linear_threshold: f32,
+    pub sleep_angular_threshold: f32,
+    pub sleep_time: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RigidBodyDimension {
+    D2,
+    D3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RigidBodyType {
+    Static,
+    Dynamic,
+    Kinematic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RigidBodyShape {
+    Auto,
+    Box,
+    Circle,
+    Sphere,
+    Capsule,
+    Cylinder,
+    ConvexHull,
+    Mesh,
+}
+
+/// Dimension-specific vectors keep malformed 2D/3D data out of the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "dimension", content = "value", rename_all = "lowercase")]
+pub enum RigidBodyLinearVelocity {
+    D2([f32; 2]),
+    D3([f32; 3]),
+}
+
+/// A 2D body rotates around one axis while a 3D body has three angular axes.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "dimension", content = "value", rename_all = "lowercase")]
+pub enum RigidBodyAngularVelocity {
+    D2(f32),
+    D3([f32; 3]),
+}
+
+/// Collider dimensions use the same public `size` attribute without allowing
+/// a 2D body to accidentally carry a 3D extent.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "dimension", content = "value", rename_all = "lowercase")]
+pub enum RigidBodyColliderSize {
+    D2([f32; 2]),
+    D3([f32; 3]),
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

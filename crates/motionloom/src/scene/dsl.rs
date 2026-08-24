@@ -252,6 +252,10 @@ pub struct ActionNode {
     pub iks: Vec<ActionIkNode>,
     #[serde(default)]
     pub markers: Vec<ActionMarkerNode>,
+    /// Normalized semantic contacts authored against the Action clip. The
+    /// actual scene surface is bound by ApplyAction.ground at use time.
+    #[serde(default)]
+    pub contacts: Vec<ActionContactNode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -261,6 +265,23 @@ pub struct ActionMarkerNode {
     pub time_ms: u64,
     #[serde(default)]
     pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionContactNode {
+    pub id: String,
+    /// Canonical humanoid effector, for example knee_l or foot_r.
+    pub effector: String,
+    /// Semantic target slot. The first version supports ground.
+    pub target: String,
+    /// Inclusive normalized clip phase in the 0..=1 range.
+    pub from: f32,
+    pub to: f32,
+    #[serde(default = "default_action_contact_mode")]
+    pub mode: String,
+    #[serde(default = "default_action_one")]
+    pub weight: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -367,6 +388,10 @@ pub struct ApplyActionNode {
     /// grounding without enabling a full rigid-body simulation.
     #[serde(default)]
     pub ground: Option<String>,
+    /// `auto` evaluates Action Contact metadata against the bound ground
+    /// surface and performs deterministic root/IK correction.
+    #[serde(default)]
+    pub contact_correction: Option<String>,
     /// Vertical offset between the model root and its planted foot plane.
     /// This keeps grounding independent of how a GLB author positioned the
     /// skeleton origin (pelvis, floor, or another convention).
@@ -375,6 +400,22 @@ pub struct ApplyActionNode {
     /// `auto` enables the renderer's humanoid foot-contact stabilization.
     #[serde(default)]
     pub foot_lock: Option<String>,
+    /// Optional kinematic body shape preset. `auto` derives a stable shape
+    /// from action markers while preserving existing scripts.
+    #[serde(default)]
+    pub collider_profile: Option<String>,
+    /// Extra separation retained between the controller and environment mesh.
+    #[serde(default = "default_action_safe_margin")]
+    pub safe_margin: String,
+    /// Downward floor probe used after horizontal motion is resolved.
+    #[serde(default = "default_action_floor_snap")]
+    pub floor_snap: String,
+    /// Maximum deterministic slide iterations for one rendered frame.
+    #[serde(default = "default_action_max_slides")]
+    pub max_slides: u32,
+    /// Maximum internal sweep distance per deterministic substep.
+    #[serde(default = "default_action_sweep_step")]
+    pub sweep_step: String,
 }
 
 fn default_action_ik_plane() -> String {
@@ -391,6 +432,26 @@ fn default_action_one() -> String {
 
 fn default_action_blend_mode() -> String {
     "override".to_string()
+}
+
+fn default_action_contact_mode() -> String {
+    "lock".to_string()
+}
+
+fn default_action_safe_margin() -> String {
+    "0.008".to_string()
+}
+
+fn default_action_floor_snap() -> String {
+    "0.08".to_string()
+}
+
+fn default_action_max_slides() -> u32 {
+    4
+}
+
+fn default_action_sweep_step() -> String {
+    "0.04".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1649,6 +1710,7 @@ pub(crate) fn parse_action_block(
                 poses: Vec::new(),
                 iks: Vec::new(),
                 markers: Vec::new(),
+                contacts: Vec::new(),
             },
             open_end_ix,
         ));
@@ -1659,6 +1721,7 @@ pub(crate) fn parse_action_block(
     let mut poses = Vec::<ActionPoseNode>::new();
     let mut iks = Vec::<ActionIkNode>::new();
     let mut markers = Vec::<ActionMarkerNode>::new();
+    let mut contacts = Vec::<ActionContactNode>::new();
     let mut i = open_end_ix + 1;
 
     while i < close_ix {
@@ -1710,10 +1773,16 @@ pub(crate) fn parse_action_block(
             i = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "Contact") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            contacts.push(parse_action_contact_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
         return Err(GraphParseError {
             line: i + 1,
             message: format!(
-                "<Action> only accepts <Pose>, <IK /> or <Marker /> children, got: {line}"
+                "<Action> only accepts <Pose>, <IK />, <Marker /> or <Contact /> children, got: {line}"
             ),
         });
     }
@@ -1746,9 +1815,70 @@ pub(crate) fn parse_action_block(
             poses,
             iks,
             markers,
+            contacts,
         },
         close_ix,
     ))
+}
+
+fn parse_action_contact_phase(
+    raw: &str,
+    line: usize,
+    attribute: &str,
+) -> Result<f32, GraphParseError> {
+    let value = strip_wrappers(raw).trim();
+    let parsed = if let Some(percent) = value.strip_suffix('%') {
+        percent.trim().parse::<f32>().map(|value| value / 100.0)
+    } else {
+        value.parse::<f32>()
+    }
+    .map_err(|_| GraphParseError {
+        line,
+        message: format!(
+            "Action Contact.{attribute} must be a percentage such as 18% or a normalized number in 0..1, got: {value}"
+        ),
+    })?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err(GraphParseError {
+            line,
+            message: format!("Action Contact.{attribute} must be inside 0%..100%, got: {value}"),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_action_contact_node(
+    block: &str,
+    line: usize,
+) -> Result<ActionContactNode, GraphParseError> {
+    let id = strip_wrappers(&required_attr_value(block, "id", line)?).to_string();
+    let effector =
+        strip_wrappers(&required_attr_value(block, "effector", line)?).to_ascii_lowercase();
+    let target = strip_wrappers(&required_attr_value(block, "target", line)?).to_ascii_lowercase();
+    let from =
+        parse_action_contact_phase(&required_attr_value(block, "from", line)?, line, "from")?;
+    let to = parse_action_contact_phase(&required_attr_value(block, "to", line)?, line, "to")?;
+    if to <= from {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "Action Contact '{id}' requires to greater than from (from={from}, to={to})."
+            ),
+        });
+    }
+    Ok(ActionContactNode {
+        id,
+        effector,
+        target,
+        from,
+        to,
+        mode: attr_value(block, "mode")
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+            .unwrap_or_else(default_action_contact_mode),
+        weight: attr_value(block, "weight")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(default_action_one),
+    })
 }
 
 fn parse_action_pose_block(
@@ -1953,6 +2083,9 @@ pub(crate) fn parse_apply_action_node(
             .or_else(|| attr_value(block, "sync_marker"))
             .map(|value| strip_wrappers(&value).to_string()),
         ground: attr_value(block, "ground").map(|value| strip_wrappers(&value).to_string()),
+        contact_correction: attr_value(block, "contactCorrection")
+            .or_else(|| attr_value(block, "contact_correction"))
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase()),
         ground_offset: attr_value(block, "groundOffset")
             .or_else(|| attr_value(block, "ground_offset"))
             .map(|value| strip_wrappers(&value).to_string())
@@ -1960,6 +2093,37 @@ pub(crate) fn parse_apply_action_node(
         foot_lock: attr_value(block, "footLock")
             .or_else(|| attr_value(block, "foot_lock"))
             .map(|value| strip_wrappers(&value).to_ascii_lowercase()),
+        collider_profile: attr_value(block, "colliderProfile")
+            .or_else(|| attr_value(block, "collider_profile"))
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase()),
+        safe_margin: attr_value(block, "safeMargin")
+            .or_else(|| attr_value(block, "safe_margin"))
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(default_action_safe_margin),
+        floor_snap: attr_value(block, "floorSnap")
+            .or_else(|| attr_value(block, "floor_snap"))
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(default_action_floor_snap),
+        max_slides: attr_value(block, "maxSlides")
+            .or_else(|| attr_value(block, "max_slides"))
+            .map(|value| {
+                strip_wrappers(&value)
+                    .parse::<u32>()
+                    .map_err(|_| GraphParseError {
+                        line,
+                        message: format!(
+                            "Invalid ApplyAction.maxSlides integer: {}",
+                            strip_wrappers(&value)
+                        ),
+                    })
+            })
+            .transpose()?
+            .unwrap_or_else(default_action_max_slides)
+            .clamp(1, 16),
+        sweep_step: attr_value(block, "sweepStep")
+            .or_else(|| attr_value(block, "sweep_step"))
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(default_action_sweep_step),
     })
 }
 
@@ -2312,11 +2476,374 @@ fn parse_composite_group_block(
         Some(&mut process_effects),
     )?;
     let mut nodes_3d = Vec::new();
+    let mut physics = None;
     let mut i = open_end_ix + 1;
     while i < close_ix {
         let line = lines[i].trim();
+        if starts_open_tag(line, "Repeat") {
+            let (repeat_tag, repeat_open_end) = collect_tag_block(lines, i, '>', false)?;
+            let mode = scene_attr_or_default(&repeat_tag, &["mode"], "linear").to_ascii_lowercase();
+            if mode != "volume" {
+                i += 1;
+                continue;
+            }
+            if space != "3d" {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" requires CompositeGroup space=\"3d\"."
+                        .to_string(),
+                });
+            }
+            let repeat_close = find_matching_close_tag(lines, repeat_open_end + 1, "Repeat")?;
+            let count = scene_attr_or_default(&repeat_tag, &["count"], "1")
+                .parse::<u32>()
+                .map_err(|_| GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" requires a literal integer count.".to_string(),
+                })?;
+            if !(1..=10_000).contains(&count) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" count must be between 1 and 10000."
+                        .to_string(),
+                });
+            }
+            let phase =
+                scene_attr_or_default(&repeat_tag, &["phase"], "random").to_ascii_lowercase();
+            if !matches!(phase.as_str(), "random" | "even") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" phase must be random or even.".to_string(),
+                });
+            }
+            let respawn =
+                scene_attr_or_default(&repeat_tag, &["respawn"], "random").to_ascii_lowercase();
+            if !matches!(respawn.as_str(), "random" | "wrap") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" respawn must be random or wrap.".to_string(),
+                });
+            }
+            let bounds_min =
+                scene_attr_or_default(&repeat_tag, &["boundsMin", "bounds_min"], "[-1,-1,-1]");
+            let bounds_max =
+                scene_attr_or_default(&repeat_tag, &["boundsMax", "bounds_max"], "[1,1,1]");
+            let parsed_min = parse_static_scene_vec3(&bounds_min, i + 1, "Repeat.boundsMin")?;
+            let parsed_max = parse_static_scene_vec3(&bounds_max, i + 1, "Repeat.boundsMax")?;
+            if (0..3).any(|axis| parsed_max[axis] <= parsed_min[axis]) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" requires boundsMax to exceed boundsMin on every axis."
+                        .to_string(),
+                });
+            }
+            let velocity = scene_attr_or_default(&repeat_tag, &["velocity"], "[0,-1,0]");
+            parse_static_scene_vec3(&velocity, i + 1, "Repeat.velocity")?;
+            let lifetime = scene_attr_or_default(&repeat_tag, &["lifetime"], "1s");
+            if parse_time_seconds(&lifetime, i + 1, "Repeat.lifetime")? <= 0.0 {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" lifetime must be greater than zero."
+                        .to_string(),
+                });
+            }
+            let scale_range = parse_literal_float_array(&repeat_tag, "scaleRange", 2, i + 1)?
+                .unwrap_or_else(|| vec![1.0, 1.0]);
+            if scale_range[0] <= 0.0 || scale_range[1] < scale_range[0] {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Repeat mode=\"volume\" scaleRange must be positive and ordered."
+                        .to_string(),
+                });
+            }
+
+            // Volume Repeat deliberately accepts one ordinary Model template.
+            // This keeps all geometry, material, and shadow behavior on the
+            // established Model path.
+            let mut template = None;
+            let mut j = repeat_open_end + 1;
+            while j < repeat_close {
+                let child = lines[j].trim();
+                if child.is_empty() || child.starts_with("//") || child.starts_with('{') {
+                    j += 1;
+                    continue;
+                }
+                if starts_open_tag(child, "Model") {
+                    if template.is_some() {
+                        return Err(GraphParseError {
+                            line: j + 1,
+                            message: "Repeat mode=\"volume\" accepts exactly one Model template."
+                                .to_string(),
+                        });
+                    }
+                    let (tag, end_ix) = collect_self_closing_block(lines, j)?;
+                    let asset =
+                        strip_wrappers(&required_attr_value(&tag, "asset", j + 1)?).to_string();
+                    template = Some(SceneModel3DNode {
+                        id: scene_optional_attr(&tag, &["id"]),
+                        asset,
+                        primitive: None,
+                        profile: scene_optional_attr(&tag, &["profile"]),
+                        rig: scene_optional_attr(&tag, &["rig"]),
+                        retarget: scene_optional_attr(&tag, &["retarget"]),
+                        position: scene_attr_or_default(&tag, &["position"], "[0,0,0]"),
+                        position_x: scene_optional_attr(&tag, &["positionX", "position_x"]),
+                        position_y: scene_optional_attr(&tag, &["positionY", "position_y"]),
+                        position_z: scene_optional_attr(&tag, &["positionZ", "position_z"]),
+                        rotation: scene_attr_or_default(&tag, &["rotation"], "[0,0,0]"),
+                        rotation_x: scene_optional_attr(&tag, &["rotationX", "rotation_x"]),
+                        rotation_y: scene_optional_attr(&tag, &["rotationY", "rotation_y"]),
+                        rotation_z: scene_optional_attr(&tag, &["rotationZ", "rotation_z"]),
+                        scale: scene_attr_or_default(&tag, &["scale"], "1"),
+                        environment: false,
+                        r#static: false,
+                        collision: None,
+                        gravity: None,
+                        ground: None,
+                        up: scene_attr_or_default(&tag, &["up"], "+Y"),
+                        forward: scene_attr_or_default(&tag, &["forward"], "+Z"),
+                        unit_scale: scene_attr_or_default(&tag, &["unitScale", "unit_scale"], "1"),
+                        scale_mode: scene_attr_or_default(
+                            &tag,
+                            &["scaleMode", "scale_mode"],
+                            "none",
+                        )
+                        .to_ascii_lowercase(),
+                        cast_shadow: scene_bool_attr(&tag, &["castShadow", "cast_shadow"], false),
+                        receive_shadow: scene_bool_attr(
+                            &tag,
+                            &["receiveShadow", "receive_shadow"],
+                            false,
+                        ),
+                        surfaces: Vec::new(),
+                        exposure: scene_attr_or_default(&tag, &["exposure"], "1"),
+                        material_bindings: Vec::new(),
+                        play: None,
+                        plays: Vec::new(),
+                        bone_overrides: Vec::new(),
+                    });
+                    j = end_ix + 1;
+                    continue;
+                }
+                return Err(GraphParseError {
+                    line: j + 1,
+                    message: format!(
+                        "Repeat mode=\"volume\" only accepts one self-closing Model child, got: {child}"
+                    ),
+                });
+            }
+            let template = template.ok_or_else(|| GraphParseError {
+                line: i + 1,
+                message: "Repeat mode=\"volume\" requires one Model child.".to_string(),
+            })?;
+            nodes_3d.push(Scene3DNode::VolumeRepeat(SceneVolumeRepeat3DNode {
+                id: scene_optional_attr(&repeat_tag, &["id"]),
+                count,
+                seed: scene_attr_or_default(&repeat_tag, &["seed"], "1")
+                    .parse::<u32>()
+                    .map_err(|_| GraphParseError {
+                        line: i + 1,
+                        message: "Repeat mode=\"volume\" seed must be an unsigned integer."
+                            .to_string(),
+                    })?,
+                bounds_min,
+                bounds_max,
+                velocity,
+                lifetime,
+                phase,
+                respawn,
+                scale_range: format!("[{},{}]", scale_range[0], scale_range[1]),
+                template,
+            }));
+            i = repeat_close + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Physics") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            if physics.is_some() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "A <CompositeGroup> may contain only one <Physics> declaration."
+                        .to_string(),
+                });
+            }
+            let iterations = scene_attr_or_default(&tag, &["iterations"], "4")
+                .parse::<u32>()
+                .map_err(|_| GraphParseError {
+                    line: i + 1,
+                    message: "Invalid <Physics iterations>. Expected an integer from 1 to 16."
+                        .to_string(),
+                })?;
+            if !(1..=16).contains(&iterations) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Invalid <Physics iterations>. Expected an integer from 1 to 16."
+                        .to_string(),
+                });
+            }
+            physics = Some(ScenePhysicsConfig {
+                gravity: scene_attr_or_default(&tag, &["gravity"], "[0,-9.81,0]"),
+                fixed_step: scene_attr_or_default(
+                    &tag,
+                    &["fixedStep", "fixed_step"],
+                    "0.008333333",
+                ),
+                iterations,
+            });
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "RigidBody") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let body = crate::simulation::dsl::parse_rigid_body(&tag, i + 1)?;
+            if body.dimension != crate::simulation::model::RigidBodyDimension::D3 {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "RigidBody inside CompositeGroup must declare dimension=\"3d\". Put a 2D body beside its target in a Layer."
+                        .to_string(),
+                });
+            }
+            nodes_3d.push(Scene3DNode::RigidBody(body));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Surface") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let id = strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string();
+            let kind = scene_attr_or_default(&tag, &["kind"], "ground").to_ascii_lowercase();
+            if kind != "ground" {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Direct <Surface id=\"{id}\"> currently supports kind=\"ground\". Use a nested Environment Surface for walls or mesh collision."
+                    ),
+                });
+            }
+            let collider = scene_attr_or_default(&tag, &["collider"], "box").to_ascii_lowercase();
+            if collider != "box" {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Direct <Surface id=\"{id}\"> currently supports collider=\"box\"."
+                    ),
+                });
+            }
+            let center_expr = scene_attr_or_default(&tag, &["center"], "[0,-0.1,0]");
+            let size_expr = scene_attr_or_default(&tag, &["size"], "[20,0.2,20]");
+            let center = parse_static_scene_vec3(&center_expr, i + 1, "Surface.center")?;
+            let size = parse_static_scene_vec3(&size_expr, i + 1, "Surface.size")?;
+            if size.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Invalid <Surface size>. All three box dimensions must be positive."
+                        .to_string(),
+                });
+            }
+            let color = scene_attr_or_default(&tag, &["color"], "#202838");
+            let encoded_color = color.trim().trim_start_matches('#');
+            if !matches!(encoded_color.len(), 6 | 8)
+                || !encoded_color.chars().all(|value| value.is_ascii_hexdigit())
+            {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Invalid <Surface color>. Expected #RRGGBB or #RRGGBBAA.".to_string(),
+                });
+            }
+            let top = center[1] + size[1] * 0.5;
+            let bounds_min = [
+                center[0] - size[0] * 0.5,
+                center[1] - size[1] * 0.5,
+                center[2] - size[2] * 0.5,
+            ];
+            let bounds_max = [
+                center[0] + size[0] * 0.5,
+                center[1] + size[1] * 0.5,
+                center[2] + size[2] * 0.5,
+            ];
+            let model_id = format!("__motionloom_surface_{id}");
+            let channel = |offset: usize| {
+                u8::from_str_radix(&encoded_color[offset..offset + 2], 16)
+                    .expect("Surface color validated as hexadecimal") as f32
+                    / 255.0
+            };
+            let primitive = crate::dsl::PrimitiveAssetNode {
+                id: format!("__motionloom_surface_asset_{id}"),
+                geometry: crate::dsl::PrimitiveGeometry::Box { size },
+                color: [
+                    channel(0),
+                    channel(2),
+                    channel(4),
+                    if encoded_color.len() == 8 {
+                        channel(6)
+                    } else {
+                        1.0
+                    },
+                ],
+                material: None,
+                material_definition: None,
+                bevel_radius: 0.0,
+                bevel_segments: 0,
+                material_seed: None,
+                collision: Default::default(),
+            };
+            nodes_3d.push(Scene3DNode::Model(SceneModel3DNode {
+                id: Some(model_id),
+                asset: primitive.id.clone(),
+                primitive: Some(primitive),
+                profile: None,
+                rig: None,
+                retarget: None,
+                position: format!("[{},{},{}]", center[0], center[1], center[2]),
+                position_x: None,
+                position_y: None,
+                position_z: None,
+                rotation: "[0,0,0]".to_string(),
+                rotation_x: None,
+                rotation_y: None,
+                rotation_z: None,
+                scale: "1".to_string(),
+                environment: true,
+                r#static: true,
+                collision: Some("surfaces".to_string()),
+                gravity: None,
+                ground: None,
+                up: "+Y".to_string(),
+                forward: "+Z".to_string(),
+                unit_scale: "1".to_string(),
+                scale_mode: "none".to_string(),
+                cast_shadow: true,
+                receive_shadow: true,
+                surfaces: vec![SceneSurface3DNode {
+                    id,
+                    node: None,
+                    kind,
+                    height: (size[1] * 0.5).to_string(),
+                    normal: "[0,1,0]".to_string(),
+                    space: "scene".to_string(),
+                    centroid: Some(format!("[{},{},{}]", center[0], top, center[2])),
+                    bounds_min: Some(format!(
+                        "[{},{},{}]",
+                        bounds_min[0], bounds_min[1], bounds_min[2]
+                    )),
+                    bounds_max: Some(format!(
+                        "[{},{},{}]",
+                        bounds_max[0], bounds_max[1], bounds_max[2]
+                    )),
+                    collision: true,
+                    collider: Some("box".to_string()),
+                }],
+                exposure: "1".to_string(),
+                material_bindings: Vec::new(),
+                play: None,
+                plays: Vec::new(),
+                bone_overrides: Vec::new(),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
         if starts_open_tag(line, "Camera3D") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let hidden_bones = parse_scene_camera_hidden_bones(&tag, i + 1)?;
             nodes_3d.push(Scene3DNode::Camera(SceneCamera3DNode {
                 id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
                 position: scene_attr_or_default(&tag, &["position"], "[0,0,6]"),
@@ -2328,6 +2855,7 @@ fn parse_composite_group_block(
                     .or_else(|| attr_value(&tag, "horizon_lock"))
                     .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
                     .unwrap_or(false),
+                hidden_bones,
             }));
             i = end_ix + 1;
             continue;
@@ -2338,16 +2866,152 @@ fn parse_composite_group_block(
                 id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
                 asset: strip_wrappers(&required_attr_value(&tag, "asset", i + 1)?).to_string(),
                 intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+                mapping: scene_attr_or_default(&tag, &["mapping"], "equirectangular"),
+                rotation_y: scene_attr_or_default(&tag, &["rotationY", "rotation_y"], "0"),
+                visible: scene_bool_attr(&tag, &["visible"], true),
+                background_intensity: scene_attr_or_default(
+                    &tag,
+                    &["backgroundIntensity", "background_intensity"],
+                    "1",
+                ),
+                background_blur: scene_attr_or_default(
+                    &tag,
+                    &["backgroundBlur", "background_blur"],
+                    "0",
+                ),
+                diffuse_intensity: scene_attr_or_default(
+                    &tag,
+                    &["diffuseIntensity", "diffuse_intensity"],
+                    "1",
+                ),
+                specular_intensity: scene_attr_or_default(
+                    &tag,
+                    &["specularIntensity", "specular_intensity"],
+                    "1",
+                ),
             }));
             i = end_ix + 1;
             continue;
         }
-        if starts_open_tag(line, "EnvironmentDebug") {
+        if starts_open_tag(line, "DirectionalLight") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::DirectionalLight(SceneDirectionalLightNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                direction: scene_attr_or_default(&tag, &["direction"], "[-0.4,-1,-0.35]"),
+                color: scene_attr_or_default(&tag, &["color"], "#FFFFFF"),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+                cast_shadow: scene_bool_attr(&tag, &["castShadow", "cast_shadow"], true),
+                shadow_strength: scene_attr_or_default(
+                    &tag,
+                    &["shadowStrength", "shadow_strength"],
+                    "0.8",
+                ),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "PointLight") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::PointLight(ScenePointLightNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                position: scene_attr_or_default(&tag, &["position"], "[0,0,0]"),
+                color: scene_attr_or_default(&tag, &["color"], "#FFFFFF"),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+                range: scene_attr_or_default(&tag, &["range"], "10"),
+                cast_shadow: scene_bool_attr(&tag, &["castShadow", "cast_shadow"], false),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "SpotLight") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::SpotLight(SceneSpotLightNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                position: scene_attr_or_default(&tag, &["position"], "[0,0,0]"),
+                direction: scene_attr_or_default(&tag, &["direction"], "[0,-1,0]"),
+                color: scene_attr_or_default(&tag, &["color"], "#FFFFFF"),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+                range: scene_attr_or_default(&tag, &["range"], "10"),
+                inner_cone: scene_attr_or_default(&tag, &["innerCone", "inner_cone"], "22"),
+                outer_cone: scene_attr_or_default(&tag, &["outerCone", "outer_cone"], "35"),
+                cast_shadow: scene_bool_attr(&tag, &["castShadow", "cast_shadow"], false),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "RectAreaLight") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::RectAreaLight(SceneRectAreaLightNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                position: scene_attr_or_default(&tag, &["position"], "[0,0,0]"),
+                direction: scene_attr_or_default(&tag, &["direction"], "[0,-1,0]"),
+                color: scene_attr_or_default(&tag, &["color"], "#FFFFFF"),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+                width: scene_attr_or_default(&tag, &["width"], "2"),
+                height: scene_attr_or_default(&tag, &["height"], "2"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "AmbientOcclusion") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::AmbientOcclusion(SceneAmbientOcclusionNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "1"),
+                radius: scene_attr_or_default(&tag, &["radius"], "1"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "ContactShadow") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            nodes_3d.push(Scene3DNode::ContactShadow(SceneContactShadowNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                intensity: scene_attr_or_default(&tag, &["intensity"], "0.8"),
+                distance: scene_attr_or_default(&tag, &["distance"], "0.25"),
+                softness: scene_attr_or_default(&tag, &["softness"], "0.5"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "ColorManagement") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let tone_mapping =
+                scene_attr_or_default(&tag, &["toneMapping", "tone_mapping"], "aces")
+                    .to_ascii_lowercase();
+            if !matches!(tone_mapping.as_str(), "aces" | "reinhard" | "none") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "Invalid <ColorManagement toneMapping=\"{tone_mapping}\">. Expected aces, reinhard, or none."
+                    ),
+                });
+            }
+            nodes_3d.push(Scene3DNode::ColorManagement(SceneColorManagementNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                tone_mapping,
+                exposure: scene_attr_or_default(&tag, &["exposure"], "1"),
+                white_balance: scene_attr_or_default(
+                    &tag,
+                    &["whiteBalance", "white_balance"],
+                    "6500",
+                ),
+                contrast: scene_attr_or_default(&tag, &["contrast"], "1"),
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "EnvironmentDebug") || starts_open_tag(line, "PhysicsDebug") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
             let enabled = |name: &str| {
                 attr_value(&tag, name)
                     .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
                     .unwrap_or(true)
+            };
+            let optional_enabled = |name: &str| {
+                attr_value(&tag, name)
+                    .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+                    .unwrap_or(false)
             };
             nodes_3d.push(Scene3DNode::Debug(SceneEnvironmentDebugNode {
                 axes: enabled("axes"),
@@ -2356,6 +3020,12 @@ fn parse_composite_group_block(
                 anchors: enabled("anchors"),
                 action_path: enabled("actionPath"),
                 cameras: enabled("cameras"),
+                // New diagnostics remain opt-in so an existing debug node
+                // does not start emitting a per-frame collision report.
+                colliders: optional_enabled("colliders"),
+                contacts: optional_enabled("contacts"),
+                sweep: optional_enabled("sweep"),
+                corrections: optional_enabled("corrections"),
             }));
             i = end_ix + 1;
             continue;
@@ -2488,6 +3158,18 @@ fn parse_composite_group_block(
                             ),
                         });
                     }
+                    let collider = scene_optional_attr(&surface_tag, &["collider"])
+                        .map(|value| value.to_ascii_lowercase());
+                    if let Some(collider) = collider.as_deref()
+                        && !matches!(collider, "plane" | "heightfield" | "box" | "mesh")
+                    {
+                        return Err(GraphParseError {
+                            line: j + 1,
+                            message: format!(
+                                "Invalid <Surface collider=\"{collider}\">. Expected plane, heightfield, box, or mesh."
+                            ),
+                        });
+                    }
                     surfaces.push(SceneSurface3DNode {
                         id: strip_wrappers(&required_attr_value(&surface_tag, "id", j + 1)?)
                             .to_string(),
@@ -2500,6 +3182,12 @@ fn parse_composite_group_block(
                         centroid: scene_optional_attr(&surface_tag, &["centroid"]),
                         bounds_min: scene_optional_attr(&surface_tag, &["boundsMin", "bounds_min"]),
                         bounds_max: scene_optional_attr(&surface_tag, &["boundsMax", "bounds_max"]),
+                        collision: attr_value(&surface_tag, "collision")
+                            .map(|value| {
+                                matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on")
+                            })
+                            .unwrap_or(false),
+                        collider,
                     });
                     j = surface_end_ix + 1;
                     continue;
@@ -2537,9 +3225,38 @@ fn parse_composite_group_block(
                 }
                 j += 1;
             }
+            let gravity =
+                scene_optional_attr(&tag, &["gravity"]).map(|value| value.to_ascii_lowercase());
+            if gravity
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "scene" | "none"))
+            {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Invalid Model gravity. Expected gravity=\"scene\" or \"none\"."
+                        .to_string(),
+                });
+            }
+            let ground = scene_optional_attr(&tag, &["ground"]);
+            if gravity.as_deref() == Some("scene") && ground.is_none() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Model gravity=\"scene\" requires ground=\"surface_id\" so falling remains deterministic and bounded."
+                        .to_string(),
+                });
+            }
+            let asset = strip_wrappers(&required_attr_value(&tag, "asset", i + 1)?).to_string();
+            if asset.starts_with("motionloom:box:") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "motionloom:box shorthand has been removed. Declare <PrimitiveAsset shape=\"box\" size={...} color=\"...\" /> and reference its id from Model.asset."
+                        .to_string(),
+                });
+            }
             nodes_3d.push(Scene3DNode::Model(SceneModel3DNode {
                 id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
-                asset: strip_wrappers(&required_attr_value(&tag, "asset", i + 1)?).to_string(),
+                asset,
+                primitive: None,
                 profile: scene_optional_attr(&tag, &["profile"]),
                 rig: scene_optional_attr(&tag, &["rig"]),
                 retarget: scene_optional_attr(&tag, &["retarget"]),
@@ -2557,15 +3274,13 @@ fn parse_composite_group_block(
                     .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
                     .unwrap_or(tag_name == "Environment"),
                 collision: scene_optional_attr(&tag, &["collision"]),
+                gravity,
+                ground,
                 up: scene_attr_or_default(&tag, &["up"], "+Y"),
                 forward: scene_attr_or_default(&tag, &["forward"], "+Z"),
                 unit_scale: scene_attr_or_default(&tag, &["unitScale", "unit_scale"], "1"),
-                scale_mode: scene_attr_or_default(
-                    &tag,
-                    &["scaleMode", "scale_mode"],
-                    "normalize_height",
-                )
-                .to_ascii_lowercase(),
+                scale_mode: scene_attr_or_default(&tag, &["scaleMode", "scale_mode"], "none")
+                    .to_ascii_lowercase(),
                 cast_shadow: attr_value(&tag, "castShadow")
                     .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
                     .unwrap_or(true),
@@ -2593,12 +3308,38 @@ fn parse_composite_group_block(
             _ => None,
         })
         .collect::<HashSet<_>>();
+    let rigid_body_targets = nodes_3d
+        .iter()
+        .filter_map(|node| match node {
+            Scene3DNode::RigidBody(body) => Some(body.target.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for target in &rigid_body_targets {
+        if !model_ids.contains(target) {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "RigidBody target '{target}' does not resolve to a Model, Environment, or direct Surface in this CompositeGroup."
+                ),
+            });
+        }
+    }
     let anchor_ids = nodes_3d
         .iter()
         .filter_map(|node| match node {
             Scene3DNode::Anchor(anchor) => Some(anchor.id.as_str()),
             _ => None,
         })
+        .collect::<HashSet<_>>();
+    let surface_ids = nodes_3d
+        .iter()
+        .filter_map(|node| match node {
+            Scene3DNode::Model(model) => Some(model.surfaces.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|surface| surface.id.as_str())
         .collect::<HashSet<_>>();
     for node in &nodes_3d {
         match node {
@@ -2612,6 +3353,25 @@ fn parse_composite_group_block(
                 });
             }
             Scene3DNode::Model(model) => {
+                if model
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| rigid_body_targets.contains(&id))
+                    && model.collision.as_deref().is_some_and(|value| {
+                        matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "kinematic" | "character" | "character_controller"
+                        )
+                    })
+                {
+                    return Err(GraphParseError {
+                        line: start + 1,
+                        message: format!(
+                            "Model '{}' cannot use both humanoid kinematic collision and RigidBody control.",
+                            model.id.as_deref().unwrap_or("unnamed")
+                        ),
+                    });
+                }
                 if let Some(anchor) = model.position.trim().strip_prefix('@')
                     && !anchor_ids.contains(anchor)
                 {
@@ -2621,6 +3381,43 @@ fn parse_composite_group_block(
                             "Model position anchor not found in this CompositeGroup: {anchor}"
                         ),
                     });
+                }
+                if model.gravity.as_deref() == Some("scene") {
+                    if physics.is_none() {
+                        return Err(GraphParseError {
+                            line: start + 1,
+                            message: format!(
+                                "Model '{}' uses gravity=\"scene\", but this CompositeGroup has no <Physics> declaration.",
+                                model.id.as_deref().unwrap_or("unnamed")
+                            ),
+                        });
+                    }
+                    if let Some(ground) = model.ground.as_deref()
+                        && !surface_ids.contains(ground)
+                    {
+                        return Err(GraphParseError {
+                            line: start + 1,
+                            message: format!(
+                                "Model '{}' ground references unknown Surface '{}'.",
+                                model.id.as_deref().unwrap_or("unnamed"),
+                                ground
+                            ),
+                        });
+                    }
+                    if !model.collision.as_deref().is_some_and(|value| {
+                        matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "kinematic" | "character" | "character_controller"
+                        )
+                    }) {
+                        return Err(GraphParseError {
+                            line: start + 1,
+                            message: format!(
+                                "Model '{}' gravity=\"scene\" requires collision=\"kinematic\" in this release.",
+                                model.id.as_deref().unwrap_or("unnamed")
+                            ),
+                        });
+                    }
                 }
             }
             Scene3DNode::Camera(camera) => {
@@ -2640,9 +3437,36 @@ fn parse_composite_group_block(
                         });
                     }
                 }
+                for selector in &camera.hidden_bones {
+                    if !model_ids.contains(selector.model.as_str()) {
+                        return Err(GraphParseError {
+                            line: start + 1,
+                            message: format!(
+                                "Camera3D hiddenBones references unknown Model '{}'.",
+                                selector.model
+                            ),
+                        });
+                    }
+                    if !is_canonical_humanoid_bone(&selector.bone) {
+                        return Err(GraphParseError {
+                            line: start + 1,
+                            message: format!(
+                                "Camera3D hiddenBones bone '{}' is not a canonical humanoid bone.",
+                                selector.bone
+                            ),
+                        });
+                    }
+                }
             }
             _ => {}
         }
+    }
+    if !rigid_body_targets.is_empty() && physics.is_none() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "A CompositeGroup containing a 3D RigidBody requires one <Physics> declaration for deterministic gravity and stepping."
+                .to_string(),
+        });
     }
 
     let synthetic_group_tag = open_tag.replacen("<CompositeGroup", "<Group", 1);
@@ -2654,9 +3478,75 @@ fn parse_composite_group_block(
         depth,
         format,
         active_camera: None,
+        physics,
         nodes_3d,
     });
     Ok((group, close_ix))
+}
+
+fn is_canonical_humanoid_bone(value: &str) -> bool {
+    matches!(
+        value,
+        "hips"
+            | "spine"
+            | "chest"
+            | "neck"
+            | "head"
+            | "shoulder_l"
+            | "upper_arm_l"
+            | "forearm_l"
+            | "hand_l"
+            | "shoulder_r"
+            | "upper_arm_r"
+            | "forearm_r"
+            | "hand_r"
+            | "upper_leg_l"
+            | "lower_leg_l"
+            | "foot_l"
+            | "toe_l"
+            | "upper_leg_r"
+            | "lower_leg_r"
+            | "foot_r"
+            | "toe_r"
+    )
+}
+
+fn parse_scene_camera_hidden_bones(
+    tag: &str,
+    line: usize,
+) -> Result<Vec<SceneCameraHiddenBoneNode>, GraphParseError> {
+    let Some(value) = attr_value(tag, "hiddenBones") else {
+        return Ok(Vec::new());
+    };
+    let mut selectors = Vec::new();
+    for raw in parse_scene_string_list(strip_wrappers(&value)) {
+        let Some((model, bone)) = raw.split_once(':') else {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Camera3D hiddenBones selector \"{raw}\" is invalid. Use model_id:canonical_bone."
+                ),
+            });
+        };
+        let model = model.trim();
+        let bone = bone.trim();
+        if model.is_empty() || bone.is_empty() {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Camera3D hiddenBones selector \"{raw}\" requires both a model id and canonical bone."
+                ),
+            });
+        }
+        let selector = SceneCameraHiddenBoneNode {
+            model: model.to_string(),
+            bone: bone.to_string(),
+        };
+        if !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
+    Ok(selectors)
 }
 
 pub(crate) fn parse_puppet_block(
@@ -3648,12 +4538,19 @@ fn parse_scene_nodes(
             i = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "RigidBody2D") {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: "<RigidBody2D> has been removed. Use <RigidBody dimension=\"2d\" type=\"dynamic|static|kinematic\" ... />."
+                    .to_string(),
+            });
+        }
         if [
             "SpringChain",
             "DynamicCurve",
             "DistanceConstraint",
             "Hinge",
-            "RigidBody2D",
+            "RigidBody",
             "ParticleEmitter",
             "Cloth",
             "HairStrandField",
@@ -3865,6 +4762,50 @@ fn scene_optional_attr(block: &str, names: &[&str]) -> Option<String> {
         .find_map(|name| attr_value(block, name))
         .map(|value| strip_wrappers(&value).to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Parse a boolean Scene attribute while preserving an explicit default.
+fn scene_bool_attr(block: &str, names: &[&str], default_value: bool) -> bool {
+    names
+        .iter()
+        .find_map(|name| attr_value(block, name))
+        .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
+        .unwrap_or(default_value)
+}
+
+fn parse_static_scene_vec3(
+    value: &str,
+    line: usize,
+    attribute: &str,
+) -> Result<[f32; 3], GraphParseError> {
+    let raw = strip_wrappers(value).trim();
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(raw);
+    let components = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if components.len() != 3 {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "Invalid {attribute}=\"{value}\". Expected a static three-number vector such as [20,0.2,20]."
+            ),
+        });
+    }
+    let mut out = [0.0_f32; 3];
+    for (index, component) in components.iter().enumerate() {
+        out[index] = component.parse::<f32>().map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "Invalid {attribute}=\"{value}\". Procedural Surface dimensions must be static numbers."
+            ),
+        })?;
+    }
+    Ok(out)
 }
 
 pub(crate) fn parse_text_node(

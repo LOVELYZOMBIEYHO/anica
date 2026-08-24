@@ -24,7 +24,117 @@ pub struct WorldGraph {
     /// Cross-actor constraints lowered from the public Scene DSL.
     #[serde(default)]
     pub constraints: Vec<WorldConstraint>,
+    /// Frame-local lighting lowered from the public Scene 3D DSL.
+    #[serde(default)]
+    pub lighting: WorldLighting,
     pub present: WorldPresent,
+}
+
+/// Internal lighting payload shared by Scene3DRenderer and the retained GPU renderer.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldLighting {
+    #[serde(default)]
+    pub environment: Option<WorldEnvironmentLighting>,
+    #[serde(default)]
+    pub lights: Vec<WorldLight>,
+    #[serde(default = "default_world_ao_intensity")]
+    pub ao_intensity: f32,
+    #[serde(default = "default_world_ao_radius")]
+    pub ao_radius: f32,
+    #[serde(default)]
+    pub contact_shadow_intensity: f32,
+    #[serde(default = "default_world_contact_distance")]
+    pub contact_shadow_distance: f32,
+    #[serde(default = "default_world_contact_softness")]
+    pub contact_shadow_softness: f32,
+    #[serde(default)]
+    pub color_management: WorldColorManagement,
+}
+
+impl Default for WorldLighting {
+    fn default() -> Self {
+        Self {
+            environment: None,
+            lights: Vec::new(),
+            ao_intensity: default_world_ao_intensity(),
+            ao_radius: default_world_ao_radius(),
+            contact_shadow_intensity: 0.0,
+            contact_shadow_distance: default_world_contact_distance(),
+            contact_shadow_softness: default_world_contact_softness(),
+            color_management: WorldColorManagement::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldEnvironmentLighting {
+    pub src: String,
+    pub mapping: String,
+    pub intensity: f32,
+    pub rotation_y_degrees: f32,
+    pub visible: bool,
+    pub background_intensity: f32,
+    pub background_blur: f32,
+    pub diffuse_intensity: f32,
+    pub specular_intensity: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldLightKind {
+    Directional,
+    Point,
+    Spot,
+    RectArea,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldLight {
+    pub id: Option<String>,
+    pub kind: WorldLightKind,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cone_degrees: f32,
+    pub outer_cone_degrees: f32,
+    pub width: f32,
+    pub height: f32,
+    pub cast_shadow: bool,
+    pub shadow_strength: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldColorManagement {
+    pub tone_mapping: String,
+    pub exposure: f32,
+    pub white_balance_kelvin: f32,
+    pub contrast: f32,
+}
+
+impl Default for WorldColorManagement {
+    fn default() -> Self {
+        Self {
+            tone_mapping: "aces".to_string(),
+            exposure: 1.0,
+            white_balance_kelvin: 6500.0,
+            contrast: 1.0,
+        }
+    }
+}
+
+fn default_world_ao_intensity() -> f32 {
+    0.18
+}
+fn default_world_ao_radius() -> f32 {
+    1.0
+}
+fn default_world_contact_distance() -> f32 {
+    0.25
+}
+fn default_world_contact_softness() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -181,9 +291,16 @@ fn default_world_camera_up_z() -> String {
 pub struct WorldActor {
     pub id: String,
     pub model: String,
+    /// Typed procedural geometry bypasses external asset resolution.
+    #[serde(default)]
+    pub primitive: Option<crate::dsl::PrimitiveAssetNode>,
     pub path_style: WorldPathStyle,
     pub hide_meshes: Vec<String>,
     pub hide_materials: Vec<String>,
+    /// Canonical bones hidden only from the active camera's view passes.
+    /// Shadow rendering intentionally ignores this list.
+    #[serde(default)]
+    pub camera_hidden_bones: Vec<String>,
     pub profile: Option<String>,
     pub rig: Option<String>,
     pub retarget: Option<String>,
@@ -193,12 +310,25 @@ pub struct WorldActor {
     pub yaw: String,
     pub pitch: String,
     pub roll: String,
+    /// Runtime-owned rotations can bypass Euler decomposition and reach the
+    /// GPU as the same normalized quaternion used by physics.
+    #[serde(default)]
+    pub rotation_quaternion: Option<[f32; 4]>,
     pub scale: String,
+    /// `none` preserves the authored glTF origin and units. The legacy
+    /// `normalize_height` mode bottom-centres the mesh and treats `scale` as
+    /// a target height.
+    #[serde(default = "default_world_actor_scale_mode")]
+    pub scale_mode: String,
     pub opacity: String,
     pub material: Option<WorldMaterial>,
     pub play: Option<WorldPlay>,
     #[serde(default)]
     pub plays: Vec<WorldPlay>,
+}
+
+fn default_world_actor_scale_mode() -> String {
+    "none".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

@@ -16,7 +16,8 @@ mod preview_host_platform;
 use motionloom::{
     PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,
     PreviewInteractionNode, Scene3DFrameProfile, SceneCpuFrameProfile,
-    WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewQuality, parse_graph_script,
+    WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewPreloadSession,
+    WgpuPreviewQuality, parse_graph_script,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
@@ -296,6 +297,7 @@ struct LivePreviewApp {
     quality: WgpuPreviewQuality,
     adaptive_quality: WgpuPreviewAdaptiveController,
     pending_preload: bool,
+    preload_session: Option<WgpuPreviewPreloadSession>,
     last_cursor_pos: Option<(f64, f64)>,
     frame: u32,
     total_frames: u32,
@@ -436,6 +438,7 @@ impl LivePreviewApp {
                 adaptive
             },
             pending_preload: preview_feature_enabled("MOTIONLOOM_PREVIEW_PRELOAD", true),
+            preload_session: None,
             last_cursor_pos: None,
             frame: 0,
             total_frames,
@@ -545,6 +548,7 @@ impl LivePreviewApp {
         self.adaptive_quality.set_target_fps(fps);
         self.overrides.clear();
         self.pending_preload = preview_feature_enabled("MOTIONLOOM_PREVIEW_PRELOAD", true);
+        self.preload_session = None;
         self.rebuild_graph_for_quality();
         Ok(())
     }
@@ -1294,6 +1298,15 @@ impl LivePreviewApp {
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             }))?;
+        // wgpu's default uncaptured-error handler panics. On macOS this render
+        // function is reached through NSView::drawRect, where Rust is not
+        // allowed to unwind; a recoverable validation error would therefore
+        // abort the entire preview process before its useful message could be
+        // reported. Keep the preview alive and preserve the complete error for
+        // diagnosis instead.
+        device.on_uncaptured_error(Box::new(|error| {
+            eprintln!("MotionLoom live preview uncaptured GPU error: {error}");
+        }));
         let device = Arc::new(device);
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -1566,22 +1579,44 @@ impl LivePreviewApp {
                 else {
                     return;
                 };
-                pollster::block_on(preview_engine.preload_graph_resources(graph))
+                let session = self
+                    .preload_session
+                    .get_or_insert_with(|| WgpuPreviewEngine::begin_preload_graph_resources(graph));
+                pollster::block_on(preview_engine.preload_graph_resources_step(graph, session))
             };
             match preload {
-                Ok(report) => preview_host_debug_log(format!(
-                    "preloaded {} declared asset(s) at frame(s) {:?}",
-                    report.asset_declarations, report.sampled_frames
-                )),
+                Ok(progress) => {
+                    preview_host_debug_log(format!(
+                        "preload progress {}/{} warmed_frame={:?}",
+                        progress.completed_frames, progress.total_frames, progress.warmed_frame
+                    ));
+                    if progress.finished {
+                        let report = self
+                            .preload_session
+                            .as_ref()
+                            .expect("preload session exists after successful step")
+                            .report();
+                        preview_host_debug_log(format!(
+                            "preloaded {} declared asset(s) at frame(s) {:?}",
+                            report.asset_declarations, report.sampled_frames
+                        ));
+                        self.pending_preload = false;
+                        self.preload_session = None;
+                        self.restart_playback_clock();
+                    } else {
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 Err(err) => {
                     eprintln!("preview preload failed: {err}");
                     self.broadcast_event(PreviewEvent::Error {
                         message: format!("preview preload failed: {err}"),
                     });
+                    self.pending_preload = false;
+                    self.preload_session = None;
                 }
             }
-            self.pending_preload = false;
-            self.restart_playback_clock();
         }
         self.update_frame_from_wall_clock();
         let render_start = Instant::now();
@@ -1852,7 +1887,7 @@ impl LivePreviewApp {
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "pending".to_string());
         println!(
-            "quality={} target={}x{} frame={}/{} cpu_submit_last_ms={:.2} expression_ms={:.3} traversal_ms={:.3} upload_ms={:.3} encode_ms={:.3} wait_ms={:.3} scene3d_prepare_ms={:.3} scene3d_submit_ms={:.3} scene3d_draw_calls={} scene3d_resources={} scene3d_targets={} gpu_last_ms={} gpu_timestamp_supported={} render_avg_ms={:.2} render_min_ms={:.2} render_max_ms={:.2} blit_last_ms={:.2} blit_avg_ms={:.2}",
+            "quality={} target={}x{} frame={}/{} cpu_submit_last_ms={:.2} expression_ms={:.3} traversal_ms={:.3} upload_ms={:.3} encode_ms={:.3} wait_ms={:.3} scene3d_prepare_ms={:.3} scene3d_asset_resolve_ms={:.3} texture_decode_ms={:.3} texture_decodes={} texture_cache_hits={} texture_decoded_bytes={} scene3d_submit_ms={:.3} scene3d_draw_calls={} scene3d_resources={} scene3d_texture_resources={} scene3d_geometry_resources={} scene3d_targets={} gpu_last_ms={} gpu_timestamp_supported={} render_avg_ms={:.2} render_min_ms={:.2} render_max_ms={:.2} blit_last_ms={:.2} blit_avg_ms={:.2}",
             self.quality.label(),
             self.target_width,
             self.target_height,
@@ -1865,9 +1900,16 @@ impl LivePreviewApp {
             self.last_cpu_profile.encode_ms,
             self.last_cpu_profile.wait_ms,
             self.last_3d_profile.prepare_ms,
+            self.last_3d_profile.asset_resolve_ms,
+            self.last_3d_profile.texture_decode_ms,
+            self.last_3d_profile.texture_decode_count,
+            self.last_3d_profile.texture_cache_hits,
+            self.last_3d_profile.texture_decoded_bytes,
             self.last_3d_profile.submit_ms,
             self.last_3d_profile.draw_calls,
             self.last_3d_profile.gpu_resource_entries,
+            self.last_3d_profile.gpu_texture_resources,
+            self.last_3d_profile.gpu_geometry_resources,
             self.last_3d_profile.target_pool_size,
             gpu_frame_label,
             self.preview_engine

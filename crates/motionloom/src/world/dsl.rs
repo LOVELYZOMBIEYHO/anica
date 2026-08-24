@@ -153,6 +153,7 @@ pub fn parse_world_graph_script(script: &str) -> Result<WorldGraph, GraphParseEr
         apply_actions,
         animation_assets: Vec::new(),
         constraints: Vec::new(),
+        lighting: crate::world::WorldLighting::default(),
         present,
     })
 }
@@ -456,9 +457,11 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
     Ok(WorldActor {
         id: required_attr_value(open, "id", line)?,
         model: required_attr_value(open, "model", line)?,
+        primitive: None,
         path_style: parse_path_style_attr(open, line)?,
         hide_meshes: parse_name_list_attr(open, "hideMeshes"),
         hide_materials: parse_name_list_attr(open, "hideMaterials"),
+        camera_hidden_bones: Vec::new(),
         profile: attr_value(open, "profile"),
         rig: attr_value(open, "rig"),
         retarget: attr_value(open, "retarget"),
@@ -468,7 +471,9 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
         yaw: attr_value(open, "yaw").unwrap_or_else(|| "0".to_string()),
         pitch: attr_value(open, "pitch").unwrap_or_else(|| "0".to_string()),
         roll: attr_value(open, "roll").unwrap_or_else(|| "0".to_string()),
+        rotation_quaternion: None,
         scale: attr_value(open, "scale").unwrap_or_else(|| "1".to_string()),
+        scale_mode: attr_value(open, "scaleMode").unwrap_or_else(|| "none".to_string()),
         opacity: attr_value(open, "opacity").unwrap_or_else(|| "1".to_string()),
         material,
         play,

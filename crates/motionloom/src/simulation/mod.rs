@@ -13,6 +13,7 @@ pub mod dsl;
 pub mod error;
 pub mod forces;
 pub mod model;
+pub(crate) mod rigid;
 pub mod runtime;
 pub mod solvers;
 pub mod state;
