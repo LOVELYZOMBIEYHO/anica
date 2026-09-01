@@ -50,6 +50,7 @@ members = [
     "crates/gpui-video-renderer",
     "crates/ai-subtitle-engine",
     "crates/motionloom",
+    "crates/motionloom-action-tool",
     "crates/media_gen_protocol",
     "crates/gpu-effect-export-engine",
 

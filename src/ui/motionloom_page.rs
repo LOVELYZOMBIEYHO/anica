@@ -38,11 +38,11 @@ use motionloom::{
     PreviewInteractionNode, RuntimeProgram, ScenePlatformPreviewSurface, ScenePreviewBackend,
     ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderProfile, SceneRenderer,
     WgpuPreviewEngine, WgpuPreviewGraphCache, WgpuPreviewQuality, WorldActor, WorldBackground,
-    WorldBackgroundFit, WorldCamera, WorldFrameRenderer, WorldGraph, WorldModelProfile, WorldNode,
-    WorldPathStyle, WorldPresent, WorldProfileRetarget, WorldRetargetMap, compile_runtime_program,
-    extract_editable_animation_timeline, is_graph_script, is_world_graph_script,
-    load_glb_mesh_data, next_scene_output_path_for_profile, parse_graph_script,
-    parse_motionloom_document, parse_world_graph_script,
+    WorldBackgroundFit, WorldCamera, WorldFrameRenderer, WorldGraph, WorldLighting,
+    WorldModelProfile, WorldNode, WorldPathStyle, WorldPresent, WorldProfileRetarget,
+    WorldRetargetMap, compile_runtime_program, extract_editable_animation_timeline,
+    is_graph_script, is_world_graph_script, load_glb_mesh_data, next_scene_output_path_for_profile,
+    parse_graph_script, parse_motionloom_document, parse_world_graph_script,
     render_motionloom_document_to_video_with_progress_and_cancel, render_scene_graph_frame,
     replace_editable_animation_targets, upsert_editable_animation_target,
 };
@@ -6957,7 +6957,13 @@ impl MotionLoomPage {
             .assets
             .iter()
             .filter(|asset| asset.kind == motionloom::GraphAssetKind::Model)
-            .map(|asset| (asset.id.clone(), asset.src.clone()))
+            // The GLB inspector only accepts external model assets. Typed
+            // primitive/compound assets deliberately have no source path.
+            .filter_map(|asset| {
+                asset
+                    .external_src()
+                    .map(|src| (asset.id.clone(), src.to_string()))
+            })
             .collect::<HashMap<_, _>>();
         let mut actors = Vec::new();
         for scene in &graph.scenes {
@@ -7020,6 +7026,7 @@ impl MotionLoomPage {
             apply_actions: Vec::new(),
             animation_assets: Vec::new(),
             constraints: Vec::new(),
+            lighting: WorldLighting::default(),
             present: WorldPresent { from: world_id },
         })
     }
@@ -7052,9 +7059,13 @@ impl MotionLoomPage {
                             actors.push(WorldActor {
                                 id: actor_id,
                                 model: source,
+                                primitive: None,
+                                terrain: None,
+                                vegetation: None,
                                 path_style: WorldPathStyle::Relative,
                                 hide_meshes: Vec::new(),
                                 hide_materials: Vec::new(),
+                                camera_hidden_bones: Vec::new(),
                                 profile: model.profile.clone(),
                                 rig: model.rig.clone(),
                                 retarget: model.retarget.clone(),
@@ -7064,7 +7075,9 @@ impl MotionLoomPage {
                                 yaw: "0".to_string(),
                                 pitch: "0".to_string(),
                                 roll: "0".to_string(),
+                                rotation_quaternion: None,
                                 scale: "1".to_string(),
+                                scale_mode: "none".to_string(),
                                 opacity: "1".to_string(),
                                 material: None,
                                 play: None,

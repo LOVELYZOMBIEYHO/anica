@@ -99,7 +99,7 @@ use crate::scene::resource::{
     collect_graph_gradient_defs, collect_graph_mask_defs, collect_graph_material_defs,
     collect_graph_noise_defs, collect_graph_palette_defs, collect_graph_precompose_defs,
     collect_graph_texture_defs, default_world_asset_root, load_extra_fonts, load_rgba_image_source,
-    load_svg_source, resolve_local_scene_asset_path,
+    load_svg_source, load_utf8_text_source, resolve_local_scene_asset_path,
 };
 
 fn scene_track_composite_order(track: &SceneTrackNode) -> i32 {
@@ -1169,9 +1169,45 @@ fn apply_animation_property_to_3d_nodes(
                     "position" => camera.position = value.to_string(),
                     "target" => camera.target = value.to_string(),
                     "fov" => camera.fov = value.to_string(),
+                    "focusDistance" => {
+                        if let Some(optics) = camera.depth_of_field.as_mut() {
+                            optics.focus_distance = Some(value.to_string());
+                        }
+                    }
+                    "focusOffset" => {
+                        if let Some(optics) = camera.depth_of_field.as_mut() {
+                            optics.focus_offset = value.to_string();
+                        }
+                    }
+                    "focalLength" => {
+                        if let Some(optics) = camera.depth_of_field.as_mut() {
+                            optics.focal_length = value.to_string();
+                        }
+                    }
+                    "fStop" => {
+                        if let Some(optics) = camera.depth_of_field.as_mut() {
+                            optics.f_stop = value.to_string();
+                        }
+                    }
+                    "maxBlur" => {
+                        if let Some(optics) = camera.depth_of_field.as_mut() {
+                            optics.max_blur = value.to_string();
+                        }
+                    }
                     _ => {}
                 }
             }
+            Scene3DNode::AtmosphereFog(fog) if fog.id.as_deref() == Some(node_id) => match property
+            {
+                "density" => fog.density = value.to_string(),
+                "start" => fog.start = value.to_string(),
+                "end" => fog.end = value.to_string(),
+                "baseHeight" => fog.base_height = value.to_string(),
+                "heightFalloff" => fog.height_falloff = value.to_string(),
+                "scattering" => fog.scattering = value.to_string(),
+                "edgeFeather" => fog.edge_feather = value.to_string(),
+                _ => {}
+            },
             Scene3DNode::EnvironmentLight(light) if light.id.as_deref() == Some(node_id) => {
                 match property {
                     "intensity" => light.intensity = value.to_string(),
@@ -1457,11 +1493,12 @@ use crate::scene::timeline::{
 use crate::world::render::Scene3DRenderer;
 use crate::world::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldAnimationAsset,
-    WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
-    WorldCamera, WorldCameraControl, WorldCameraProjection, WorldColorManagement, WorldConstraint,
-    WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind, WorldLighting, WorldMaterial,
-    WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldPresent,
-    WorldProfileRetarget, WorldRetargetMap, parse_world_graph_script,
+    WorldApplyAction, WorldAtmosphereFog, WorldBackground, WorldBackgroundFit, WorldBoneAxis,
+    WorldBoneAxisMap, WorldCamera, WorldCameraControl, WorldCameraProjection, WorldColorManagement,
+    WorldConstraint, WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight,
+    WorldLightKind, WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode,
+    WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetargetMap,
+    parse_world_graph_script,
 };
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use image::{Rgba, RgbaImage, imageops::FilterType};
@@ -1571,6 +1608,49 @@ fn scene_world_lighting(
     let mut lighting = WorldLighting::default();
     for node in &composite.nodes_3d {
         match node {
+            Scene3DNode::AtmosphereFog(node) => {
+                let bounds_min = node
+                    .bounds_min
+                    .as_deref()
+                    .map(|value| eval_scene_vec3(value, time_norm, time_sec, [0.0; 3]))
+                    .transpose()?;
+                let bounds_max = node
+                    .bounds_max
+                    .as_deref()
+                    .map(|value| eval_scene_vec3(value, time_norm, time_sec, [0.0; 3]))
+                    .transpose()?;
+                if let (Some(minimum), Some(maximum)) = (bounds_min, bounds_max)
+                    && minimum
+                        .iter()
+                        .zip(maximum.iter())
+                        .any(|(minimum, maximum)| minimum >= maximum)
+                {
+                    return Err(MotionLoomSceneRenderError::InvalidExpression {
+                        expr: format!("boundsMin={minimum:?}, boundsMax={maximum:?}"),
+                        message:
+                            "AtmosphereFog boundsMin must be smaller than boundsMax on every axis"
+                                .to_string(),
+                    });
+                }
+                lighting.atmosphere_fog = Some(WorldAtmosphereFog {
+                    mode: node.mode.clone(),
+                    color: scene_fog_color(&node.color)?,
+                    density: eval_scene_number(&node.density, time_norm, time_sec)?
+                        .clamp(0.0, 10.0),
+                    start: eval_scene_number(&node.start, time_norm, time_sec)?.max(0.0),
+                    end: eval_scene_number(&node.end, time_norm, time_sec)?.max(0.001),
+                    base_height: eval_scene_number(&node.base_height, time_norm, time_sec)?,
+                    height_falloff: eval_scene_number(&node.height_falloff, time_norm, time_sec)?
+                        .max(0.0),
+                    scattering: eval_scene_number(&node.scattering, time_norm, time_sec)?
+                        .clamp(0.0, 1.0),
+                    affect_sky: node.affect_sky,
+                    bounds_min,
+                    bounds_max,
+                    edge_feather: eval_scene_number(&node.edge_feather, time_norm, time_sec)?
+                        .max(0.0),
+                });
+            }
             Scene3DNode::EnvironmentLight(node) => {
                 let authored_src = image_assets
                     .get(&node.asset)
@@ -1726,6 +1806,17 @@ fn scene_light_color(value: &str) -> Result<[f32; 3], MotionLoomSceneRenderError
         (bgra[2] as f32 / 255.0).powf(2.2),
         (bgra[1] as f32 / 255.0).powf(2.2),
         (bgra[0] as f32 / 255.0).powf(2.2),
+    ])
+}
+
+/// Fog is a new linear medium and therefore uses the parser's canonical RGBA
+/// order without inheriting the legacy authored-light channel convention.
+fn scene_fog_color(value: &str) -> Result<[f32; 3], MotionLoomSceneRenderError> {
+    let rgba = parse_color(value)?;
+    Ok([
+        (rgba[0] as f32 / 255.0).powf(2.2),
+        (rgba[1] as f32 / 255.0).powf(2.2),
+        (rgba[2] as f32 / 255.0).powf(2.2),
     ])
 }
 
@@ -2010,6 +2101,99 @@ pub struct SceneRenderer {
     inner: SceneFrameRenderer,
 }
 
+fn enrich_scene_rig_evaluation(graph: &GraphScript, report: &mut crate::RigEvaluationReport) {
+    let time_ms = (report.time_sec.max(0.0) * 1000.0).round() as u64;
+    let selected_action = report
+        .action_execution
+        .selected_controller_action
+        .as_deref();
+    if let Some(action) = selected_action
+        .and_then(|action_id| graph.actions.iter().find(|action| action.id == action_id))
+    {
+        report.provenance.action.id = Some(action.id.clone());
+        report.provenance.action.fingerprint =
+            crate::rig_diagnostics::fingerprint_scene_action(action);
+        report.provenance.action.duration_sec = Some(action.duration_ms as f32 / 1000.0);
+        report.provenance.action.pose_count = action.poses.len();
+        report.provenance.action.contact_count = action.contacts.len();
+    }
+    if let Some(profile) = report
+        .provenance
+        .profile
+        .id
+        .as_deref()
+        .and_then(|profile_id| {
+            graph
+                .model_profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+        })
+    {
+        report.provenance.profile.fingerprint =
+            crate::rig_diagnostics::fingerprint_scene_profile(profile);
+    }
+    let active_apply = graph.apply_actions.iter().find(|apply| {
+        apply.target == report.actor_id
+            && selected_action.is_none_or(|action| action == apply.action)
+            && time_ms >= apply.at_ms
+            && apply
+                .duration_ms
+                .is_none_or(|duration| time_ms <= apply.at_ms.saturating_add(duration))
+    });
+    let contact_enabled =
+        active_apply.and_then(|apply| apply.contact_correction.as_deref()) == Some("auto");
+    let foot_lock_enabled =
+        active_apply.and_then(|apply| apply.foot_lock.as_deref()) == Some("auto");
+    let selected_ground = active_apply.and_then(|apply| {
+        apply
+            .ground
+            .clone()
+            .or_else(|| apply.contact_targets.get("ground").cloned())
+    });
+    let ground_kind = selected_ground.as_ref().map(|ground| {
+        graph
+            .assets
+            .iter()
+            .find(|asset| &asset.id == ground)
+            .map_or_else(
+                || "contactSurface".to_string(),
+                |asset| match &asset.source {
+                    GraphAssetSource::Terrain(_) => "terrainAsset".to_string(),
+                    GraphAssetSource::Primitive(_) => "primitiveAsset".to_string(),
+                    GraphAssetSource::Vegetation(_) => "vegetationAsset".to_string(),
+                    GraphAssetSource::Compound(_) => "compoundAsset".to_string(),
+                    GraphAssetSource::External { .. } => "externalModel".to_string(),
+                },
+            )
+    });
+    report.capabilities.post_constraints = true;
+    report.capabilities.post_contact = true;
+    report.capabilities.screen_projection = true;
+    report.contact_evaluation.available = true;
+    report.contact_evaluation.selected_ground = selected_ground;
+    report.contact_evaluation.ground_kind = ground_kind;
+    report.contact_evaluation.controller_action = selected_action.map(str::to_string);
+    report.contact_evaluation.contact_correction_enabled = contact_enabled;
+    report.contact_evaluation.foot_lock_enabled = foot_lock_enabled;
+    for bone in &mut report.bones {
+        let final_transform = bone
+            .stages
+            .iter()
+            .rev()
+            .find(|stage| stage.stage != crate::BonePoseStage::ScreenProjected)
+            .cloned();
+        if let Some(mut final_transform) = final_transform {
+            final_transform.stage = if contact_enabled || foot_lock_enabled {
+                crate::BonePoseStage::PostContact
+            } else {
+                crate::BonePoseStage::FinalScene
+            };
+            final_transform.space = "modelGlobalAfterSceneSolve".into();
+            bone.stages.push(final_transform);
+        }
+    }
+}
+
 /// Native CPU work for the most recently submitted scene frame.
 ///
 /// Expression covers animation/action evaluation and dependency invalidation.
@@ -2112,6 +2296,276 @@ impl SceneRenderer {
         self.inner.render_frame(graph, frame).await
     }
 
+    /// Evaluate one actor using the exact Scene 3D render path without changing
+    /// the authored graph. The report includes final constraints, grounding and
+    /// screen projection when those stages are active for the sampled frame.
+    pub async fn evaluate_rig_frame(
+        &mut self,
+        graph: &GraphScript,
+        actor_id: &str,
+        frame: u32,
+    ) -> Result<crate::RigEvaluationReport, SceneRenderError> {
+        validate_scene_graph(graph)?;
+        self.inner
+            .scene_3d_renderer
+            .set_collect_editor_rig_snapshot(true);
+        self.inner
+            .scene_3d_renderer
+            .set_collect_rig_diagnostics(true);
+        if let Err(error) = self.inner.render_frame(graph, frame).await {
+            self.inner
+                .scene_3d_renderer
+                .set_collect_rig_diagnostics(false);
+            self.inner
+                .scene_3d_renderer
+                .set_collect_editor_rig_snapshot(false);
+            return Err(error);
+        }
+        let report = self
+            .inner
+            .scene_3d_renderer
+            .last_editor_rig_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .rig_reports
+                    .iter()
+                    .find(|report| report.actor_id == actor_id)
+            })
+            .cloned();
+        self.inner
+            .scene_3d_renderer
+            .set_collect_editor_rig_snapshot(false);
+        self.inner
+            .scene_3d_renderer
+            .set_collect_rig_diagnostics(false);
+        let mut report = report.ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+            message: format!(
+                "rig evaluation did not find actor '{actor_id}' in the rendered 3D scene"
+            ),
+        })?;
+        enrich_scene_rig_evaluation(graph, &mut report);
+        if let Some(action) = report
+            .action_execution
+            .selected_controller_action
+            .as_deref()
+            .and_then(|action_id| {
+                self.inner
+                    .prepared_scene_actions
+                    .iter()
+                    .find(|action| action.id == action_id)
+            })
+        {
+            report.provenance.action.id = Some(action.id.clone());
+            report.provenance.action.fingerprint =
+                crate::rig_diagnostics::fingerprint_scene_action(action);
+            report.provenance.action.duration_sec = Some(action.duration_ms as f32 / 1000.0);
+            report.provenance.action.pose_count = action.poses.len();
+            report.provenance.action.contact_count = action.contacts.len();
+        }
+        if let Some(profile) = report
+            .provenance
+            .profile
+            .id
+            .as_deref()
+            .and_then(|profile_id| {
+                self.inner
+                    .prepared_scene_model_profiles
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+            })
+        {
+            report.provenance.profile.fingerprint =
+                crate::rig_diagnostics::fingerprint_scene_profile(profile);
+        }
+        if let Some(contact) = self
+            .inner
+            .last_rig_contact_evaluations
+            .get(actor_id)
+            .cloned()
+        {
+            report.contact_evaluation = contact;
+        }
+        Ok(report)
+    }
+
+    /// Evaluate one actor by absolute frame/time or normalized Action phase.
+    /// Action-phase sampling resolves imported ActionLibrary content through
+    /// the same prepared Scene graph used by rendering.
+    pub async fn evaluate_rig(
+        &mut self,
+        graph: &GraphScript,
+        request: &crate::RigEvaluationRequest,
+    ) -> Result<crate::RigEvaluationReport, SceneRenderError> {
+        let frame = match &request.sample {
+            crate::RigSamplePoint::Frame { frame } => *frame,
+            crate::RigSamplePoint::Time { time_sec } => {
+                if !time_sec.is_finite() || *time_sec < 0.0 {
+                    return Err(MotionLoomSceneRenderError::GpuRender {
+                        message: "rig evaluation timeSec must be finite and non-negative".into(),
+                    });
+                }
+                (*time_sec * graph.fps.max(1.0)).round() as u32
+            }
+            crate::RigSamplePoint::ActionPhase { action_id, phase } => {
+                if !phase.is_finite() || !(0.0..=1.0).contains(phase) {
+                    return Err(MotionLoomSceneRenderError::GpuRender {
+                        message: "rig evaluation Action phase must be within 0..=1".into(),
+                    });
+                }
+                // Preparing frame zero resolves namespaced ActionLibrary imports
+                // without changing graph text or persistent playback state.
+                self.inner.render_frame(graph, 0).await?;
+                let apply = self
+                    .inner
+                    .prepared_scene_apply_actions
+                    .iter()
+                    .find(|apply| apply.target == request.actor_id && apply.action == *action_id)
+                    .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                        message: format!(
+                            "Action '{action_id}' is not applied to actor '{}'",
+                            request.actor_id
+                        ),
+                    })?;
+                let action = self
+                    .inner
+                    .prepared_scene_actions
+                    .iter()
+                    .find(|action| action.id == *action_id)
+                    .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                        message: format!("Action '{action_id}' was not resolved"),
+                    })?;
+                let speed = apply.speed.parse::<f32>().unwrap_or(1.0).max(0.0001);
+                let time_sec = apply.at_ms as f32 / 1000.0
+                    + phase * action.duration_ms as f32 / 1000.0 / speed;
+                (time_sec * graph.fps.max(1.0)).round() as u32
+            }
+        };
+        let mut report = self
+            .evaluate_rig_frame(graph, &request.actor_id, frame)
+            .await?;
+        report.sample = request.sample.clone();
+        if request.detail == crate::RigReportDetail::Summary {
+            report.bones.clear();
+        } else if request.detail == crate::RigReportDetail::Body {
+            report.bones.retain(|bone| {
+                !["thumb", "index", "middle", "ring", "pinky"]
+                    .iter()
+                    .any(|finger| bone.canonical_bone.contains(finger))
+            });
+        }
+        for bone in &mut report.bones {
+            for stage in &mut bone.stages {
+                if !request.include_matrices {
+                    stage.matrix = None;
+                }
+                if !request.include_screen_projection {
+                    stage.screen = None;
+                }
+            }
+            if !request.include_screen_projection {
+                bone.stages
+                    .retain(|stage| stage.stage != crate::BonePoseStage::ScreenProjected);
+            }
+        }
+        if !request.include_screen_projection {
+            report.capabilities.screen_projection = false;
+        }
+        Ok(report)
+    }
+
+    /// Validate a sampled frame range without changing the authored DSL.
+    ///
+    /// Render-derived exposure checks run on every sampled frame. Checks whose
+    /// observations are not yet available on the selected backend are reported
+    /// as `unavailable`, never as a fabricated pass.
+    pub async fn validate_shots(
+        &mut self,
+        graph: &GraphScript,
+        options: crate::ShotValidationOptions,
+    ) -> Result<crate::ShotValidationReport, SceneRenderError> {
+        self.validate_shots_with_observations(graph, options, &[])
+            .await
+    }
+
+    /// Validate rendered frames plus host/backend observations such as ID-mask
+    /// visibility, collider overlap, or camera sweep clearance.
+    pub async fn validate_shots_with_observations(
+        &mut self,
+        graph: &GraphScript,
+        options: crate::ShotValidationOptions,
+        observations: &[crate::ShotValidationFrameObservation],
+    ) -> Result<crate::ShotValidationReport, SceneRenderError> {
+        validate_scene_graph(graph)?;
+        let options = options.normalized();
+        let graph_frames = ((graph.duration_ms as f64 / 1000.0) * graph.fps.max(1.0) as f64)
+            .ceil()
+            .max(1.0) as u32;
+        let graph_end = graph_frames.saturating_sub(1);
+        let start = options.frame_start.min(graph_end);
+        let end = options
+            .frame_end
+            .unwrap_or(graph_end)
+            .min(graph_end)
+            .max(start);
+        let frames = crate::shot_validation_sample_frames(start, end, options.sample_interval);
+        let mut validator = crate::ShotValidator::new(options.clone(), start, end);
+        self.inner
+            .scene_3d_renderer
+            .set_collect_editor_rig_snapshot(options.check_framing);
+        for frame in frames {
+            validator.mark_sampled_frame(frame);
+            let must_render =
+                options.check_exposure || options.check_composition || options.check_framing;
+            if must_render {
+                let image = match self.inner.render_frame(graph, frame).await {
+                    Ok(image) => image,
+                    Err(error) => {
+                        self.inner
+                            .scene_3d_renderer
+                            .set_collect_editor_rig_snapshot(false);
+                        return Err(error);
+                    }
+                };
+                if options.check_exposure || options.check_composition {
+                    validator.observe_rgba(frame, &image);
+                }
+            }
+
+            if options.check_framing {
+                if let Some(snapshot) = self.inner.scene_3d_renderer.last_editor_rig_snapshot() {
+                    validator.observe_frame(crate::ShotValidationFrameObservation {
+                        frame,
+                        width: snapshot.width,
+                        height: snapshot.height,
+                        observed_checks: vec![crate::ShotValidationCheck::Framing],
+                        projected_joints: snapshot
+                            .joints
+                            .iter()
+                            .map(|joint| crate::ProjectedJointObservation {
+                                actor: joint.actor.clone(),
+                                bone: joint.bone.clone(),
+                                x: joint.x,
+                                y: joint.y,
+                                depth: joint.depth,
+                                visible: None,
+                            })
+                            .collect(),
+                        ..crate::ShotValidationFrameObservation::default()
+                    });
+                }
+            }
+        }
+        self.inner
+            .scene_3d_renderer
+            .set_collect_editor_rig_snapshot(false);
+        for observation in observations {
+            if observation.frame >= start && observation.frame <= end {
+                validator.observe_frame(observation.clone());
+            }
+        }
+        Ok(validator.finish())
+    }
+
     pub async fn render_frame_with_cpu_inputs(
         &mut self,
         graph: &GraphScript,
@@ -2173,6 +2627,15 @@ impl SceneRenderer {
     /// scenes that did not render a 3D CompositeGroup.
     pub fn last_3d_frame_profile(&self) -> crate::world::Scene3DFrameProfile {
         self.inner.scene_3d_renderer.last_frame_profile()
+    }
+
+    /// Canonical joints projected by the exact 3D camera used for the most
+    /// recent frame. This powers editor picking without inventing a second rig.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn last_editor_rig_snapshot(
+        &self,
+    ) -> Option<&crate::world::render::Scene3DEditorRigSnapshot> {
+        self.inner.scene_3d_renderer.last_editor_rig_snapshot()
     }
 
     /// Whether the active native adapter exposes WebGPU timestamp queries.
@@ -2526,12 +2989,17 @@ struct SceneFrameRenderer {
     animation_source_signature: u64,
     compiled_animation_graph: Option<Arc<GraphScript>>,
     compiled_animation_has_dynamic_channels: bool,
+    action_library_source_signature: u64,
+    compiled_action_library_graph: Option<Arc<GraphScript>>,
     prepared_graph_signature: u64,
     prepared_graph_fps: f32,
     prepared_graph_duration_ms: u64,
     prepared_scene_model_profiles: Vec<crate::scene::dsl::ModelProfileNode>,
+    prepared_scene_skeletons: Vec<crate::scene::dsl::SkeletonNode>,
     prepared_scene_actions: Vec<crate::scene::dsl::ActionNode>,
+    prepared_scene_world_actions: HashMap<String, WorldAction>,
     prepared_scene_apply_actions: Vec<crate::scene::dsl::ApplyActionNode>,
+    prepared_scene_contact_surfaces: Vec<crate::dsl::ContactSurfaceNode>,
     prepared_scene_animation_assets: Vec<crate::dsl::GraphAssetNode>,
     prepared_scene_constraints: Vec<crate::dsl::SceneConstraintNode>,
     gpu_path_cache_hits: usize,
@@ -2567,6 +3035,7 @@ struct SceneFrameRenderer {
     /// not clone or re-transform thousands of triangles on every frame.
     environment_spatial_cache: HashMap<EnvironmentSpatialKey, Arc<EnvironmentTriangleSpatialIndex>>,
     gpu_pick_ids: HashMap<String, u32>,
+    last_rig_contact_evaluations: HashMap<String, crate::ContactEvaluation>,
     scene_3d_renderer: Scene3DRenderer,
     gpu_compositor: Option<WgpuSceneCompositor>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -2925,6 +3394,9 @@ fn scene_action_to_world(action: &crate::scene::dsl::ActionNode) -> WorldAction 
                         turn: bone.turn.clone(),
                         scale: bone.scale.clone(),
                         opacity: bone.opacity.clone(),
+                        interpolation: bone.interpolation.clone(),
+                        in_tangent: bone.in_tangent.clone(),
+                        out_tangent: bone.out_tangent.clone(),
                     })
                     .collect(),
             })
@@ -2982,6 +3454,45 @@ fn scene_apply_action_is_active(
     // `loop` repeats the source clip inside the authored ApplyAction window;
     // it must not turn a finite scheduled layer into an infinite one.
     apply.target == actor_id && time_sec >= start && time_sec <= start + duration.max(0.0)
+}
+
+/// Select the scheduled native-rig action for this frame instead of pinning a
+/// CompoundAsset to the first ApplyAction authored for its target.
+fn active_compound_rig_action<'a>(
+    applies: &'a [crate::scene::dsl::ApplyActionNode],
+    actions: &'a [crate::scene::dsl::ActionNode],
+    actor_id: &str,
+    rig: &crate::scene::dsl::SkeletonNode,
+    time_sec: f32,
+    graph_duration_ms: u64,
+) -> Option<(
+    &'a crate::scene::dsl::ActionNode,
+    &'a crate::scene::dsl::ApplyActionNode,
+)> {
+    let apply = applies
+        .iter()
+        .find(|apply| scene_apply_action_is_active(apply, actor_id, time_sec, graph_duration_ms))?;
+    let action = actions.iter().find(|action| {
+        action.id == apply.action && action_skeleton_matches_native_rig(action, rig)
+    })?;
+    Some((action, apply))
+}
+
+fn action_skeleton_matches_native_rig(
+    action: &crate::scene::dsl::ActionNode,
+    rig: &crate::scene::dsl::SkeletonNode,
+) -> bool {
+    let Some(action_skeleton) = action.skeleton.as_deref() else {
+        return false;
+    };
+    if action_skeleton == rig.id {
+        return true;
+    }
+    matches!(action_skeleton, "humanoid_v1" | "motionloom_humanoid_v1")
+        && rig
+            .profile
+            .as_deref()
+            .is_some_and(|profile| matches!(profile, "humanoid_v1" | "motionloom_humanoid_v1"))
 }
 
 struct RetainedGpuTransformFrame {
@@ -3701,6 +4212,12 @@ impl EnvironmentSpatialKey {
     }
 }
 
+fn terrain_collision_cache_source(terrain: &crate::dsl::TerrainAssetNode) -> String {
+    let mut hasher = DefaultHasher::new();
+    format!("{terrain:?}").hash(&mut hasher);
+    format!("__motionloom_terrain__:{:016x}", hasher.finish())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SceneEnvironmentTriangle {
     points: [[f32; 3]; 3],
@@ -4017,6 +4534,7 @@ fn resolved_primitive_collider_shape(asset: &PrimitiveAssetNode) -> PrimitiveCol
         match asset.geometry {
             PrimitiveGeometry::Box { .. } => PrimitiveColliderShape::Box,
             PrimitiveGeometry::Sphere { .. } => PrimitiveColliderShape::Sphere,
+            PrimitiveGeometry::Capsule { .. } => PrimitiveColliderShape::Capsule,
             PrimitiveGeometry::Plane { .. } => PrimitiveColliderShape::Plane,
             PrimitiveGeometry::Cylinder { .. } => PrimitiveColliderShape::Cylinder,
             PrimitiveGeometry::Cone { .. } => PrimitiveColliderShape::Cone,
@@ -4054,6 +4572,15 @@ fn primitive_collision_geometry(asset: &PrimitiveAssetNode) -> PrimitiveGeometry
                 .radius
                 .unwrap_or(dimensions.into_iter().fold(0.0, f32::max) * 0.5)
                 + collision.margin,
+            segments: 16,
+            rings: 8,
+        },
+        PrimitiveColliderShape::Capsule => PrimitiveGeometry::Capsule {
+            radius: collision
+                .radius
+                .unwrap_or(dimensions[0].max(dimensions[2]) * 0.5)
+                + collision.margin,
+            height: collision.height.unwrap_or(dimensions[1]) + collision.margin * 2.0,
             segments: 16,
             rings: 8,
         },
@@ -4114,6 +4641,7 @@ fn primitive_rigid_collider_spec(
             crate::simulation::model::RigidBodyShape::Box
         }
         PrimitiveColliderShape::Sphere => crate::simulation::model::RigidBodyShape::Sphere,
+        PrimitiveColliderShape::Capsule => crate::simulation::model::RigidBodyShape::Capsule,
         PrimitiveColliderShape::Cylinder => crate::simulation::model::RigidBodyShape::Cylinder,
         PrimitiveColliderShape::Cone | PrimitiveColliderShape::Convex => {
             crate::simulation::model::RigidBodyShape::ConvexHull
@@ -4146,6 +4674,323 @@ fn rotate_scene_point(mut point: [f32; 3], rotation: [f32; 3]) -> [f32; 3] {
     let x = point[0] * roll.cos() - point[1] * roll.sin();
     let y = point[0] * roll.sin() + point[1] * roll.cos();
     [x, y, point[2]]
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompoundRigTransform {
+    position: [f32; 3],
+    rotation: [f32; 4],
+    scale: f32,
+}
+
+fn action_bone_x(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.x.as_ref()
+}
+
+fn action_bone_y(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.y.as_ref()
+}
+
+fn action_bone_z(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.z.as_ref()
+}
+
+fn action_bone_rotation_x(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.rotation_x.as_ref()
+}
+
+fn action_bone_rotation_y(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.rotation_y.as_ref()
+}
+
+fn action_bone_rotation_z(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.rotation_z.as_ref().or(bone.rotation.as_ref())
+}
+
+fn action_bone_forward(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.forward.as_ref()
+}
+
+fn action_bone_side(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.side.as_ref()
+}
+
+fn action_bone_twist(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.twist.as_ref()
+}
+
+fn action_bone_bend(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.bend.as_ref()
+}
+
+fn action_bone_turn(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
+    bone.turn.as_ref()
+}
+
+fn apply_native_axis_binding(rotation: &mut [f32; 3], binding: &str, value: f32) {
+    let mut parts = binding.split(':');
+    let axis = match parts.next().unwrap_or_default().trim() {
+        "rotationX" | "x" => Some(0),
+        "rotationY" | "y" => Some(1),
+        "rotationZ" | "z" => Some(2),
+        _ => None,
+    };
+    let sign = parts
+        .next()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(1.0);
+    if let Some(axis) = axis {
+        rotation[axis] += value * sign;
+    }
+}
+
+fn scene_quaternion_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn scene_quaternion_from_euler(rotation: [f32; 3]) -> [f32; 4] {
+    let [x, y, z] = rotation.map(|value| value.to_radians() * 0.5);
+    let qx = [x.sin(), 0.0, 0.0, x.cos()];
+    let qy = [0.0, y.sin(), 0.0, y.cos()];
+    let qz = [0.0, 0.0, z.sin(), z.cos()];
+    scene_quaternion_mul(qz, scene_quaternion_mul(qy, qx))
+}
+
+fn scene_rotate_by_quaternion(value: [f32; 3], q: [f32; 4]) -> [f32; 3] {
+    let u = [q[0], q[1], q[2]];
+    let dot_uv = u[0] * value[0] + u[1] * value[1] + u[2] * value[2];
+    let dot_uu = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
+    let cross = [
+        u[1] * value[2] - u[2] * value[1],
+        u[2] * value[0] - u[0] * value[2],
+        u[0] * value[1] - u[1] * value[0],
+    ];
+    [
+        2.0 * dot_uv * u[0] + (q[3] * q[3] - dot_uu) * value[0] + 2.0 * q[3] * cross[0],
+        2.0 * dot_uv * u[1] + (q[3] * q[3] - dot_uu) * value[1] + 2.0 * q[3] * cross[1],
+        2.0 * dot_uv * u[2] + (q[3] * q[3] - dot_uu) * value[2] + 2.0 * q[3] * cross[2],
+    ]
+}
+
+fn sample_compound_rig(
+    skeleton: &crate::scene::dsl::SkeletonNode,
+    action: Option<(
+        &crate::scene::dsl::ActionNode,
+        &crate::scene::dsl::ApplyActionNode,
+    )>,
+    world_action: Option<&WorldAction>,
+    time_norm: f32,
+    time_sec: f32,
+    frame: u32,
+    fps: f32,
+    duration_ms: u64,
+) -> Result<HashMap<String, CompoundRigTransform>, MotionLoomSceneRenderError> {
+    let mut pose_pair = None;
+    let mut sampled_action_time = None;
+    if let Some((action, apply)) = action
+        && !action.poses.is_empty()
+    {
+        let apply_start = apply.at_ms as f32 / 1000.0;
+        let apply_duration = apply.duration_ms.unwrap_or(action.duration_ms) as f32 / 1000.0;
+        if time_sec >= apply_start && time_sec <= apply_start + apply_duration + 0.0001 {
+            let speed = eval_scene_number(&apply.speed, time_norm, time_sec)?.max(0.0);
+            let clip_duration = (action.duration_ms as f32 / 1000.0).max(0.0001);
+            let mut local = (time_sec - apply_start).max(0.0) * speed;
+            local = if apply.r#loop {
+                local % clip_duration
+            } else {
+                local.min(clip_duration)
+            };
+            sampled_action_time = Some(local);
+            let mut previous = &action.poses[0];
+            let mut next = action.poses.last().unwrap_or(previous);
+            for pose in &action.poses {
+                if pose.t <= local {
+                    previous = pose;
+                }
+                if pose.t >= local {
+                    next = pose;
+                    break;
+                }
+            }
+            let span = next.t - previous.t;
+            let mix = if span.abs() <= 0.0001 {
+                0.0
+            } else {
+                ((local - previous.t) / span).clamp(0.0, 1.0)
+            };
+            pose_pair = Some((previous, next, mix));
+        }
+    }
+
+    let sample_attr = |bone_id: &str,
+                       get: fn(&crate::scene::dsl::ActionBoneNode) -> Option<&String>|
+     -> Result<Option<f32>, MotionLoomSceneRenderError> {
+        let Some((previous, next, mix)) = pose_pair else {
+            return Ok(None);
+        };
+        let a = previous.bones.iter().find(|bone| bone.id == bone_id);
+        let b = next.bones.iter().find(|bone| bone.id == bone_id);
+        let mix = crate::scene::domain::action_key_mix(a, b, mix);
+        let av = a.and_then(get);
+        let bv = b.and_then(get);
+        match (av, bv) {
+            (Some(a), Some(b)) => Ok(Some(
+                eval_scene_number(a, time_norm, time_sec)? * (1.0 - mix)
+                    + eval_scene_number(b, time_norm, time_sec)? * mix,
+            )),
+            (Some(value), None) | (None, Some(value)) => {
+                Ok(Some(eval_scene_number(value, time_norm, time_sec)?))
+            }
+            (None, None) => Ok(None),
+        }
+    };
+
+    let model_rotation_deltas = if let Some((action, _)) = action
+        && skeleton.source_rig.as_deref() == Some("character1_reference_v1")
+        && let Some(action_time) = sampled_action_time
+        && let Some(world_action) = world_action
+    {
+        if crate::world::render::action_uses_baked_humanoid_reference(world_action) {
+            Some(
+                crate::world::render::humanoid_v1_reference_model_rotation_deltas(
+                    world_action,
+                    action_time,
+                    crate::world::WorldTime {
+                        frame,
+                        fps,
+                        duration_ms,
+                    },
+                )
+                .map_err(|error| {
+                    MotionLoomSceneRenderError::InvalidExpression {
+                        expr: action.id.clone(),
+                        message: format!("failed to sample native humanoid retarget: {error}"),
+                    }
+                })?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut world = HashMap::<String, CompoundRigTransform>::new();
+    let mut rest_world_rotations = HashMap::<String, [f32; 4]>::new();
+    for bone in &skeleton.bones {
+        let mut position = [
+            eval_scene_number(&bone.x, time_norm, time_sec)?,
+            eval_scene_number(&bone.y, time_norm, time_sec)?,
+            eval_scene_number(&bone.z, time_norm, time_sec)?,
+        ];
+        for (axis, get) in [
+            (0, action_bone_x as _),
+            (1, action_bone_y as _),
+            (2, action_bone_z as _),
+        ] {
+            if let Some(value) = sample_attr(&bone.id, get)? {
+                position[axis] += value;
+            }
+        }
+        let rest_rotation = [
+            eval_scene_number(&bone.rotation_x, time_norm, time_sec)?,
+            eval_scene_number(&bone.rotation_y, time_norm, time_sec)?,
+            eval_scene_number(&bone.rotation_z, time_norm, time_sec)?,
+        ];
+        let local_rest_rotation = scene_quaternion_from_euler(rest_rotation);
+        let rest_global_rotation = bone
+            .parent
+            .as_ref()
+            .and_then(|id| rest_world_rotations.get(id).copied())
+            .map(|parent| scene_quaternion_mul(parent, local_rest_rotation))
+            .unwrap_or(local_rest_rotation);
+        rest_world_rotations.insert(bone.id.clone(), rest_global_rotation);
+
+        let mut rotation = rest_rotation;
+        if model_rotation_deltas.is_none() {
+            for (axis, get) in [
+                (0, action_bone_rotation_x as _),
+                (1, action_bone_rotation_y as _),
+                (2, action_bone_rotation_z as _),
+            ] {
+                if let Some(value) = sample_attr(&bone.id, get)? {
+                    rotation[axis] += value;
+                }
+            }
+            if let Some(axis) = skeleton
+                .bone_axis_map
+                .as_ref()
+                .and_then(|map| map.axes.iter().find(|axis| axis.bone == bone.id))
+            {
+                for (binding, get) in [
+                    (axis.forward.as_deref(), action_bone_forward as _),
+                    (axis.side.as_deref(), action_bone_side as _),
+                    (axis.twist.as_deref(), action_bone_twist as _),
+                    (axis.bend.as_deref(), action_bone_bend as _),
+                    (axis.turn.as_deref(), action_bone_turn as _),
+                ] {
+                    if let (Some(binding), Some(value)) = (binding, sample_attr(&bone.id, get)?) {
+                        apply_native_axis_binding(&mut rotation, binding, value);
+                    }
+                }
+            }
+        }
+        let local_scale = sample_attr(&bone.id, |bone| bone.scale.as_ref())?
+            .unwrap_or(eval_scene_number(&bone.scale, time_norm, time_sec)?);
+        let local_rotation = scene_quaternion_from_euler(rotation);
+        let transform = if let Some(parent) = bone.parent.as_ref().and_then(|id| world.get(id)) {
+            let local = scene_rotate_by_quaternion(
+                position.map(|value| value * parent.scale),
+                parent.rotation,
+            );
+            CompoundRigTransform {
+                position: add_scene_vec3(parent.position, local),
+                rotation: model_rotation_deltas
+                    .as_ref()
+                    .and_then(|deltas| deltas.get(&bone.id).copied())
+                    .map(|delta| scene_quaternion_mul(delta, rest_global_rotation))
+                    .unwrap_or_else(|| scene_quaternion_mul(parent.rotation, local_rotation)),
+                scale: parent.scale * local_scale,
+            }
+        } else {
+            CompoundRigTransform {
+                position,
+                rotation: model_rotation_deltas
+                    .as_ref()
+                    .and_then(|deltas| deltas.get(&bone.id).copied())
+                    .map(|delta| scene_quaternion_mul(delta, rest_global_rotation))
+                    .unwrap_or(local_rotation),
+                scale: local_scale,
+            }
+        };
+        world.insert(bone.id.clone(), transform);
+    }
+    Ok(world)
+}
+
+fn skeleton_bone_is_descendant(
+    skeleton: &crate::scene::dsl::SkeletonNode,
+    bone: &str,
+    ancestor: &str,
+) -> bool {
+    let mut current = Some(bone);
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = skeleton
+            .bones
+            .iter()
+            .find(|bone| bone.id == id)
+            .and_then(|bone| bone.parent.as_deref());
+    }
+    false
 }
 
 fn primitive_collision_triangles(
@@ -4379,19 +5224,51 @@ fn reachable_environment_height(
     max_step_height: f32,
     padding: f32,
 ) -> Option<f32> {
+    const DENSE_SUPPORT_LIMIT: usize = 4_096;
+    let mut dense_height = None::<f32>;
+    for environment in environments {
+        if environment.triangles.len() > DENSE_SUPPORT_LIMIT {
+            if let Some(height) = raycast_environment_height(environment, x, z, None)
+                && dense_height.is_none_or(|current| height > current)
+            {
+                dense_height = Some(height);
+            }
+        }
+    }
     let supports = environments
         .iter()
+        .filter(|environment| environment.triangles.len() <= DENSE_SUPPORT_LIMIT)
         .flat_map(|environment| environment.triangles.iter().copied())
         .filter(|triangle| triangle.normal[1] >= 0.45)
         .collect::<Vec<_>>();
+    // Dense heightfields already own a spatial grid. Running the sparse
+    // connectivity flood over every terrain triangle is O(n²) and can stall
+    // a preview before its first frame. Query dense ground locally, then use
+    // it as the seed for the much smaller set of steps and platforms.
+    if supports.len() > DENSE_SUPPORT_LIMIT {
+        return environments
+            .iter()
+            .filter_map(|environment| raycast_environment_height(environment, x, z, None))
+            .min_by(f32::total_cmp);
+    }
+    if supports.is_empty() {
+        return dense_height;
+    }
     let heights = supports
         .iter()
         .map(|triangle| triangle.points.iter().map(|point| point[1]).sum::<f32>() / 3.0)
         .collect::<Vec<_>>();
-    let lowest = heights.iter().copied().min_by(f32::total_cmp)?;
+    let lowest = dense_height.or_else(|| heights.iter().copied().min_by(f32::total_cmp))?;
     let mut reachable = heights
         .iter()
-        .map(|height| (*height - lowest).abs() <= padding.max(0.01))
+        .map(|height| {
+            (*height - lowest).abs()
+                <= if dense_height.is_some() {
+                    max_step_height + padding
+                } else {
+                    padding.max(0.01)
+                }
+        })
         .collect::<Vec<_>>();
     loop {
         let mut changed = false;
@@ -4413,11 +5290,15 @@ fn reachable_environment_height(
             break;
         }
     }
-    supports
+    let sparse_height = supports
         .iter()
         .enumerate()
         .filter(|(index, _)| reachable[*index])
         .filter_map(|(_, triangle)| triangle_height_at_xz(triangle, x, z))
+        .max_by(f32::total_cmp);
+    dense_height
+        .into_iter()
+        .chain(sparse_height)
         .max_by(f32::total_cmp)
 }
 
@@ -4474,6 +5355,17 @@ fn add_scene_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn sub_scene_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|axis| a[axis] - b[axis])
+}
+
+fn translated_humanoid_frame(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    translation: [f32; 3],
+) -> crate::world::render::Scene3DHumanoidFrame {
+    let mut translated = frame.clone();
+    for point in translated.joints.values_mut() {
+        *point = add_scene_vec3(*point, translation);
+    }
+    translated
 }
 
 fn scale_scene_vec3(value: [f32; 3], scale: f32) -> [f32; 3] {
@@ -4699,6 +5591,27 @@ fn humanoid_collision_spheres_for_profile(
         .collect()
 }
 
+/// Approximate a feet-rooted vertical capsule with overlapping spheres. This
+/// matches native CompoundAsset rigs whose root remains on the ground plane.
+fn native_capsule_collision_spheres(
+    root: [f32; 3],
+    radius: f32,
+    cylinder_height: f32,
+) -> Vec<HumanoidCollisionSphere> {
+    let radius = radius.max(0.01);
+    let cylinder_height = cylinder_height.max(0.0);
+    let intervals = ((cylinder_height / (radius * 2.0)).ceil() as usize).clamp(1, 8);
+    (0..=intervals)
+        .map(|index| {
+            let phase = index as f32 / intervals as f32;
+            HumanoidCollisionSphere {
+                center: [root[0], root[1] + radius + cylinder_height * phase, root[2]],
+                radius,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn humanoid_collision_spheres(
     frame: &crate::world::render::Scene3DHumanoidFrame,
@@ -4783,6 +5696,74 @@ fn depenetrate_humanoid(
     (translation, contacts)
 }
 
+/// Sweep a set of root-owned collision spheres from an authored start to a
+/// desired root. Native rigs and imported humanoids share this deterministic
+/// narrow phase so direct timeline motion cannot bypass solid primitives.
+fn sweep_kinematic_spheres(
+    spheres: &[HumanoidCollisionSphere],
+    previous_root: [f32; 3],
+    desired_root: [f32; 3],
+    environments: &[Arc<EnvironmentTriangleSpatialIndex>],
+    config: KinematicControllerConfig,
+) -> ([f32; 3], usize, u32) {
+    let desired_motion = sub_scene_vec3(desired_root, previous_root);
+    let motion_length = length_scene_vec3(desired_motion);
+    let substeps = ((motion_length / config.sweep_step.max(0.005)).ceil() as u32).clamp(1, 32);
+    let step = scale_scene_vec3(desired_motion, 1.0 / substeps as f32);
+    // Spheres are rooted at desired_root, so translation zero represents the
+    // desired body and previous_root is expressed relative to that target.
+    let mut translation = sub_scene_vec3(previous_root, desired_root);
+    let (resolved_start, mut contacts) =
+        depenetrate_humanoid(spheres, translation, environments, config);
+    translation = resolved_start;
+
+    for _ in 0..substeps {
+        let start = translation;
+        let target = add_scene_vec3(start, step);
+        if deepest_humanoid_push(spheres, target, environments, config.safe_margin).is_none() {
+            translation = target;
+            continue;
+        }
+
+        // Find the earliest non-overlapping portion of this deterministic
+        // substep, then project the remainder onto the contact tangent.
+        let mut low = 0.0_f32;
+        let mut high = 1.0_f32;
+        for _ in 0..8 {
+            let mid = (low + high) * 0.5;
+            let probe = add_scene_vec3(start, scale_scene_vec3(step, mid));
+            if deepest_humanoid_push(spheres, probe, environments, config.safe_margin).is_some() {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        translation = add_scene_vec3(start, scale_scene_vec3(step, low));
+        let probe = add_scene_vec3(start, scale_scene_vec3(step, high));
+        if let Some(push) = deepest_humanoid_push(spheres, probe, environments, config.safe_margin)
+        {
+            contacts += 1;
+            let normal = if length_scene_vec3(push) > 1.0e-6 {
+                scale_scene_vec3(push, 1.0 / length_scene_vec3(push))
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            let remainder = scale_scene_vec3(step, 1.0 - low);
+            let into_surface = dot_scene_vec3(remainder, normal).min(0.0);
+            let slide = sub_scene_vec3(remainder, scale_scene_vec3(normal, into_surface));
+            let (slid, slide_contacts) = depenetrate_humanoid(
+                spheres,
+                add_scene_vec3(translation, slide),
+                environments,
+                config,
+            );
+            translation = slid;
+            contacts += slide_contacts;
+        }
+    }
+    (translation, contacts, substeps)
+}
+
 fn probe_humanoid_ground(
     frame: &crate::world::render::Scene3DHumanoidFrame,
     root: [f32; 3],
@@ -4860,61 +5841,8 @@ fn resolve_humanoid_kinematic_controller(
         }
     }
     let spheres = humanoid_collision_spheres_for_profile(frame, config.profile, desired_root);
-    let desired_motion = sub_scene_vec3(desired_root, previous_root);
-    let motion_length = length_scene_vec3(desired_motion);
-    let substeps = ((motion_length / config.sweep_step.max(0.005)).ceil() as u32).clamp(1, 32);
-    let step = scale_scene_vec3(desired_motion, 1.0 / substeps as f32);
-    // Spheres are rooted at desired_root, so translation zero represents the
-    // desired character-controller body and previous_root is relative to it.
-    let mut translation = sub_scene_vec3(previous_root, desired_root);
-    let (resolved_start, mut contacts) =
-        depenetrate_humanoid(&spheres, translation, environments, config);
-    translation = resolved_start;
-
-    for _ in 0..substeps {
-        let start = translation;
-        let target = add_scene_vec3(start, step);
-        if deepest_humanoid_push(&spheres, target, environments, config.safe_margin).is_none() {
-            translation = target;
-            continue;
-        }
-
-        // Find the earliest non-overlapping portion of this deterministic
-        // substep, then project the remainder onto the contact tangent.
-        let mut low = 0.0_f32;
-        let mut high = 1.0_f32;
-        for _ in 0..8 {
-            let mid = (low + high) * 0.5;
-            let probe = add_scene_vec3(start, scale_scene_vec3(step, mid));
-            if deepest_humanoid_push(&spheres, probe, environments, config.safe_margin).is_some() {
-                high = mid;
-            } else {
-                low = mid;
-            }
-        }
-        translation = add_scene_vec3(start, scale_scene_vec3(step, low));
-        let probe = add_scene_vec3(start, scale_scene_vec3(step, high));
-        if let Some(push) = deepest_humanoid_push(&spheres, probe, environments, config.safe_margin)
-        {
-            contacts += 1;
-            let normal = if length_scene_vec3(push) > 1.0e-6 {
-                scale_scene_vec3(push, 1.0 / length_scene_vec3(push))
-            } else {
-                [0.0, 1.0, 0.0]
-            };
-            let remainder = scale_scene_vec3(step, 1.0 - low);
-            let into_surface = dot_scene_vec3(remainder, normal).min(0.0);
-            let slide = sub_scene_vec3(remainder, scale_scene_vec3(normal, into_surface));
-            let (slid, slide_contacts) = depenetrate_humanoid(
-                &spheres,
-                add_scene_vec3(translation, slide),
-                environments,
-                config,
-            );
-            translation = slid;
-            contacts += slide_contacts;
-        }
-    }
+    let (mut translation, contacts, substeps) =
+        sweep_kinematic_spheres(&spheres, previous_root, desired_root, environments, config);
 
     let mut ground_probe = HumanoidGroundProbe::default();
     if config.floor_snap > 0.0 && config.profile != HumanoidColliderProfile::Airborne {
@@ -5008,12 +5936,202 @@ fn action_contact_phase_envelope(from: f32, to: f32, phase: f32) -> f32 {
     entering.min(leaving)
 }
 
+/// Resolve a deterministic timeline sample for the start of the current
+/// planted interval. Random-access renders therefore use the same lock point
+/// as sequential preview without retaining mutable per-frame animation state.
+fn action_contact_lock_time_sec(
+    apply_start_sec: f32,
+    action_duration_sec: f32,
+    contact_from: f32,
+    contact_to: f32,
+    time_sec: f32,
+    speed: f32,
+    should_loop: bool,
+) -> Option<f32> {
+    if speed <= f32::EPSILON || action_duration_sec <= f32::EPSILON {
+        return None;
+    }
+    let action_elapsed = (time_sec - apply_start_sec) * speed;
+    if action_elapsed < 0.0 {
+        return None;
+    }
+    let cycle_start = if should_loop {
+        (action_elapsed / action_duration_sec).floor() * action_duration_sec
+    } else {
+        0.0
+    };
+    let feather = ((contact_to - contact_from) * 0.2).min(0.035).max(0.001);
+    let lock_phase = (contact_from + feather).min(contact_to);
+    let lock_action_time = cycle_start + lock_phase * action_duration_sec;
+    Some(apply_start_sec + lock_action_time / speed)
+}
+
 #[derive(Clone, Debug)]
 struct HumanoidContactSample {
     correction: [f32; 3],
     authored_weight: f32,
     envelope: f32,
     support: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedContactSurface {
+    id: String,
+    kind: String,
+    origin: [f32; 3],
+    normal: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    half_bounds: [f32; 2],
+    margin: f32,
+}
+
+fn cross_scene_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn resolve_contact_surface(
+    authored: &crate::dsl::ContactSurfaceNode,
+    source_position: [f32; 3],
+    source_rotation: [f32; 3],
+    source_scale: f32,
+    source_primitive: Option<&crate::dsl::PrimitiveAssetNode>,
+) -> ResolvedContactSurface {
+    let normal = normalize_scene_vec3(rotate_scene_point(authored.normal, source_rotation));
+    let mut forward = rotate_scene_point(authored.forward, source_rotation);
+    // Remove the normal component so authored forward always lies on the plane.
+    forward = sub_scene_vec3(
+        forward,
+        scale_scene_vec3(normal, dot_scene_vec3(forward, normal)),
+    );
+    if length_scene_vec3(forward) <= 1.0e-6 {
+        forward = cross_scene_vec3([1.0, 0.0, 0.0], normal);
+    }
+    forward = normalize_scene_vec3(forward);
+    let right = normalize_scene_vec3(cross_scene_vec3(normal, forward));
+    let local_origin = authored.position.unwrap_or_else(|| {
+        let top = source_primitive
+            .map(|primitive| crate::world::primitive::primitive_bounds(&primitive.geometry).1[1])
+            .unwrap_or(0.0);
+        [0.0, top, 0.0]
+    });
+    let origin = add_scene_vec3(
+        source_position,
+        rotate_scene_point(
+            scale_scene_vec3(local_origin, source_scale),
+            source_rotation,
+        ),
+    );
+    ResolvedContactSurface {
+        id: authored.id.clone(),
+        kind: authored.kind.clone(),
+        origin,
+        normal,
+        forward,
+        right,
+        half_bounds: [authored.bounds[0] * 0.5, authored.bounds[1] * 0.5],
+        margin: authored.margin,
+    }
+}
+
+fn contact_surface_target(surface: &ResolvedContactSurface, point: [f32; 3]) -> [f32; 3] {
+    let relative = sub_scene_vec3(point, surface.origin);
+    let lateral = dot_scene_vec3(relative, surface.right)
+        .clamp(-surface.half_bounds[0], surface.half_bounds[0]);
+    let depth = if surface.kind == "seat" {
+        0.0
+    } else {
+        dot_scene_vec3(relative, surface.forward)
+            .clamp(-surface.half_bounds[1], surface.half_bounds[1])
+    };
+    add_scene_vec3(
+        add_scene_vec3(
+            surface.origin,
+            add_scene_vec3(
+                scale_scene_vec3(surface.right, lateral),
+                scale_scene_vec3(surface.forward, depth),
+            ),
+        ),
+        scale_scene_vec3(surface.normal, surface.margin),
+    )
+}
+
+fn semantic_contact_point(
+    frame: &crate::world::render::Scene3DHumanoidFrame,
+    effector: &str,
+    surface: &ResolvedContactSurface,
+) -> Option<[f32; 3]> {
+    match effector {
+        "pelvis" => {
+            let hips = frame.joints.get("hips").copied()?;
+            // Hip joints sit near the centre of the skinned pelvis rather than
+            // on its visible lower envelope. Derive seat clearance from the
+            // bind-pose body height so differently scaled humanoids do not
+            // require scene-specific root offsets.
+            let seated_offset = (frame.rig_metrics.body_height * 0.15)
+                .clamp(frame.actor_scale * 0.09, frame.actor_scale * 0.18)
+                .max(0.035);
+            let mut support = sub_scene_vec3(hips, scale_scene_vec3(surface.normal, seated_offset));
+            let thigh_radius = (frame.rig_metrics.body_height * 0.05)
+                .clamp(frame.actor_scale * 0.025, frame.actor_scale * 0.07);
+            let hips_height = dot_scene_vec3(hips, surface.normal);
+            // A seated thigh can slope below the hip joint before reaching the
+            // knee. Sample only its proximal section: knees and lower legs are
+            // intentionally allowed to hang below the seat plane.
+            for side in ["l", "r"] {
+                let upper_name = format!("upper_leg_{side}");
+                let lower_name = format!("lower_leg_{side}");
+                let (Some(upper), Some(knee)) = (
+                    frame.joints.get(&upper_name).copied(),
+                    frame.joints.get(&lower_name).copied(),
+                ) else {
+                    continue;
+                };
+                let proximal =
+                    add_scene_vec3(upper, scale_scene_vec3(sub_scene_vec3(knee, upper), 0.35));
+                let candidate_height = dot_scene_vec3(proximal, surface.normal) - thigh_radius;
+                let support_height = dot_scene_vec3(support, surface.normal);
+                if candidate_height < support_height {
+                    support = add_scene_vec3(
+                        hips,
+                        scale_scene_vec3(surface.normal, candidate_height - hips_height),
+                    );
+                }
+            }
+            Some(support)
+        }
+        "back" => frame
+            .joints
+            .get("chest")
+            .or_else(|| frame.joints.get("spine"))
+            .copied(),
+        other => canonical_action_contact_effector(other)
+            .and_then(|canonical| frame.joints.get(canonical).copied()),
+    }
+}
+
+fn action_surface_contact_envelope(
+    contact: &crate::scene::dsl::ActionContactNode,
+    phase: f32,
+) -> f32 {
+    if contact.mode != "surface" || contact.to < 0.999 {
+        return action_contact_phase_envelope(contact.from, contact.to, phase);
+    }
+    if phase < contact.from || phase > contact.to {
+        return 0.0;
+    }
+    // A contact authored from phase zero describes an already-established
+    // support, such as a seated idle. It must survive action boundaries
+    // without briefly releasing the actor back to ground or bind pose.
+    if contact.from <= f32::EPSILON {
+        return 1.0;
+    }
+    let feather = ((contact.to - contact.from) * 0.2).min(0.08).max(0.001);
+    ((phase - contact.from) / feather).clamp(0.0, 1.0)
 }
 
 fn combine_humanoid_contact_samples(
@@ -5062,8 +6180,7 @@ fn automatic_humanoid_supports(
     motion_root: [f32; 3],
     grounded_root: [f32; 3],
     profile: HumanoidColliderProfile,
-    surface: &ResolvedSceneSurface,
-    environment: Option<&EnvironmentTriangleSpatialIndex>,
+    ground: ResolvedSceneGround<'_>,
 ) -> Vec<String> {
     let candidates: &[&str] = match profile {
         HumanoidColliderProfile::Standing | HumanoidColliderProfile::Airborne => {
@@ -5085,7 +6202,7 @@ fn automatic_humanoid_supports(
         .iter()
         .filter_map(|bone| {
             let point = add_scene_vec3(*frame.joints.get(*bone)?, root_delta);
-            let target = scene_surface_contact_target(surface, environment, point, 0.0);
+            let target = scene_ground_contact_target(ground, point, 0.0)?;
             (length_scene_vec3(sub_scene_vec3(target, point)) <= threshold)
                 .then(|| (*bone).to_string())
         })
@@ -5169,6 +6286,30 @@ fn scene_surface_contact_target(
         });
     let base = [point[0], height, point[2]];
     add_scene_vec3(base, scale_scene_vec3(surface.normal, offset))
+}
+
+fn scene_ground_contact_target(
+    ground: ResolvedSceneGround<'_>,
+    point: [f32; 3],
+    offset: f32,
+) -> Option<[f32; 3]> {
+    match ground {
+        ResolvedSceneGround::Surface {
+            surface,
+            environment,
+        } => Some(scene_surface_contact_target(
+            surface,
+            environment,
+            point,
+            offset,
+        )),
+        ResolvedSceneGround::Terrain { environment } => {
+            // Terrain grounding follows generated collision triangles so
+            // native WGPU and WASM consume the same deterministic CPU query.
+            let height = raycast_environment_height(environment, point[0], point[2], None)?;
+            Some([point[0], height + offset, point[2]])
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5289,6 +6430,7 @@ fn is_scene_canonical_humanoid_bone(value: &str) -> bool {
         "hips"
             | "spine"
             | "chest"
+            | "upper_chest"
             | "neck"
             | "head"
             | "shoulder_l"
@@ -5307,7 +6449,15 @@ fn is_scene_canonical_humanoid_bone(value: &str) -> bool {
             | "lower_leg_r"
             | "foot_r"
             | "toe_r"
-    )
+    ) || is_scene_canonical_humanoid_finger(value)
+}
+
+fn is_scene_canonical_humanoid_finger(value: &str) -> bool {
+    let Some((finger, suffix)) = value.split_once('_') else {
+        return false;
+    };
+    matches!(finger, "thumb" | "index" | "middle" | "ring" | "pinky")
+        && matches!(suffix, "1_l" | "2_l" | "3_l" | "1_r" | "2_r" | "3_r")
 }
 
 fn scene_camera_to_world_camera(
@@ -5336,6 +6486,40 @@ fn scene_camera_to_world_camera(
     } else {
         eval_scene_vec3(&node.up, time_norm, time_sec, [0.0, 1.0, 0.0])?
     };
+    let depth_of_field = node
+        .depth_of_field
+        .as_ref()
+        .and_then(|optics| optics.enabled.then_some(optics))
+        .map(|optics| {
+            let target_distance = optics
+                .focus_target
+                .as_deref()
+                .and_then(|value| resolve_scene_3d_reference(value, anchors, models))
+                .map(|focus| length_scene_vec3(sub_scene_vec3(position, focus)))
+                .unwrap_or(distance);
+            let focus_distance = optics
+                .focus_distance
+                .as_deref()
+                .map(|value| eval_scene_number(value, time_norm, time_sec))
+                .transpose()?
+                .unwrap_or(target_distance);
+            Ok::<WorldDepthOfField, MotionLoomSceneRenderError>(WorldDepthOfField {
+                focus_distance: (focus_distance
+                    + eval_scene_number(&optics.focus_offset, time_norm, time_sec)?)
+                .max(0.05)
+                .to_string(),
+                focal_length_mm: eval_scene_number(&optics.focal_length, time_norm, time_sec)?
+                    .clamp(1.0, 300.0)
+                    .to_string(),
+                f_stop: eval_scene_number(&optics.f_stop, time_norm, time_sec)?
+                    .clamp(0.7, 64.0)
+                    .to_string(),
+                max_blur_px: eval_scene_number(&optics.max_blur, time_norm, time_sec)?
+                    .clamp(0.0, 32.0)
+                    .to_string(),
+            })
+        })
+        .transpose()?;
     Ok(WorldCamera {
         id: node.id.clone(),
         control: WorldCameraControl::Orbit,
@@ -5360,6 +6544,7 @@ fn scene_camera_to_world_camera(
         zoom: "1".to_string(),
         fov: eval_scene_number(&node.fov, time_norm, time_sec)?.to_string(),
         orthographic_scale: None,
+        depth_of_field,
     })
 }
 
@@ -5370,6 +6555,17 @@ struct ResolvedSceneSurface {
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
     normal: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+enum ResolvedSceneGround<'a> {
+    Surface {
+        surface: &'a ResolvedSceneSurface,
+        environment: Option<&'a EnvironmentTriangleSpatialIndex>,
+    },
+    Terrain {
+        environment: &'a EnvironmentTriangleSpatialIndex,
+    },
 }
 
 fn scene_surface_contains_xz(surface: &ResolvedSceneSurface, point: [f32; 3]) -> bool {
@@ -5560,12 +6756,17 @@ impl SceneFrameRenderer {
             animation_source_signature: 0,
             compiled_animation_graph: None,
             compiled_animation_has_dynamic_channels: false,
+            action_library_source_signature: 0,
+            compiled_action_library_graph: None,
             prepared_graph_signature: 0,
             prepared_graph_fps: 30.0,
             prepared_graph_duration_ms: 1_000,
             prepared_scene_model_profiles: Vec::new(),
+            prepared_scene_skeletons: Vec::new(),
             prepared_scene_actions: Vec::new(),
+            prepared_scene_world_actions: HashMap::new(),
             prepared_scene_apply_actions: Vec::new(),
+            prepared_scene_contact_surfaces: Vec::new(),
             prepared_scene_animation_assets: Vec::new(),
             prepared_scene_constraints: Vec::new(),
             gpu_path_cache_hits: 0,
@@ -5591,6 +6792,7 @@ impl SceneFrameRenderer {
             environment_triangle_cache: HashMap::new(),
             environment_spatial_cache: HashMap::new(),
             gpu_pick_ids: HashMap::new(),
+            last_rig_contact_evaluations: HashMap::new(),
             scene_3d_renderer: Scene3DRenderer::with_resolver(world_asset_resolver),
             gpu_compositor: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -5625,6 +6827,57 @@ impl SceneFrameRenderer {
             .entry(source.to_string())
             .or_insert_with(|| Arc::from(load_environment_triangles(source, resolver.as_ref())))
             .clone()
+    }
+
+    fn terrain_triangles(
+        &mut self,
+        terrain: &crate::dsl::TerrainAssetNode,
+    ) -> Result<
+        Arc<[crate::world::model_inspection::EnvironmentWalkableTriangle]>,
+        MotionLoomSceneRenderError,
+    > {
+        let key = terrain_collision_cache_source(terrain);
+        if let Some(triangles) = self.environment_triangle_cache.get(&key) {
+            return Ok(Arc::clone(triangles));
+        }
+        let source = terrain
+            .height_map_src
+            .as_deref()
+            .unwrap_or(terrain.height_map.as_str());
+        let height_map = self.load_image_asset(source)?.clone();
+        let triangles = Arc::from(crate::world::terrain::terrain_collision_triangles(
+            terrain,
+            &height_map,
+        ));
+        self.environment_triangle_cache
+            .insert(key, Arc::clone(&triangles));
+        Ok(triangles)
+    }
+
+    fn terrain_spatial_index(
+        &mut self,
+        terrain: &crate::dsl::TerrainAssetNode,
+        model_position: [f32; 3],
+        model_rotation: [f32; 3],
+        model_scale: f32,
+    ) -> Result<Arc<EnvironmentTriangleSpatialIndex>, MotionLoomSceneRenderError> {
+        let source = terrain_collision_cache_source(terrain);
+        let key =
+            EnvironmentSpatialKey::new(&source, None, model_position, model_rotation, model_scale);
+        if let Some(index) = self.environment_spatial_cache.get(&key) {
+            return Ok(Arc::clone(index));
+        }
+        let triangles = self.terrain_triangles(terrain)?;
+        let index = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            triangles.as_ref(),
+            None,
+            model_position,
+            model_rotation,
+            model_scale,
+        ));
+        self.environment_spatial_cache
+            .insert(key, Arc::clone(&index));
+        Ok(index)
     }
 
     fn environment_spatial_index(
@@ -5688,12 +6941,17 @@ impl SceneFrameRenderer {
             animation_source_signature: 0,
             compiled_animation_graph: None,
             compiled_animation_has_dynamic_channels: false,
+            action_library_source_signature: 0,
+            compiled_action_library_graph: None,
             prepared_graph_signature: 0,
             prepared_graph_fps: 30.0,
             prepared_graph_duration_ms: 1_000,
             prepared_scene_model_profiles: Vec::new(),
+            prepared_scene_skeletons: Vec::new(),
             prepared_scene_actions: Vec::new(),
+            prepared_scene_world_actions: HashMap::new(),
             prepared_scene_apply_actions: Vec::new(),
+            prepared_scene_contact_surfaces: Vec::new(),
             prepared_scene_animation_assets: Vec::new(),
             prepared_scene_constraints: Vec::new(),
             gpu_path_cache_hits: 0,
@@ -5719,6 +6977,7 @@ impl SceneFrameRenderer {
             environment_triangle_cache: HashMap::new(),
             environment_spatial_cache: HashMap::new(),
             gpu_pick_ids: HashMap::new(),
+            last_rig_contact_evaluations: HashMap::new(),
             scene_3d_renderer: Scene3DRenderer::with_resolver(world_asset_resolver),
             gpu_compositor: None,
             last_cpu_frame_profile: SceneCpuFrameProfile::default(),
@@ -5741,8 +7000,10 @@ impl SceneFrameRenderer {
         graph: &GraphScript,
         frame: u32,
     ) -> Result<Option<Arc<GraphScript>>, MotionLoomSceneRenderError> {
+        let library_graph = self.compiled_action_library_graph(graph)?;
+        let graph = library_graph.as_deref().unwrap_or(graph);
         if graph.animation_targets.is_empty() {
-            return Ok(None);
+            return Ok(library_graph);
         }
         let mut hasher = DefaultHasher::new();
         if let Some(raw_script) = graph.raw_script.as_deref() {
@@ -5785,6 +7046,63 @@ impl SceneFrameRenderer {
             apply_animation_property_to_graph(&mut resolved, &target.node, &target.property, value);
         }
         Ok(Some(Arc::new(resolved)))
+    }
+
+    fn compiled_action_library_graph(
+        &mut self,
+        graph: &GraphScript,
+    ) -> Result<Option<Arc<GraphScript>>, MotionLoomSceneRenderError> {
+        if graph.action_libraries.is_empty() {
+            return Ok(None);
+        }
+        let mut hasher = DefaultHasher::new();
+        if let Some(raw_script) = graph.raw_script.as_deref() {
+            raw_script.hash(&mut hasher);
+        } else {
+            format!("{:?}", graph.action_libraries).hash(&mut hasher);
+        }
+        let source_signature = hasher.finish();
+        if self.action_library_source_signature == source_signature
+            && let Some(cached) = self.compiled_action_library_graph.as_ref()
+        {
+            return Ok(Some(Arc::clone(cached)));
+        }
+
+        let mut resolved = graph.clone();
+        for library in &graph.action_libraries {
+            let source = load_utf8_text_source(&library.src, self.asset_resolver.as_ref())?;
+            let parsed = crate::dsl::parse_action_library_document(&source).map_err(|error| {
+                MotionLoomSceneRenderError::ParseActionLibrary {
+                    source_ref: library.src.clone(),
+                    line: error.line,
+                    message: error.message,
+                }
+            })?;
+            let by_id = parsed
+                .into_iter()
+                .map(|action| (action.id.clone(), action))
+                .collect::<HashMap<_, _>>();
+            for selected in &library.actions {
+                let mut action = by_id.get(selected).cloned().ok_or_else(|| {
+                    MotionLoomSceneRenderError::LoadActionLibrary {
+                        source_ref: library.src.clone(),
+                        message: format!(
+                            "selected Action '{}' was not found in the library",
+                            selected
+                        ),
+                    }
+                })?;
+                action.id = format!("{}.{}", library.id, selected);
+                resolved.actions.push(action);
+            }
+        }
+        let resolved = Arc::new(resolved);
+        self.action_library_source_signature = source_signature;
+        self.compiled_action_library_graph = Some(Arc::clone(&resolved));
+        // Animation compilation depends on the hydrated action graph.
+        self.animation_source_signature = 0;
+        self.compiled_animation_graph = None;
+        Ok(Some(resolved))
     }
 
     async fn render_frame_with_cpu_inputs(
@@ -6354,8 +7672,15 @@ impl SceneFrameRenderer {
             // only mutates evaluated node values, so cloning the full action
             // pool and profile registry on every frame is unnecessary.
             self.prepared_scene_model_profiles = graph.model_profiles.clone();
+            self.prepared_scene_skeletons = graph.skeletons.clone();
             self.prepared_scene_actions = graph.actions.clone();
+            self.prepared_scene_world_actions = graph
+                .actions
+                .iter()
+                .map(|action| (action.id.clone(), scene_action_to_world(action)))
+                .collect();
             self.prepared_scene_apply_actions = graph.apply_actions.clone();
+            self.prepared_scene_contact_surfaces = graph.contact_surfaces.clone();
             self.prepared_scene_animation_assets = graph
                 .assets
                 .iter()
@@ -9143,6 +10468,7 @@ impl SceneFrameRenderer {
         time_norm: f32,
         time_sec: f32,
     ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+        self.last_rig_contact_evaluations.clear();
         // Expand universal volume instances before the established 3D bridge
         // resolves anchors, surfaces, lighting, and ordinary Model actors.
         let mut expanded_composite = composite.clone();
@@ -9153,6 +10479,7 @@ impl SceneFrameRenderer {
         let mut camera = WorldCamera::default();
         let mut active_scene_camera = None;
         let mut actors = Vec::new();
+        let mut compound_actor_bones = HashMap::<String, (String, String, String)>::new();
         let mut material_overrides = Vec::new();
         let mut world_model_profiles = self
             .prepared_scene_model_profiles
@@ -9230,6 +10557,12 @@ impl SceneFrameRenderer {
                         GraphAssetSource::Primitive(asset) => {
                             Some(crate::world::primitive::primitive_bounds(&asset.geometry))
                         }
+                        GraphAssetSource::Terrain(asset) => {
+                            Some(crate::world::terrain::terrain_bounds(asset))
+                        }
+                        GraphAssetSource::Vegetation(asset) => {
+                            Some(crate::world::vegetation::vegetation_bounds(asset))
+                        }
                         GraphAssetSource::Compound(_) => None,
                     };
                     model_environment_bounds.insert(id.clone(), environment_bounds);
@@ -9240,6 +10573,8 @@ impl SceneFrameRenderer {
                                 self.environment_node_positions(src).clone()
                             }
                             GraphAssetSource::Primitive(_) => HashMap::new(),
+                            GraphAssetSource::Terrain(_) => HashMap::new(),
+                            GraphAssetSource::Vegetation(_) => HashMap::new(),
                             GraphAssetSource::Compound(_) => HashMap::new(),
                         },
                     );
@@ -9520,6 +10855,8 @@ impl SceneFrameRenderer {
                                     .and_then(|source| match source {
                                         GraphAssetSource::Primitive(asset) => Some(asset),
                                         GraphAssetSource::External { .. }
+                                        | GraphAssetSource::Terrain(_)
+                                        | GraphAssetSource::Vegetation(_)
                                         | GraphAssetSource::Compound(_) => None,
                                     })
                             })?;
@@ -9532,6 +10869,9 @@ impl SceneFrameRenderer {
                                 }
                                 crate::dsl::PrimitiveGeometry::Sphere { .. } => {
                                     crate::simulation::model::RigidBodyShape::Sphere
+                                }
+                                crate::dsl::PrimitiveGeometry::Capsule { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Capsule
                                 }
                                 crate::dsl::PrimitiveGeometry::Cylinder { .. } => {
                                     crate::simulation::model::RigidBodyShape::Cylinder
@@ -9575,6 +10915,12 @@ impl SceneFrameRenderer {
                                 }
                                 GraphAssetSource::Primitive(asset) => {
                                     crate::world::primitive::primitive_bounds(&asset.geometry)
+                                }
+                                GraphAssetSource::Terrain(asset) => {
+                                    crate::world::terrain::terrain_bounds(asset)
+                                }
+                                GraphAssetSource::Vegetation(asset) => {
+                                    crate::world::vegetation::vegetation_bounds(asset)
                                 }
                                 GraphAssetSource::Compound(_) => return None,
                             };
@@ -9702,6 +11048,161 @@ impl SceneFrameRenderer {
                 .collect::<HashMap<_, _>>()
         };
 
+        // Native CompoundAsset rigs are expanded into primitive child actors,
+        // so their parent kinematic body must own collision before expansion.
+        // The opt-in continuous sweep uses solid primitive assets as the same
+        // environment authority consumed by the humanoid controller below.
+        let mut native_collision_environments = composite
+            .nodes_3d
+            .iter()
+            .filter_map(|node| {
+                let Scene3DNode::Model(model) = node else {
+                    return None;
+                };
+                let model_id = model.id.as_deref()?;
+                let primitive = model.primitive.as_ref().or_else(|| {
+                    self.model_asset_sources
+                        .get(&model.asset)
+                        .and_then(|source| match source {
+                            GraphAssetSource::Primitive(asset) => Some(asset),
+                            GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => {
+                                None
+                            }
+                            GraphAssetSource::Terrain(_) => None,
+                            GraphAssetSource::Vegetation(_) => None,
+                        })
+                })?;
+                (primitive.collision.mode == PrimitiveCollisionMode::Solid).then(|| {
+                    Arc::new(EnvironmentTriangleSpatialIndex::from_scene_triangles(
+                        primitive_collision_triangles(
+                            primitive,
+                            model_positions.get(model_id).copied().unwrap_or([0.0; 3]),
+                            model_rotations.get(model_id).copied().unwrap_or([0.0; 3]),
+                            model_scales.get(model_id).copied().unwrap_or(1.0),
+                        ),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for node in &composite.nodes_3d {
+            let Scene3DNode::Model(model) = node else {
+                continue;
+            };
+            let Some(model_id) = model.id.as_deref() else {
+                continue;
+            };
+            let Some(GraphAssetSource::Terrain(terrain)) =
+                self.model_asset_sources.get(&model.asset).cloned()
+            else {
+                continue;
+            };
+            if terrain.collision != PrimitiveCollisionMode::Solid {
+                continue;
+            }
+            native_collision_environments.push(self.terrain_spatial_index(
+                &terrain,
+                model_positions.get(model_id).copied().unwrap_or([0.0; 3]),
+                model_rotations.get(model_id).copied().unwrap_or([0.0; 3]),
+                model_scales.get(model_id).copied().unwrap_or(1.0),
+            )?);
+        }
+        for node in &composite.nodes_3d {
+            let Scene3DNode::Model(model) = node else {
+                continue;
+            };
+            let Some(model_id) = model.id.as_deref() else {
+                continue;
+            };
+            let Some(GraphAssetSource::Vegetation(vegetation)) =
+                self.model_asset_sources.get(&model.asset)
+            else {
+                continue;
+            };
+            if vegetation.collision != PrimitiveCollisionMode::Solid {
+                continue;
+            }
+            let triangles = crate::world::vegetation::vegetation_collision_triangles(vegetation);
+            native_collision_environments.push(Arc::new(EnvironmentTriangleSpatialIndex::build(
+                &triangles,
+                None,
+                model_positions.get(model_id).copied().unwrap_or([0.0; 3]),
+                model_rotations.get(model_id).copied().unwrap_or([0.0; 3]),
+                model_scales.get(model_id).copied().unwrap_or(1.0),
+            )));
+        }
+        if !native_collision_environments.is_empty() {
+            for body in rigid_body_nodes.iter().copied().filter(|body| {
+                body.body_type == crate::simulation::model::RigidBodyType::Kinematic
+                    && body.dimension == crate::simulation::model::RigidBodyDimension::D3
+                    && body.shape == crate::simulation::model::RigidBodyShape::Capsule
+                    && body.continuous_collision
+            }) {
+                let Some(model) = composite.nodes_3d.iter().find_map(|node| {
+                    let Scene3DNode::Model(model) = node else {
+                        return None;
+                    };
+                    (model.id.as_deref() == Some(body.target.as_str())).then_some(model)
+                }) else {
+                    continue;
+                };
+                let native_rig = self
+                    .model_asset_sources
+                    .get(&model.asset)
+                    .is_some_and(|source| {
+                        matches!(source, GraphAssetSource::Compound(compound) if compound.rig.is_some())
+                    });
+                if !native_rig {
+                    continue;
+                }
+                let desired_root = model_positions
+                    .get(&body.target)
+                    .copied()
+                    .unwrap_or([0.0; 3]);
+                let mut authored_start = if model.position.trim().starts_with('@') {
+                    desired_root
+                } else {
+                    eval_scene_vec3(&model.position, 0.0, 0.0, desired_root)?
+                };
+                if let Some(value) = &model.position_x {
+                    authored_start[0] = eval_scene_number(value, 0.0, 0.0)?;
+                }
+                if let Some(value) = &model.position_y {
+                    authored_start[1] = eval_scene_number(value, 0.0, 0.0)?;
+                }
+                if let Some(value) = &model.position_z {
+                    authored_start[2] = eval_scene_number(value, 0.0, 0.0)?;
+                }
+                let scale = model_scales.get(&body.target).copied().unwrap_or(1.0);
+                let spheres = native_capsule_collision_spheres(
+                    desired_root,
+                    body.radius * scale,
+                    body.height * scale,
+                );
+                let config = KinematicControllerConfig {
+                    profile: HumanoidColliderProfile::Standing,
+                    safe_margin: 0.008 * scale.max(0.05),
+                    floor_snap: 0.0,
+                    max_step_height: 0.0,
+                    max_slides: composite
+                        .physics
+                        .as_ref()
+                        .map_or(4, |physics| physics.iterations),
+                    sweep_step: 0.04 * scale.max(0.05),
+                };
+                let (translation, _, _) = sweep_kinematic_spheres(
+                    &spheres,
+                    authored_start,
+                    desired_root,
+                    &native_collision_environments,
+                    config,
+                );
+                model_positions.insert(
+                    body.target.clone(),
+                    add_scene_vec3(desired_root, translation),
+                );
+            }
+        }
+
         let world_lighting =
             scene_world_lighting(composite, &self.image_asset_sources, time_norm, time_sec)?;
 
@@ -9718,6 +11219,7 @@ impl SceneFrameRenderer {
                     active_scene_camera = Some(node.clone());
                 }
                 Scene3DNode::EnvironmentLight(_)
+                | Scene3DNode::AtmosphereFog(_)
                 | Scene3DNode::DirectionalLight(_)
                 | Scene3DNode::PointLight(_)
                 | Scene3DNode::SpotLight(_)
@@ -9741,7 +11243,10 @@ impl SceneFrameRenderer {
                         });
                     let compound = match &authored_source {
                         GraphAssetSource::Compound(asset) => Some(asset.clone()),
-                        GraphAssetSource::External { .. } | GraphAssetSource::Primitive(_) => None,
+                        GraphAssetSource::External { .. }
+                        | GraphAssetSource::Primitive(_)
+                        | GraphAssetSource::Terrain(_)
+                        | GraphAssetSource::Vegetation(_) => None,
                     };
                     // Scene-authored model and environment paths are relative
                     // to the MotionLoom document, not to the legacy World
@@ -9749,7 +11254,7 @@ impl SceneFrameRenderer {
                     // crossing the internal Scene3D bridge. HTTP(S) sources
                     // remain unchanged because canonicalization simply fails
                     // and falls back to the original URL string.
-                    let (src, primitive) = match authored_source {
+                    let (src, primitive, terrain, vegetation) = match authored_source {
                         GraphAssetSource::External { src } => {
                             let resolved = resolve_local_scene_asset_path(&src);
                             (
@@ -9758,20 +11263,32 @@ impl SceneFrameRenderer {
                                     .to_string_lossy()
                                     .into_owned(),
                                 None,
+                                None,
+                                None,
                             )
                         }
-                        GraphAssetSource::Primitive(asset) => (asset.id.clone(), Some(asset)),
-                        GraphAssetSource::Compound(asset) => (asset.id.clone(), None),
+                        GraphAssetSource::Primitive(asset) => {
+                            (asset.id.clone(), Some(asset), None, None)
+                        }
+                        GraphAssetSource::Terrain(asset) => {
+                            (asset.id.clone(), None, Some(asset), None)
+                        }
+                        GraphAssetSource::Vegetation(asset) => {
+                            (asset.id.clone(), None, None, Some(asset))
+                        }
+                        GraphAssetSource::Compound(asset) => (asset.id.clone(), None, None, None),
                     };
-                    let mut position = node
+                    let mut position = if let Some(position) = node
                         .id
                         .as_ref()
                         .and_then(|id| model_positions.get(id).copied())
-                        .unwrap_or(if node.position.trim().starts_with('@') {
-                            [0.0, 0.0, 0.0]
-                        } else {
-                            eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 0.0])?
-                        });
+                    {
+                        position
+                    } else if node.position.trim().starts_with('@') {
+                        [0.0, 0.0, 0.0]
+                    } else {
+                        eval_scene_vec3(&node.position, time_norm, time_sec, [0.0, 0.0, 0.0])?
+                    };
                     if let Some(value) = &node.position_x {
                         position[0] = eval_scene_number(value, time_norm, time_sec)?;
                     }
@@ -9781,8 +11298,15 @@ impl SceneFrameRenderer {
                     if let Some(value) = &node.position_z {
                         position[2] = eval_scene_number(value, time_norm, time_sec)?;
                     }
-                    let mut rotation =
-                        eval_scene_vec3(&node.rotation, time_norm, time_sec, [0.0, 0.0, 0.0])?;
+                    let mut rotation = if let Some(rotation) = node
+                        .id
+                        .as_ref()
+                        .and_then(|id| model_rotations.get(id).copied())
+                    {
+                        rotation
+                    } else {
+                        eval_scene_vec3(&node.rotation, time_norm, time_sec, [0.0, 0.0, 0.0])?
+                    };
                     let mut rotation_quaternion = None;
                     if let Some(value) = &node.rotation_x {
                         rotation[0] = eval_scene_number(value, time_norm, time_sec)?;
@@ -9805,6 +11329,43 @@ impl SceneFrameRenderer {
                             .unwrap_or(eval_scene_number(&node.scale, time_norm, time_sec)?);
                         let exposure =
                             eval_scene_number(&node.exposure, time_norm, time_sec)?.to_string();
+                        let rig_transforms = compound
+                            .rig
+                            .as_deref()
+                            .and_then(|rig_id| {
+                                self.prepared_scene_skeletons
+                                    .iter()
+                                    .find(|skeleton| {
+                                        skeleton.id == rig_id && skeleton.space == "3d"
+                                    })
+                                    .map(|skeleton| {
+                                        let action = active_compound_rig_action(
+                                            &self.prepared_scene_apply_actions,
+                                            &self.prepared_scene_actions,
+                                            &actor_id,
+                                            skeleton,
+                                            time_sec,
+                                            duration_ms,
+                                        );
+                                        let world_action = action.and_then(|(action, _)| {
+                                            self.prepared_scene_world_actions.get(&action.id)
+                                        });
+                                        sample_compound_rig(
+                                            skeleton,
+                                            action,
+                                            world_action,
+                                            time_norm,
+                                            time_sec,
+                                            frame,
+                                            fps,
+                                            duration_ms,
+                                        )
+                                    })
+                            })
+                            .transpose()?
+                            .unwrap_or_default();
+                        let parent_rotation = rotation_quaternion
+                            .unwrap_or_else(|| scene_quaternion_from_euler(rotation));
                         for instance in compound.instances {
                             let Some(mut primitive) = self
                                 .model_asset_sources
@@ -9812,6 +11373,8 @@ impl SceneFrameRenderer {
                                 .and_then(|source| match source {
                                     GraphAssetSource::Primitive(asset) => Some(asset.clone()),
                                     GraphAssetSource::External { .. }
+                                    | GraphAssetSource::Terrain(_)
+                                    | GraphAssetSource::Vegetation(_)
                                     | GraphAssetSource::Compound(_) => None,
                                 })
                             else {
@@ -9828,18 +11391,53 @@ impl SceneFrameRenderer {
                                     )
                                 })
                             });
-                            let local = rotate_scene_point(
-                                instance.position.map(|value| value * actor_scale),
-                                rotation,
+                            let bone = instance
+                                .bone
+                                .as_deref()
+                                .and_then(|bone| rig_transforms.get(bone));
+                            let (part_position, part_rotation, part_scale) =
+                                if let Some(bone) = bone {
+                                    let offset = scene_rotate_by_quaternion(
+                                        instance.position.map(|value| value * bone.scale),
+                                        bone.rotation,
+                                    );
+                                    (
+                                        add_scene_vec3(bone.position, offset),
+                                        scene_quaternion_mul(
+                                            bone.rotation,
+                                            scene_quaternion_from_euler(instance.rotation),
+                                        ),
+                                        bone.scale * instance.scale,
+                                    )
+                                } else {
+                                    (
+                                        instance.position,
+                                        scene_quaternion_from_euler(instance.rotation),
+                                        instance.scale,
+                                    )
+                                };
+                            let local = scene_rotate_by_quaternion(
+                                part_position.map(|value| value * actor_scale),
+                                parent_rotation,
                             );
                             let child_position = add_scene_vec3(position, local);
-                            let child_rotation: [f32; 3] = std::array::from_fn(|axis| {
-                                rotation[axis] + instance.rotation[axis]
-                            });
+                            let child_rotation =
+                                scene_quaternion_mul(parent_rotation, part_rotation);
+                            let child_id = format!("{actor_id}::{}", instance.id);
+                            if let (Some(rig), Some(bone)) =
+                                (compound.rig.as_ref(), instance.bone.as_ref())
+                            {
+                                compound_actor_bones.insert(
+                                    child_id.clone(),
+                                    (actor_id.clone(), rig.clone(), bone.clone()),
+                                );
+                            }
                             actors.push(WorldActor {
-                                id: format!("{actor_id}::{}", instance.id),
+                                id: child_id,
                                 model: primitive.id.clone(),
                                 primitive: Some(primitive),
+                                terrain: None,
+                                vegetation: None,
                                 path_style: WorldPathStyle::Relative,
                                 hide_meshes: Vec::new(),
                                 hide_materials: Vec::new(),
@@ -9850,11 +11448,11 @@ impl SceneFrameRenderer {
                                 x: child_position[0].to_string(),
                                 y: child_position[1].to_string(),
                                 z: child_position[2].to_string(),
-                                yaw: child_rotation[1].to_string(),
-                                pitch: child_rotation[0].to_string(),
-                                roll: child_rotation[2].to_string(),
-                                rotation_quaternion: None,
-                                scale: (actor_scale * instance.scale).to_string(),
+                                yaw: "0".to_string(),
+                                pitch: "0".to_string(),
+                                roll: "0".to_string(),
+                                rotation_quaternion: Some(child_rotation),
+                                scale: (actor_scale * part_scale).to_string(),
                                 scale_mode: "none".to_string(),
                                 opacity: "1".to_string(),
                                 material: Some(WorldMaterial {
@@ -10045,6 +11643,9 @@ impl SceneFrameRenderer {
                                         turn: None,
                                         scale: bone.scale.clone(),
                                         opacity: None,
+                                        interpolation: None,
+                                        in_tangent: None,
+                                        out_tangent: None,
                                     })
                                     .collect(),
                             }],
@@ -10070,14 +11671,17 @@ impl SceneFrameRenderer {
                         });
                     }
 
-                    let actor_scale = model_scales
-                        .get(&actor_id)
-                        .copied()
-                        .unwrap_or(eval_scene_number(&node.scale, time_norm, time_sec)?);
+                    let actor_scale = if let Some(scale) = model_scales.get(&actor_id).copied() {
+                        scale
+                    } else {
+                        eval_scene_number(&node.scale, time_norm, time_sec)?
+                    };
                     actors.push(WorldActor {
                         id: actor_id,
                         model: src,
                         primitive,
+                        terrain,
+                        vegetation,
                         path_style: WorldPathStyle::Relative,
                         hide_meshes: Vec::new(),
                         hide_materials: Vec::new(),
@@ -10262,6 +11866,8 @@ impl SceneFrameRenderer {
 
         let world_asset_root = crate::scene::resource::default_world_asset_root();
         let mut collision_environments = Vec::<Arc<EnvironmentTriangleSpatialIndex>>::new();
+        let mut terrain_ground_environments =
+            HashMap::<String, Arc<EnvironmentTriangleSpatialIndex>>::new();
         for node in &composite.nodes_3d {
             let Scene3DNode::Model(model) = node else {
                 continue;
@@ -10283,6 +11889,8 @@ impl SceneFrameRenderer {
                             GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => {
                                 None
                             }
+                            GraphAssetSource::Terrain(_) => None,
+                            GraphAssetSource::Vegetation(_) => None,
                         },
                     ) else {
                         continue;
@@ -10312,7 +11920,10 @@ impl SceneFrameRenderer {
                     .get(&model.asset)
                     .and_then(|source| match source {
                         GraphAssetSource::Primitive(asset) => Some(asset),
-                        GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => None,
+                        GraphAssetSource::External { .. }
+                        | GraphAssetSource::Terrain(_)
+                        | GraphAssetSource::Vegetation(_)
+                        | GraphAssetSource::Compound(_) => None,
                     })
             });
             if let Some(primitive) = primitive
@@ -10329,6 +11940,33 @@ impl SceneFrameRenderer {
                         EnvironmentTriangleSpatialIndex::from_scene_triangles(triangles),
                     ));
                 }
+            }
+            if let Some(GraphAssetSource::Terrain(terrain)) =
+                self.model_asset_sources.get(&model.asset).cloned()
+                && terrain.collision == PrimitiveCollisionMode::Solid
+            {
+                let environment = self.terrain_spatial_index(
+                    &terrain,
+                    model_positions.get(model_id).copied().unwrap_or([0.0; 3]),
+                    model_rotations.get(model_id).copied().unwrap_or([0.0; 3]),
+                    model_scales.get(model_id).copied().unwrap_or(1.0),
+                )?;
+                terrain_ground_environments.insert(model_id.to_string(), Arc::clone(&environment));
+                collision_environments.push(environment);
+            }
+            if let Some(GraphAssetSource::Vegetation(vegetation)) =
+                self.model_asset_sources.get(&model.asset)
+                && vegetation.collision == PrimitiveCollisionMode::Solid
+            {
+                let triangles =
+                    crate::world::vegetation::vegetation_collision_triangles(vegetation);
+                collision_environments.push(Arc::new(EnvironmentTriangleSpatialIndex::build(
+                    &triangles,
+                    None,
+                    model_positions.get(model_id).copied().unwrap_or([0.0; 3]),
+                    model_rotations.get(model_id).copied().unwrap_or([0.0; 3]),
+                    model_scales.get(model_id).copied().unwrap_or(1.0),
+                )));
             }
             if !model.environment
                 || !model
@@ -10366,6 +12004,66 @@ impl SceneFrameRenderer {
                 ));
             }
         }
+        // Contact surfaces are semantic planes, not rigid bodies. Resolving
+        // them from the already-evaluated model transforms keeps random seek
+        // deterministic and avoids rebuilding or colliding with visual slats.
+        let mut contact_surfaces = HashMap::<String, ResolvedContactSurface>::new();
+        for authored in self.prepared_scene_contact_surfaces.clone() {
+            let source_model = composite.nodes_3d.iter().find_map(|node| {
+                let Scene3DNode::Model(model) = node else {
+                    return None;
+                };
+                (model.id.as_deref() == Some(authored.source.as_str())).then_some(model)
+            });
+            let source_primitive = source_model.and_then(|model| {
+                model.primitive.as_ref().or_else(|| {
+                    self.model_asset_sources
+                        .get(&model.asset)
+                        .and_then(|source| match source {
+                            GraphAssetSource::Primitive(primitive) => Some(primitive),
+                            GraphAssetSource::External { .. }
+                            | GraphAssetSource::Compound(_)
+                            | GraphAssetSource::Terrain(_)
+                            | GraphAssetSource::Vegetation(_) => None,
+                        })
+                })
+            });
+            let resolved = resolve_contact_surface(
+                &authored,
+                model_positions
+                    .get(&authored.source)
+                    .copied()
+                    .unwrap_or([0.0; 3]),
+                model_rotations
+                    .get(&authored.source)
+                    .copied()
+                    .unwrap_or([0.0; 3]),
+                model_scales.get(&authored.source).copied().unwrap_or(1.0),
+                source_primitive,
+            );
+            contact_surfaces.insert(authored.id.clone(), resolved);
+        }
+        if frame == 0 && debug_collision.is_some_and(|flags| flags.1) {
+            let mut evidence = contact_surfaces.values().collect::<Vec<_>>();
+            evidence.sort_by_key(|surface| surface.id.as_str());
+            for surface in evidence {
+                eprintln!(
+                    "MotionLoom ContactSurface id={} kind={} origin={:?} normal={:?} forward={:?} bounds={:?} margin={:.4}",
+                    surface.id,
+                    surface.kind,
+                    surface.origin,
+                    surface.normal,
+                    surface.forward,
+                    surface.half_bounds.map(|value| value * 2.0),
+                    surface.margin,
+                );
+            }
+        }
+        // Samples in this map are valid for the final actor root and current
+        // constraint revision of this render only. It is deliberately local
+        // to one frame so random-access rendering cannot observe stale poses.
+        let mut frame_humanoid_samples =
+            HashMap::<String, crate::world::render::Scene3DHumanoidFrame>::new();
         let mut root_solve_actors = composite
             .nodes_3d
             .iter()
@@ -10427,6 +12125,7 @@ impl SceneFrameRenderer {
                     ]
                 })
                 .unwrap_or([0.0; 3]);
+            let sampled_root = motion_root;
             let previous_time_sec = (time_sec - 1.0 / fps.max(1.0)).max(0.0);
             let authored_start = composite
                 .nodes_3d
@@ -10585,18 +12284,33 @@ impl SceneFrameRenderer {
                 .is_some_and(|apply| apply.contact_correction.as_deref() == Some("auto"));
             let contact_phase =
                 active_apply.and_then(|apply| sampled.action_phases.get(&apply.action).copied());
+            let semantic_foot_lock = active_apply.is_some_and(|apply| {
+                apply
+                    .foot_lock
+                    .as_deref()
+                    .is_some_and(|value| matches!(value, "auto" | "true" | "on"))
+            });
             let ground_binding = active_apply.and_then(|apply| {
-                let surface_id = apply.ground.as_deref()?;
-                let surface = surfaces.get(surface_id)?;
-                let environment = surface_models
-                    .get(surface_id)
-                    .and_then(|model_id| model_environment_triangles.get(model_id))
-                    .map(Arc::as_ref);
-                Some((apply, surface, environment))
+                let ground_id = apply.ground.as_deref()?;
+                let ground = if let Some(surface) = surfaces.get(ground_id) {
+                    let environment = surface_models
+                        .get(ground_id)
+                        .and_then(|model_id| model_environment_triangles.get(model_id))
+                        .map(Arc::as_ref);
+                    ResolvedSceneGround::Surface {
+                        surface,
+                        environment,
+                    }
+                } else {
+                    ResolvedSceneGround::Terrain {
+                        environment: terrain_ground_environments.get(ground_id)?.as_ref(),
+                    }
+                };
+                Some((apply, ground))
             });
             let ground_candidate =
                 if contact_auto && profile != HumanoidColliderProfile::Airborne {
-                    ground_binding.map(|(apply, surface, environment)| {
+                    ground_binding.and_then(|(apply, ground)| {
                         let ground_offset =
                             eval_scene_number(&apply.ground_offset, time_norm, time_sec)
                                 .unwrap_or(0.0);
@@ -10605,17 +12319,17 @@ impl SceneFrameRenderer {
                             motion_root[1] + sampled.rig_metrics.sole_offset,
                             motion_root[2],
                         ];
-                        let target =
-                            scene_surface_contact_target(surface, environment, sole, ground_offset);
-                        add_scene_vec3(motion_root, sub_scene_vec3(target, sole))
+                        let target = scene_ground_contact_target(ground, sole, ground_offset)?;
+                        Some(add_scene_vec3(motion_root, sub_scene_vec3(target, sole)))
                     })
                 } else {
                     None
                 }
                 .or(gravity_ground_candidate);
             let mut contact_samples = Vec::<HumanoidContactSample>::new();
+            let mut contact_lock_targets = HashMap::<String, [f32; 3]>::new();
             if contact_auto
-                && let (Some(action), Some(phase), Some((_, surface, environment))) =
+                && let (Some(action), Some(phase), Some((apply, ground))) =
                     (active_action, contact_phase, ground_binding)
             {
                 for contact in &action.contacts {
@@ -10632,12 +12346,96 @@ impl SceneFrameRenderer {
                     let Some(point) = sampled.joints.get(canonical).copied() else {
                         continue;
                     };
-                    let target = scene_surface_contact_target(
-                        surface,
-                        environment,
+                    let Some(target) = scene_ground_contact_target(
+                        ground,
                         point,
                         action_contact_effector_radius(&contact.effector, sampled.actor_scale),
-                    );
+                    ) else {
+                        continue;
+                    };
+                    if semantic_foot_lock && envelope > f32::EPSILON {
+                        let action_duration_sec = action.duration_ms as f32 / 1000.0;
+                        let mut speed =
+                            eval_scene_number(&apply.speed, time_norm, time_sec)?.max(0.0);
+                        if !apply.r#loop
+                            && let Some(window_ms) =
+                                apply.duration_ms.filter(|duration| *duration > 0)
+                        {
+                            speed *= action.duration_ms as f32 / window_ms as f32;
+                        }
+                        if let Some(lock_time_sec) = action_contact_lock_time_sec(
+                            apply.at_ms as f32 / 1000.0,
+                            action_duration_sec,
+                            contact.from,
+                            contact.to,
+                            time_sec,
+                            speed,
+                            apply.r#loop,
+                        ) {
+                            let lock_time_sec =
+                                lock_time_sec.clamp(0.0, duration_ms as f32 / 1000.0);
+                            let lock_time_norm = (lock_time_sec
+                                / (duration_ms as f32 / 1000.0).max(0.0001))
+                            .clamp(0.0, 1.0);
+                            let mut lock_graph = world_graph.clone();
+                            let mut lock_root = motion_root;
+                            if let Some(model) = actor_model {
+                                if let Some(anchor) = model.position.trim().strip_prefix('@') {
+                                    lock_root = anchors.get(anchor).copied().unwrap_or(lock_root);
+                                } else {
+                                    lock_root = eval_scene_vec3(
+                                        &model.position,
+                                        lock_time_norm,
+                                        lock_time_sec,
+                                        lock_root,
+                                    )?;
+                                }
+                                if let Some(value) = &model.position_x {
+                                    lock_root[0] =
+                                        eval_scene_number(value, lock_time_norm, lock_time_sec)?;
+                                }
+                                if let Some(value) = &model.position_y {
+                                    lock_root[1] =
+                                        eval_scene_number(value, lock_time_norm, lock_time_sec)?;
+                                }
+                                if let Some(value) = &model.position_z {
+                                    lock_root[2] =
+                                        eval_scene_number(value, lock_time_norm, lock_time_sec)?;
+                                }
+                            }
+                            if let Some(actor) = lock_graph.worlds.first_mut().and_then(|world| {
+                                world.actors.iter_mut().find(|actor| actor.id == actor_id)
+                            }) {
+                                actor.x = lock_root[0].to_string();
+                                actor.y = lock_root[1].to_string();
+                                actor.z = lock_root[2].to_string();
+                            }
+                            let lock_frame = (lock_time_sec * fps.max(1.0)).round() as u32;
+                            if let Ok(lock_sample) = self.scene_3d_renderer.sample_humanoid_frame(
+                                &lock_graph,
+                                &actor_id,
+                                lock_frame,
+                                &world_asset_root,
+                            ) && let Some(lock_point) =
+                                lock_sample.joints.get(canonical).copied()
+                            {
+                                let Some(projected) = scene_ground_contact_target(
+                                    ground,
+                                    lock_point,
+                                    action_contact_effector_radius(
+                                        &contact.effector,
+                                        sampled.actor_scale,
+                                    ),
+                                ) else {
+                                    continue;
+                                };
+                                contact_lock_targets.insert(
+                                    contact.id.clone(),
+                                    [lock_point[0], projected[1], lock_point[2]],
+                                );
+                            }
+                        }
+                    }
                     let correction = sub_scene_vec3(target, point);
                     if debug_root_trace {
                         eprintln!(
@@ -10666,20 +12464,80 @@ impl SceneFrameRenderer {
                     });
                 }
             }
+            if contact_auto
+                && let (Some(action), Some(phase), Some(apply)) =
+                    (active_action, contact_phase, active_apply)
+            {
+                for contact_node in &action.contacts {
+                    if contact_node.target == "ground" {
+                        continue;
+                    }
+                    let Some(surface_id) = apply.contact_targets.get(&contact_node.target) else {
+                        continue;
+                    };
+                    let Some(surface) = contact_surfaces.get(surface_id) else {
+                        continue;
+                    };
+                    let envelope = action_surface_contact_envelope(contact_node, phase);
+                    let authored_weight =
+                        eval_scene_number(&contact_node.weight, time_norm, time_sec)?
+                            .clamp(0.0, 1.0);
+                    if authored_weight * envelope <= f32::EPSILON {
+                        continue;
+                    }
+                    let Some(point) =
+                        semantic_contact_point(&sampled, &contact_node.effector, surface)
+                    else {
+                        continue;
+                    };
+                    let target = contact_surface_target(surface, point);
+                    let mut correction = sub_scene_vec3(target, point);
+                    // Root correction stays deliberately bounded. Limb-level
+                    // contacts are handled later by IK instead of translating
+                    // the whole character across an unreachable distance.
+                    let max_vertical = (sampled.actor_scale * 0.65).max(0.12);
+                    let max_horizontal = (sampled.actor_scale * 0.45).max(0.10);
+                    correction[1] = correction[1].clamp(-max_vertical, max_vertical);
+                    let horizontal = [correction[0], 0.0, correction[2]];
+                    let horizontal_length = length_scene_vec3(horizontal);
+                    if horizontal_length > max_horizontal {
+                        let scale = max_horizontal / horizontal_length.max(1.0e-6);
+                        correction[0] *= scale;
+                        correction[2] *= scale;
+                    }
+                    if debug_root_trace {
+                        eprintln!(
+                            "MotionLoom ContactSurface actor={} frame={} contact={} surface={} kind={} point={:?} target={:?} delta={:?} envelope={:.6}",
+                            actor_id,
+                            frame,
+                            contact_node.id,
+                            surface.id,
+                            surface.kind,
+                            point,
+                            target,
+                            correction,
+                            envelope,
+                        );
+                    }
+                    contact_samples.push(HumanoidContactSample {
+                        correction,
+                        authored_weight,
+                        envelope,
+                        support: contact_node.effector.clone(),
+                    });
+                }
+            }
             let mut contact = combine_humanoid_contact_samples(
                 &contact_samples,
                 (sampled.actor_scale * 1.25).max(0.1),
             );
-            if let (Some(grounded_root), Some((_, surface, environment))) =
-                (ground_candidate, ground_binding)
-            {
+            if let (Some(grounded_root), Some((_, ground))) = (ground_candidate, ground_binding) {
                 contact.supports.extend(automatic_humanoid_supports(
                     &sampled,
                     motion_root,
                     grounded_root,
                     profile,
-                    surface,
-                    environment,
+                    ground,
                 ));
                 contact.supports.sort();
                 contact.supports.dedup();
@@ -10750,24 +12608,74 @@ impl SceneFrameRenderer {
                 );
             }
 
-            // Re-sample after root correction, then keep exposed humanoid
-            // effectors outside the environment with pose-only two-bone IK.
-            let corrected = self
-                .scene_3d_renderer
-                .sample_humanoid_frame(&world_graph, &actor_id, frame, &world_asset_root)
-                .map_err(|err| MotionLoomSceneRenderError::GpuRender {
-                    message: format!(
-                        "Scene 3D contact IK could not sample humanoid '{actor_id}': {err}"
-                    ),
-                })?;
-            let contact_ik_enabled = active_apply.is_some_and(|apply| {
-                apply
-                    .foot_lock
-                    .as_deref()
-                    .is_some_and(|value| matches!(value, "auto" | "true" | "on"))
-            }) && profile != HumanoidColliderProfile::Airborne;
+            // Root solving changes only the actor translation. Rebuilding the
+            // imported clip, retarget map and global skeleton here produced an
+            // identical pose translated to the corrected root, so retain the
+            // sampled animation and apply that exact delta directly.
+            let corrected = translated_humanoid_frame(
+                &sampled,
+                sub_scene_vec3(root_state.final_root, sampled_root),
+            );
+            if self.scene_3d_renderer.collects_rig_diagnostics() {
+                let mut feet = std::collections::BTreeMap::new();
+                for (bone, effector) in [("foot_l", "foot_l"), ("foot_r", "foot_r")] {
+                    let authored_contact = active_action.and_then(|action| {
+                        action.contacts.iter().find(|contact| {
+                            contact.effector == effector && contact.target == "ground"
+                        })
+                    });
+                    let active =
+                        authored_contact
+                            .zip(contact_phase)
+                            .is_some_and(|(contact, phase)| {
+                                action_contact_phase_envelope(contact.from, contact.to, phase)
+                                    > f32::EPSILON
+                            });
+                    let before = sampled.joints.get(bone).copied();
+                    let after = corrected.joints.get(bone).copied();
+                    feet.insert(
+                        bone.to_string(),
+                        crate::FootContactTrace {
+                            contact_active: active,
+                            authored_contact_window: authored_contact
+                                .map(|contact| [contact.from, contact.to]),
+                            position_before: before,
+                            position_after: after,
+                            correction_distance: before.zip(after).map(|(before, after)| {
+                                length_scene_vec3(sub_scene_vec3(after, before))
+                            }),
+                        },
+                    );
+                }
+                self.last_rig_contact_evaluations.insert(
+                    actor_id.clone(),
+                    crate::ContactEvaluation {
+                        available: true,
+                        selected_ground: active_apply.and_then(|apply| apply.ground.clone()),
+                        ground_kind: active_apply.and_then(|apply| apply.ground.as_ref()).map(
+                            |ground| {
+                                if terrain_ground_environments.contains_key(ground) {
+                                    "terrainAsset".to_string()
+                                } else {
+                                    "surface".to_string()
+                                }
+                            },
+                        ),
+                        controller_action: active_apply.map(|apply| apply.action.clone()),
+                        contact_correction_enabled: contact_auto,
+                        foot_lock_enabled: semantic_foot_lock,
+                        root_before: Some(motion_root),
+                        root_after: Some(root_state.final_root),
+                        root_correction: Some(sub_scene_vec3(root_state.final_root, motion_root)),
+                        feet,
+                    },
+                );
+            }
+            let constraint_count_before_contact_ik = world_graph.constraints.len();
+            let contact_ik_enabled =
+                semantic_foot_lock && profile != HumanoidColliderProfile::Airborne;
             if contact_auto
-                && let (Some(action), Some(phase), Some((_, surface, environment))) =
+                && let (Some(action), Some(phase), Some((_, ground))) =
                     (active_action, contact_phase, ground_binding)
             {
                 let max_residual = (corrected.actor_scale * 0.12).max(0.025);
@@ -10792,17 +12700,30 @@ impl SceneFrameRenderer {
                     let Some(point) = corrected.joints.get(canonical).copied() else {
                         continue;
                     };
-                    let target = scene_surface_contact_target(
-                        surface,
-                        environment,
-                        point,
-                        action_contact_effector_radius(
-                            &contact_node.effector,
-                            corrected.actor_scale,
-                        ),
-                    );
+                    let target =
+                        if let Some(target) = contact_lock_targets.get(&contact_node.id).copied() {
+                            target
+                        } else if let Some(target) = scene_ground_contact_target(
+                            ground,
+                            point,
+                            action_contact_effector_radius(
+                                &contact_node.effector,
+                                corrected.actor_scale,
+                            ),
+                        ) {
+                            target
+                        } else {
+                            continue;
+                        };
+                    let semantic_lock_reach =
+                        (corrected.rig_metrics.hips_offset.abs() * 0.45).max(0.15);
+                    let allowed_residual = if contact_lock_targets.contains_key(&contact_node.id) {
+                        semantic_lock_reach
+                    } else {
+                        max_residual
+                    };
                     if weight <= f32::EPSILON
-                        || length_scene_vec3(sub_scene_vec3(target, point)) > max_residual
+                        || length_scene_vec3(sub_scene_vec3(target, point)) > allowed_residual
                     {
                         continue;
                     }
@@ -10861,6 +12782,9 @@ impl SceneFrameRenderer {
                     });
                 }
             }
+            if world_graph.constraints.len() == constraint_count_before_contact_ik {
+                frame_humanoid_samples.insert(actor_id.clone(), corrected);
+            }
         }
 
         if let Some(scene_camera) = active_scene_camera.as_ref() {
@@ -10873,6 +12797,29 @@ impl SceneFrameRenderer {
                 }) && !actor.camera_hidden_bones.contains(&selector.bone)
                 {
                     actor.camera_hidden_bones.push(selector.bone.clone());
+                }
+                if let Some(world) = world_graph.worlds.first_mut() {
+                    for actor in &mut world.actors {
+                        let Some((parent, rig, bone)) = compound_actor_bones.get(&actor.id) else {
+                            continue;
+                        };
+                        if parent != &selector.model {
+                            continue;
+                        }
+                        let hidden = self
+                            .prepared_scene_skeletons
+                            .iter()
+                            .find(|skeleton| skeleton.id == *rig)
+                            .is_some_and(|skeleton| {
+                                skeleton_bone_is_descendant(skeleton, bone, &selector.bone)
+                            });
+                        if hidden && !actor.camera_hidden_bones.iter().any(|bone| bone == "hips") {
+                            // Primitive children have no skin joint table. The
+                            // established hips sentinel excludes only their
+                            // camera beauty draw; shadow submission is retained.
+                            actor.camera_hidden_bones.push("hips".to_string());
+                        }
+                    }
                 }
             }
 
@@ -10893,7 +12840,6 @@ impl SceneFrameRenderer {
                 }
             }
             let mut resolved_anchors = anchors.clone();
-            let mut sampled_humanoids = HashMap::new();
             for node in &composite.nodes_3d {
                 let Scene3DNode::Anchor(anchor) = node else {
                     continue;
@@ -10904,7 +12850,7 @@ impl SceneFrameRenderer {
                 if let Some(bone) = anchor.node.as_deref()
                     && is_scene_canonical_humanoid_bone(bone)
                 {
-                    if !sampled_humanoids.contains_key(&anchor.relative_to) {
+                    if !frame_humanoid_samples.contains_key(&anchor.relative_to) {
                         let sampled = self
                             .scene_3d_renderer
                             .sample_humanoid_frame(
@@ -10919,9 +12865,9 @@ impl SceneFrameRenderer {
                                     anchor.id, anchor.relative_to
                                 ),
                             })?;
-                        sampled_humanoids.insert(anchor.relative_to.clone(), sampled);
+                        frame_humanoid_samples.insert(anchor.relative_to.clone(), sampled);
                     }
-                    let sampled = &sampled_humanoids[&anchor.relative_to];
+                    let sampled = &frame_humanoid_samples[&anchor.relative_to];
                     if let Some(position) = sampled.joints.get(bone).copied() {
                         base = position;
                     }
@@ -19765,23 +21711,25 @@ mod tests {
 
     use super::{
         EnvironmentTriangleSpatialIndex, HumanoidColliderProfile, HumanoidContactSample,
-        KinematicControllerConfig, MotionLoomSceneRenderError, ResolvedSceneSurface,
-        SceneFrameRenderer, ScenePlatformPreviewSurface, ScenePreviewBackend,
+        KinematicControllerConfig, MotionLoomSceneRenderError, ResolvedSceneGround,
+        ResolvedSceneSurface, SceneFrameRenderer, ScenePlatformPreviewSurface, ScenePreviewBackend,
         ScenePreviewPixelFormat, ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderError,
         SceneRenderProfile, SceneRenderer, action_collider_profile, action_contact_phase_envelope,
-        apply_animation_targets_at_frame, collect_material_binding_scene_ids,
-        combine_humanoid_contact_samples, deterministic_gravity_displacement,
-        eval_text_box_padding, eval_text_font_weight, eval_text_render_scale,
-        eval_text_tracking_em, expand_scene_volume_repeats, global_process_liveness,
-        graph_logical_render_size, graph_output_size, graph_requires_scene_resource,
-        humanoid_collision_spheres, humanoid_collision_spheres_for_profile,
-        load_environment_bounds, match_target_action_position, parse_scene_fixed_step,
+        active_compound_rig_action, apply_animation_targets_at_frame,
+        collect_material_binding_scene_ids, combine_humanoid_contact_samples,
+        deterministic_gravity_displacement, eval_text_box_padding, eval_text_font_weight,
+        eval_text_render_scale, eval_text_tracking_em, expand_scene_volume_repeats,
+        global_process_liveness, graph_logical_render_size, graph_output_size,
+        graph_requires_scene_resource, humanoid_collision_spheres,
+        humanoid_collision_spheres_for_profile, load_environment_bounds,
+        match_target_action_position, native_capsule_collision_spheres, parse_scene_fixed_step,
         primitive_collision_triangles, primitive_rigid_collider_spec, probe_humanoid_ground,
-        raycast_environment_height, render_size_root_transform,
-        resolve_humanoid_kinematic_controller, scene_apply_action_is_active,
-        scene_material_texture_cache_key, scene_nodes_for_present, scene_surface_contains_xz,
-        semantic_box_triangles, semantic_surface_triangles, solve_humanoid_root_frame,
-        validate_scene_graph,
+        raycast_environment_height, reachable_environment_height, render_size_root_transform,
+        resolve_humanoid_kinematic_controller, sample_compound_rig, scene_apply_action_is_active,
+        scene_ground_contact_target, scene_material_texture_cache_key, scene_nodes_for_present,
+        scene_surface_contains_xz, semantic_box_triangles, semantic_surface_triangles,
+        skeleton_bone_is_descendant, solve_humanoid_root_frame, sweep_kinematic_spheres,
+        terrain_collision_cache_source, validate_scene_graph,
     };
 
     #[test]
@@ -19872,6 +21820,139 @@ mod tests {
     }
 
     #[test]
+    fn native_compound_rig_selects_the_action_scheduled_for_the_current_time() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="2s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="part" shape="capsule" radius="0.1" height="0.3" />
+    <CompoundAsset id="body" rig="rig">
+      <Instance id="part_instance" asset="part" bone="root" />
+    </CompoundAsset>
+  </Assets>
+  <Skeleton id="rig" space="3d">
+    <Bone id="root" position={[0,0,0]} />
+  </Skeleton>
+  <Action id="idle" skeleton="rig" duration="1s">
+    <Pose t="0s">
+      <Bone id="root" rotationY="0" />
+    </Pose>
+  </Action>
+  <Action id="wave" skeleton="rig" duration="1s">
+    <Pose t="0s">
+      <Bone id="root" rotationY="20" />
+    </Pose>
+  </Action>
+  <ApplyAction target="actor" action="idle" at="0s" duration="1s" loop="true" />
+  <ApplyAction target="actor" action="wave" at="1s" duration="1s" loop="true" />
+  <Scene id="native_action_scene">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="2s">
+          <CompositeGroup space="3d">
+            <Model id="actor" asset="body" />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="native_action_scene" />
+</Graph>
+"##,
+        )
+        .expect("scheduled native rig actions should parse");
+
+        let first = active_compound_rig_action(
+            &graph.apply_actions,
+            &graph.actions,
+            "actor",
+            &graph.skeletons[0],
+            0.5,
+            graph.duration_ms,
+        )
+        .expect("idle action");
+        let second = active_compound_rig_action(
+            &graph.apply_actions,
+            &graph.actions,
+            "actor",
+            &graph.skeletons[0],
+            1.5,
+            graph.duration_ms,
+        )
+        .expect("wave action");
+        assert_eq!(first.0.id, "idle");
+        assert_eq!(second.0.id, "wave");
+    }
+
+    #[test]
+    fn native_compound_rig_accepts_portable_humanoid_action_profile() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Skeleton id="showcase_rig" profile="motionloom_humanoid_v1" space="3d">
+    <Bone id="root" position={[0,0,0]} />
+  </Skeleton>
+  <Action id="portable.wave" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="root" rotationY="20" />
+    </Pose>
+  </Action>
+  <ApplyAction target="actor" action="portable.wave" at="0s" duration="1s" />
+  <Scene id="portable_scene_test">
+    <Timeline>
+    </Timeline>
+  </Scene>
+  <Present from="portable_scene_test" />
+</Graph>
+"##,
+        )
+        .expect("portable humanoid action should parse");
+
+        let selected = active_compound_rig_action(
+            &graph.apply_actions,
+            &graph.actions,
+            "actor",
+            &graph.skeletons[0],
+            0.5,
+            graph.duration_ms,
+        )
+        .expect("portable humanoid action should match profile-compatible native rig");
+        assert_eq!(selected.0.id, "portable.wave");
+    }
+
+    #[test]
+    fn native_capsule_continuous_sweep_stops_before_a_solid_wall() {
+        let wall = ResolvedSceneSurface {
+            height: 1.5,
+            centroid: [0.0, 1.5, -2.0],
+            bounds_min: [-2.0, 0.0, -2.1],
+            bounds_max: [2.0, 3.0, -1.9],
+            normal: [0.0, 0.0, 1.0],
+        };
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::from_scene_triangles(
+            semantic_box_triangles(&wall),
+        ));
+        let desired = [0.0, 0.0, -3.0];
+        let spheres = native_capsule_collision_spheres(desired, 0.3, 1.2);
+        let config = KinematicControllerConfig {
+            profile: HumanoidColliderProfile::Standing,
+            safe_margin: 0.008,
+            floor_snap: 0.0,
+            max_step_height: 0.0,
+            max_slides: 4,
+            sweep_step: 0.04,
+        };
+        let (translation, contacts, _) =
+            sweep_kinematic_spheres(&spheres, [0.0, 0.0, 0.0], desired, &[environment], config);
+        let resolved = super::add_scene_vec3(desired, translation);
+        assert!(contacts > 0);
+        assert!(
+            resolved[2] > -1.595 && resolved[2] < -1.58,
+            "resolved root did not stop at the wall margin: {resolved:?}"
+        );
+    }
+
+    #[test]
     fn gravity_is_deterministic_for_absolute_time_and_fractional_fixed_step() {
         let step = parse_scene_fixed_step("1/120s").expect("fractional fixed step");
         assert!((step - 1.0 / 120.0).abs() < 1.0e-6);
@@ -19913,6 +21994,50 @@ mod tests {
             load_environment_bounds("ship.glb", &resolver),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn action_library_is_hydrated_once_from_memory_resolver() {
+        let resolver = Arc::new(MemoryAssetResolver::new());
+        resolver.insert(
+            "actions.motionloom".to_string(),
+            br#"<ActionLibrary id="source">
+  <Action id="bow" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="hips" bend="0" />
+    </Pose>
+  </Action>
+</ActionLibrary>"#
+                .to_vec(),
+        );
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <ActionLibrary id="performance" src="actions.motionloom" actions={["bow"]} />
+  <Background color="#000000" />
+  <ApplyAction target="actor" action="performance.bow" at="0s" duration="1s" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("graph parse");
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new_for_profile_with_resolver(
+            SceneRenderProfile::Cpu,
+            resolver,
+        ));
+        let hydrated = renderer
+            .compiled_action_library_graph(&graph)
+            .expect("library hydration")
+            .expect("hydrated graph");
+        assert!(
+            hydrated
+                .actions
+                .iter()
+                .any(|action| action.id == "performance.bow")
+        );
+        let repeated = renderer
+            .compiled_action_library_graph(&graph)
+            .expect("cached hydration")
+            .expect("cached graph");
+        assert!(Arc::ptr_eq(&hydrated, &repeated));
     }
 
     #[test]
@@ -20005,6 +22130,150 @@ mod tests {
             raycast_environment_height(&index, 20.0, 20.0, Some(&surface)),
             None
         );
+    }
+
+    #[test]
+    fn terrain_heightfield_feeds_existing_ground_raycast() {
+        let terrain = crate::dsl::TerrainAssetNode {
+            id: "slope".into(),
+            height_map: "height".into(),
+            height_map_src: Some("height.png".into()),
+            size: [4.0, 4.0],
+            height_scale: 2.0,
+            height_offset: 1.0,
+            material: Some("soil".into()),
+            material_definition: None,
+            layers: Vec::new(),
+            layer_definitions: Vec::new(),
+            blend_map: None,
+            blend_map_src: None,
+            chunks: [1, 1],
+            lod: "full".into(),
+            collision: crate::dsl::PrimitiveCollisionMode::Solid,
+        };
+        let height_map = RgbaImage::from_pixel(3, 3, image::Rgba([128, 128, 128, 255]));
+        let triangles = crate::world::terrain::terrain_collision_triangles(&terrain, &height_map);
+        let index = EnvironmentTriangleSpatialIndex::build(
+            &triangles,
+            None,
+            [2.0, 0.25, -3.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+        );
+        let expected = 0.25 + 1.0 + 128.0 / 255.0 * 2.0;
+        let sampled = raycast_environment_height(&index, 2.0, -3.0, None).unwrap();
+        assert!((sampled - expected).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn terrain_ground_handles_slopes_both_directions_and_random_seek() {
+        let triangles = [
+            crate::world::model_inspection::EnvironmentWalkableTriangle {
+                points: [[-2.0, 0.0, -2.0], [2.0, 2.0, -2.0], [2.0, 2.0, 2.0]],
+                normal: [-0.4472136, 0.8944272, 0.0],
+            },
+            crate::world::model_inspection::EnvironmentWalkableTriangle {
+                points: [[-2.0, 0.0, -2.0], [2.0, 2.0, 2.0], [-2.0, 0.0, 2.0]],
+                normal: [-0.4472136, 0.8944272, 0.0],
+            },
+        ];
+        let index = EnvironmentTriangleSpatialIndex::build(
+            &triangles,
+            None,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+        );
+        let ground = ResolvedSceneGround::Terrain {
+            environment: &index,
+        };
+        let sample = |x: f32| {
+            scene_ground_contact_target(ground, [x, 8.0, 0.0], 0.03).expect("terrain height")[1]
+        };
+        let uphill = [-1.5, -0.5, 0.5, 1.5].map(sample);
+        assert!(uphill.windows(2).all(|pair| pair[1] > pair[0]));
+        let downhill = [1.5, 0.5, -0.5, -1.5].map(sample);
+        assert!(downhill.windows(2).all(|pair| pair[1] < pair[0]));
+
+        // Random-access preview must not depend on the order in which frames
+        // ask for terrain support heights.
+        let random_seek = [0.5, -1.5, 1.5, -0.5].map(sample);
+        assert_eq!(random_seek, [uphill[2], uphill[0], uphill[3], uphill[1]]);
+    }
+
+    #[test]
+    fn dense_terrain_reachable_height_uses_spatial_query_without_global_flood() {
+        let terrain = crate::dsl::TerrainAssetNode {
+            id: "dense_slope".into(),
+            height_map: "height".into(),
+            height_map_src: Some("height.png".into()),
+            size: [16.0, 16.0],
+            height_scale: 3.0,
+            height_offset: 0.0,
+            material: Some("soil".into()),
+            material_definition: None,
+            layers: Vec::new(),
+            layer_definitions: Vec::new(),
+            blend_map: None,
+            blend_map_src: None,
+            chunks: [4, 4],
+            lod: "full".into(),
+            collision: crate::dsl::PrimitiveCollisionMode::Solid,
+        };
+        let height_map = RgbaImage::from_fn(65, 65, |x, _| {
+            let height = ((x as f32 / 64.0) * 255.0).round() as u8;
+            image::Rgba([height, height, height, 255])
+        });
+        let triangles = crate::world::terrain::terrain_collision_triangles(&terrain, &height_map);
+        assert!(triangles.len() > 4_096);
+        let environment = Arc::new(EnvironmentTriangleSpatialIndex::build(
+            &triangles, None, [0.0; 3], [0.0; 3], 1.0,
+        ));
+        let low = reachable_environment_height(&[Arc::clone(&environment)], -6.0, 0.0, 0.4, 0.01)
+            .expect("low slope height");
+        let high = reachable_environment_height(&[environment], 6.0, 0.0, 0.4, 0.01)
+            .expect("high slope height");
+        assert!(high > low + 1.5, "low={low} high={high}");
+    }
+
+    #[test]
+    fn terrain_spatial_index_is_retained_across_preview_frames() {
+        let terrain = crate::dsl::TerrainAssetNode {
+            id: "cached".into(),
+            height_map: "height".into(),
+            height_map_src: Some("height.png".into()),
+            size: [4.0, 4.0],
+            height_scale: 1.0,
+            height_offset: 0.0,
+            material: Some("soil".into()),
+            material_definition: None,
+            layers: Vec::new(),
+            layer_definitions: Vec::new(),
+            blend_map: None,
+            blend_map_src: None,
+            chunks: [1, 1],
+            lod: "full".into(),
+            collision: crate::dsl::PrimitiveCollisionMode::Solid,
+        };
+        let mut renderer =
+            pollster::block_on(SceneFrameRenderer::new_for_profile(SceneRenderProfile::Cpu));
+        renderer.environment_triangle_cache.insert(
+            terrain_collision_cache_source(&terrain),
+            Arc::from([
+                crate::world::model_inspection::EnvironmentWalkableTriangle {
+                    points: [[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [2.0, 0.0, 2.0]],
+                    normal: [0.0, 1.0, 0.0],
+                },
+            ]),
+        );
+        let first = renderer
+            .terrain_spatial_index(&terrain, [0.0; 3], [0.0; 3], 1.0)
+            .expect("first terrain index");
+        let second = renderer
+            .terrain_spatial_index(&terrain, [0.0; 3], [0.0; 3], 1.0)
+            .expect("cached terrain index");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(renderer.environment_spatial_cache.len(), 1);
     }
 
     #[test]
@@ -20105,6 +22374,90 @@ mod tests {
             action_contact_phase_envelope(0.18, 0.72, 0.4),
             action_contact_phase_envelope(0.18, 0.72, 0.4)
         );
+    }
+
+    #[test]
+    fn semantic_seat_surface_resolves_primitive_top_and_persistent_contact() {
+        let primitive = crate::dsl::PrimitiveAssetNode {
+            id: "seat_asset".to_string(),
+            geometry: crate::dsl::PrimitiveGeometry::Box {
+                size: [2.0, 0.12, 0.7],
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: crate::dsl::PrimitiveCollisionNode::default(),
+        };
+        let authored = crate::dsl::ContactSurfaceNode {
+            id: "seat".to_string(),
+            source: "bench".to_string(),
+            kind: "seat".to_string(),
+            plane: "top".to_string(),
+            position: None,
+            normal: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+            bounds: [2.0, 0.7],
+            margin: 0.01,
+        };
+        let surface = super::resolve_contact_surface(
+            &authored,
+            [0.0, 0.98, -0.54],
+            [0.0; 3],
+            1.0,
+            Some(&primitive),
+        );
+        assert!((surface.origin[1] - 1.04).abs() < 1.0e-6);
+        assert_eq!(surface.origin[2], -0.54);
+        let mut frame = crate::world::render::Scene3DHumanoidFrame::default();
+        frame.actor_scale = 1.0;
+        frame.rig_metrics.body_height = 0.9;
+        frame.joints.insert("hips".to_string(), [0.0, 1.2, 0.0]);
+        let pelvis = super::semantic_contact_point(&frame, "pelvis", &surface)
+            .expect("pelvis support point");
+        assert!((pelvis[1] - 1.065).abs() < 1.0e-6);
+        frame
+            .joints
+            .insert("upper_leg_l".to_string(), [0.0, 1.2, 0.0]);
+        frame
+            .joints
+            .insert("lower_leg_l".to_string(), [0.0, 0.7, 0.2]);
+        let pelvis_with_sloped_thigh = super::semantic_contact_point(&frame, "pelvis", &surface)
+            .expect("pose-aware pelvis support point");
+        assert!((pelvis_with_sloped_thigh[1] - 0.98).abs() < 1.0e-6);
+        let contact = crate::scene::dsl::ActionContactNode {
+            id: "pelvis_seat".to_string(),
+            effector: "pelvis".to_string(),
+            target: "seat".to_string(),
+            from: 0.62,
+            to: 1.0,
+            mode: "surface".to_string(),
+            weight: "1".to_string(),
+        };
+        assert_eq!(super::action_surface_contact_envelope(&contact, 1.0), 1.0);
+        assert!(super::action_surface_contact_envelope(&contact, 0.64) > 0.0);
+        let mut persistent = contact.clone();
+        persistent.from = 0.0;
+        assert_eq!(
+            super::action_surface_contact_envelope(&persistent, 0.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn contact_lock_time_is_stable_across_random_access_loop_samples() {
+        let first_cycle = super::action_contact_lock_time_sec(0.0, 1.0, 0.0, 0.36, 0.2, 1.0, true)
+            .expect("first planted interval");
+        let third_cycle = super::action_contact_lock_time_sec(0.0, 1.0, 0.0, 0.36, 2.2, 1.0, true)
+            .expect("third planted interval");
+        let stretched = super::action_contact_lock_time_sec(0.5, 1.0, 0.5, 0.86, 2.0, 0.5, true)
+            .expect("stretched planted interval");
+
+        assert!((first_cycle - 0.035).abs() < 1.0e-6);
+        assert!((third_cycle - 2.035).abs() < 1.0e-6);
+        assert!((stretched - 1.57).abs() < 1.0e-6);
     }
 
     #[test]
@@ -20278,6 +22631,27 @@ mod tests {
                 root,
             )
         );
+    }
+
+    #[test]
+    fn corrected_root_reuses_pose_with_exact_joint_translation() {
+        let original = crate::world::render::Scene3DHumanoidFrame {
+            joints: HashMap::from([
+                ("hips".to_string(), [1.0, 0.5, -2.0]),
+                ("foot_l".to_string(), [0.8, 0.0, -1.9]),
+            ]),
+            actor_scale: 1.25,
+            rig_metrics: Default::default(),
+            action_phases: HashMap::from([("walk".to_string(), 0.375)]),
+        };
+        let translated = super::translated_humanoid_frame(&original, [0.25, 0.1, -0.5]);
+
+        assert_eq!(translated.joints["hips"], [1.25, 0.6, -2.5]);
+        assert_eq!(translated.joints["foot_l"], [1.05, 0.1, -2.4]);
+        assert_eq!(translated.actor_scale, original.actor_scale);
+        assert_eq!(translated.rig_metrics, original.rig_metrics);
+        assert_eq!(translated.action_phases, original.action_phases);
+        assert_eq!(original.joints["hips"], [1.0, 0.5, -2.0]);
     }
 
     #[test]
@@ -20581,6 +22955,7 @@ mod tests {
             sync_group: None,
             sync_marker: None,
             ground: None,
+            contact_targets: HashMap::new(),
             contact_correction: None,
             ground_offset: "0".to_string(),
             foot_lock: Some("auto".to_string()),
@@ -21711,6 +24086,12 @@ mod tests {
             super::parse_color("rgba(10, 20, 30, 25%)").unwrap(),
             [10, 20, 30, 64]
         );
+    }
+
+    #[test]
+    fn scene_fog_color_preserves_canonical_rgb_order() {
+        let color = super::scene_fog_color("#668FA8").unwrap();
+        assert!(color[0] < color[1] && color[1] < color[2], "got {color:?}");
     }
 
     #[test]
@@ -26580,5 +28961,64 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("curve"))
         );
+    }
+
+    #[test]
+    fn compound_rig_samples_authored_3d_action_hierarchy() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[16,16]}>
+  <Skeleton id="rig" space="3d">
+    <Bone id="root" role="root" position={[0,0,0]} />
+    <Bone id="thigh_l" role="thigh" side="left" parent="root" position={[0,1,0]} />
+    <Bone id="shin_l" role="shin" side="left" parent="thigh_l" position={[0,-1,0]} />
+  </Skeleton>
+  <Action id="step" skeleton="rig" duration="1s">
+    <Pose t="0s">
+      <Bone id="thigh_l" rotationX="0" />
+    </Pose>
+    <Pose t="1s">
+      <Bone id="thigh_l" rotationX="90" />
+    </Pose>
+  </Action>
+  <ApplyAction target="actor" action="step" at="0s" />
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect("3D rig graph");
+        let sampled = sample_compound_rig(
+            &graph.skeletons[0],
+            Some((&graph.actions[0], &graph.apply_actions[0])),
+            None,
+            0.5,
+            0.5,
+            15,
+            30.0,
+            1_000,
+        )
+        .expect("rig sample");
+        let shin = sampled.get("shin_l").expect("shin transform");
+        assert!((shin.position[1] - (1.0 - 0.5_f32.sqrt())).abs() < 0.001);
+        assert!((shin.position[2] + 0.5_f32.sqrt()).abs() < 0.001);
+        assert!(skeleton_bone_is_descendant(
+            &graph.skeletons[0],
+            "shin_l",
+            "thigh_l"
+        ));
+        assert!(!skeleton_bone_is_descendant(
+            &graph.skeletons[0],
+            "thigh_l",
+            "shin_l"
+        ));
     }
 }

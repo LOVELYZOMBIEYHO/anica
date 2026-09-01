@@ -965,6 +965,7 @@ fn default_scene_composite_format() -> String {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Scene3DNode {
     Camera(SceneCamera3DNode),
+    AtmosphereFog(SceneAtmosphereFogNode),
     EnvironmentLight(SceneEnvironmentLightNode),
     DirectionalLight(SceneDirectionalLightNode),
     PointLight(ScenePointLightNode),
@@ -1102,10 +1103,93 @@ pub struct SceneCamera3DNode {
     pub roll: String,
     #[serde(default)]
     pub horizon_lock: bool,
+    /// Optional optical depth of field. Omission preserves the legacy sharp render path.
+    #[serde(default)]
+    pub depth_of_field: Option<SceneDepthOfFieldNode>,
     /// Camera-local bone exclusions affect view passes without mutating the
     /// actor pose or its shadow-casting geometry.
     #[serde(default)]
     pub hidden_bones: Vec<SceneCameraHiddenBoneNode>,
+}
+
+/// Camera-owned optical controls resolved by the 3D renderer after the active shot is selected.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneDepthOfFieldNode {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub focus_target: Option<String>,
+    #[serde(default)]
+    pub focus_distance: Option<String>,
+    #[serde(default = "default_scene_zero")]
+    pub focus_offset: String,
+    #[serde(default = "default_scene_dof_focal_length")]
+    pub focal_length: String,
+    #[serde(default = "default_scene_dof_f_stop")]
+    pub f_stop: String,
+    #[serde(default = "default_scene_dof_max_blur")]
+    pub max_blur: String,
+}
+
+fn default_scene_dof_focal_length() -> String {
+    "50".to_string()
+}
+
+fn default_scene_dof_f_stop() -> String {
+    "2.8".to_string()
+}
+
+fn default_scene_dof_max_blur() -> String {
+    "10".to_string()
+}
+
+/// World-medium fog remains independent from cameras so shot cuts do not alter the atmosphere.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneAtmosphereFogNode {
+    pub id: Option<String>,
+    #[serde(default = "default_scene_fog_mode")]
+    pub mode: String,
+    #[serde(default = "default_scene_fog_color")]
+    pub color: String,
+    #[serde(default = "default_scene_zero")]
+    pub density: String,
+    #[serde(default = "default_scene_zero")]
+    pub start: String,
+    #[serde(default = "default_scene_fog_end")]
+    pub end: String,
+    #[serde(default = "default_scene_zero")]
+    pub base_height: String,
+    #[serde(default = "default_scene_fog_height_falloff")]
+    pub height_falloff: String,
+    #[serde(default = "default_scene_zero")]
+    pub scattering: String,
+    #[serde(default)]
+    pub affect_sky: bool,
+    /// Optional world-space volume bounds. Omitting both preserves global fog.
+    #[serde(default)]
+    pub bounds_min: Option<String>,
+    #[serde(default)]
+    pub bounds_max: Option<String>,
+    #[serde(default = "default_scene_zero")]
+    pub edge_feather: String,
+}
+
+fn default_scene_fog_mode() -> String {
+    "linear".to_string()
+}
+
+fn default_scene_fog_color() -> String {
+    "#FFFFFF".to_string()
+}
+
+fn default_scene_fog_end() -> String {
+    "100".to_string()
+}
+
+fn default_scene_fog_height_falloff() -> String {
+    "0.25".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

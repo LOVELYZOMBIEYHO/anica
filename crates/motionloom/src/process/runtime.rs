@@ -1211,6 +1211,12 @@ fn normalize_param_expr(value: &str) -> String {
 
 pub fn eval_time_expr(value: &str, time_norm: f32, time_sec: f32) -> Result<f32, String> {
     let expr = normalize_param_expr(value);
+    // Static numeric fields dominate large Scene3D graphs. Sending every
+    // literal through custom-call folding, variable replacement and exmex
+    // parsing on every frame is equivalent but needlessly expensive.
+    if let Ok(value) = expr.parse::<f32>() {
+        return Ok(value);
+    }
     eval_expr(&expr, time_norm, time_sec)
 }
 
@@ -1940,6 +1946,12 @@ mod tests {
         let at_15 = runtime.evaluate_frame(15);
         assert!(at_0.invert_mix >= 0.0 && at_0.invert_mix <= 1.0);
         assert!(at_15.invert_mix >= 0.0 && at_15.invert_mix <= 1.0);
+    }
+
+    #[test]
+    fn runtime_eval_time_expr_preserves_static_numeric_literals() {
+        assert_eq!(eval_time_expr("  -3.25  ", 0.2, 7.0), Ok(-3.25));
+        assert_eq!(eval_time_expr("\"1.5\"", 0.8, 2.0), Ok(1.5));
     }
 
     #[test]

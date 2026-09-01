@@ -50,6 +50,27 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    fn parse_summary_accepts_local_atmosphere_fog() {
+        let script = r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="fog_stage">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <CompositeGroup space="3d">
+            <AtmosphereFog mode="exp" density="0.045" boundsMin={[-4,0,-8]} boundsMax={[4,6,-1]} edgeFeather="0.75" />
+            <Camera3D position={[0,1,5]} target={[0,1,0]} />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="fog_stage" />
+</Graph>"##;
+        let summary = motionloom_parse_summary(script).expect("parse local fog summary");
+        assert!(summary.starts_with("scene graph"));
+    }
+
+    #[wasm_bindgen_test]
     async fn render_scene_frame_produces_rgba_buffer() {
         let mut renderer = WasmSceneRenderer::new(COLOR_SCENE, "cpu").expect("scene renderer");
         let buffer = renderer.render_frame(0).await.expect("render frame");

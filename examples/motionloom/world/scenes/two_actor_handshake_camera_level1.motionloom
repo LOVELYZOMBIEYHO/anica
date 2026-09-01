@@ -50,27 +50,27 @@
                 model="../sample_assets/glb/your_character.glb"
                 preset="humanoid_v1">
     <Retarget>
-      <Map from="mixamorig:Hips_01" to="hips" />
-      <Map from="mixamorig:Spine_02" to="spine" />
-      <Map from="mixamorig:Spine2_04" to="chest" />
-      <Map from="mixamorig:Neck_05" to="neck" />
-      <Map from="mixamorig:Head_06" to="head" />
-      <Map from="mixamorig:LeftShoulder_032" to="shoulder_l" />
-      <Map from="mixamorig:LeftArm_033" to="upper_arm_l" />
-      <Map from="mixamorig:LeftForeArm_034" to="forearm_l" />
-      <Map from="mixamorig:LeftHand_035" to="hand_l" />
-      <Map from="mixamorig:RightShoulder_050" to="shoulder_r" />
-      <Map from="mixamorig:RightArm_051" to="upper_arm_r" />
-      <Map from="mixamorig:RightForeArm_052" to="forearm_r" />
-      <Map from="mixamorig:RightHand_053" to="hand_r" />
-      <Map from="mixamorig:LeftUpLeg_069" to="upper_leg_l" />
-      <Map from="mixamorig:LeftLeg_070" to="lower_leg_l" />
-      <Map from="mixamorig:LeftFoot_071" to="foot_l" />
-      <Map from="mixamorig:LeftToeBase_072" to="toe_l" />
-      <Map from="mixamorig:RightUpLeg_073" to="upper_leg_r" />
-      <Map from="mixamorig:RightLeg_074" to="lower_leg_r" />
-      <Map from="mixamorig:RightFoot_075" to="foot_r" />
-      <Map from="mixamorig:RightToeBase_076" to="toe_r" />
+      <Map from="source:Hips_01" to="hips" />
+      <Map from="source:Spine_02" to="spine" />
+      <Map from="source:Spine2_04" to="chest" />
+      <Map from="source:Neck_05" to="neck" />
+      <Map from="source:Head_06" to="head" />
+      <Map from="source:LeftShoulder_032" to="shoulder_l" />
+      <Map from="source:LeftArm_033" to="upper_arm_l" />
+      <Map from="source:LeftForeArm_034" to="forearm_l" />
+      <Map from="source:LeftHand_035" to="hand_l" />
+      <Map from="source:RightShoulder_050" to="shoulder_r" />
+      <Map from="source:RightArm_051" to="upper_arm_r" />
+      <Map from="source:RightForeArm_052" to="forearm_r" />
+      <Map from="source:RightHand_053" to="hand_r" />
+      <Map from="source:LeftUpLeg_069" to="upper_leg_l" />
+      <Map from="source:LeftLeg_070" to="lower_leg_l" />
+      <Map from="source:LeftFoot_071" to="foot_l" />
+      <Map from="source:LeftToeBase_072" to="toe_l" />
+      <Map from="source:RightUpLeg_073" to="upper_leg_r" />
+      <Map from="source:RightLeg_074" to="lower_leg_r" />
+      <Map from="source:RightFoot_075" to="foot_r" />
+      <Map from="source:RightToeBase_076" to="toe_r" />
     </Retarget>
 
     <BoneAxisMap>

@@ -141,39 +141,40 @@ fn sample_action_bones(
     for bone_id in bone_ids {
         let prev = prev_pose.bones.iter().find(|bone| bone.id == bone_id);
         let next = next_pose.bones.iter().find(|bone| bone.id == bone_id);
+        let bone_mix = action_key_mix(prev, next, mix);
         let sample = ActionBoneSample {
             x: interpolate_action_attr(
                 prev.and_then(|bone| bone.x.as_ref()),
                 next.and_then(|bone| bone.x.as_ref()),
-                mix,
+                bone_mix,
                 time_norm,
                 time_sec,
             )?,
             y: interpolate_action_attr(
                 prev.and_then(|bone| bone.y.as_ref()),
                 next.and_then(|bone| bone.y.as_ref()),
-                mix,
+                bone_mix,
                 time_norm,
                 time_sec,
             )?,
             rotation: interpolate_action_attr(
                 prev.and_then(|bone| bone.rotation.as_ref()),
                 next.and_then(|bone| bone.rotation.as_ref()),
-                mix,
+                bone_mix,
                 time_norm,
                 time_sec,
             )?,
             scale: interpolate_action_attr(
                 prev.and_then(|bone| bone.scale.as_ref()),
                 next.and_then(|bone| bone.scale.as_ref()),
-                mix,
+                bone_mix,
                 time_norm,
                 time_sec,
             )?,
             opacity: interpolate_action_attr(
                 prev.and_then(|bone| bone.opacity.as_ref()),
                 next.and_then(|bone| bone.opacity.as_ref()),
-                mix,
+                bone_mix,
                 time_norm,
                 time_sec,
             )?,
@@ -182,6 +183,35 @@ fn sample_action_bones(
     }
 
     Ok(samples)
+}
+
+pub(crate) fn action_key_mix(
+    prev: Option<&crate::scene::dsl::ActionBoneNode>,
+    next: Option<&crate::scene::dsl::ActionBoneNode>,
+    phase: f32,
+) -> f32 {
+    let phase = phase.clamp(0.0, 1.0);
+    match prev
+        .and_then(|bone| bone.interpolation.as_deref())
+        .unwrap_or("linear")
+    {
+        "hold" => 0.0,
+        "ease" => phase * phase * (3.0 - 2.0 * phase),
+        "bezier" => {
+            let m0 = prev
+                .and_then(|bone| bone.out_tangent.as_deref())
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            let m1 = next
+                .and_then(|bone| bone.in_tangent.as_deref())
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            let t2 = phase * phase;
+            let t3 = t2 * phase;
+            ((-2.0 * t3 + 3.0 * t2) + (t3 - 2.0 * t2 + phase) * m0 + (t3 - t2) * m1).clamp(0.0, 1.0)
+        }
+        _ => phase,
+    }
 }
 
 fn interpolate_action_attr(

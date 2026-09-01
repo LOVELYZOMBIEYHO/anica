@@ -20,15 +20,102 @@ use crate::process::cpu_renderer::render_process_frame_cpu;
 #[cfg(target_arch = "wasm32")]
 use crate::process::wasm_webgpu::render_process_frame_to_canvas_gpu as render_process_frame_to_canvas_gpu_impl;
 use crate::scene::animation::{animation_property_schema_json, inspect_animation_targets};
-use crate::scene::model::{GroupNode, SceneNode};
+use crate::scene::editor_actions::{
+    ActionEditCommand, apply_action_edit, extract_editable_action_document,
+};
+use crate::scene::model::{GroupNode, Scene3DNode, SceneNode};
 use crate::scene::render::{SceneRenderProfile, SceneRenderer, render_scene_graph_frame};
 use crate::world::{
-    WorldFrameRenderer, inspect_glb_environment_json, inspect_glb_skeleton_json,
-    is_world_graph_script, parse_world_graph_script,
+    WorldFrameRenderer, inspect_glb_environment_json, inspect_glb_humanoid_profile_json,
+    inspect_glb_skeleton_json, is_world_graph_script, parse_world_graph_script,
 };
 
 fn js_error(message: String) -> JsValue {
     js_sys::Error::new(&message).into()
+}
+
+/// CPU-only diagnostic handle; does not change any preview or renderer state.
+#[wasm_bindgen]
+pub struct WasmPoseDiagnostics {
+    graph: crate::WorldGraph,
+    mesh: crate::GlbMeshData,
+}
+
+#[wasm_bindgen]
+impl WasmPoseDiagnostics {
+    /// Accept an existing World DSL document and GLB bytes; never fetch assets.
+    #[wasm_bindgen(constructor)]
+    pub fn new(world_dsl: &str, glb: &[u8]) -> Result<WasmPoseDiagnostics, JsValue> {
+        let graph = parse_world_graph_script(world_dsl).map_err(|e| js_error(e.to_string()))?;
+        let mesh = crate::experimental::load_glb_mesh_data_from_bytes(
+            std::path::Path::new("diagnostic.glb"),
+            glb,
+        )
+        .map_err(|e| js_error(e.to_string()))?;
+        Ok(Self { graph, mesh })
+    }
+
+    /// Return complete model-global joint matrices using the native evaluator.
+    pub fn sample_json(&self, actor_id: &str, frame: u32, fps: f32) -> Result<String, JsValue> {
+        let pose = crate::experimental::diagnose_world_actor_pose(
+            &self.graph,
+            &self.mesh,
+            actor_id,
+            crate::WorldTime {
+                frame,
+                fps,
+                duration_ms: self.graph.duration_ms,
+            },
+        )
+        .map_err(|e| js_error(e.to_string()))?;
+        serde_json::to_string(&pose).map_err(|e| js_error(e.to_string()))
+    }
+
+    /// Evaluate the same World pose path into the stable, versioned rig report.
+    pub fn evaluate_json(&self, request_json: &str) -> Result<String, JsValue> {
+        let request: crate::RigEvaluationRequest = serde_json::from_str(request_json)
+            .map_err(|error| js_error(format!("invalid rig evaluation request: {error}")))?;
+        let report = crate::evaluate_world_actor_rig(&self.graph, &self.mesh, &request)
+            .map_err(|error| js_error(error.to_string()))?;
+        Ok(crate::rig_evaluation_report_json(&report))
+    }
+}
+
+/// Compare two previously evaluated rig reports without loading or rendering assets.
+#[wasm_bindgen]
+pub fn motionloom_compare_rigs_json(
+    reference_json: &str,
+    candidate_json: &str,
+    options_json: &str,
+) -> Result<String, JsValue> {
+    let reference: crate::RigEvaluationReport = serde_json::from_str(reference_json)
+        .map_err(|error| js_error(format!("invalid reference rig report: {error}")))?;
+    let candidate: crate::RigEvaluationReport = serde_json::from_str(candidate_json)
+        .map_err(|error| js_error(format!("invalid candidate rig report: {error}")))?;
+    let options = if options_json.trim().is_empty() {
+        crate::RigComparisonOptions::default()
+    } else {
+        serde_json::from_str(options_json)
+            .map_err(|error| js_error(format!("invalid rig comparison options: {error}")))?
+    };
+    Ok(crate::rig_comparison_report_json(
+        &crate::compare_humanoid_poses(&reference, &candidate, options),
+    ))
+}
+
+/// Produce read-only calibration suggestions from one comparison report.
+#[wasm_bindgen]
+pub fn motionloom_propose_rig_calibration_json(comparison_json: &str) -> Result<String, JsValue> {
+    let comparison: crate::RigComparisonReport = serde_json::from_str(comparison_json)
+        .map_err(|error| js_error(format!("invalid rig comparison report: {error}")))?;
+    serde_json::to_string_pretty(&crate::propose_rig_calibration(&comparison))
+        .map_err(|error| js_error(error.to_string()))
+}
+
+/// Return the versioned JSON Schema envelope for rig diagnostics.
+#[wasm_bindgen]
+pub fn motionloom_rig_diagnostics_schema_json() -> String {
+    crate::rig_diagnostics_schema_json()
 }
 
 /// Surface Rust panic locations in the browser instead of an opaque WASM
@@ -158,6 +245,118 @@ fn set_graph_group_attr(graph: &mut GraphScript, group_id: &str, attr: &str, val
     set_group_attr_in_nodes(&mut graph.scene_nodes, group_id, attr, value)
 }
 
+fn set_camera_pose_in_nodes(
+    nodes: &mut [SceneNode],
+    camera_id: &str,
+    position: &str,
+    target: &str,
+) -> bool {
+    for node in nodes {
+        let children = match node {
+            SceneNode::Timeline(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Track(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Sequence(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Chain(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Part(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Repeat(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Mask(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Precompose(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Layer(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Camera(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Character(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Puppet(node) => Some(node.children.as_mut_slice()),
+            SceneNode::MeshTopology(node) => Some(node.children.as_mut_slice()),
+            SceneNode::Group(group) => {
+                if let Some(composite) = group.composite.as_mut()
+                    && let Some(camera) =
+                        composite.nodes_3d.iter_mut().find_map(|node| match node {
+                            Scene3DNode::Camera(camera)
+                                if camera.id.as_deref() == Some(camera_id) =>
+                            {
+                                Some(camera)
+                            }
+                            _ => None,
+                        })
+                {
+                    camera.position = position.to_string();
+                    camera.target = target.to_string();
+                    return true;
+                }
+                Some(group.children.as_mut_slice())
+            }
+            _ => None,
+        };
+        if let Some(children) = children
+            && set_camera_pose_in_nodes(children, camera_id, position, target)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn set_graph_camera_pose(
+    graph: &mut GraphScript,
+    camera_id: &str,
+    position: &str,
+    target: &str,
+) -> bool {
+    for scene in &mut graph.scenes {
+        if set_camera_pose_in_nodes(&mut scene.children, camera_id, position, target) {
+            return true;
+        }
+    }
+    set_camera_pose_in_nodes(&mut graph.scene_nodes, camera_id, position, target)
+}
+
+fn set_action_bone_channel(
+    graph: &mut GraphScript,
+    action_id: &str,
+    pose_ms: u32,
+    bone_id: &str,
+    channel: &str,
+    value: &str,
+) -> bool {
+    let Some(action) = graph
+        .actions
+        .iter_mut()
+        .find(|action| action.id == action_id)
+    else {
+        return false;
+    };
+    let pose_time = pose_ms as f32 / 1_000.0;
+    let Some(pose) = action
+        .poses
+        .iter_mut()
+        .find(|pose| (pose.t - pose_time).abs() < 0.000_51)
+    else {
+        return false;
+    };
+    let Some(bone) = pose.bones.iter_mut().find(|bone| bone.id == bone_id) else {
+        return false;
+    };
+    let slot = match channel {
+        "x" => &mut bone.x,
+        "y" => &mut bone.y,
+        "z" => &mut bone.z,
+        "rotation" => &mut bone.rotation,
+        "rotationX" | "rotation_x" => &mut bone.rotation_x,
+        "rotationY" | "rotation_y" => &mut bone.rotation_y,
+        "rotationZ" | "rotation_z" => &mut bone.rotation_z,
+        "forward" => &mut bone.forward,
+        "side" => &mut bone.side,
+        "twist" => &mut bone.twist,
+        "bend" => &mut bone.bend,
+        "turn" => &mut bone.turn,
+        "scale" => &mut bone.scale,
+        "opacity" => &mut bone.opacity,
+        _ => return false,
+    };
+    *slot = Some(value.to_string());
+    graph.raw_script = None;
+    true
+}
+
 /// Parse a MotionLoom script and return a short diagnostic summary.
 ///
 /// Returns an error string if parsing fails.
@@ -216,6 +415,25 @@ pub fn motionloom_showcase_schema_json(script: &str) -> String {
     showcase_schema_json(script)
 }
 
+/// Analyze host/backend observations without parsing or changing MotionLoom DSL.
+/// Empty options select the cinematic defaults.
+#[wasm_bindgen]
+pub fn motionloom_analyze_shot_observations_json(
+    options_json: &str,
+    observations_json: &str,
+) -> Result<String, JsValue> {
+    let options = if options_json.trim().is_empty() {
+        crate::ShotValidationOptions::default()
+    } else {
+        serde_json::from_str(options_json).map_err(|err| js_error(err.to_string()))?
+    };
+    let observations: Vec<crate::ShotValidationFrameObservation> =
+        serde_json::from_str(observations_json).map_err(|err| js_error(err.to_string()))?;
+    crate::analyze_shot_observations(options, observations)
+        .to_json()
+        .map_err(|err| js_error(err.to_string()))
+}
+
 /// Inspect GLB bytes and propose humanoid mapping, axes, rest pose, and confidence.
 #[wasm_bindgen]
 pub fn motionloom_inspect_glb_skeleton_json(
@@ -223,6 +441,16 @@ pub fn motionloom_inspect_glb_skeleton_json(
     bytes: &[u8],
 ) -> Result<String, JsValue> {
     inspect_glb_skeleton_json(bytes, asset_label).map_err(|err| js_error(err.to_string()))
+}
+
+/// Detect declared/known humanoid rigs and propose a compatible profile.
+/// This additive API preserves the legacy skeleton-inspection JSON contract.
+#[wasm_bindgen]
+pub fn motionloom_inspect_glb_humanoid_profile_json(
+    asset_label: &str,
+    bytes: &[u8],
+) -> Result<String, JsValue> {
+    inspect_glb_humanoid_profile_json(bytes, asset_label).map_err(|err| js_error(err.to_string()))
 }
 
 #[wasm_bindgen]
@@ -239,6 +467,22 @@ pub fn motionloom_inspect_animation_targets(script: &str) -> Result<String, JsVa
     let graph = parse_graph_script(script).map_err(|err| js_error(err.to_string()))?;
     serde_json::to_string_pretty(&inspect_animation_targets(&graph))
         .map_err(|err| js_error(err.to_string()))
+}
+
+/// Return the typed Action authoring document used by browser editors.
+#[wasm_bindgen]
+pub fn motionloom_editable_actions_json(script: &str) -> Result<String, JsValue> {
+    let document =
+        extract_editable_action_document(script).map_err(|err| js_error(err.to_string()))?;
+    serde_json::to_string(&document).map_err(|err| js_error(err.to_string()))
+}
+
+/// Apply one JSON-encoded Action edit and return a validated DSL revision.
+#[wasm_bindgen]
+pub fn motionloom_apply_action_edit(script: &str, command_json: &str) -> Result<String, JsValue> {
+    let command = serde_json::from_str::<ActionEditCommand>(command_json)
+        .map_err(|err| js_error(format!("Invalid Action edit command: {err}")))?;
+    apply_action_edit(script, command).map_err(|err| js_error(err.to_string()))
 }
 
 /// Render one frame of a scene graph script to an RGBA byte buffer.
@@ -578,6 +822,122 @@ impl WasmSceneRenderer {
         Ok(updated)
     }
 
+    /// Update one Camera3D pose in the parsed graph without recreating GPU
+    /// pipelines, GLB meshes, textures, or the scene renderer.
+    pub fn set_camera3d_pose(
+        &mut self,
+        camera_id: &str,
+        position: &str,
+        target: &str,
+    ) -> Result<bool, JsValue> {
+        if camera_id.trim().is_empty() || position.trim().is_empty() || target.trim().is_empty() {
+            return Err(js_error(
+                "camera id, position, and target are required".to_string(),
+            ));
+        }
+        let updated =
+            set_graph_camera_pose(&mut self.graph, camera_id, position.trim(), target.trim());
+        if updated && let Some(renderer) = self.renderer.as_mut() {
+            renderer.invalidate_runtime_scene_transforms();
+        }
+        Ok(updated)
+    }
+
+    /// Update one authored Action channel without reconstructing the renderer.
+    ///
+    /// The source editor remains authoritative: hosts use this method while a
+    /// pointer is moving, then commit the same value through the typed Action
+    /// edit API when the gesture ends. GLB bytes and GPU mesh caches stay live.
+    pub fn set_action_pose_channel(
+        &mut self,
+        action_id: &str,
+        pose_ms: u32,
+        bone_id: &str,
+        channel: &str,
+        value: &str,
+    ) -> Result<bool, JsValue> {
+        let value_num = value
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| js_error(format!("Action channel value must be numeric: {value}")))?;
+        if !value_num.is_finite() {
+            return Err(js_error(format!(
+                "Action channel value must be finite: {value}"
+            )));
+        }
+        let updated = set_action_bone_channel(
+            &mut self.graph,
+            action_id,
+            pose_ms,
+            bone_id,
+            channel,
+            value.trim(),
+        );
+        if updated && let Some(renderer) = self.renderer.as_mut() {
+            renderer.invalidate_runtime_scene_transforms();
+        }
+        Ok(updated)
+    }
+
+    /// Return true screen-space joints for the most recently rendered frame.
+    /// Coordinates use the renderer's authored pixel size and include finger
+    /// bones when the active ModelProfile maps them.
+    pub fn editor_rig_snapshot_json(&self) -> Result<String, JsValue> {
+        let snapshot = self
+            .renderer
+            .as_ref()
+            .and_then(SceneRenderer::last_editor_rig_snapshot);
+        serde_json::to_string(&snapshot).map_err(|err| js_error(err.to_string()))
+    }
+
+    /// Evaluate one actor through the exact browser Scene renderer and return
+    /// the stable, versioned rig report as JSON.
+    pub async fn evaluate_rig_frame_json(
+        &mut self,
+        actor_id: &str,
+        frame: u32,
+    ) -> Result<String, JsValue> {
+        if self.renderer.is_none() {
+            self.renderer = Some(
+                SceneRenderer::with_resolver(self.profile, self.resolver.clone())
+                    .await
+                    .map_err(|err| js_error(err.to_string()))?,
+            );
+        }
+        let renderer = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| js_error("scene renderer was not initialized".to_string()))?;
+        let report = renderer
+            .evaluate_rig_frame(&self.graph, actor_id, frame)
+            .await
+            .map_err(|err| js_error(err.to_string()))?;
+        serde_json::to_string_pretty(&report).map_err(|err| js_error(err.to_string()))
+    }
+
+    /// Evaluate a frame, time, or Action phase from a serialized
+    /// `RigEvaluationRequest` and return the versioned report JSON.
+    pub async fn evaluate_rig_json(&mut self, request_json: &str) -> Result<String, JsValue> {
+        let request: crate::RigEvaluationRequest = serde_json::from_str(request_json)
+            .map_err(|error| js_error(format!("invalid rig evaluation request: {error}")))?;
+        if self.renderer.is_none() {
+            self.renderer = Some(
+                SceneRenderer::with_resolver(self.profile, self.resolver.clone())
+                    .await
+                    .map_err(|err| js_error(err.to_string()))?,
+            );
+        }
+        let renderer = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| js_error("scene renderer was not initialized".to_string()))?;
+        let report = renderer
+            .evaluate_rig(&self.graph, &request)
+            .await
+            .map_err(|err| js_error(err.to_string()))?;
+        serde_json::to_string_pretty(&report).map_err(|err| js_error(err.to_string()))
+    }
+
     /// Render `frame` to an RGBA byte buffer.
     pub async fn render_frame(&mut self, frame: u32) -> Result<Vec<u8>, JsValue> {
         if self.renderer.is_none() {
@@ -596,6 +956,44 @@ impl WasmSceneRenderer {
             .await
             .map_err(|err| js_error(err.to_string()))?;
         Ok(image.into_raw())
+    }
+
+    /// Render a sampled range and return a machine-readable shot validation
+    /// report. Optional editor/physics observations use the same JSON shape as
+    /// `motionloom_analyze_shot_observations_json`.
+    pub async fn validate_shots_json(
+        &mut self,
+        options_json: &str,
+        observations_json: &str,
+    ) -> Result<String, JsValue> {
+        let options = if options_json.trim().is_empty() {
+            crate::ShotValidationOptions::default()
+        } else {
+            serde_json::from_str(options_json).map_err(|err| js_error(err.to_string()))?
+        };
+        let observations: Vec<crate::ShotValidationFrameObservation> =
+            if observations_json.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(observations_json).map_err(|err| js_error(err.to_string()))?
+            };
+        if self.renderer.is_none() {
+            self.renderer = Some(
+                SceneRenderer::with_resolver(self.profile, self.resolver.clone())
+                    .await
+                    .map_err(|err| js_error(err.to_string()))?,
+            );
+        }
+        let renderer = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| js_error("scene renderer was not initialized".to_string()))?;
+        renderer
+            .validate_shots_with_observations(&self.graph, options, &observations)
+            .await
+            .map_err(|err| js_error(err.to_string()))?
+            .to_json()
+            .map_err(|err| js_error(err.to_string()))
     }
 
     /// Render `frame` directly into an HTML canvas using the GPU canvas path.
@@ -772,5 +1170,84 @@ fn parse_profile(profile: &str) -> Result<SceneRenderProfile, JsValue> {
         "cpu" => Ok(SceneRenderProfile::Cpu),
         "gpu" => Ok(SceneRenderProfile::Gpu),
         _ => Err(js_error(format!("unknown render profile: {profile}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_action_channel_mutates_existing_pose_without_reparse() {
+        let source = r#"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Action id="wave" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0.5s"><Bone id="upper_arm_r" forward="10" /></Pose>
+  </Action>
+</Graph>"#;
+        let mut graph = parse_graph_script(source).expect("Action fixture parses");
+        assert!(set_action_bone_channel(
+            &mut graph,
+            "wave",
+            500,
+            "upper_arm_r",
+            "forward",
+            "42"
+        ));
+        assert_eq!(
+            graph.actions[0].poses[0].bones[0].forward.as_deref(),
+            Some("42")
+        );
+        assert!(graph.raw_script.is_none());
+    }
+
+    #[test]
+    fn runtime_action_channel_rejects_unknown_channel() {
+        let source = r#"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Action id="idle" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s"><Bone id="hips" turn="0" /></Pose>
+  </Action>
+</Graph>"#;
+        let mut graph = parse_graph_script(source).expect("Action fixture parses");
+        assert!(!set_action_bone_channel(
+            &mut graph,
+            "idle",
+            0,
+            "hips",
+            "notAChannel",
+            "1"
+        ));
+    }
+
+    #[test]
+    fn runtime_camera_pose_mutates_composite_camera_without_reparse() {
+        let source = r#"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Scene id="scene"><Timeline><Track id="track" space="3d"><Sequence from="0s" duration="1s">
+    <CompositeGroup id="world" space="3d"><Camera3D id="editor_camera" position={[0,1,4]} target={[0,1,0]} /></CompositeGroup>
+  </Sequence></Track></Timeline></Scene><Present from="scene" />
+</Graph>"#;
+        let mut graph = parse_graph_script(source).expect("Camera fixture parses");
+        assert!(set_graph_camera_pose(
+            &mut graph,
+            "editor_camera",
+            "[1,2,3]",
+            "[0,1,0]"
+        ));
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline")
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track")
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence")
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("group")
+        };
+        let Scene3DNode::Camera(camera) = &group.composite.as_ref().unwrap().nodes_3d[0] else {
+            panic!("camera")
+        };
+        assert_eq!(camera.position, "[1,2,3]");
+        assert_eq!(camera.target, "[0,1,0]");
     }
 }

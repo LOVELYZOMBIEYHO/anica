@@ -313,6 +313,18 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
     number_property!("shakeY", "px", "number", &["Camera"]),
     number_property!("zoom", "ratio", "number", &["Camera"]),
     number_property!("fov", "deg", "angle", &["Camera3D"]),
+    number_property!("focusDistance", "world", "number", &["Camera3D"]),
+    number_property!("focusOffset", "world", "number", &["Camera3D"]),
+    number_property!("focalLength", "mm", "number", &["Camera3D"]),
+    number_property!("fStop", "ratio", "number", &["Camera3D"]),
+    number_property!("maxBlur", "px", "number", &["Camera3D"]),
+    number_property!("density", "ratio", "number", &["AtmosphereFog"]),
+    number_property!("start", "world", "number", &["AtmosphereFog"]),
+    number_property!("end", "world", "number", &["AtmosphereFog"]),
+    number_property!("baseHeight", "world", "number", &["AtmosphereFog"]),
+    number_property!("heightFalloff", "ratio", "number", &["AtmosphereFog"]),
+    number_property!("scattering", "ratio", "slider", &["AtmosphereFog"]),
+    number_property!("edgeFeather", "world", "number", &["AtmosphereFog"]),
     number_property!(
         "intensity",
         "ratio",
@@ -665,6 +677,9 @@ fn collect_scene_node_kinds(nodes: &[SceneNode], node_kinds: &mut HashMap<String
                         match node_3d {
                             Scene3DNode::Camera(node) => {
                                 collect_optional_id(node_kinds, node.id.as_ref(), "Camera3D")
+                            }
+                            Scene3DNode::AtmosphereFog(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "AtmosphereFog")
                             }
                             Scene3DNode::EnvironmentLight(node) => collect_optional_id(
                                 node_kinds,

@@ -458,6 +458,8 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
         id: required_attr_value(open, "id", line)?,
         model: required_attr_value(open, "model", line)?,
         primitive: None,
+        terrain: None,
+        vegetation: None,
         path_style: parse_path_style_attr(open, line)?,
         hide_meshes: parse_name_list_attr(open, "hideMeshes"),
         hide_materials: parse_name_list_attr(open, "hideMaterials"),
@@ -689,6 +691,9 @@ fn parse_action_bone_node(block: &str) -> Result<WorldActionBone, GraphParseErro
         turn: attr_value(block, "turn"),
         scale: attr_value(block, "scale"),
         opacity: attr_value(block, "opacity"),
+        interpolation: attr_value(block, "interpolation"),
+        in_tangent: attr_value(block, "inTangent").or_else(|| attr_value(block, "in_tangent")),
+        out_tangent: attr_value(block, "outTangent").or_else(|| attr_value(block, "out_tangent")),
     })
 }
 
@@ -719,12 +724,17 @@ fn parse_apply_action_node(block: &str) -> Result<WorldApplyAction, GraphParseEr
                     .collect()
             })
             .unwrap_or_default(),
-        duration_ms: None,
-        root_motion: None,
-        destination: None,
-        face: None,
-        sync_group: None,
-        sync_marker: None,
+        duration_ms: attr_value(block, "duration")
+            .map(|raw| parse_duration_ms(&raw, line, "ApplyAction.duration"))
+            .transpose()?,
+        root_motion: attr_value(block, "rootMotion")
+            .or_else(|| attr_value(block, "root_motion")),
+        destination: attr_value(block, "destination"),
+        face: attr_value(block, "face"),
+        sync_group: attr_value(block, "syncGroup")
+            .or_else(|| attr_value(block, "sync_group")),
+        sync_marker: attr_value(block, "syncMarker")
+            .or_else(|| attr_value(block, "sync_marker")),
     })
 }
 
@@ -1473,7 +1483,9 @@ mod tests {
     </Pose>
   </Action>
 
-  <ApplyAction target="anime" action="wave_hand" at="0s" loop="true" />
+  <ApplyAction target="anime" action="wave_hand" at="0s" duration="1.5s"
+               loop="true" rootMotion="clip" destination="exit"
+               face="forward" syncGroup="walk" syncMarker="left_foot" />
   <Present from="stage" />
 </Graph>"##,
         )
@@ -1483,10 +1495,41 @@ mod tests {
         assert_eq!(graph.actions.len(), 1);
         assert_eq!(graph.actions[0].poses.len(), 2);
         assert_eq!(graph.apply_actions.len(), 1);
+        assert_eq!(graph.apply_actions[0].duration_ms, Some(1_500));
+        assert_eq!(graph.apply_actions[0].root_motion.as_deref(), Some("clip"));
+        assert_eq!(graph.apply_actions[0].destination.as_deref(), Some("exit"));
+        assert_eq!(graph.apply_actions[0].face.as_deref(), Some("forward"));
+        assert_eq!(graph.apply_actions[0].sync_group.as_deref(), Some("walk"));
+        assert_eq!(
+            graph.apply_actions[0].sync_marker.as_deref(),
+            Some("left_foot")
+        );
         assert_eq!(
             graph.worlds[0].actors[0].retarget.as_deref(),
             Some("anime_humanoid_map")
         );
+    }
+
+    #[test]
+    fn parses_action_interpolation_and_tangents_without_changing_linear_default() {
+        let graph = parse_world_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <World id="stage"><Actor id="hero" model="hero.glb" /></World>
+  <Action id="curve" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s"><Bone id="hips" y="0" interpolation="bezier" outTangent="1.5" /></Pose>
+    <Pose t="1s"><Bone id="hips" y="1" inTangent="-0.5" /></Pose>
+  </Action>
+  <ApplyAction target="hero" action="curve" />
+  <Present from="stage" />
+</Graph>"##,
+        )
+        .expect("world action interpolation");
+        let first = &graph.actions[0].poses[0].bones[0];
+        let second = &graph.actions[0].poses[1].bones[0];
+        assert_eq!(first.interpolation.as_deref(), Some("bezier"));
+        assert_eq!(first.out_tangent.as_deref(), Some("1.5"));
+        assert_eq!(second.in_tangent.as_deref(), Some("-0.5"));
+        assert_eq!(second.interpolation, None);
     }
 
     #[test]

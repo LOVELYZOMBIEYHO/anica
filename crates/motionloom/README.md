@@ -12,7 +12,7 @@ automation systems, and LLM authoring tools.
 - Unified 2D, 2.5D, 3D, and Process render graph
 - WebGPU rendering with CPU fallback paths
 - Resolution-independent vector shapes and resolution-aware text
-- GLB/glTF models, PBR materials, HDR/EXR image-based lighting, shadows, and cameras
+- GLB/glTF models, PBR materials, HDR/EXR lighting, atmospheric fog, camera DoF, and shadows
 - AnimationTarget keyframes, reusable external humanoid actions, puppet deformation, and IK
 - Deterministic swept humanoid collision, action-aware traversal, and contact correction
 - Unified deterministic 2D/3D rigid bodies with static, dynamic, and kinematic modes
@@ -36,6 +36,11 @@ First-person and editorial camera cuts reuse `Camera3D`, `Anchor`, and the
 Scene `activeCamera` animation property. A first-person camera may declare
 `hiddenBones={["hero:head"]}` to hide its owner's head only from that camera's
 view while retaining the complete animated body and shadow for later shots.
+
+`AtmosphereFog` remains global when bounds are omitted. Add matching
+`boundsMin`/`boundsMax` values and optional `edgeFeather` to confine fog to a
+world-space box, such as the exterior beyond a station entrance. Native WGPU
+and browser WebGPU use the same bounded ray integration.
 
 ## Install
 
@@ -142,8 +147,8 @@ Reusable generated 3D geometry uses typed assets:
            dimension="3d" type="dynamic" shape="auto" />
 ```
 
-`PrimitiveAsset` supports `box`, `sphere`, `plane`, `cylinder`, `cone`, and
-`wedge`. It shares the normal Model PBR, lighting, shadow, bounds, cache, and
+`PrimitiveAsset` supports `box`, `sphere`, `capsule`, `plane`, `cylinder`,
+`cone`, and `wedge`. It shares the normal Model PBR, lighting, shadow, bounds, cache, and
 physics paths. The former encoded `motionloom:box` ModelAsset source has been
 removed.
 
@@ -157,6 +162,207 @@ and emissive texture slots. `color` remains a multiplicative tint. Box bevels
 are visual-only and preserve authored bounds; auto collision still uses the
 unbeveled canonical box. `materialSeed` adds deterministic per-instance UV
 variation without moving collision surfaces.
+
+Heightfield ground is an additive typed asset and uses the same Model/PBR path:
+
+```xml
+<ImageAsset id="height" src="forest-height.png" colorSpace="linear-srgb" />
+<ImageAsset id="blend" src="forest-splat.png" colorSpace="linear-srgb" />
+<TerrainAsset id="forest" heightMap="height" size={[40,40]}
+              heightScale="4" heightOffset="-1"
+              layers={["soil","moss","stone","leaves"]} blendMap="blend"
+              chunks={[4,4]} lod="auto" collision="solid" />
+<Model id="ground" asset="forest" />
+```
+
+`TerrainAsset` converts a grayscale height map into a smooth triangle
+heightfield. `lod="full|half|quarter|auto"` controls source sampling; `auto`
+caps either height-map dimension at approximately 257 retained samples.
+`collision="solid"` feeds the existing environment grounding and kinematic
+controller queries. An optional RGBA `blendMap` combines up to four PBR
+`MaterialAsset` ids in R, G, B, and A order at load time, so native and WASM
+renderers receive the same retained mesh and textures. Heightfields remain
+2.5D; use a GLB Environment for caves, overhangs, and vertical interiors.
+`chunks={[x,z]}` partitions the retained terrain into independent GPU draws;
+off-camera terrain chunks are conservatively frustum-culled without changing
+the collision mesh.
+
+The Model id of a solid terrain is also a direct humanoid ground provider:
+
+```xml
+<Model id="terrain_ground" asset="forest" />
+<Model id="hero" asset="hero_asset" collision="kinematic" />
+<ApplyAction target="hero" action="walk" ground="terrain_ground"
+             contactCorrection="auto" footLock="auto" />
+```
+
+This is additive: `ground="floor"` continues to resolve an existing
+`<Surface id="floor" ... />` exactly as before. A Terrain Model binding uses
+the generated solid collision triangles for slopes and uneven height, and the
+same deterministic CPU query feeds native WGPU and WASM random-access frames.
+The authoring analyzer warns when a position-animated humanoid uses an Action
+in a scene with solid terrain but omits `collision="kinematic"`.
+
+Terrain migration is not required. Before this addition, existing
+`ModelAsset`, `PrimitiveAsset`, and `CompoundAsset` ground scenes render as
+authored. After it, those declarations remain unchanged; authors opt in only
+by declaring a new `TerrainAsset` and referencing it from a normal `Model`.
+
+Procedural vegetation is also an additive typed asset:
+
+```xml
+<VegetationAsset id="forest_tree" kind="tree" height="7"
+                 trunkMaterial="bark" foliageMaterial="leaves"
+                 density="28" branchLevels="3" seed="12"
+                 lod="auto" wind="true" collision="solid" />
+<VegetationAsset id="forest_fern" kind="fern" height="0.8"
+                 material="fern_leaves" density="18" seed="77"
+                 lod="auto" wind="true" />
+<VegetationAsset id="old_stump" kind="deadwood" height="1.2"
+                 trunkMaterial="old_bark" branchLevels="1" seed="18" />
+```
+
+V1 supports `tree`, `shrub`, `grass`, `flower`, `fern`, and `deadwood`.
+Trees and shrubs use `trunkMaterial` plus `foliageMaterial`; grass and ferns
+use `material`; flowers use `material` and an optional `stemMaterial`; deadwood
+uses `trunkMaterial`. `density` controls the bounded amount of foliage, blades,
+stems, or fronds inside one asset, not world scattering. `branchLevels` is
+limited to tree, shrub, and deadwood. Geometry and atlas-cell choices are
+deterministic for a given `seed`.
+
+`lod="full|half|quarter|auto"` adjusts procedural detail. Auto LOD is selected
+from camera distance relative to authored height. Wind is a lightweight GPU
+vertex deformation shared by native and WASM rendering; it does not rebuild
+meshes. `collision="solid"` is intentionally limited to tree and deadwood and
+uses a coarse trunk cylinder rather than foliage triangles. Repeated Models of
+the same resolved asset reuse retained mesh and texture resources. V1 does not
+include a scatter system, biome simulation, or runtime-growing plants.
+
+Vegetation migration is not required. Existing ModelAsset, PrimitiveAsset,
+CompoundAsset, and TerrainAsset declarations remain unchanged. Authors opt in
+by declaring a VegetationAsset and placing it through a normal Model node.
+
+A `CompoundAsset` can also be a native rigid hierarchy without becoming a GLB:
+
+```xml
+<CompoundAsset id="hero" rig="hero_rig">
+  <Instance asset="torso" bone="chest" />
+  <Instance asset="limb" bone="upper_arm_l" position={[0,-0.2,0]} />
+</CompoundAsset>
+<Skeleton id="hero_rig" profile="motionloom_humanoid_v1" space="3d">
+  <Bone id="root" role="root" position={[0,0,0]} />
+  <Bone id="chest" role="chest" parent="root" position={[0,1.25,0]} />
+  <Bone id="upper_arm_l" role="upper_arm" side="left" parent="chest"
+        position={[-0.25,0.1,0]} />
+</Skeleton>
+```
+
+`space="3d"` keeps the existing `Skeleton`, `Bone`, `Action`, and
+`ApplyAction` vocabulary. Bone `position` and `rotation` are local XYZ values;
+the legacy `x`, `y`, and scalar `rotation` attributes remain unchanged for 2D
+rigs. Each bone-bound `Instance` inherits the complete parent hierarchy.
+Authored Action `rotationX/Y/Z` values are additive to the rest pose, while
+`forward/bend`, `turn/twist`, and `side` map to canonical X, Y, and Z axes.
+Visual parts normally keep collision disabled and share one kinematic capsule
+`RigidBody` on the parent Model. Set `continuousCollision="true"` on that
+feet-rooted capsule when a timeline animates the parent position. MotionLoom
+then sweeps the native rig from its authored start to the current target and
+expands the primitive children from the collision-resolved root, so direct
+timeline motion cannot tunnel through solid PrimitiveAsset walls.
+
+Authored and imported humanoid Actions share one contact pipeline:
+
+```xml
+<Action id="walk" skeleton="humanoid_v1" duration="1.066s">
+  <Pose t="0s">...</Pose>
+  <Pose t="1.066s">...</Pose>
+  <Contact id="left_plant" effector="foot_l" target="ground"
+           from="0" to="0.36" mode="lock" />
+</Action>
+<ApplyAction target="hero" action="walk" loop="true"
+             rootMotion="in_place" ground="floor"
+             contactCorrection="auto" footLock="auto" />
+```
+
+`Contact` times are normalized Action phases. Canonical Pose Actions and
+external clips both publish those phases to the Scene solver. Ground
+correction owns vertical root placement, while `footLock="auto"` reconstructs
+a deterministic world-space support target and applies two-bone IK. This
+keeps random-access rendering and sequential preview identical without a
+mutable animation-history cache. `ApplyAction` blend-in and blend-out apply to
+the authored timeline window; a looping Action does not fade back to bind pose
+at every internal cycle seam. Existing scripts remain unchanged unless they
+explicitly opt into contact correction and foot locking.
+`ground` accepts either a semantic Surface id or the Model id of a
+`TerrainAsset collision="solid"`; Surface bindings remain fully compatible.
+
+Non-ground contacts use an additive semantic `ContactSurface`. This avoids a
+full rigid-body simulation while allowing the same Action to sit on differently
+sized props and differently proportioned humanoids:
+
+```xml
+<ContactSurface id="bench_seat" source="bench_seat_model" kind="seat"
+                plane="top" forward={[0,0,1]} bounds={[2.8,0.72]}
+                margin="0.02" />
+<Action id="sit" skeleton="humanoid_v1" duration="2s">
+  <Pose t="0s">...</Pose>
+  <Contact id="pelvis_seat" effector="pelvis" target="seat"
+           from="0.62" to="1" mode="surface" weight="1" />
+</Action>
+<ApplyAction target="hero" action="sit" contactCorrection="auto"
+             contactTargets={{ seat: "bench_seat" }} />
+```
+
+`plane="top"` derives the plane from a PrimitiveAsset Model; explicit
+`position`, `normal`, and `forward` are available for imported or compound
+props. The renderer resolves the plane in world space, clamps correction to its
+bounds, and estimates a scale-aware pelvis contact offset. Contacts beginning
+at phase zero remain active across direct seek and Action transitions. Existing
+`ground` and Actions without `contactTargets` keep their previous behavior.
+
+Each authored Bone key may choose `interpolation="linear|hold|ease|bezier"`.
+The default remains `linear`. A Bezier key may additionally provide numeric
+`inTangent` and `outTangent` values; these shape the normalized transition to
+the next pose without changing the canonical Bone values themselves. The 2D,
+native-rig, and imported-GLB Action paths use the same interpolation contract.
+
+External animation is an offline authoring input, not a runtime dependency.
+The separate `motionloom-action-tool` workspace crate can inspect an animated
+glTF/GLB and export a standalone `humanoid_v1` `<Action>`. The generated file
+contains only MotionLoom Pose/Bone data and can be edited in the Action Editor,
+committed to an Action Library, or generated by an LLM without loading the
+source clip at render time.
+
+Large authored Actions can remain in a standalone MotionLoom document and be
+selected into a Graph with an `ActionLibrary` declaration:
+
+```xml
+<ActionLibrary id="performance" src="actions/performance.motionloom"
+               actions={["formal_bow","stand_up"]} />
+<ApplyAction target="hero" action="performance.formal_bow" />
+```
+
+The external file uses `<ActionLibrary> ... <Action> ... </ActionLibrary>` as
+its root. Imported ids are always namespaced by the declaration id, only the
+listed Actions enter the executable graph, and the parsed result is retained
+across preview frames. Relative paths resolve from the main `.motionloom`
+project root. Browser hosts preload the file under the unchanged `src` key.
+This is additive: inline `Action` and AnimationAsset-backed `Action` keep their
+existing behavior.
+
+Migration is optional. Before, authors pasted the complete `<Action>` block
+directly under `<Graph>` and referenced `action="formal_bow"`. After moving
+that unchanged block under an external `<ActionLibrary>` root, declare the
+selection in the Graph and reference `action="performance.formal_bow"`.
+
+`humanoid_v1` full body conformance requires the 22 canonical body bones,
+including separate `chest` and `upper_chest` joints. Its 30 named finger bones
+are canonical but optional: an Action that does not key fingers remains fully
+usable on a hand rig without them. Tooling can call
+`inspect_humanoid_action_compatibility` to distinguish a complete profile from
+degraded playback when an Action actually references an unmapped optional
+bone. Existing profile DSL remains parseable; this check is diagnostic and
+does not silently alter playback.
 
 Transmissive surfaces use the same tag instead of a glass-specific node:
 
@@ -238,6 +444,32 @@ source-addressed diagnostics, effective behavior, and recommended repairs.
 Per-showcase `schema.json` files describe the syntax demonstrated by individual
 examples. The complete protocol is documented in
 [LLM_AUTHORING.md](LLM_AUTHORING.md).
+
+## Visual Action Authoring
+
+MotionLoom exposes typed editor helpers for authored humanoid motion without
+making a browser UI reimplement the DSL parser. `extract_editable_action_document`
+returns Actions, poses, canonical Bone channels, contacts, ApplyAction bindings,
+skeletons, and model targets. `apply_action_edit` applies a typed command,
+preserves unrelated source text, and re-parses the resulting graph before it is
+returned.
+
+Browser hosts use the matching WASM functions
+`motionloom_editable_actions_json` and `motionloom_apply_action_edit`. The Anica
+landing-page playground exposes them through the **Action** option directly
+below **Puppet Warp**, while keeping the DSL textarea as the source of truth.
+
+## Rig Diagnostics
+
+Humanoid parity checks use a non-mutating API, not extra DSL. Call
+`SceneRenderer::evaluate_rig_frame` to capture the exact rendered pose and
+`compare_humanoid_poses` to compare two actors or documents by Action phase and
+canonical bone. Reports include provenance, active layers, pose drivers,
+effective axis maps, contact settings, stage transforms and screen projection.
+The same report is available in browsers through
+`WasmSceneRenderer.evaluate_rig_json`; CLI examples are documented in
+[PUBLIC_API.md](PUBLIC_API.md), with the report contract and comparison rules in
+[RIG_DIAGNOSTICS.md](RIG_DIAGNOSTICS.md).
 
 ## Public API
 

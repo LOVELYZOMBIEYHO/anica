@@ -82,8 +82,16 @@ pub struct ModelProfileBoneAxisNode {
 #[serde(rename_all = "camelCase")]
 pub struct SkeletonNode {
     pub id: String,
+    #[serde(default = "default_skeleton_space")]
+    pub space: String,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional authored source rig used to compile model-space action deltas.
+    #[serde(default)]
+    pub source_rig: Option<String>,
+    /// Target-local semantic axis and rest-pose calibration for native rigs.
+    #[serde(default)]
+    pub bone_axis_map: Option<ModelProfileBoneAxisMapNode>,
     #[serde(default)]
     pub height: Option<String>,
     #[serde(default = "default_skeleton_facing")]
@@ -117,8 +125,16 @@ fn default_skeleton_facing() -> String {
     "front".to_string()
 }
 
+fn default_skeleton_space() -> String {
+    "2d".to_string()
+}
+
 fn default_skeleton_validation() -> String {
     "warn".to_string()
+}
+
+fn default_skeleton_zero() -> String {
+    "0".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -132,7 +148,15 @@ pub struct SkeletonBoneNode {
     pub side: Option<String>,
     pub x: String,
     pub y: String,
+    #[serde(default = "default_skeleton_zero")]
+    pub z: String,
     pub rotation: String,
+    #[serde(default = "default_skeleton_zero")]
+    pub rotation_x: String,
+    #[serde(default = "default_skeleton_zero")]
+    pub rotation_y: String,
+    #[serde(default = "default_skeleton_zero")]
+    pub rotation_z: String,
     pub scale: String,
     pub length: Option<String>,
 }
@@ -318,11 +342,21 @@ pub struct ActionBoneNode {
     pub turn: Option<String>,
     pub scale: Option<String>,
     pub opacity: Option<String>,
+    /// Interpolation used from this key to the next key.
+    #[serde(default)]
+    pub interpolation: Option<String>,
+    /// Normalized incoming/outgoing Hermite slopes used by `bezier`.
+    #[serde(default)]
+    pub in_tangent: Option<String>,
+    #[serde(default)]
+    pub out_tangent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionIkNode {
+    #[serde(default)]
+    pub id: Option<String>,
     pub root: String,
     pub mid: String,
     pub end: String,
@@ -388,6 +422,10 @@ pub struct ApplyActionNode {
     /// grounding without enabling a full rigid-body simulation.
     #[serde(default)]
     pub ground: Option<String>,
+    /// Semantic Action contact slots mapped to scene ContactSurface ids.
+    /// The legacy ground attribute remains an equivalent ground-slot binding.
+    #[serde(default)]
+    pub contact_targets: HashMap<String, String>,
     /// `auto` evaluates Action Contact metadata against the bound ground
     /// surface and performs deterministic root/IK correction.
     #[serde(default)]
@@ -829,7 +867,7 @@ fn validate_scene_model_profile_refs_in_nodes(
 fn is_builtin_humanoid_profile(profile: &str) -> bool {
     matches!(
         profile,
-        "motionloom_humanoid_v1" | "humanoid_v1" | "mixamo_humanoid"
+        "motionloom_humanoid_v1" | "humanoid_v1" | "fbx_humanoid"
     )
 }
 
@@ -1418,6 +1456,15 @@ pub(crate) fn parse_skeleton_block(
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Skeleton")?;
     let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
     let profile = skeleton_optional_attr(&open_tag, &["profile"]);
+    let source_rig = skeleton_optional_attr(&open_tag, &["sourceRig", "source_rig"]);
+    let space =
+        skeleton_optional_attr(&open_tag, &["space"]).unwrap_or_else(default_skeleton_space);
+    if !matches!(space.as_str(), "2d" | "3d") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("Skeleton \"{id}\" space must be \"2d\" or \"3d\"."),
+        });
+    }
     let height = skeleton_optional_attr(&open_tag, &["height"]);
     let facing =
         skeleton_optional_attr(&open_tag, &["facing"]).unwrap_or_else(default_skeleton_facing);
@@ -1436,6 +1483,7 @@ pub(crate) fn parse_skeleton_block(
     let mut constraints = Vec::<SkeletonConstraintNode>::new();
     let mut guides = Vec::<SkeletonGuideNode>::new();
     let mut controls = Vec::<SkeletonControlNode>::new();
+    let mut bone_axis_map = None;
     let mut i = open_end_ix + 1;
 
     while i < close_ix {
@@ -1451,6 +1499,12 @@ pub(crate) fn parse_skeleton_block(
         if starts_open_tag(line, "Bone") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
             bones.push(parse_skeleton_bone_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "BoneAxisMap") {
+            let (node, end_ix) = parse_model_profile_bone_axis_map_block(lines, i)?;
+            bone_axis_map = Some(node);
             i = end_ix + 1;
             continue;
         }
@@ -1474,14 +1528,17 @@ pub(crate) fn parse_skeleton_block(
         return Err(GraphParseError {
             line: i + 1,
             message: format!(
-                "<Skeleton> only accepts Bone, Landmark, Measure, Ratio, Region, Constraint, Guide, or Control children, got: {line}"
+                "<Skeleton> only accepts Bone, BoneAxisMap, Landmark, Measure, Ratio, Region, Constraint, Guide, or Control children, got: {line}"
             ),
         });
     }
 
     let mut skeleton = SkeletonNode {
         id,
+        space,
         profile,
+        source_rig,
+        bone_axis_map,
         height,
         facing,
         symmetry_axis,
@@ -1508,16 +1565,37 @@ fn parse_skeleton_bone_node(block: &str, line: usize) -> Result<SkeletonBoneNode
         .or_else(|| attr_value(block, "parent_id"))
         .map(|v| strip_wrappers(&v).to_string())
         .filter(|v| !v.is_empty());
+    let position = skeleton_vec3_attr(block, "position", line)?;
+    let rotations = skeleton_vec3_attr(block, "rotation", line)?;
     let x = attr_value(block, "x")
         .map(|v| strip_wrappers(&v).to_string())
+        .or_else(|| position.as_ref().map(|value| value[0].clone()))
         .unwrap_or_else(|| "0".to_string());
     let y = attr_value(block, "y")
         .map(|v| strip_wrappers(&v).to_string())
+        .or_else(|| position.as_ref().map(|value| value[1].clone()))
+        .unwrap_or_else(|| "0".to_string());
+    let z = attr_value(block, "z")
+        .map(|v| strip_wrappers(&v).to_string())
+        .or_else(|| position.as_ref().map(|value| value[2].clone()))
         .unwrap_or_else(|| "0".to_string());
     let rotation = attr_value(block, "rotation")
+        .filter(|value| !strip_wrappers(value).trim().starts_with('['))
         .or_else(|| attr_value(block, "rotate"))
         .map(|v| strip_wrappers(&v).to_string())
         .unwrap_or_else(|| "0".to_string());
+    let rotation_x = attr_value(block, "rotationX")
+        .map(|v| strip_wrappers(&v).to_string())
+        .or_else(|| rotations.as_ref().map(|value| value[0].clone()))
+        .unwrap_or_else(|| "0".to_string());
+    let rotation_y = attr_value(block, "rotationY")
+        .map(|v| strip_wrappers(&v).to_string())
+        .or_else(|| rotations.as_ref().map(|value| value[1].clone()))
+        .unwrap_or_else(|| "0".to_string());
+    let rotation_z = attr_value(block, "rotationZ")
+        .map(|v| strip_wrappers(&v).to_string())
+        .or_else(|| rotations.as_ref().map(|value| value[2].clone()))
+        .unwrap_or_else(|| rotation.clone());
     let scale = attr_value(block, "scale")
         .map(|v| strip_wrappers(&v).to_string())
         .unwrap_or_else(|| "1.0".to_string());
@@ -1532,10 +1610,42 @@ fn parse_skeleton_bone_node(block: &str, line: usize) -> Result<SkeletonBoneNode
         side: skeleton_optional_attr(block, &["side"]),
         x,
         y,
+        z,
         rotation,
+        rotation_x,
+        rotation_y,
+        rotation_z,
         scale,
         length,
     })
+}
+
+fn skeleton_vec3_attr(
+    block: &str,
+    name: &str,
+    line: usize,
+) -> Result<Option<[String; 3]>, GraphParseError> {
+    let Some(value) = attr_value(block, name) else {
+        return Ok(None);
+    };
+    let raw = strip_wrappers(&value);
+    let raw = raw
+        .trim()
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(raw.trim());
+    let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.len() != 3 {
+        return Err(GraphParseError {
+            line,
+            message: format!("Bone {name} must contain exactly three values."),
+        });
+    }
+    Ok(Some([
+        values[0].to_string(),
+        values[1].to_string(),
+        values[2].to_string(),
+    ]))
 }
 
 fn skeleton_optional_attr(block: &str, keys: &[&str]) -> Option<String> {
@@ -1940,6 +2050,14 @@ fn parse_action_bone_node(block: &str, line: usize) -> Result<ActionBoneNode, Gr
         turn: attr_value(block, "turn").map(|v| strip_wrappers(&v).to_string()),
         scale: attr_value(block, "scale").map(|v| strip_wrappers(&v).to_string()),
         opacity: attr_value(block, "opacity").map(|v| strip_wrappers(&v).to_string()),
+        interpolation: attr_value(block, "interpolation")
+            .map(|v| strip_wrappers(&v).to_ascii_lowercase()),
+        in_tangent: attr_value(block, "inTangent")
+            .or_else(|| attr_value(block, "in_tangent"))
+            .map(|v| strip_wrappers(&v).to_string()),
+        out_tangent: attr_value(block, "outTangent")
+            .or_else(|| attr_value(block, "out_tangent"))
+            .map(|v| strip_wrappers(&v).to_string()),
     })
 }
 
@@ -2003,6 +2121,7 @@ fn parse_action_ik_node(block: &str, line: usize) -> Result<ActionIkNode, GraphP
         .unwrap_or_else(|| "8".to_string());
 
     Ok(ActionIkNode {
+        id: attr_value(block, "id").map(|v| strip_wrappers(&v).to_string()),
         root,
         mid,
         end,
@@ -2042,6 +2161,11 @@ pub(crate) fn parse_apply_action_node(
         .unwrap_or(0);
     let mask = attr_value(block, "mask")
         .map(|value| parse_scene_string_list(strip_wrappers(&value)))
+        .unwrap_or_default();
+    let contact_targets = attr_value(block, "contactTargets")
+        .or_else(|| attr_value(block, "contact_targets"))
+        .map(|value| parse_action_contact_targets(&value, line))
+        .transpose()?
         .unwrap_or_default();
     Ok(ApplyActionNode {
         target,
@@ -2083,6 +2207,7 @@ pub(crate) fn parse_apply_action_node(
             .or_else(|| attr_value(block, "sync_marker"))
             .map(|value| strip_wrappers(&value).to_string()),
         ground: attr_value(block, "ground").map(|value| strip_wrappers(&value).to_string()),
+        contact_targets,
         contact_correction: attr_value(block, "contactCorrection")
             .or_else(|| attr_value(block, "contact_correction"))
             .map(|value| strip_wrappers(&value).to_ascii_lowercase()),
@@ -2125,6 +2250,42 @@ pub(crate) fn parse_apply_action_node(
             .map(|value| strip_wrappers(&value).to_string())
             .unwrap_or_else(default_action_sweep_step),
     })
+}
+
+fn parse_action_contact_targets(
+    raw: &str,
+    line: usize,
+) -> Result<HashMap<String, String>, GraphParseError> {
+    let text = strip_wrappers(raw).trim();
+    let body = text
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .unwrap_or(text);
+    let mut targets = HashMap::new();
+    for entry in body
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((slot, target)) = entry.split_once(':') else {
+            return Err(GraphParseError {
+                line,
+                message: "ApplyAction contactTargets entries must use slot: surface_id syntax."
+                    .to_string(),
+            });
+        };
+        let slot = strip_wrappers(slot).trim().to_ascii_lowercase();
+        let target = strip_wrappers(target).trim().to_string();
+        if slot.is_empty() || target.is_empty() {
+            return Err(GraphParseError {
+                line,
+                message: "ApplyAction contactTargets cannot contain an empty slot or surface id."
+                    .to_string(),
+            });
+        }
+        targets.insert(slot, target);
+    }
+    Ok(targets)
 }
 
 fn parse_optional_seconds_expr(
@@ -2844,6 +3005,24 @@ fn parse_composite_group_block(
         if starts_open_tag(line, "Camera3D") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
             let hidden_bones = parse_scene_camera_hidden_bones(&tag, i + 1)?;
+            let depth_of_field = scene_bool_attr(&tag, &["depthOfField", "depth_of_field"], false)
+                .then(|| SceneDepthOfFieldNode {
+                    enabled: true,
+                    focus_target: scene_optional_attr(&tag, &["focusTarget", "focus_target"]),
+                    focus_distance: scene_optional_attr(&tag, &["focusDistance", "focus_distance"]),
+                    focus_offset: scene_attr_or_default(
+                        &tag,
+                        &["focusOffset", "focus_offset"],
+                        "0",
+                    ),
+                    focal_length: scene_attr_or_default(
+                        &tag,
+                        &["focalLength", "focal_length"],
+                        "50",
+                    ),
+                    f_stop: scene_attr_or_default(&tag, &["fStop", "f_stop"], "2.8"),
+                    max_blur: scene_attr_or_default(&tag, &["maxBlur", "max_blur"], "10"),
+                });
             nodes_3d.push(Scene3DNode::Camera(SceneCamera3DNode {
                 id: attr_value(&tag, "id").map(|v| strip_wrappers(&v).to_string()),
                 position: scene_attr_or_default(&tag, &["position"], "[0,0,6]"),
@@ -2855,7 +3034,50 @@ fn parse_composite_group_block(
                     .or_else(|| attr_value(&tag, "horizon_lock"))
                     .map(|value| matches!(strip_wrappers(&value), "true" | "1" | "yes" | "on"))
                     .unwrap_or(false),
+                depth_of_field,
                 hidden_bones,
+            }));
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "AtmosphereFog") {
+            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let mode = scene_attr_or_default(&tag, &["mode"], "linear");
+            if !matches!(mode.as_str(), "linear" | "exp" | "height") {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: format!(
+                        "AtmosphereFog mode must be linear, exp, or height; found '{mode}'."
+                    ),
+                });
+            }
+            let bounds_min = scene_optional_attr(&tag, &["boundsMin", "bounds_min"]);
+            let bounds_max = scene_optional_attr(&tag, &["boundsMax", "bounds_max"]);
+            if bounds_min.is_some() != bounds_max.is_some() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "AtmosphereFog boundsMin and boundsMax must be provided together."
+                        .to_string(),
+                });
+            }
+            nodes_3d.push(Scene3DNode::AtmosphereFog(SceneAtmosphereFogNode {
+                id: scene_optional_attr(&tag, &["id"]),
+                mode,
+                color: scene_attr_or_default(&tag, &["color"], "#FFFFFF"),
+                density: scene_attr_or_default(&tag, &["density"], "0"),
+                start: scene_attr_or_default(&tag, &["start"], "0"),
+                end: scene_attr_or_default(&tag, &["end"], "100"),
+                base_height: scene_attr_or_default(&tag, &["baseHeight", "base_height"], "0"),
+                height_falloff: scene_attr_or_default(
+                    &tag,
+                    &["heightFalloff", "height_falloff"],
+                    "0.25",
+                ),
+                scattering: scene_attr_or_default(&tag, &["scattering"], "0"),
+                affect_sky: scene_bool_attr(&tag, &["affectSky", "affect_sky"], false),
+                bounds_min,
+                bounds_max,
+                edge_feather: scene_attr_or_default(&tag, &["edgeFeather", "edge_feather"], "0"),
             }));
             i = end_ix + 1;
             continue;
@@ -3437,6 +3659,21 @@ fn parse_composite_group_block(
                         });
                     }
                 }
+                if let Some(reference) = camera
+                    .depth_of_field
+                    .as_ref()
+                    .and_then(|optics| optics.focus_target.as_deref())
+                    .and_then(|value| value.trim().strip_prefix('@'))
+                    && !anchor_ids.contains(reference)
+                    && !model_ids.contains(reference)
+                {
+                    return Err(GraphParseError {
+                        line: start + 1,
+                        message: format!(
+                            "Camera3D focusTarget=\"@{reference}\" references unknown Anchor or Model '{reference}'."
+                        ),
+                    });
+                }
                 for selector in &camera.hidden_bones {
                     if !model_ids.contains(selector.model.as_str()) {
                         return Err(GraphParseError {
@@ -3490,6 +3727,7 @@ fn is_canonical_humanoid_bone(value: &str) -> bool {
         "hips"
             | "spine"
             | "chest"
+            | "upper_chest"
             | "neck"
             | "head"
             | "shoulder_l"
@@ -3508,7 +3746,15 @@ fn is_canonical_humanoid_bone(value: &str) -> bool {
             | "lower_leg_r"
             | "foot_r"
             | "toe_r"
-    )
+    ) || is_canonical_humanoid_finger(value)
+}
+
+fn is_canonical_humanoid_finger(value: &str) -> bool {
+    let Some((finger, suffix)) = value.split_once('_') else {
+        return false;
+    };
+    matches!(finger, "thumb" | "index" | "middle" | "ring" | "pinky")
+        && matches!(suffix, "1_l" | "2_l" | "3_l" | "1_r" | "2_r" | "3_r")
 }
 
 fn parse_scene_camera_hidden_bones(

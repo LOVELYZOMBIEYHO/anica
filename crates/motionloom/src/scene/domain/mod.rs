@@ -6,7 +6,7 @@
 
 mod action;
 mod skeleton;
-pub(crate) use action::apply_action_graph_at_time;
+pub(crate) use action::{action_key_mix, apply_action_graph_at_time};
 pub(crate) use skeleton::prepare_skeleton;
 pub use skeleton::{
     ProportionProfile, SkeletonDiagnostic, SkeletonDiagnosticSeverity, SkeletonOverlayPrimitive,

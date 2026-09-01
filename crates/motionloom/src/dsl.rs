@@ -79,8 +79,14 @@ pub struct GraphScript {
     pub skeletons: Vec<SkeletonNode>,
     #[serde(default)]
     pub actions: Vec<ActionNode>,
+    /// Selective, namespaced imports from standalone MotionLoom action libraries.
+    #[serde(default)]
+    pub action_libraries: Vec<ActionLibraryNode>,
     #[serde(default)]
     pub apply_actions: Vec<ApplyActionNode>,
+    /// Reusable semantic planes used by Action contact correction.
+    #[serde(default)]
+    pub contact_surfaces: Vec<ContactSurfaceNode>,
     /// Time-bounded relationships between 3D model endpoints.
     #[serde(default)]
     pub scene_constraints: Vec<SceneConstraintNode>,
@@ -98,6 +104,17 @@ pub struct GraphScript {
     pub passes: Vec<PassNode>,
     pub outputs: Vec<OutputNode>,
     pub present: PresentNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionLibraryNode {
+    /// Namespace used by ApplyAction, for example `cinematic.formal_bow`.
+    pub id: String,
+    /// Relative path, URL, or WASM resolver key for the library document.
+    pub src: String,
+    /// Action ids selectively imported from the external document.
+    pub actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -124,6 +141,8 @@ pub struct GraphAssetNode {
 pub enum GraphAssetSource {
     External { src: String },
     Primitive(PrimitiveAssetNode),
+    Terrain(TerrainAssetNode),
+    Vegetation(VegetationAssetNode),
     Compound(CompoundAssetNode),
 }
 
@@ -131,29 +150,137 @@ impl GraphAssetNode {
     pub fn external_src(&self) -> Option<&str> {
         match &self.source {
             GraphAssetSource::External { src } => Some(src),
-            GraphAssetSource::Primitive(_) | GraphAssetSource::Compound(_) => None,
+            GraphAssetSource::Primitive(_)
+            | GraphAssetSource::Terrain(_)
+            | GraphAssetSource::Vegetation(_)
+            | GraphAssetSource::Compound(_) => None,
         }
     }
 
     pub fn primitive(&self) -> Option<&PrimitiveAssetNode> {
         match &self.source {
             GraphAssetSource::Primitive(asset) => Some(asset),
-            GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => None,
+            GraphAssetSource::External { .. }
+            | GraphAssetSource::Terrain(_)
+            | GraphAssetSource::Vegetation(_)
+            | GraphAssetSource::Compound(_) => None,
         }
     }
 
     pub fn compound(&self) -> Option<&CompoundAssetNode> {
         match &self.source {
             GraphAssetSource::Compound(asset) => Some(asset),
-            GraphAssetSource::External { .. } | GraphAssetSource::Primitive(_) => None,
+            GraphAssetSource::External { .. }
+            | GraphAssetSource::Primitive(_)
+            | GraphAssetSource::Terrain(_)
+            | GraphAssetSource::Vegetation(_) => None,
         }
     }
+
+    pub fn terrain(&self) -> Option<&TerrainAssetNode> {
+        match &self.source {
+            GraphAssetSource::Terrain(asset) => Some(asset),
+            GraphAssetSource::External { .. }
+            | GraphAssetSource::Primitive(_)
+            | GraphAssetSource::Vegetation(_)
+            | GraphAssetSource::Compound(_) => None,
+        }
+    }
+
+    pub fn vegetation(&self) -> Option<&VegetationAssetNode> {
+        match &self.source {
+            GraphAssetSource::Vegetation(asset) => Some(asset),
+            GraphAssetSource::External { .. }
+            | GraphAssetSource::Primitive(_)
+            | GraphAssetSource::Terrain(_)
+            | GraphAssetSource::Compound(_) => None,
+        }
+    }
+}
+
+/// A heightfield terrain remains a typed model asset while reusing the shared
+/// PBR mesh renderer on native and WASM targets.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerrainAssetNode {
+    pub id: String,
+    pub height_map: String,
+    #[serde(default)]
+    pub height_map_src: Option<String>,
+    pub size: [f32; 2],
+    pub height_scale: f32,
+    pub height_offset: f32,
+    pub material: Option<String>,
+    #[serde(default)]
+    pub material_definition: Option<MaterialAssetNode>,
+    /// Up to four PBR materials blended by the RGBA channels of blend_map.
+    #[serde(default)]
+    pub layers: Vec<String>,
+    #[serde(default)]
+    pub layer_definitions: Vec<MaterialAssetNode>,
+    #[serde(default)]
+    pub blend_map: Option<String>,
+    #[serde(default)]
+    pub blend_map_src: Option<String>,
+    pub chunks: [u32; 2],
+    pub lod: String,
+    pub collision: PrimitiveCollisionMode,
+}
+
+/// One reusable procedural plant or plant cluster. Scene-wide distribution is
+/// deliberately outside this asset so vegetation generation stays bounded.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VegetationAssetNode {
+    pub id: String,
+    pub kind: VegetationKind,
+    pub height: f32,
+    pub material: Option<String>,
+    #[serde(default)]
+    pub material_definition: Option<MaterialAssetNode>,
+    pub stem_material: Option<String>,
+    #[serde(default)]
+    pub stem_material_definition: Option<MaterialAssetNode>,
+    pub trunk_material: Option<String>,
+    #[serde(default)]
+    pub trunk_material_definition: Option<MaterialAssetNode>,
+    pub foliage_material: Option<String>,
+    #[serde(default)]
+    pub foliage_material_definition: Option<MaterialAssetNode>,
+    pub density: u32,
+    pub branch_levels: u32,
+    pub seed: u64,
+    pub lod: VegetationLod,
+    pub wind: bool,
+    pub collision: PrimitiveCollisionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VegetationKind {
+    Tree,
+    Shrub,
+    Grass,
+    Flower,
+    Fern,
+    Deadwood,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VegetationLod {
+    Auto,
+    Full,
+    Half,
+    Quarter,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompoundAssetNode {
     pub id: String,
+    #[serde(default)]
+    pub rig: Option<String>,
     #[serde(default)]
     pub material_seed: Option<u64>,
     pub instances: Vec<CompoundAssetInstanceNode>,
@@ -164,6 +291,8 @@ pub struct CompoundAssetNode {
 pub struct CompoundAssetInstanceNode {
     pub id: String,
     pub asset: String,
+    #[serde(default)]
+    pub bone: Option<String>,
     pub position: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: f32,
@@ -328,6 +457,7 @@ pub enum PrimitiveColliderShape {
     Auto,
     Box,
     Sphere,
+    Capsule,
     Plane,
     Cylinder,
     Cone,
@@ -343,6 +473,12 @@ pub enum PrimitiveGeometry {
     },
     Sphere {
         radius: f32,
+        segments: u32,
+        rings: u32,
+    },
+    Capsule {
+        radius: f32,
+        height: f32,
         segments: u32,
         rings: u32,
     },
@@ -370,6 +506,7 @@ impl PrimitiveGeometry {
         match self {
             Self::Box { .. } => "box",
             Self::Sphere { .. } => "sphere",
+            Self::Capsule { .. } => "capsule",
             Self::Plane { .. } => "plane",
             Self::Cylinder { .. } => "cylinder",
             Self::Cone { .. } => "cone",
@@ -383,6 +520,12 @@ impl PrimitiveGeometry {
             Self::Sphere {
                 segments, rings, ..
             } => (*segments * *rings * 2) as usize,
+            Self::Capsule {
+                segments, rings, ..
+            } => {
+                let hemisphere_rings = ((*rings).max(4) / 2).max(2);
+                (*segments * (hemisphere_rings * 2 + 1) * 2) as usize
+            }
             Self::Plane { segments, .. } => (*segments * *segments * 2) as usize,
             Self::Cylinder { segments, .. } => (*segments * 4) as usize,
             Self::Cone { segments, .. } => (*segments * 2) as usize,
@@ -412,6 +555,23 @@ pub struct SceneConstraintNode {
     pub solver: String,
     #[serde(default)]
     pub weight: String,
+}
+
+/// A lightweight semantic contact plane. It complements collision geometry
+/// with author intent such as a seat, bed, wall, or work surface.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactSurfaceNode {
+    pub id: String,
+    pub source: String,
+    pub kind: String,
+    pub plane: String,
+    #[serde(default)]
+    pub position: Option<[f32; 3]>,
+    pub normal: [f32; 3],
+    pub forward: [f32; 3],
+    pub bounds: [f32; 2],
+    pub margin: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -847,7 +1007,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut model_profiles = Vec::<ModelProfileNode>::new();
     let mut skeletons = Vec::<SkeletonNode>::new();
     let mut actions = Vec::<ActionNode>::new();
+    let mut action_libraries = Vec::<ActionLibraryNode>::new();
     let mut apply_actions = Vec::<ApplyActionNode>::new();
+    let mut contact_surfaces = Vec::<ContactSurfaceNode>::new();
     let mut scene_constraints = Vec::<SceneConstraintNode>::new();
     let mut animation_targets = Vec::<AnimationTargetNode>::new();
     let mut layers = Vec::<LayerNode>::new();
@@ -937,6 +1099,13 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
             continue;
         }
 
+        if starts_open_tag(line, "ActionLibrary") {
+            let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
+            action_libraries.push(parse_action_library_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+
         if starts_open_tag(line, "Action") {
             let (action, end_ix) = parse_action_block(&lines, i)?;
             actions.push(action);
@@ -954,6 +1123,13 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         if starts_open_tag(line, "ApplyAction") {
             let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
             apply_actions.push(parse_apply_action_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+
+        if starts_open_tag(line, "ContactSurface") {
+            let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
+            contact_surfaces.push(parse_contact_surface_node(&tag, i + 1)?);
             i = end_ix + 1;
             continue;
         }
@@ -1236,7 +1412,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         &model_profiles,
         &skeletons,
         &actions,
+        &action_libraries,
         &apply_actions,
+        &contact_surfaces,
         &scene_constraints,
         &layers,
         &world_sources,
@@ -1270,7 +1448,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         model_profiles,
         skeletons,
         actions,
+        action_libraries,
         apply_actions,
+        contact_surfaces,
         scene_constraints,
         animation_targets,
         layers,
@@ -1282,6 +1462,180 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     };
     crate::render_graph::compile_render_pass_dag(&graph)?;
     Ok(graph)
+}
+
+fn parse_contact_surface_node(
+    block: &str,
+    line: usize,
+) -> Result<ContactSurfaceNode, GraphParseError> {
+    let id = strip_wrappers(&required_attr_value(block, "id", line)?)
+        .trim()
+        .to_string();
+    let source = strip_wrappers(&required_attr_value(block, "source", line)?)
+        .trim()
+        .to_string();
+    let kind = attr_value(block, "kind")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "surface".to_string());
+    let plane = attr_value(block, "plane")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "top".to_string());
+    let position = parse_optional_primitive_vec::<3>(block, "position", &id, line, false)?;
+    let normal = attr_value(block, "normal")
+        .map(|value| parse_primitive_vec_value::<3>(&value, "normal", &id, line, false))
+        .transpose()?
+        .unwrap_or([0.0, 1.0, 0.0]);
+    let forward = attr_value(block, "forward")
+        .map(|value| parse_primitive_vec_value::<3>(&value, "forward", &id, line, false))
+        .transpose()?
+        .unwrap_or([0.0, 0.0, 1.0]);
+    let bounds = attr_value(block, "bounds")
+        .map(|value| parse_primitive_vec_value::<2>(&value, "bounds", &id, line, true))
+        .transpose()?
+        .unwrap_or([1.0, 1.0]);
+    let margin = attr_value(block, "margin")
+        .map(|value| {
+            strip_wrappers(&value)
+                .parse::<f32>()
+                .map_err(|_| GraphParseError {
+                    line,
+                    message: format!("ContactSurface '{id}' margin must be a finite number."),
+                })
+        })
+        .transpose()?
+        .unwrap_or(0.0);
+    Ok(ContactSurfaceNode {
+        id,
+        source,
+        kind,
+        plane,
+        position,
+        normal,
+        forward,
+        bounds,
+        margin,
+    })
+}
+
+fn parse_action_library_node(
+    block: &str,
+    line: usize,
+) -> Result<ActionLibraryNode, GraphParseError> {
+    let id = strip_wrappers(&required_attr_value(block, "id", line)?)
+        .trim()
+        .to_string();
+    let src = strip_wrappers(&required_attr_value(block, "src", line)?)
+        .trim()
+        .to_string();
+    let actions = parse_string_array(
+        &required_attr_value(block, "actions", line)?,
+        line,
+        "ActionLibrary.actions",
+    )?;
+    if id.is_empty() || id.contains('.') {
+        return Err(GraphParseError {
+            line,
+            message: "ActionLibrary.id must be non-empty and cannot contain '.'.".to_string(),
+        });
+    }
+    if src.is_empty() {
+        return Err(GraphParseError {
+            line,
+            message: "ActionLibrary.src cannot be empty.".to_string(),
+        });
+    }
+    let mut unique = HashSet::new();
+    for action in &actions {
+        if action.is_empty() || action.contains('.') {
+            return Err(GraphParseError {
+                line,
+                message: "ActionLibrary action ids must be non-empty and cannot contain '.'."
+                    .to_string(),
+            });
+        }
+        if !unique.insert(action.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate ActionLibrary action selection: {action}"),
+            });
+        }
+    }
+    Ok(ActionLibraryNode { id, src, actions })
+}
+
+/// Parse a standalone `<ActionLibrary>` document produced by the Action Editor.
+pub fn parse_action_library_document(input: &str) -> Result<Vec<ActionNode>, GraphParseError> {
+    let normalized = input.replace('＝', "=");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    let Some(start) = lines
+        .iter()
+        .position(|line| starts_open_tag(line.trim(), "ActionLibrary"))
+    else {
+        return Err(GraphParseError {
+            line: 0,
+            message: "Missing <ActionLibrary ...> root tag.".to_string(),
+        });
+    };
+    let (_, open_end) = collect_tag_block(&lines, start, '>', false)?;
+    let close = find_matching_close_tag(&lines, open_end + 1, "ActionLibrary")?;
+    let mut actions = Vec::new();
+    let mut ids = HashSet::new();
+    let mut index = open_end + 1;
+    while index < close {
+        let line = lines[index].trim();
+        if line.starts_with("<!--") {
+            while index < close && !lines[index].contains("-->") {
+                index += 1;
+            }
+            index += 1;
+            continue;
+        }
+        if line.is_empty() || line.starts_with("//") {
+            index += 1;
+            continue;
+        }
+        if starts_open_tag(line, "Action") {
+            let (action, end) = parse_action_block(&lines, index)?;
+            if action.source.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "ActionLibrary Action {} must be authored inline; external AnimationAsset-backed Actions are not supported in ActionLibrary v1.",
+                        action.id
+                    ),
+                });
+            }
+            if action.poses.is_empty() && action.iks.is_empty() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "ActionLibrary Action {} must contain at least one <Pose> or <IK />.",
+                        action.id
+                    ),
+                });
+            }
+            if !ids.insert(action.id.clone()) {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("Duplicate Action id in ActionLibrary: {}", action.id),
+                });
+            }
+            actions.push(action);
+            index = end + 1;
+            continue;
+        }
+        return Err(GraphParseError {
+            line: index + 1,
+            message: "ActionLibrary documents may only contain <Action> children.".to_string(),
+        });
+    }
+    if actions.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "ActionLibrary must contain at least one <Action>.".to_string(),
+        });
+    }
+    Ok(actions)
 }
 
 fn parse_animation_target_block(
@@ -1430,7 +1784,9 @@ fn validate_graph(
     model_profiles: &[ModelProfileNode],
     skeletons: &[SkeletonNode],
     actions: &[ActionNode],
+    action_libraries: &[ActionLibraryNode],
     apply_actions: &[ApplyActionNode],
+    contact_surfaces: &[ContactSurfaceNode],
     scene_constraints: &[SceneConstraintNode],
     layers: &[LayerNode],
     world_sources: &[WorldSourceNode],
@@ -1570,6 +1926,56 @@ fn validate_graph(
         }
     }
 
+    for compound in assets.iter().filter_map(GraphAssetNode::compound) {
+        let Some(rig_id) = compound.rig.as_deref() else {
+            if compound
+                .instances
+                .iter()
+                .any(|instance| instance.bone.is_some())
+            {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "CompoundAsset {} has bone-bound Instances but does not declare rig.",
+                        compound.id
+                    ),
+                });
+            }
+            continue;
+        };
+        let Some(skeleton) = skeletons.iter().find(|skeleton| skeleton.id == rig_id) else {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "CompoundAsset {} references unknown Skeleton rig: {rig_id}",
+                    compound.id
+                ),
+            });
+        };
+        if skeleton.space != "3d" {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "CompoundAsset {} rig {} must use Skeleton space=\"3d\".",
+                    compound.id, rig_id
+                ),
+            });
+        }
+        for instance in &compound.instances {
+            if let Some(bone) = instance.bone.as_deref()
+                && !skeleton.bones.iter().any(|candidate| candidate.id == bone)
+            {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "CompoundAsset {} Instance {} references unknown bone {} in rig {}.",
+                        compound.id, instance.id, bone, rig_id
+                    ),
+                });
+            }
+        }
+    }
+
     let mut action_ids = HashSet::<String>::new();
     let animation_assets = assets
         .iter()
@@ -1632,29 +2038,34 @@ fn validate_graph(
                     | "hand_r"
                     | "elbow_l"
                     | "elbow_r"
+                    | "pelvis"
+                    | "back"
             ) {
                 return Err(GraphParseError {
                     line,
                     message: format!(
-                        "Action {} Contact '{}' uses unsupported canonical effector '{}'. Use knee_l, knee_r, foot_l, foot_r, hand_l, hand_r, elbow_l, or elbow_r.",
+                        "Action {} Contact '{}' uses unsupported canonical effector '{}'. Use a canonical limb effector, pelvis, or back.",
                         action.id, contact.id, contact.effector
                     ),
                 });
             }
-            if contact.target != "ground" {
+            if !matches!(
+                contact.target.as_str(),
+                "ground" | "seat" | "support" | "wall" | "rail"
+            ) {
                 return Err(GraphParseError {
                     line,
                     message: format!(
-                        "Action {} Contact '{}' target must currently be ground, got: {}.",
+                        "Action {} Contact '{}' uses unsupported semantic target: {}.",
                         action.id, contact.id, contact.target
                     ),
                 });
             }
-            if contact.mode != "lock" {
+            if !matches!(contact.mode.as_str(), "lock" | "surface") {
                 return Err(GraphParseError {
                     line,
                     message: format!(
-                        "Action {} Contact '{}' mode must currently be lock, got: {}.",
+                        "Action {} Contact '{}' mode must be lock or surface, got: {}.",
                         action.id, contact.id, contact.mode
                     ),
                 });
@@ -1673,6 +2084,75 @@ fn validate_graph(
                         "Action {} Contact '{}' weight must be inside 0..1, got: {}.",
                         action.id, contact.id, contact.weight
                     ),
+                });
+            }
+        }
+    }
+    let mut contact_surface_ids = HashSet::new();
+    for surface in contact_surfaces {
+        if surface.id.is_empty() || !contact_surface_ids.insert(surface.id.clone()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate or empty ContactSurface id: {}", surface.id),
+            });
+        }
+        if !matches!(
+            surface.kind.as_str(),
+            "seat" | "support" | "wall" | "rail" | "surface"
+        ) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ContactSurface {} has unsupported kind: {}",
+                    surface.id, surface.kind
+                ),
+            });
+        }
+        if !matches!(surface.plane.as_str(), "top" | "explicit") {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ContactSurface {} plane must be top or explicit, got: {}",
+                    surface.id, surface.plane
+                ),
+            });
+        }
+        if surface.plane == "explicit" && surface.position.is_none() {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "ContactSurface {} plane=explicit requires position.",
+                    surface.id
+                ),
+            });
+        }
+        let normal_length = surface
+            .normal
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if !normal_length.is_finite() || normal_length <= 0.0001 {
+            return Err(GraphParseError {
+                line,
+                message: format!("ContactSurface {} normal must be non-zero.", surface.id),
+            });
+        }
+    }
+    let mut action_library_ids = HashSet::<String>::new();
+    for library in action_libraries {
+        if !action_library_ids.insert(library.id.clone()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate ActionLibrary id: {}", library.id),
+            });
+        }
+        for selected in &library.actions {
+            let namespaced = format!("{}.{}", library.id, selected);
+            if !action_ids.insert(namespaced.clone()) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!("Duplicate action id: {namespaced}"),
                 });
             }
         }
@@ -1727,14 +2207,29 @@ fn validate_graph(
         }
         if apply_action.contact_correction.as_deref() == Some("auto")
             && apply_action.ground.is_none()
+            && apply_action.contact_targets.is_empty()
         {
             return Err(GraphParseError {
                 line,
                 message: format!(
-                    "ApplyAction target '{}' uses contactCorrection=auto but has no ground Surface binding.",
+                    "ApplyAction target '{}' uses contactCorrection=auto but has no ground or contactTargets binding.",
                     apply_action.target
                 ),
             });
+        }
+        for (slot, surface_id) in &apply_action.contact_targets {
+            if slot == "ground" {
+                continue;
+            }
+            if !contact_surface_ids.contains(surface_id) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "ApplyAction target '{}' contactTargets.{slot} references unknown ContactSurface: {surface_id}",
+                        apply_action.target
+                    ),
+                });
+            }
         }
         if apply_action.contact_correction.as_deref() == Some("auto")
             && actions
@@ -2051,13 +2546,17 @@ fn parse_assets_block(
             (GraphAssetKind::Animation, "AnimationAsset")
         } else if starts_open_tag(line, "PrimitiveAsset") {
             (GraphAssetKind::Model, "PrimitiveAsset")
+        } else if starts_open_tag(line, "TerrainAsset") {
+            (GraphAssetKind::Model, "TerrainAsset")
+        } else if starts_open_tag(line, "VegetationAsset") {
+            (GraphAssetKind::Model, "VegetationAsset")
         } else if starts_open_tag(line, "CompoundAsset") {
             (GraphAssetKind::Model, "CompoundAsset")
         } else {
             return Err(GraphParseError {
                 line: i + 1,
                 message: format!(
-                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <PrimitiveAsset>, <CompoundAsset>, <MaterialAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
+                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <PrimitiveAsset>, <TerrainAsset>, <VegetationAsset>, <CompoundAsset>, <MaterialAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
                 ),
             });
         };
@@ -2094,6 +2593,10 @@ fn parse_assets_block(
         let id = strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string();
         let source = if tag_name == "PrimitiveAsset" {
             GraphAssetSource::Primitive(parse_primitive_asset(&tag, &id, i + 1)?)
+        } else if tag_name == "TerrainAsset" {
+            GraphAssetSource::Terrain(parse_terrain_asset(&tag, &id, i + 1)?)
+        } else if tag_name == "VegetationAsset" {
+            GraphAssetSource::Vegetation(parse_vegetation_asset(&tag, &id, i + 1)?)
         } else {
             let src = strip_wrappers(&required_attr_value(&tag, "src", i + 1)?).to_string();
             if src.starts_with("motionloom:box:") {
@@ -2186,6 +2689,7 @@ fn parse_compound_asset(
         });
     }
     let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
+    let rig = attr_value(&open_tag, "rig").map(|value| strip_wrappers(&value).to_string());
     let material_seed = parse_optional_primitive_u64(&open_tag, "materialSeed", &id, start + 1)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "CompoundAsset")?;
     let mut instances = Vec::new();
@@ -2209,6 +2713,7 @@ fn parse_compound_asset(
             .map(|value| strip_wrappers(&value).to_string())
             .unwrap_or_else(|| format!("instance_{}", instances.len() + 1));
         let asset = strip_wrappers(&required_attr_value(&tag, "asset", index + 1)?).to_string();
+        let bone = attr_value(&tag, "bone").map(|value| strip_wrappers(&value).to_string());
         let position =
             parse_optional_primitive_vec::<3>(&tag, "position", &instance_id, index + 1, false)?
                 .unwrap_or([0.0; 3]);
@@ -2223,6 +2728,7 @@ fn parse_compound_asset(
         instances.push(CompoundAssetInstanceNode {
             id: instance_id,
             asset,
+            bone,
             position,
             rotation,
             scale,
@@ -2252,6 +2758,7 @@ fn parse_compound_asset(
     Ok((
         CompoundAssetNode {
             id,
+            rig,
             material_seed,
             instances,
         },
@@ -2485,7 +2992,16 @@ fn resolve_primitive_material_assets(
     let image_sources = assets
         .iter()
         .filter(|asset| asset.kind == GraphAssetKind::Image)
-        .filter_map(|asset| asset.external_src().map(|src| (asset.id.as_str(), src)))
+        .filter_map(|asset| {
+            asset
+                .external_src()
+                .map(|src| (asset.id.clone(), src.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let image_color_spaces = assets
+        .iter()
+        .filter(|asset| asset.kind == GraphAssetKind::Image)
+        .map(|asset| (asset.id.clone(), asset.color_space.clone()))
         .collect::<HashMap<_, _>>();
     let resolve_texture = |material: &MaterialAssetNode,
                            slot: &str,
@@ -2496,7 +3012,7 @@ fn resolve_primitive_material_assets(
         };
         image_sources
             .get(reference)
-            .map(|src| Some((*src).to_string()))
+            .map(|src| Some(src.clone()))
             .ok_or_else(|| GraphParseError {
                 line,
                 message: format!(
@@ -2524,24 +3040,586 @@ fn resolve_primitive_material_assets(
         resolved_materials.insert(material.id.as_str(), resolved);
     }
     for asset in assets {
-        let GraphAssetSource::Primitive(primitive) = &mut asset.source else {
-            continue;
-        };
-        let Some(material_id) = primitive.material.as_deref() else {
-            continue;
-        };
-        primitive.material_definition = resolved_materials.get(material_id).cloned();
-        if primitive.material_definition.is_none() {
-            return Err(GraphParseError {
-                line,
-                message: format!(
-                    "PrimitiveAsset \"{}\" references unknown MaterialAsset \"{material_id}\".",
-                    primitive.id
-                ),
-            });
+        match &mut asset.source {
+            GraphAssetSource::Primitive(primitive) => {
+                let Some(material_id) = primitive.material.as_deref() else {
+                    continue;
+                };
+                primitive.material_definition = resolved_materials.get(material_id).cloned();
+                if primitive.material_definition.is_none() {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "PrimitiveAsset \"{}\" references unknown MaterialAsset \"{material_id}\".",
+                            primitive.id
+                        ),
+                    });
+                }
+            }
+            GraphAssetSource::Terrain(terrain) => {
+                terrain.height_map_src = image_sources.get(terrain.height_map.as_str()).cloned();
+                if terrain.height_map_src.is_none() {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "TerrainAsset \"{}\" heightMap references unknown ImageAsset \"{}\".",
+                            terrain.id, terrain.height_map
+                        ),
+                    });
+                }
+                require_linear_terrain_image(
+                    &terrain.id,
+                    "heightMap",
+                    &terrain.height_map,
+                    &image_color_spaces,
+                    line,
+                )?;
+                if let Some(material_id) = terrain.material.as_deref() {
+                    terrain.material_definition = resolved_materials.get(material_id).cloned();
+                    if terrain.material_definition.is_none() {
+                        return Err(GraphParseError {
+                            line,
+                            message: format!(
+                                "TerrainAsset \"{}\" references unknown MaterialAsset \"{material_id}\".",
+                                terrain.id
+                            ),
+                        });
+                    }
+                }
+                terrain.layer_definitions = terrain
+                    .layers
+                    .iter()
+                    .map(|material_id| {
+                        resolved_materials.get(material_id.as_str()).cloned().ok_or_else(|| {
+                            GraphParseError {
+                                line,
+                                message: format!(
+                                    "TerrainAsset \"{}\" layers references unknown MaterialAsset \"{material_id}\".",
+                                    terrain.id
+                                ),
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(blend_map) = terrain.blend_map.as_deref() {
+                    terrain.blend_map_src = image_sources.get(blend_map).cloned();
+                    if terrain.blend_map_src.is_none() {
+                        return Err(GraphParseError {
+                            line,
+                            message: format!(
+                                "TerrainAsset \"{}\" blendMap references unknown ImageAsset \"{blend_map}\".",
+                                terrain.id
+                            ),
+                        });
+                    }
+                    require_linear_terrain_image(
+                        &terrain.id,
+                        "blendMap",
+                        blend_map,
+                        &image_color_spaces,
+                        line,
+                    )?;
+                }
+            }
+            GraphAssetSource::Vegetation(vegetation) => {
+                vegetation.material_definition = resolve_vegetation_material(
+                    vegetation,
+                    "material",
+                    vegetation.material.as_deref(),
+                    &resolved_materials,
+                    line,
+                )?;
+                vegetation.stem_material_definition = resolve_vegetation_material(
+                    vegetation,
+                    "stemMaterial",
+                    vegetation.stem_material.as_deref(),
+                    &resolved_materials,
+                    line,
+                )?;
+                vegetation.trunk_material_definition = resolve_vegetation_material(
+                    vegetation,
+                    "trunkMaterial",
+                    vegetation.trunk_material.as_deref(),
+                    &resolved_materials,
+                    line,
+                )?;
+                vegetation.foliage_material_definition = resolve_vegetation_material(
+                    vegetation,
+                    "foliageMaterial",
+                    vegetation.foliage_material.as_deref(),
+                    &resolved_materials,
+                    line,
+                )?;
+            }
+            GraphAssetSource::External { .. } | GraphAssetSource::Compound(_) => {}
         }
     }
     Ok(())
+}
+
+fn resolve_vegetation_material(
+    vegetation: &VegetationAssetNode,
+    slot: &str,
+    material_id: Option<&str>,
+    materials: &HashMap<&str, MaterialAssetNode>,
+    line: usize,
+) -> Result<Option<MaterialAssetNode>, GraphParseError> {
+    let Some(material_id) = material_id else {
+        return Ok(None);
+    };
+    materials
+        .get(material_id)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| GraphParseError {
+            line,
+            message: format!(
+                "VegetationAsset \"{}\" {slot} references unknown MaterialAsset \"{material_id}\".",
+                vegetation.id
+            ),
+        })
+}
+
+fn require_linear_terrain_image(
+    terrain_id: &str,
+    slot: &str,
+    image_id: &str,
+    color_spaces: &HashMap<String, Option<String>>,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    if color_spaces
+        .get(image_id)
+        .and_then(|value| value.as_deref())
+        .is_some_and(|value| value.eq_ignore_ascii_case("linear-srgb"))
+    {
+        return Ok(());
+    }
+    Err(GraphParseError {
+        line,
+        message: format!(
+            "TerrainAsset \"{terrain_id}\" {slot} ImageAsset \"{image_id}\" must declare colorSpace=\"linear-srgb\"."
+        ),
+    })
+}
+
+fn parse_terrain_asset(
+    tag: &str,
+    id: &str,
+    line: usize,
+) -> Result<TerrainAssetNode, GraphParseError> {
+    const ALLOWED: &[&str] = &[
+        "id",
+        "heightMap",
+        "size",
+        "heightScale",
+        "heightOffset",
+        "material",
+        "layers",
+        "blendMap",
+        "chunks",
+        "lod",
+        "collision",
+    ];
+    for attribute in tag_attribute_names(tag) {
+        if !ALLOWED.contains(&attribute.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("TerrainAsset \"{id}\" does not support \"{attribute}\"."),
+            });
+        }
+    }
+    let height_map = strip_wrappers(&required_attr_value(tag, "heightMap", line)?)
+        .trim()
+        .to_string();
+    let size = parse_primitive_vec::<2>(tag, "size", id, line)?;
+    let height_scale = attr_value(tag, "heightScale")
+        .map(|value| strip_wrappers(&value).parse::<f32>())
+        .transpose()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!("TerrainAsset \"{id}\" heightScale must be a finite number."),
+        })?
+        .unwrap_or(1.0);
+    let height_offset = attr_value(tag, "heightOffset")
+        .map(|value| strip_wrappers(&value).parse::<f32>())
+        .transpose()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!("TerrainAsset \"{id}\" heightOffset must be a finite number."),
+        })?
+        .unwrap_or(0.0);
+    if !height_scale.is_finite() || !height_offset.is_finite() {
+        return Err(GraphParseError {
+            line,
+            message: format!("TerrainAsset \"{id}\" height values must be finite."),
+        });
+    }
+    let material = attr_value(tag, "material").map(|value| strip_wrappers(&value).to_string());
+    let layers = attr_value(tag, "layers")
+        .map(|value| parse_string_array(&value, line, "TerrainAsset.layers"))
+        .transpose()?
+        .unwrap_or_default();
+    if layers.len() > 4 {
+        return Err(GraphParseError {
+            line,
+            message: format!("TerrainAsset \"{id}\" supports at most four material layers."),
+        });
+    }
+    let blend_map = attr_value(tag, "blendMap").map(|value| strip_wrappers(&value).to_string());
+    if blend_map.is_some() != !layers.is_empty() {
+        return Err(GraphParseError {
+            line,
+            message: format!("TerrainAsset \"{id}\" must declare layers and blendMap together."),
+        });
+    }
+    if material.is_none() && layers.is_empty() {
+        return Err(GraphParseError {
+            line,
+            message: format!("TerrainAsset \"{id}\" requires material or layered materials."),
+        });
+    }
+    let chunk_values =
+        parse_optional_primitive_vec::<2>(tag, "chunks", id, line, true)?.unwrap_or([1.0, 1.0]);
+    let chunks = chunk_values.map(|value| value as u32);
+    if chunk_values
+        .iter()
+        .any(|value| value.fract() != 0.0 || !(1.0..=32.0).contains(value))
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "TerrainAsset \"{id}\" chunks must contain integers from 1 through 32."
+            ),
+        });
+    }
+    let lod = attr_value(tag, "lod")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+    if !matches!(lod.as_str(), "auto" | "full" | "half" | "quarter") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "TerrainAsset \"{id}\" lod=\"{lod}\" is invalid. Use auto, full, half, or quarter."
+            ),
+        });
+    }
+    let collision = match attr_value(tag, "collision")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("solid")
+    {
+        "none" => PrimitiveCollisionMode::None,
+        "solid" => PrimitiveCollisionMode::Solid,
+        other => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "TerrainAsset \"{id}\" collision=\"{other}\" is invalid. Use none or solid."
+                ),
+            });
+        }
+    };
+    Ok(TerrainAssetNode {
+        id: id.to_string(),
+        height_map,
+        height_map_src: None,
+        size,
+        height_scale,
+        height_offset,
+        material,
+        material_definition: None,
+        layers,
+        layer_definitions: Vec::new(),
+        blend_map,
+        blend_map_src: None,
+        chunks,
+        lod,
+        collision,
+    })
+}
+
+fn parse_vegetation_asset(
+    tag: &str,
+    id: &str,
+    line: usize,
+) -> Result<VegetationAssetNode, GraphParseError> {
+    const ALLOWED: &[&str] = &[
+        "id",
+        "kind",
+        "height",
+        "material",
+        "stemMaterial",
+        "trunkMaterial",
+        "foliageMaterial",
+        "density",
+        "branchLevels",
+        "seed",
+        "lod",
+        "wind",
+        "collision",
+    ];
+    for attribute in tag_attribute_names(tag) {
+        if !ALLOWED.contains(&attribute.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("VegetationAsset \"{id}\" does not support \"{attribute}\"."),
+            });
+        }
+    }
+    let kind_name = strip_wrappers(&required_attr_value(tag, "kind", line)?).to_ascii_lowercase();
+    let kind = match kind_name.as_str() {
+        "tree" => VegetationKind::Tree,
+        "shrub" => VegetationKind::Shrub,
+        "grass" => VegetationKind::Grass,
+        "flower" => VegetationKind::Flower,
+        "fern" => VegetationKind::Fern,
+        "deadwood" => VegetationKind::Deadwood,
+        _ => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "VegetationAsset \"{id}\" kind=\"{kind_name}\" is invalid. Use tree, shrub, grass, flower, fern, or deadwood."
+                ),
+            });
+        }
+    };
+    let height = strip_wrappers(&required_attr_value(tag, "height", line)?)
+        .parse::<f32>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!(
+                "VegetationAsset \"{id}\" height must be a finite number greater than zero."
+            ),
+        })?;
+    if !height.is_finite() || height <= 0.0 {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "VegetationAsset \"{id}\" height must be a finite number greater than zero."
+            ),
+        });
+    }
+    let material = vegetation_material_attr(tag, "material");
+    let stem_material = vegetation_material_attr(tag, "stemMaterial");
+    let trunk_material = vegetation_material_attr(tag, "trunkMaterial");
+    let foliage_material = vegetation_material_attr(tag, "foliageMaterial");
+    validate_vegetation_material_slots(
+        id,
+        kind,
+        material.as_deref(),
+        stem_material.as_deref(),
+        trunk_material.as_deref(),
+        foliage_material.as_deref(),
+        line,
+    )?;
+    let density = parse_vegetation_u32(tag, "density", id, line)?.unwrap_or(match kind {
+        VegetationKind::Tree => 28,
+        VegetationKind::Shrub => 20,
+        VegetationKind::Grass => 18,
+        VegetationKind::Flower => 10,
+        VegetationKind::Fern => 12,
+        VegetationKind::Deadwood => 0,
+    });
+    if density > 256 || (kind != VegetationKind::Deadwood && density == 0) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "VegetationAsset \"{id}\" density must be from 1 through 256; deadwood omits density."
+            ),
+        });
+    }
+    if kind == VegetationKind::Deadwood && attr_value(tag, "density").is_some() {
+        return Err(GraphParseError {
+            line,
+            message: format!("VegetationAsset \"{id}\" deadwood does not support density."),
+        });
+    }
+    let branch_levels =
+        parse_vegetation_u32(tag, "branchLevels", id, line)?.unwrap_or(match kind {
+            VegetationKind::Tree => 3,
+            VegetationKind::Shrub => 2,
+            VegetationKind::Deadwood => 1,
+            VegetationKind::Grass | VegetationKind::Flower | VegetationKind::Fern => 0,
+        });
+    if branch_levels > 5 {
+        return Err(GraphParseError {
+            line,
+            message: format!("VegetationAsset \"{id}\" branchLevels must be from 0 through 5."),
+        });
+    }
+    if matches!(
+        kind,
+        VegetationKind::Grass | VegetationKind::Flower | VegetationKind::Fern
+    ) && attr_value(tag, "branchLevels").is_some()
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "VegetationAsset \"{id}\" kind=\"{kind_name}\" does not support branchLevels."
+            ),
+        });
+    }
+    let seed = attr_value(tag, "seed")
+        .map(|value| strip_wrappers(&value).parse::<u64>())
+        .transpose()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!("VegetationAsset \"{id}\" seed must be an unsigned integer."),
+        })?
+        .unwrap_or(0);
+    let lod_name = attr_value(tag, "lod")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+    let lod = match lod_name.as_str() {
+        "auto" => VegetationLod::Auto,
+        "full" => VegetationLod::Full,
+        "half" => VegetationLod::Half,
+        "quarter" => VegetationLod::Quarter,
+        _ => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "VegetationAsset \"{id}\" lod=\"{lod_name}\" is invalid. Use auto, full, half, or quarter."
+                ),
+            });
+        }
+    };
+    let wind = attr_value(tag, "wind")
+        .map(|value| parse_bool(&value, line, "VegetationAsset.wind"))
+        .transpose()?
+        .unwrap_or(false);
+    let collision_name = attr_value(tag, "collision")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .unwrap_or_else(|| "none".to_string());
+    let collision = match collision_name.as_str() {
+        "none" => PrimitiveCollisionMode::None,
+        "solid" if matches!(kind, VegetationKind::Tree | VegetationKind::Deadwood) => {
+            PrimitiveCollisionMode::Solid
+        }
+        "solid" => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "VegetationAsset \"{id}\" kind=\"{kind_name}\" does not support solid collision in V1."
+                ),
+            });
+        }
+        _ => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "VegetationAsset \"{id}\" collision=\"{collision_name}\" is invalid. Use none or solid."
+                ),
+            });
+        }
+    };
+    Ok(VegetationAssetNode {
+        id: id.to_string(),
+        kind,
+        height,
+        material,
+        material_definition: None,
+        stem_material,
+        stem_material_definition: None,
+        trunk_material,
+        trunk_material_definition: None,
+        foliage_material,
+        foliage_material_definition: None,
+        density,
+        branch_levels,
+        seed,
+        lod,
+        wind,
+        collision,
+    })
+}
+
+fn vegetation_material_attr(tag: &str, attribute: &str) -> Option<String> {
+    attr_value(tag, attribute).map(|value| strip_wrappers(&value).to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_vegetation_material_slots(
+    id: &str,
+    kind: VegetationKind,
+    material: Option<&str>,
+    stem_material: Option<&str>,
+    trunk_material: Option<&str>,
+    foliage_material: Option<&str>,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    let invalid = |message: String| Err(GraphParseError { line, message });
+    match kind {
+        VegetationKind::Tree | VegetationKind::Shrub => {
+            if trunk_material.is_none() || foliage_material.is_none() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" tree/shrub requires trunkMaterial and foliageMaterial."
+                ));
+            }
+            if material.is_some() || stem_material.is_some() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" tree/shrub uses trunkMaterial and foliageMaterial, not material or stemMaterial."
+                ));
+            }
+        }
+        VegetationKind::Grass | VegetationKind::Fern => {
+            if material.is_none() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" grass/fern requires material."
+                ));
+            }
+            if stem_material.is_some() || trunk_material.is_some() || foliage_material.is_some() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" grass/fern only supports material."
+                ));
+            }
+        }
+        VegetationKind::Flower => {
+            if material.is_none() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" flower requires material."
+                ));
+            }
+            if trunk_material.is_some() || foliage_material.is_some() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" flower supports material and optional stemMaterial."
+                ));
+            }
+        }
+        VegetationKind::Deadwood => {
+            if trunk_material.is_none() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" deadwood requires trunkMaterial."
+                ));
+            }
+            if material.is_some() || stem_material.is_some() || foliage_material.is_some() {
+                return invalid(format!(
+                    "VegetationAsset \"{id}\" deadwood only supports trunkMaterial."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_vegetation_u32(
+    tag: &str,
+    attribute: &str,
+    id: &str,
+    line: usize,
+) -> Result<Option<u32>, GraphParseError> {
+    attr_value(tag, attribute)
+        .map(|value| {
+            strip_wrappers(&value)
+                .parse::<u32>()
+                .map_err(|_| GraphParseError {
+                    line,
+                    message: format!(
+                        "VegetationAsset \"{id}\" {attribute} must be an unsigned integer."
+                    ),
+                })
+        })
+        .transpose()
 }
 
 fn parse_primitive_asset(
@@ -2553,6 +3631,9 @@ fn parse_primitive_asset(
     let mut allowed = match shape.as_str() {
         "box" | "wedge" => vec!["id", "shape", "size", "color"],
         "sphere" => vec!["id", "shape", "radius", "segments", "rings", "color"],
+        "capsule" => vec![
+            "id", "shape", "radius", "height", "segments", "rings", "color",
+        ],
         "plane" => vec!["id", "shape", "size", "segments", "color"],
         "cylinder" | "cone" => {
             vec!["id", "shape", "radius", "height", "segments", "color"]
@@ -2561,7 +3642,7 @@ fn parse_primitive_asset(
             return Err(GraphParseError {
                 line,
                 message: format!(
-                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, plane, cylinder, cone, or wedge."
+                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, capsule, plane, cylinder, cone, or wedge."
                 ),
             });
         }
@@ -2590,6 +3671,7 @@ fn parse_primitive_asset(
         if !allowed.contains(&attribute.as_str()) {
             let guidance = match shape.as_str() {
                 "sphere" => "Use radius=\"...\" and optional segments/rings.",
+                "capsule" => "Use radius=\"...\", height=\"...\", and optional segments/rings.",
                 "box" | "wedge" | "plane" => "Use size={...}.",
                 "cylinder" | "cone" => "Use radius=\"...\", height=\"...\", and optional segments.",
                 _ => unreachable!(),
@@ -2619,6 +3701,15 @@ fn parse_primitive_asset(
                 radius: parse_positive_primitive_number(tag, "radius", id, line)?,
                 segments,
                 rings: parse_primitive_segments(tag, "rings", segments / 2, id, line)?,
+            }
+        }
+        "capsule" => {
+            let segments = parse_primitive_segments(tag, "segments", 24, id, line)?;
+            PrimitiveGeometry::Capsule {
+                radius: parse_positive_primitive_number(tag, "radius", id, line)?,
+                height: parse_positive_primitive_number(tag, "height", id, line)?,
+                segments,
+                rings: parse_primitive_segments(tag, "rings", 12, id, line)?,
             }
         }
         "cylinder" => PrimitiveGeometry::Cylinder {
@@ -2668,6 +3759,16 @@ fn parse_primitive_asset(
             ),
         });
     }
+    if let PrimitiveGeometry::Capsule { radius, height, .. } = &geometry
+        && *height < *radius * 2.0
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{id}\" capsule height must be at least twice its radius."
+            ),
+        });
+    }
     let material_seed = parse_optional_primitive_u64(tag, "materialSeed", id, line)?;
     let collision = parse_primitive_collision(tag, id, &geometry, line)?;
     Ok(PrimitiveAssetNode {
@@ -2714,6 +3815,7 @@ fn parse_primitive_collision(
         "auto" => PrimitiveColliderShape::Auto,
         "box" => PrimitiveColliderShape::Box,
         "sphere" => PrimitiveColliderShape::Sphere,
+        "capsule" => PrimitiveColliderShape::Capsule,
         "plane" => PrimitiveColliderShape::Plane,
         "cylinder" => PrimitiveColliderShape::Cylinder,
         "cone" => PrimitiveColliderShape::Cone,
@@ -2723,7 +3825,7 @@ fn parse_primitive_collision(
             return Err(GraphParseError {
                 line,
                 message: format!(
-                    "PrimitiveAsset \"{id}\" collider=\"{other}\" is invalid. Use auto, box, sphere, plane, cylinder, cone, convex, or mesh."
+                    "PrimitiveAsset \"{id}\" collider=\"{other}\" is invalid. Use auto, box, sphere, capsule, plane, cylinder, cone, convex, or mesh."
                 ),
             });
         }
@@ -2758,6 +3860,7 @@ fn parse_primitive_collision(
         match geometry {
             PrimitiveGeometry::Box { .. } => PrimitiveColliderShape::Box,
             PrimitiveGeometry::Sphere { .. } => PrimitiveColliderShape::Sphere,
+            PrimitiveGeometry::Capsule { .. } => PrimitiveColliderShape::Capsule,
             PrimitiveGeometry::Plane { .. } => PrimitiveColliderShape::Plane,
             PrimitiveGeometry::Cylinder { .. } => PrimitiveColliderShape::Cylinder,
             PrimitiveGeometry::Cone { .. } => PrimitiveColliderShape::Cone,
@@ -2791,6 +3894,7 @@ fn parse_primitive_collision(
         && !matches!(
             effective_shape,
             PrimitiveColliderShape::Sphere
+                | PrimitiveColliderShape::Capsule
                 | PrimitiveColliderShape::Cylinder
                 | PrimitiveColliderShape::Cone
         )
@@ -2806,13 +3910,15 @@ fn parse_primitive_collision(
     if height.is_some()
         && !matches!(
             effective_shape,
-            PrimitiveColliderShape::Cylinder | PrimitiveColliderShape::Cone
+            PrimitiveColliderShape::Capsule
+                | PrimitiveColliderShape::Cylinder
+                | PrimitiveColliderShape::Cone
         )
     {
         return Err(GraphParseError {
             line,
             message: format!(
-                "PrimitiveAsset \"{id}\" colliderHeight requires a cylinder or cone collider."
+                "PrimitiveAsset \"{id}\" colliderHeight requires a capsule, cylinder, or cone collider."
             ),
         });
     }
@@ -4093,6 +5199,29 @@ fn parse_resource_ref_array(
     Ok(out)
 }
 
+fn parse_string_array(raw: &str, line: usize, field: &str) -> Result<Vec<String>, GraphParseError> {
+    let text = strip_wrappers(raw).trim();
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| GraphParseError {
+            line,
+            message: format!("{field} must be an array of strings."),
+        })?;
+    let values = split_top_level_csv(inner)
+        .into_iter()
+        .map(|value| strip_wrappers(value.trim()).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(GraphParseError {
+            line,
+            message: format!("{field} cannot be empty."),
+        });
+    }
+    Ok(values)
+}
+
 fn parse_resource_ref(
     token: &str,
     line: usize,
@@ -4773,8 +5902,8 @@ mod tests {
         ColorSpace, GraphApplyScope, GraphAssetKind, GraphAssetSource, GraphParseError, InputType,
         PassCache, PassKind, PassRole, PassTransitionClips, PassTransitionEasing,
         PassTransitionFallback, PassTransitionMode, PrimitiveColliderShape, PrimitiveCollisionMode,
-        PrimitiveGeometry, Quality, ResourceRef, SceneNode, TextureFormat, is_graph_script,
-        parse_graph_script,
+        PrimitiveGeometry, Quality, ResourceRef, SceneNode, TextureFormat, VegetationKind,
+        VegetationLod, is_graph_script, parse_action_library_document, parse_graph_script,
     };
     use crate::scene::model::Scene3DNode;
 
@@ -4812,7 +5941,7 @@ mod tests {
     <Timeline>
       <Track id="main" space="world" z="0">
         <Sequence from="0s" duration="1s" out="hold">
-          <Layer>
+          <Layer id="empty_layer">
             <Text x="24" y="48" value="Comment OK" fontSize="24" color="#111111" />
           </Layer>
         </Sequence>
@@ -7100,7 +8229,7 @@ Font note: this is not a structured XML comment.
   <Assets>
     <ModelAsset id="actor_asset" src="actor.glb" />
   </Assets>
-  <Scene id="scene">
+  <Scene id="TerrainScene">
     <Timeline>
       <Track>
         <Sequence duration="1s">
@@ -7115,7 +8244,7 @@ Font note: this is not a structured XML comment.
       </Track>
     </Timeline>
   </Scene>
-  <Present from="scene" />
+  <Present from="TerrainScene" />
 </Graph>
 "#;
         let error = parse_graph_script(script).expect_err("invalid canonical bone must fail");
@@ -7137,7 +8266,7 @@ Font note: this is not a structured XML comment.
     <AnimationAsset id="sneak_walk_source" src="motions/sneak-walk.glb" />
   </Assets>
   <Action id="sneak_walk" source="sneak_walk_source"
-          sourceProfile="mixamo_humanoid" clip="Sneak Walk"
+          sourceProfile="fbx_humanoid" clip="Sneak Walk"
           skeleton="humanoid_v1" duration="3.2s">
     <Marker id="takeoff" time="0.4s" role="takeoff" />
     <Marker id="contact" time="1.6s" role="contact" />
@@ -7191,7 +8320,7 @@ Font note: this is not a structured XML comment.
         );
         assert_eq!(
             graph.actions[0].source_profile.as_deref(),
-            Some("mixamo_humanoid")
+            Some("fbx_humanoid")
         );
         assert_eq!(graph.actions[0].clip.as_deref(), Some("Sneak Walk"));
         assert_eq!(graph.actions[0].markers.len(), 3);
@@ -7366,6 +8495,54 @@ Font note: this is not a structured XML comment.
             Some("auto")
         );
         assert_eq!(graph.apply_actions[0].ground.as_deref(), Some("ship_deck"));
+    }
+
+    #[test]
+    fn graph_parser_accepts_semantic_seat_surface_binding() {
+        let graph = parse_graph_script(
+            r#"
+<Graph fps={30} duration="2s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="character" src="character.glb" />
+    <PrimitiveAsset id="seat_asset" shape="box" size={[2,0.1,0.7]} />
+  </Assets>
+  <Action id="sit" skeleton="humanoid_v1" duration="2s">
+    <Contact id="pelvis_seat" effector="pelvis" target="seat"
+             from="0.6" to="1" mode="surface" weight="1" />
+    <Pose t="0s">
+      <Bone id="hips" y="0" />
+    </Pose>
+  </Action>
+  <ContactSurface id="seat" source="bench" kind="seat" plane="top"
+                  forward={[0,0,1]} bounds={[2,0.7]} margin="0.01" />
+  <ApplyAction target="actor" action="sit" contactCorrection="auto"
+               contactTargets={{ seat: "seat" }} />
+  <Scene id="SeatScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="2s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <Model id="bench" asset="seat_asset" position={[0,0.5,0]} />
+              <Model id="actor" asset="character" position={[0,0,0]} />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="SeatScene" />
+</Graph>
+"#,
+        )
+        .expect("semantic seat contact should parse");
+        assert_eq!(graph.contact_surfaces[0].source, "bench");
+        assert_eq!(graph.actions[0].contacts[0].effector, "pelvis");
+        assert_eq!(
+            graph.apply_actions[0].contact_targets.get("seat"),
+            Some(&"seat".to_string())
+        );
+        assert!(graph.apply_actions[0].ground.is_none());
     }
 
     #[test]
@@ -7776,6 +8953,7 @@ Font note: this is not a structured XML comment.
   <Assets>
     <PrimitiveAsset id="box" shape="box" size={[1,2,3]} color="#FF000080" />
     <PrimitiveAsset id="sphere" shape="sphere" radius="0.5" segments="32" rings="12" />
+    <PrimitiveAsset id="capsule" shape="capsule" radius="0.2" height="0.8" segments="24" rings="12" />
     <PrimitiveAsset id="plane" shape="plane" size={[8,6]} segments="4" />
     <PrimitiveAsset id="cylinder" shape="cylinder" radius="1" height="2" />
     <PrimitiveAsset id="cone" shape="cone" radius="1" height="2" segments="16" />
@@ -7797,7 +8975,7 @@ Font note: this is not a structured XML comment.
 "##,
         )
         .expect("all V1 primitive shapes should parse");
-        assert_eq!(graph.assets.len(), 6);
+        assert_eq!(graph.assets.len(), 7);
         assert!(matches!(
             graph.assets[0].source,
             GraphAssetSource::Primitive(_)
@@ -7813,6 +8991,177 @@ Font note: this is not a structured XML comment.
         ));
         assert_eq!(sphere.collision.mode, PrimitiveCollisionMode::None);
         assert_eq!(sphere.collision.collider, PrimitiveColliderShape::Auto);
+    }
+
+    #[test]
+    fn terrain_asset_resolves_height_material_layers_and_blend_map() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[128,128]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" colorSpace="linear-srgb" />
+    <ImageAsset id="blend" src="blend.png" colorSpace="linear-srgb" />
+    <ImageAsset id="soil_color" src="soil.png" colorSpace="srgb" />
+    <MaterialAsset id="soil" baseColorTexture="soil_color" roughness="0.9" />
+    <MaterialAsset id="grass" baseColor="#4A713B" roughness="0.8" />
+    <TerrainAsset id="ground" heightMap="height" size={[40,30]}
+                  heightScale="5" heightOffset="-1" layers={["soil","grass"]}
+                  blendMap="blend" chunks={[4,3]} lod="half" collision="solid" />
+  </Assets>
+  <Scene id="TerrainScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="TerrainScene" />
+</Graph>"##,
+        )
+        .expect("terrain graph should parse");
+        let terrain = graph
+            .assets
+            .iter()
+            .find_map(|asset| asset.terrain())
+            .unwrap();
+        assert_eq!(terrain.height_map_src.as_deref(), Some("height.png"));
+        assert_eq!(terrain.blend_map_src.as_deref(), Some("blend.png"));
+        assert_eq!(terrain.layer_definitions.len(), 2);
+        assert_eq!(terrain.chunks, [4, 3]);
+        assert_eq!(terrain.lod, "half");
+        assert_eq!(terrain.collision, PrimitiveCollisionMode::Solid);
+    }
+
+    #[test]
+    fn terrain_asset_rejects_blend_map_without_layers() {
+        let error = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[128,128]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" />
+    <ImageAsset id="blend" src="blend.png" />
+    <MaterialAsset id="soil" baseColor="#604A38" />
+    <TerrainAsset id="ground" heightMap="height" size={[10,10]}
+                  material="soil" blendMap="blend" />
+  </Assets>
+  <Scene id="scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect_err("blendMap without layers must fail");
+        assert!(error.message.contains("layers and blendMap together"));
+    }
+
+    #[test]
+    fn terrain_asset_requires_linear_height_map_data() {
+        let error = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[128,128]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" colorSpace="srgb" />
+    <MaterialAsset id="soil" baseColor="#604A38" />
+    <TerrainAsset id="ground" heightMap="height" size={[10,10]} material="soil" />
+  </Assets>
+  <Scene id="scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect_err("height fields must not be gamma decoded");
+        assert!(
+            error
+                .message
+                .contains("must declare colorSpace=\"linear-srgb\""),
+            "unexpected parser error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn vegetation_assets_resolve_conditional_materials_and_runtime_settings() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[128,128]}>
+  <Assets>
+    <MaterialAsset id="bark" baseColor="#4B3426" roughness="0.95" />
+    <MaterialAsset id="leaves" baseColor="#315D2C" roughness="0.88" doubleSided="true" />
+    <VegetationAsset id="oak" kind="tree" height="7.5"
+      trunkMaterial="bark" foliageMaterial="leaves" density="24"
+      branchLevels="3" seed="77" lod="half" wind="true" collision="solid" />
+    <VegetationAsset id="fern" kind="fern" height="0.8"
+      material="leaves" density="18" seed="9" lod="auto" wind="true" />
+  </Assets>
+  <Scene id="vegetation_scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer id="vegetation_empty_layer">
+            <Rect id="vegetation_probe" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="vegetation_scene" />
+</Graph>"##,
+        )
+        .expect("V1 vegetation assets should parse");
+        let oak = graph
+            .assets
+            .iter()
+            .find_map(|asset| asset.vegetation())
+            .unwrap();
+        assert_eq!(oak.kind, VegetationKind::Tree);
+        assert_eq!(oak.lod, VegetationLod::Half);
+        assert!(oak.wind);
+        assert!(oak.trunk_material_definition.is_some());
+        assert!(oak.foliage_material_definition.is_some());
+        assert_eq!(oak.collision, PrimitiveCollisionMode::Solid);
+    }
+
+    #[test]
+    fn vegetation_asset_rejects_kind_specific_attributes() {
+        let error = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[128,128]}>
+  <Assets>
+    <MaterialAsset id="grass" baseColor="#315D2C" />
+    <VegetationAsset id="bad" kind="grass" height="0.8"
+      material="grass" branchLevels="2" />
+  </Assets>
+  <Scene id="scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect_err("grass must not silently accept branch settings");
+        assert!(error.message.contains("does not support branchLevels"));
     }
 
     #[test]
@@ -8099,6 +9448,65 @@ Font note: this is not a structured XML comment.
     }
 
     #[test]
+    fn capsule_and_rigged_compound_assets_parse_as_typed_data() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="limb" shape="capsule" radius="0.1" height="0.4"
+                    segments="20" rings="10" collision="solid" />
+    <CompoundAsset id="actor" rig="rig">
+      <Instance id="arm" asset="limb" bone="upper_arm_l" position={[0,-0.2,0]} />
+    </CompoundAsset>
+  </Assets>
+  <Skeleton id="rig" profile="motionloom_humanoid_v1"
+            sourceRig="character1_reference_v1" space="3d">
+    <Bone id="root" role="root" position={[0,0,0]} />
+    <Bone id="upper_arm_l" role="upper_arm" side="left" parent="root"
+          position={[-0.2,1.2,0]} rotation={[0,0,-5]} />
+    <BoneAxisMap>
+      <Axis bone="upper_arm_l" forward="rotationX:1" side="rotationZ:-1" />
+    </BoneAxisMap>
+  </Skeleton>
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>"##,
+        )
+        .expect("native rigged compound should parse");
+        let primitive = graph.assets[0].primitive().expect("capsule primitive");
+        assert!(matches!(
+            primitive.geometry,
+            PrimitiveGeometry::Capsule { .. }
+        ));
+        assert_eq!(primitive.collision.collider, PrimitiveColliderShape::Auto);
+        let compound = graph.assets[1].compound().expect("compound asset");
+        assert_eq!(compound.rig.as_deref(), Some("rig"));
+        assert_eq!(compound.instances[0].bone.as_deref(), Some("upper_arm_l"));
+        assert_eq!(graph.skeletons[0].space, "3d");
+        assert_eq!(
+            graph.skeletons[0].source_rig.as_deref(),
+            Some("character1_reference_v1")
+        );
+        let axes = graph.skeletons[0]
+            .bone_axis_map
+            .as_ref()
+            .expect("native rig axis map");
+        assert_eq!(axes.axes[0].bone, "upper_arm_l");
+        assert_eq!(axes.axes[0].side.as_deref(), Some("rotationZ:-1"));
+        assert_eq!(graph.skeletons[0].bones[1].z, "0");
+        assert_eq!(graph.skeletons[0].bones[1].rotation_z, "-5");
+    }
+
+    #[test]
     fn removed_procedural_box_shorthand_has_migration_error() {
         let error = parse_graph_script(
             r##"<Graph fps={30} duration="1s" size={[1,1]}>
@@ -8111,5 +9519,41 @@ Font note: this is not a structured XML comment.
         )
         .expect_err("removed shorthand must fail");
         assert!(error.message.contains("shorthand has been removed"));
+    }
+
+    #[test]
+    fn action_library_declaration_registers_namespaced_actions() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="2s" size={[320,180]}>
+  <ActionLibrary id="performance" src="actions.motionloom" actions={["bow"]} />
+  <Background color="#000000" />
+  <ApplyAction target="actor" action="performance.bow" at="0s" duration="2s" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("namespaced library action should validate before asset resolution");
+        assert_eq!(graph.action_libraries[0].id, "performance");
+        assert_eq!(graph.action_libraries[0].actions, ["bow"]);
+    }
+
+    #[test]
+    fn standalone_action_library_parses_authored_actions() {
+        let actions = parse_action_library_document(
+            r#"<ActionLibrary id="performance" skeleton="humanoid_v1">
+  <!-- Exported Action Editor metadata can span
+       more than one line. -->
+  <Action id="bow" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="hips" bend="0" />
+    </Pose>
+    <Pose t="1s">
+      <Bone id="hips" bend="8" />
+    </Pose>
+  </Action>
+</ActionLibrary>"#,
+        )
+        .expect("standalone library should parse");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].id, "bow");
     }
 }

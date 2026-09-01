@@ -274,8 +274,8 @@ pub fn load_glb_mesh_data(path: impl AsRef<Path>) -> Result<GlbMeshData, GlbLoad
 }
 
 /// Load nodes, skinning data, and animation clips from a GLB that may not
-/// contain renderable mesh primitives. Mixamo "Without Skin" exports use this
-/// shape after conversion to glTF.
+/// contain renderable mesh primitives. Animation-only humanoid exports use
+/// this shape after conversion to glTF.
 pub fn load_glb_animation_data(path: impl AsRef<Path>) -> Result<GlbMeshData, GlbLoadError> {
     let path = path.as_ref();
     let bytes = read_file(path)?;
@@ -325,6 +325,13 @@ pub fn parse_glb_metadata(path: &Path, bytes: &[u8]) -> Result<GlbMetadata, GlbL
         animation_names: string_names(chunks.json.get("animations")),
         has_skin: skin_count > 0,
     })
+}
+
+/// Return the source glTF JSON for in-crate inspectors that consume optional
+/// metadata such as VRM humanoid declarations. Rendering continues to use the
+/// typed mesh representation, so unknown extensions remain non-authoritative.
+pub(crate) fn parse_gltf_json_value(path: &Path, bytes: &[u8]) -> Result<Value, GlbLoadError> {
+    Ok(parse_gltf_or_glb_chunks(path, bytes)?.json)
 }
 
 pub fn parse_glb_mesh_data(path: &Path, bytes: &[u8]) -> Result<GlbMeshData, GlbLoadError> {
@@ -1968,7 +1975,7 @@ mod tests {
           "asset":{"version":"2.0"},
           "scene":0,
           "scenes":[{"nodes":[0]}],
-          "nodes":[{"name":"mixamorig:Hips"}],
+          "nodes":[{"name":"source:Hips"}],
           "skins":[{"joints":[0]}],
           "animations":[{"name":"Walk","channels":[],"samplers":[]}]
         }"#;

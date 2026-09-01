@@ -94,6 +94,60 @@ pub(crate) fn load_rgba_image_source(
     }
 }
 
+pub(crate) fn load_utf8_text_source(
+    src: &str,
+    resolver: &dyn AssetResolver,
+) -> Result<String, MotionLoomSceneRenderError> {
+    let bytes = if is_remote_image_source(src) {
+        if let Ok(crate::asset::AssetSource::Bytes(bytes)) = resolver.resolve(src) {
+            bytes
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                fetch_remote_asset_bytes(src)?
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                return Err(MotionLoomSceneRenderError::LoadActionLibrary {
+                    source_ref: src.to_string(),
+                    message: "browser hosts must preload the library with add_asset".to_string(),
+                });
+            }
+        }
+    } else {
+        match resolver.resolve(src) {
+            Ok(crate::asset::AssetSource::Bytes(bytes)) => bytes,
+            Ok(crate::asset::AssetSource::Path(path)) => {
+                let path = if path.exists() {
+                    path
+                } else {
+                    resolve_local_scene_asset_path(src)
+                };
+                fs::read(&path).map_err(|error| MotionLoomSceneRenderError::LoadActionLibrary {
+                    source_ref: src.to_string(),
+                    message: format!("{}: {error}", path.display()),
+                })?
+            }
+            Ok(crate::asset::AssetSource::Url(url)) => {
+                return Err(MotionLoomSceneRenderError::LoadActionLibrary {
+                    source_ref: src.to_string(),
+                    message: format!("URL source requires preloading: {url}"),
+                });
+            }
+            Err(message) => {
+                return Err(MotionLoomSceneRenderError::LoadActionLibrary {
+                    source_ref: src.to_string(),
+                    message,
+                });
+            }
+        }
+    };
+    String::from_utf8(bytes).map_err(|error| MotionLoomSceneRenderError::LoadActionLibrary {
+        source_ref: src.to_string(),
+        message: format!("library is not UTF-8: {error}"),
+    })
+}
+
 fn decode_image_bytes(src: &str, bytes: &[u8]) -> Result<RgbaImage, MotionLoomSceneRenderError> {
     image::load_from_memory(bytes)
         .map_err(|source| MotionLoomSceneRenderError::DecodeImage {

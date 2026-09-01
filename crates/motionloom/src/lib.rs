@@ -109,8 +109,10 @@ pub mod preview;
 pub mod preview_protocol;
 mod process;
 mod render_graph;
+mod rig_diagnostics;
 mod root;
 mod scene;
+mod shot_validation;
 pub mod simulation;
 mod world;
 
@@ -139,17 +141,30 @@ pub use render_graph::{
     RenderEffectScope, RenderPassDag, RenderPassDagEdge, RenderPassDagKind, RenderPassDagNode,
     RenderPassSpace, compile_render_pass_dag,
 };
+pub use rig_diagnostics::{
+    ActionDriver, ActionExecutionTrace, AppliedActionTrace, AxisEffectiveness, BoneDifference,
+    BoneDriver, BoneEvaluation, BonePoseStage, BoneStageTransform, ContactEvaluation,
+    FootContactTrace, RIG_DIAGNOSTICS_SCHEMA_VERSION, RigActionProvenance, RigAlignment,
+    RigAlignmentMode, RigAssetProvenance, RigCalibrationProposal, RigCalibrationSuggestion,
+    RigComparisonOptions, RigComparisonReport, RigComparisonStatus, RigDiagnostic,
+    RigDiagnosticSeverity, RigDifferenceCause, RigEvaluationCapabilities, RigEvaluationReport,
+    RigEvaluationRequest, RigProfileProvenance, RigProvenance, RigRecommendation, RigReportDetail,
+    RigSamplePoint, RigUnits, RootCauseAssessment, ScreenProjection, compare_humanoid_poses,
+    propose_rig_calibration, quaternion_angular_error_deg, rig_comparison_report_json,
+    rig_diagnostics_schema_json, rig_evaluation_report_json,
+};
 
 pub use common::keyframe::ScalarKeyframe;
 pub use dsl::{
-    ActionBoneNode, ActionContactNode, ActionNode, ActionPoseNode, AnimationKeyNode,
-    AnimationTargetNode, ApplyActionNode, BackgroundNode, GraphAssetKind, GraphAssetNode,
-    GraphAssetSource, GraphScript, ImageNode, ModelProfileBoneAxisMapNode,
-    ModelProfileBoneAxisNode, ModelProfileNode, ModelProfileRetargetMapNode,
-    ModelProfileRetargetNode, PrimitiveAssetNode, PrimitiveGeometry, ProcessDefinitionNode,
-    SkeletonBoneNode, SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode,
-    SkeletonLandmarkNode, SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode,
-    SvgNode, is_graph_script, parse_graph_script,
+    ActionBoneNode, ActionContactNode, ActionLibraryNode, ActionNode, ActionPoseNode,
+    AnimationKeyNode, AnimationTargetNode, ApplyActionNode, BackgroundNode, ContactSurfaceNode,
+    GraphAssetKind, GraphAssetNode, GraphAssetSource, GraphScript, ImageNode,
+    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
+    ModelProfileRetargetMapNode, ModelProfileRetargetNode, PrimitiveAssetNode, PrimitiveGeometry,
+    ProcessDefinitionNode, SkeletonBoneNode, SkeletonConstraintNode, SkeletonControlNode,
+    SkeletonGuideNode, SkeletonLandmarkNode, SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode,
+    SkeletonRegionNode, SvgNode, TerrainAssetNode, VegetationAssetNode, VegetationKind,
+    VegetationLod, is_graph_script, parse_action_library_document, parse_graph_script,
 };
 pub use error::{GraphParseError, MotionLoomError, RootGraphError, RuntimeCompileError};
 pub use preview::{
@@ -213,6 +228,12 @@ pub use scene::domain::{
     builtin_proportion_profile, builtin_proportion_profiles, builtin_skeleton_pose_presets,
     validate_skeleton,
 };
+pub use scene::editor_actions::{
+    ActionEditCommand, ActionEditError, EditableAction, EditableActionBinding, EditableActionBone,
+    EditableActionContact, EditableActionDiagnostic, EditableActionDocument, EditableActionPose,
+    EditableModelTarget, EditableSkeleton, EditableSkeletonBone, apply_action_edit,
+    extract_editable_action_document,
+};
 pub use scene::editor_keyframes::{
     AnimationKeyframeEditError, EditableAnimationKey, EditableAnimationTarget,
     EditableAnimationTimeline, animation_target_inline_curve_expression, editable_animation_target,
@@ -251,25 +272,36 @@ pub use scene::text::{
     TextAlignMode, TextAnimatorNode, TextEffectNode, TextGlowEffectNode, TextLayoutNode, TextNode,
     TextOverflowMode, TextSelectorKind, TextStyleOverrideNode, TextTransformNode, TextWrapMode,
 };
+pub use shot_validation::{
+    ActorVisibilityObservation, CameraClearanceObservation, CompositionObservation,
+    ExposureObservation, PenetrationObservation, ProjectedJointObservation, ShotValidationCheck,
+    ShotValidationCheckReport, ShotValidationFrameObservation, ShotValidationIssue,
+    ShotValidationOptions, ShotValidationReport, ShotValidationSeverity, ShotValidationStatus,
+    ShotValidationSummary, ShotValidator, analyze_exposure, analyze_shot_observations,
+    shot_validation_sample_frames,
+};
 pub use world::error::{MotionLoomWorldError, WorldAssetError, WorldError, WorldParseError};
 pub use world::{
-    BodyBasisProposal, BoneAxisProposal, CharacterDesignGpuViewport, CharacterDesignViewportFrame,
-    EnvironmentAnchorProposal, EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic,
-    EnvironmentSurfaceProposal, GlbEnvironmentInspectionReport, GlbLoadError, GlbMeshData,
-    GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HumanoidBoneProposal, JointAlternative,
-    ModelInspectionDiagnostic, ModelInspectionError, RestPoseProposal, Scene3DFrameProfile,
+    ActorPoseDiagnostic, BodyBasisProposal, BoneAxisProposal, CharacterDesignGpuViewport,
+    CharacterDesignViewportFrame, DetectedHumanoidRig, EnvironmentAnchorProposal,
+    EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic, EnvironmentSurfaceProposal,
+    GlbEnvironmentInspectionReport, GlbHumanoidProfileInspectionReport, GlbLoadError, GlbMeshData,
+    GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HumanoidActionCompatibilityReport,
+    HumanoidBoneProposal, JointAlternative, JointPoseDiagnostic, ModelInspectionDiagnostic,
+    ModelInspectionError, PoseDiagnosticError, RestPoseProposal, Scene3DFrameProfile,
     SemanticAxisProposal, WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor,
     WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
     WorldCamera, WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldFrameRenderer,
-    WorldGpuDiagnostics, WorldGraph, WorldMaterial, WorldMaterialStyle, WorldModelProfile,
-    WorldNode, WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget, WorldRenderError,
-    WorldRenderProgress, WorldRetarget, WorldRetargetMap, WorldSpritePlayback, WorldTime,
-    diagnose_world_glb_gpu_plan, diagnose_world_graph_actor_gpu_frame,
-    inspect_glb_environment_bytes, inspect_glb_environment_json, inspect_glb_environment_path,
-    inspect_glb_skeleton_bytes, inspect_glb_skeleton_json, inspect_glb_skeleton_path,
-    is_world_graph_script, load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data,
-    parse_glb_metadata, parse_world_graph_script, render_world_frame,
-    render_world_graph_to_png_sequence_with_progress,
+    WorldGpuDiagnostics, WorldGraph, WorldLighting, WorldMaterial, WorldMaterialStyle,
+    WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget,
+    WorldRenderError, WorldRenderProgress, WorldRetarget, WorldRetargetMap, WorldSpritePlayback,
+    WorldTime, diagnose_world_actor_pose, diagnose_world_glb_gpu_plan,
+    diagnose_world_graph_actor_gpu_frame, evaluate_world_actor_rig, inspect_glb_environment_bytes,
+    inspect_glb_environment_json, inspect_glb_environment_path, inspect_glb_humanoid_profile_bytes,
+    inspect_glb_humanoid_profile_json, inspect_glb_skeleton_bytes, inspect_glb_skeleton_json,
+    inspect_glb_skeleton_path, inspect_humanoid_action_compatibility, is_world_graph_script,
+    load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data, parse_glb_metadata,
+    parse_world_graph_script, render_world_frame, render_world_graph_to_png_sequence_with_progress,
     render_world_graph_to_png_sequence_with_progress_and_cancel,
     render_world_graph_to_video_with_progress,
 };

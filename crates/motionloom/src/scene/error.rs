@@ -54,6 +54,14 @@ pub enum MotionLoomSceneRenderError {
     },
     #[error("failed to fetch media asset ({url}): {message}")]
     FetchAsset { url: String, message: String },
+    #[error("failed to load ActionLibrary ({source_ref}): {message}")]
+    LoadActionLibrary { source_ref: String, message: String },
+    #[error("failed to parse ActionLibrary ({source_ref}) at line {line}: {message}")]
+    ParseActionLibrary {
+        source_ref: String,
+        line: usize,
+        message: String,
+    },
     #[error("failed to decode image asset ({source_ref}): {source}")]
     DecodeImage {
         source_ref: String,

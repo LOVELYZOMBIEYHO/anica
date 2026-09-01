@@ -48,12 +48,22 @@ Use this when the caller expects a scene/composition graph and wants typed
 control over rendering.
 
 `GraphAssetSource`, `MaterialAssetNode`, `PrimitiveAssetNode`, `PrimitiveGeometry`,
-`PrimitiveCollisionNode`, and `CompoundAssetNode` expose the typed asset
+`PrimitiveCollisionNode`, `TerrainAssetNode`, `VegetationAssetNode`,
+`VegetationKind`, `VegetationLod`, and `CompoundAssetNode` expose the typed asset
 representation used by generated geometry. External GLB, individual
 primitives, and compound primitive assets remain distinct through parsing and
 asset resolution. A resolved PrimitiveAsset retains its referenced PBR
 MaterialAsset so native and WASM world renderers consume the same self-contained
 material definition after CompoundAsset expansion.
+`TerrainAssetNode` retains its resolved height map, optional RGBA blend map,
+and up to four resolved PBR layer definitions. Terrain is an additive
+`GraphAssetSource::Terrain` variant and therefore does not change existing
+PrimitiveAsset, external ModelAsset, or CompoundAsset behavior.
+`VegetationAssetNode` retains its resolved kind-specific MaterialAssets and
+bounded generation, LOD, wind, and collision settings. Vegetation is an
+additive `GraphAssetSource::Vegetation` variant and does not change existing
+DSL assets. As with any new public Rust enum variant, downstream exhaustive
+matches over `GraphAssetSource` must add the Vegetation case or a wildcard.
 `MaterialAssetNode` also carries transmissive PBR controls (`transmission`,
 `ior`, optical `thickness`, attenuation, depth-write policy, and sort priority)
 without coupling the visual material to PrimitiveAsset collision.
@@ -195,12 +205,18 @@ legacy World implementation types. A `CompositeGroup space="3d"` accepts:
 - `DirectionalLight`, `PointLight`, `SpotLight`, and `RectAreaLight`
 - `AmbientOcclusion` and `ContactShadow`
 - `ColorManagement` with `aces`, `reinhard`, or `none` tone mapping
+- `AtmosphereFog` with `linear`, `exp`, or height-aware distance attenuation;
+  optional `boundsMin`/`boundsMax` and `edgeFeather` confine the medium to a
+  world-space box without changing unbounded scenes
+- optional `Camera3D` depth-of-field optics (`focusTarget`, `focusDistance`,
+  `focalLength`, `fStop`, and `maxBlur`)
 
 The renderer caches decoded environments across frames, uploads linear
 RGBA16F mip levels, and evaluates animated light values per frame. The same
 contract is used by `SceneRenderer`, GPU-texture rendering, native export, and
 WASM WebGPU rendering. Existing scenes with no authored light retain the
-legacy studio-light fallback.
+legacy studio-light fallback. Existing cameras without `depthOfField="true"`
+skip the depth-aware post pass and retain their previous output path.
 
 ## Process / Layer FX APIs
 
@@ -436,6 +452,8 @@ not be treated as the main MotionLoom integration path yet:
 - `render_world_graph_to_video_with_progress`
 - `render_world_graph_to_png_sequence_with_progress`
 - GLB metadata and diagnostics helpers
+- Animation-only GLB inspection data and byte/path loaders used by external
+  authoring tools
 - Anica/editor-oriented helpers such as `experimental::effects`,
   `experimental::keyframe`, `experimental::transitions`, and
   `experimental::clip`
@@ -484,6 +502,18 @@ tooling that needs to inspect or generate UI-editable scene graphs:
   environments camera-safe. `ApplyAction.groundOffset` separates a target rig's
   root origin from the physical surface while preserving all older action
   syntax.
+- `ApplyAction.ground` also accepts the Model id of a `TerrainAsset` whose
+  collision mode is `solid`. This additive provider raycasts the generated
+  terrain collision triangles; existing semantic Surface ids retain priority
+  and unchanged behavior. Position-animated humanoids over solid terrain
+  should declare `Model collision="kinematic"`.
+- `ContactSurfaceNode` and `ApplyAction.contactTargets` add semantic support
+  planes without changing `ApplyAction.ground`. The first runtime profile is
+  `kind="seat"`: an Action `Contact` may use `effector="pelvis"`,
+  `target="seat"`, and `mode="surface"`. Primitive top planes follow Model
+  translation, rotation, and scale; random-access native and WASM frames use
+  the same stateless resolver. Missing fields remain optional and older Graphs
+  deserialize with an empty contact-surface registry.
 - `CharacterNode` and `PartNode` for bone-attached or dense vector artwork.
 - `PuppetNode`, `PinNode`, `MeshTopologyNode`, `VertexNode`, `TriangleNode`,
   `EdgeNode`, and `RegionNode` for AE-style pin deformation and optional manual
@@ -516,6 +546,38 @@ Frame-key UI integrations can use:
 These helpers re-parse generated DSL after write-back, so UI saves fail fast
 instead of emitting invalid MotionLoom text.
 
+Action-authoring integrations can use the experimental editor surface:
+
+- `extract_editable_action_document(script)` returns editable Action, Pose,
+  Bone channel, Contact, ApplyAction binding, Skeleton, and Model target data.
+- `apply_action_edit(script, command)` applies one typed `ActionEditCommand`
+  such as `SetBoneChannel`, `AddPose`, `MirrorPose`, `UpsertContact`, or
+  `SetBinding`.
+- `motionloom_editable_actions_json(script)` and
+  `motionloom_apply_action_edit(script, command_json)` expose the same contract
+  to WASM browser hosts.
+- `inspect_humanoid_action_compatibility(action, profile)` reports missing
+  required body mappings and optional mappings actually referenced by the
+  Action. It is read-only and does not change retargeting or playback.
+
+External clip-backed Actions are inspectable and retain editable Contact and
+ApplyAction metadata, but authored Pose commands reject them. This prevents a
+visual editor from pretending it can rewrite animation data stored inside an
+external GLB.
+
+`ActionLibraryNode` is an additive Graph declaration for selectively importing
+authored Actions from a standalone MotionLoom file. Imported ids use
+`library.action` namespaces and the renderer caches the hydrated graph. Native
+resolvers support project-relative paths and URLs; WASM hosts register the
+library bytes through the existing asset resolver before rendering. No
+`ActionAsset` type is introduced and existing Action APIs are unchanged.
+
+The workspace `motionloom-action-tool` binary is the supported offline bridge
+from an animated glTF/GLB clip to a standalone canonical `<Action>`. Its
+dependency points towards `motionloom`; neither the stable renderer API nor
+the WASM runtime depends on the converter. Imported source animation therefore
+never becomes a runtime or deployment requirement.
+
 Animation capability discovery is available through
 `animation_property_descriptor`, `animation_properties_for_node_kind`,
 `animation_property_schema_json`, and `inspect_animation_targets`. They share
@@ -528,6 +590,42 @@ machine-readable `MotionLoomAuthoringReport`, including parse and compile
 status, source-addressed errors and warnings, effective graph facts, and
 recommended repairs. Invalid authored DSL is represented by
 `status: "unrenderable"` rather than a thrown WASM exception.
+
+## Shot Validation
+
+Shot quality validation is an additive runtime API; it does not add tags or
+attributes to the MotionLoom DSL. Use a persistent renderer for render-derived
+checks:
+
+```rust
+let options = motionloom::api::ShotValidationOptions::cinematic();
+let report = renderer.validate_shots(&graph, options).await?;
+```
+
+`SceneRenderer::validate_shots` samples an inclusive frame range and currently
+computes linear-light average luminance, dark/highlight ratios, clipped-pixel
+ratio, and a 64-bin luminance histogram from actual rendered RGBA frames. On
+WASM, the renderer also consumes the exact Action Editor joint projection for
+framing checks when a 3D humanoid snapshot is available.
+
+Backends and hosts feed additional typed `ShotValidationFrameObservation`
+values to `validate_shots_with_observations`. Supported observations cover
+projected joints, ID/depth visibility samples, penetration depth, camera
+clearance/path sweeps, and external composition scores. `observedChecks`
+distinguishes an evaluated empty result from missing data. Enabled checks with
+no observations are reported as `unavailable`, never as a fabricated pass.
+
+Browser hosts use `WasmSceneRenderer.validate_shots_json(options, observations)`
+or the render-independent `motionloom_analyze_shot_observations_json`. Native
+CI can run:
+
+```text
+cargo run -p motionloom --example shot_validation -- scene.motionloom strict gpu
+```
+
+The report is versioned JSON suitable for Action Editor, Anica, CI, or a later
+Vision LLM review stage. A Vision LLM remains an orchestration concern above
+MotionLoom and is not invoked by this API.
 
 Use `motionloom_dsl_schema_json()` to retrieve the complete registered DSL
 catalog before generation. Its `requiredAttributes` field makes mandatory
@@ -547,6 +645,14 @@ Anchor proposals, confidence, diagnostics, and a starter DSL fragment. The WASM 
 `motionloom_inspect_glb_environment_json(asset_label, bytes)` operates on bytes
 that a browser host has already fetched; inspection never requires a public
 `World` authoring API.
+
+Humanoid importers may opt into `inspect_glb_humanoid_profile_bytes` or
+`inspect_glb_humanoid_profile_json`. These additive APIs prioritize VRM 1.0 or
+0.x humanoid metadata, then validate known Mixamo-compatible names and joint
+hierarchy, and finally reuse the existing geometry/name heuristic. Their WASM
+wrapper is `motionloom_inspect_glb_humanoid_profile_json(asset_label, bytes)`.
+The existing `inspect_glb_skeleton_*` report shape and `humanoid_v1` DSL remain
+unchanged for compatibility.
 
 Low-level kernel resolution helpers such as `default_kernel_for_effect` and
 `resolve_pass_kernel` are also kept for compatibility. Prefer the process
@@ -579,7 +685,55 @@ rotational impulses, rolling friction and fixed-step island sleeping.
 | Discover available process effects | `process_effects` |
 | Analyze LLM-authored DSL and suggest repairs | `motionloom_analyze_script_json` |
 | Analyze for a specific renderer | `motionloom_analyze_script_for_target_json` |
+| Validate rendered shot quality | `SceneRenderer::validate_shots` |
+| Merge renderer/editor observations | `SceneRenderer::validate_shots_with_observations` |
+| Evaluate the final humanoid rig at one Scene frame | `SceneRenderer::evaluate_rig_frame` |
+| Compare two versioned humanoid reports | `compare_humanoid_poses` |
+| Generate read-only calibration suggestions | `propose_rig_calibration` |
 | Generate one example's learning schema | `motionloom_showcase_schema_json` |
 | GPU preview texture | `SceneRenderer::render_frame_to_wgpu_texture` |
 | Host-owned zero-copy target | `SceneRenderer::render_frame_to_wgpu_target_texture` |
 | Cross-platform preview abstraction | `SceneRenderer::render_frame_to_preview_surface` |
+
+## Stable Rig Evaluation and Comparison
+
+`SceneRenderer::evaluate_rig_frame` samples the same 3D path used for the
+rendered frame. Its versioned `RigEvaluationReport` records asset, profile and
+Action provenance; active/inactive Action layers and normalized phase; each
+canonical bone's driver, stage transforms and effective axis declarations;
+ground/contact settings; and final screen projection. Missing stages remain
+explicitly unavailable instead of being estimated.
+
+`compare_humanoid_poses` compares two reports by canonical bone and returns
+angular/endpoint errors, the first divergent stage, a rule-based root-cause
+category and evidence. `propose_rig_calibration` is deliberately read-only. It
+will not recommend `BoneAxisMap` changes when a baked-reference driver bypasses
+those semantic axes.
+
+Native command-line workflows are available without changing the DSL:
+
+```text
+cargo run -p motionloom --example rig_scene_evaluate -- scene.motionloom actor 120 report.json
+cargo run -p motionloom --example rig_scene_evaluate -- scene.motionloom actor phase:standard_walk_loop:0.5 report.json
+cargo run -p motionloom --example rig_compare -- reference.json candidate.json comparison.json
+cargo run -p motionloom --example rig_calibrate -- comparison.json proposal.json
+```
+
+Browser hosts use `WasmSceneRenderer.evaluate_rig_json` for frame, time, or
+Action-phase requests, or `evaluate_rig_frame_json` as a convenience. Pure JSON
+comparison and calibration entry points are `motionloom_compare_rigs_json` and
+`motionloom_propose_rig_calibration_json`. These APIs are additive and do not
+add tags or attributes to MotionLoom DSL.
+
+## Experimental Low-level Pose Diagnostics
+
+Offline authoring and parity tests may call
+`motionloom::experimental::diagnose_world_actor_pose`. It evaluates existing
+Action DSL through the runtime's CPU pose evaluator and returns read-only,
+column-major model-global joint matrices. It does not fetch assets, submit GPU
+work, mutate playback, or include scene contact/skin deformation.
+
+WASM exposes the additive `WasmPoseDiagnostics` handle with the same evaluation
+stage. Prefer the stable Scene report when contact, constraints or camera
+projection matter. Existing rendering and editor APIs are unchanged, and the
+DSL remains the authored source of truth.

@@ -374,7 +374,11 @@ pub fn motionloom_dsl_schema_json() -> String {
                     "strict".to_string()
                 },
                 required_attributes: required_attributes(name),
-                discriminator: (name == &"PrimitiveAsset").then(|| "shape".to_string()),
+                discriminator: match *name {
+                    "PrimitiveAsset" => Some("shape".to_string()),
+                    "VegetationAsset" => Some("kind".to_string()),
+                    _ => None,
+                },
                 variants: tag_variants(name),
                 attributes,
             })
@@ -396,6 +400,8 @@ pub fn motionloom_dsl_schema_json() -> String {
             "audio".to_string(),
             "animation".to_string(),
             "primitive".to_string(),
+            "terrain".to_string(),
+            "vegetation".to_string(),
             "compound".to_string(),
             "material".to_string(),
         ],
@@ -613,6 +619,9 @@ fn append_semantic_diagnostics(
             crate::dsl::PrimitiveGeometry::Sphere {
                 segments, rings, ..
             } => (*segments).max(*rings),
+            crate::dsl::PrimitiveGeometry::Capsule {
+                segments, rings, ..
+            } => (*segments).max(*rings),
             crate::dsl::PrimitiveGeometry::Plane { segments, .. }
             | crate::dsl::PrimitiveGeometry::Cylinder { segments, .. }
             | crate::dsl::PrimitiveGeometry::Cone { segments, .. } => *segments,
@@ -648,6 +657,97 @@ fn append_semantic_diagnostics(
         .filter(|tag| tag.name == "Model")
         .filter_map(|tag| Some((attribute_value(tag, "id")?, attribute_value(tag, "asset")?)))
         .collect::<BTreeMap<_, _>>();
+    for surface in &graph.contact_surfaces {
+        if !model_assets.contains_key(&surface.source) {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Error,
+                code: "CONTACT_SURFACE_SOURCE_NOT_FOUND".to_string(),
+                phase: "contact-surface".to_string(),
+                line: find_tag_line(tags, "ContactSurface", Some(&surface.id)),
+                column: 1,
+                tag: Some("ContactSurface".to_string()),
+                node_id: Some(surface.id.clone()),
+                attribute: Some("source".to_string()),
+                authored_value: Some(surface.source.clone()),
+                effective_value: None,
+                message: format!(
+                    "ContactSurface '{}' references unknown Model '{}'.",
+                    surface.id, surface.source
+                ),
+                effect: "The semantic contact plane cannot follow scene geometry.".to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "choose-model".to_string(),
+                    message: "Set source to an existing Model id.".to_string(),
+                    replacement: model_assets.keys().next().cloned(),
+                    attribute: Some("source".to_string()),
+                    confidence: Some(0.98),
+                }],
+            });
+        }
+    }
+    for apply in &graph.apply_actions {
+        if apply.contact_correction.as_deref() != Some("auto") {
+            continue;
+        }
+        let Some(action) = graph
+            .actions
+            .iter()
+            .find(|action| action.id == apply.action)
+        else {
+            continue;
+        };
+        for contact in action
+            .contacts
+            .iter()
+            .filter(|contact| contact.target != "ground")
+        {
+            if apply.contact_targets.contains_key(&contact.target) {
+                continue;
+            }
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Warning,
+                code: "ACTION_CONTACT_TARGET_UNBOUND".to_string(),
+                phase: "contact-surface".to_string(),
+                line: find_tag_line(tags, "ApplyAction", None),
+                column: 1,
+                tag: Some("ApplyAction".to_string()),
+                node_id: Some(apply.target.clone()),
+                attribute: Some("contactTargets".to_string()),
+                authored_value: None,
+                effective_value: Some("contact skipped".to_string()),
+                message: format!(
+                    "Action '{}' declares a '{}' contact but ApplyAction does not bind that slot.",
+                    action.id, contact.target
+                ),
+                effect: "The authored semantic contact will not correct penetration.".to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "bind-contact-surface".to_string(),
+                    message: format!(
+                        "Add contactTargets={{{{ {}: \"surface_id\" }}}}.",
+                        contact.target
+                    ),
+                    replacement: None,
+                    attribute: Some("contactTargets".to_string()),
+                    confidence: Some(0.99),
+                }],
+            });
+        }
+    }
+    let solid_terrain_assets = graph
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            asset
+                .terrain()
+                .filter(|terrain| terrain.collision == crate::dsl::PrimitiveCollisionMode::Solid)
+                .map(|terrain| terrain.id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let solid_terrain_models = model_assets
+        .iter()
+        .filter(|(_, asset)| solid_terrain_assets.contains(*asset))
+        .map(|(model, _)| model.clone())
+        .collect::<BTreeSet<_>>();
     for body in tags.iter().filter(|tag| {
         tag.name == "RigidBody" && attribute_value(tag, "type").as_deref() == Some("dynamic")
     }) {
@@ -756,7 +856,12 @@ fn append_semantic_diagnostics(
         let Some(ground) = attribute_value(tag, "ground") else {
             continue;
         };
-        if !surface_ids.contains(&ground) {
+        if !surface_ids.contains(&ground) && !solid_terrain_models.contains(&ground) {
+            let known_grounds = surface_ids
+                .iter()
+                .chain(solid_terrain_models.iter())
+                .cloned()
+                .collect::<Vec<_>>();
             diagnostics.push(AuthoringDiagnostic {
                 severity: AuthoringDiagnosticSeverity::Error,
                 code: "ACTION_GROUND_SURFACE_NOT_FOUND".to_string(),
@@ -768,22 +873,83 @@ fn append_semantic_diagnostics(
                 attribute: Some("ground".to_string()),
                 authored_value: Some(ground.clone()),
                 effective_value: None,
-                message: format!("ApplyAction ground references unknown Surface '{ground}'."),
+                message: format!(
+                    "ApplyAction ground references unknown Surface or solid Terrain Model '{ground}'."
+                ),
                 effect: "The actor cannot be deterministically grounded.".to_string(),
                 suggestions: vec![AuthoringSuggestion {
                     kind: "choose-known-surface".to_string(),
-                    message: if surface_ids.is_empty() {
-                        "Add <Surface id=\"ground\" kind=\"ground\" ... /> inside Environment."
+                    message: if known_grounds.is_empty() {
+                        "Add a Surface, or instantiate a TerrainAsset collision=\"solid\" as a Model."
                             .to_string()
                     } else {
                         format!(
-                            "Use one of the known surface ids: {}.",
-                            surface_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+                            "Use one of the known ground ids: {}.",
+                            known_grounds.join(", ")
                         )
                     },
-                    replacement: surface_ids.iter().next().cloned(),
+                    replacement: known_grounds.first().cloned(),
                     attribute: Some("ground".to_string()),
                     confidence: Some(0.95),
+                }],
+            });
+        }
+    }
+    if !solid_terrain_models.is_empty() {
+        let action_targets = tags
+            .iter()
+            .filter(|tag| tag.name == "ApplyAction")
+            .filter_map(|tag| attribute_value(tag, "target"))
+            .collect::<BTreeSet<_>>();
+        let moving_targets = graph
+            .animation_targets
+            .iter()
+            .filter(|target| {
+                matches!(
+                    target.property.to_ascii_lowercase().as_str(),
+                    "position" | "positionx" | "positiony" | "positionz"
+                )
+            })
+            .map(|target| target.node.clone())
+            .collect::<BTreeSet<_>>();
+        for model in tags.iter().filter(|tag| tag.name == "Model") {
+            let Some(model_id) = attribute_value(model, "id") else {
+                continue;
+            };
+            if !action_targets.contains(&model_id) || !moving_targets.contains(&model_id) {
+                continue;
+            }
+            let collision = attribute_value(model, "collision")
+                .unwrap_or_else(|| "none".to_string())
+                .to_ascii_lowercase();
+            if matches!(
+                collision.as_str(),
+                "kinematic" | "character" | "character_controller"
+            ) {
+                continue;
+            }
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Warning,
+                code: "MOVING_HUMANOID_TERRAIN_COLLISION_DISABLED".to_string(),
+                phase: "kinematic-collision".to_string(),
+                line: model.line,
+                column: model.column,
+                tag: Some("Model".to_string()),
+                node_id: Some(model_id),
+                attribute: Some("collision".to_string()),
+                authored_value: Some(collision),
+                effective_value: Some("none".to_string()),
+                message: "A moving humanoid is used with solid terrain but has no kinematic collision."
+                    .to_string(),
+                effect: "Authored root height is preserved, so feet can float above or penetrate uneven terrain."
+                    .to_string(),
+                suggestions: vec![AuthoringSuggestion {
+                    kind: "set-attribute".to_string(),
+                    message: "Set collision=\"kinematic\" on the humanoid Model."
+                        .to_string(),
+                    replacement: Some("kinematic".to_string()),
+                    attribute: Some("collision".to_string()),
+                    confidence: Some(0.99),
                 }],
             });
         }
@@ -1178,6 +1344,7 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
                     inferred_auto_collider: match &asset.geometry {
                         crate::dsl::PrimitiveGeometry::Box { .. } => "box",
                         crate::dsl::PrimitiveGeometry::Sphere { .. } => "sphere",
+                        crate::dsl::PrimitiveGeometry::Capsule { .. } => "capsule",
                         crate::dsl::PrimitiveGeometry::Cylinder { .. } => "cylinder",
                         crate::dsl::PrimitiveGeometry::Cone { .. }
                         | crate::dsl::PrimitiveGeometry::Wedge { .. } => "convex_hull",
@@ -1282,6 +1449,10 @@ fn build_showcase_schema(
                     .map(|asset| {
                         if asset.primitive().is_some() {
                             "primitive".to_string()
+                        } else if asset.terrain().is_some() {
+                            "terrain".to_string()
+                        } else if asset.vegetation().is_some() {
+                            "vegetation".to_string()
                         } else if asset.compound().is_some() {
                             "compound".to_string()
                         } else {
@@ -1303,8 +1474,11 @@ fn required_attributes(tag: &str) -> Vec<String> {
         "Graph" => &["fps", "duration", "size"],
         "RigidBody" => &["id", "target", "dimension", "type"],
         "PrimitiveAsset" => &["id", "shape"],
+        "TerrainAsset" => &["id", "heightMap", "size"],
+        "VegetationAsset" => &["id", "kind", "height"],
         "CompoundAsset" => &["id"],
         "MaterialAsset" => &["id"],
+        "ActionLibrary" => &["id", "src", "actions"],
         "Instance" => &["asset"],
         _ => &[],
     };
@@ -1315,6 +1489,58 @@ fn required_attributes(tag: &str) -> Vec<String> {
 }
 
 fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
+    if tag == "VegetationAsset" {
+        return [
+            (
+                "tree",
+                vec!["id", "kind", "height", "trunkMaterial", "foliageMaterial"],
+                vec![
+                    "density",
+                    "branchLevels",
+                    "seed",
+                    "lod",
+                    "wind",
+                    "collision",
+                ],
+            ),
+            (
+                "shrub",
+                vec!["id", "kind", "height", "trunkMaterial", "foliageMaterial"],
+                vec!["density", "branchLevels", "seed", "lod", "wind"],
+            ),
+            (
+                "grass",
+                vec!["id", "kind", "height", "material"],
+                vec!["density", "seed", "lod", "wind"],
+            ),
+            (
+                "flower",
+                vec!["id", "kind", "height", "material"],
+                vec!["stemMaterial", "density", "seed", "lod", "wind"],
+            ),
+            (
+                "fern",
+                vec!["id", "kind", "height", "material"],
+                vec!["density", "seed", "lod", "wind"],
+            ),
+            (
+                "deadwood",
+                vec!["id", "kind", "height", "trunkMaterial"],
+                vec!["branchLevels", "seed", "lod", "wind", "collision"],
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, required, optional)| {
+            (
+                kind.to_string(),
+                ShowcaseTagVariantSchema {
+                    required: required.into_iter().map(str::to_string).collect(),
+                    optional: optional.into_iter().map(str::to_string).collect(),
+                },
+            )
+        })
+        .collect();
+    }
     if tag != "PrimitiveAsset" {
         return BTreeMap::new();
     }
@@ -1323,6 +1549,11 @@ fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
         (
             "sphere",
             vec!["id", "shape", "radius"],
+            vec!["segments", "rings", "color"],
+        ),
+        (
+            "capsule",
+            vec!["id", "shape", "radius", "height"],
             vec!["segments", "rings", "color"],
         ),
         (
@@ -1836,10 +2067,39 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "restitution",
             "density",
         ]),
-        "CompoundAsset" => strict(&["id", "materialSeed"]),
+        "TerrainAsset" => strict(&[
+            "id",
+            "heightMap",
+            "size",
+            "heightScale",
+            "heightOffset",
+            "material",
+            "layers",
+            "blendMap",
+            "chunks",
+            "lod",
+            "collision",
+        ]),
+        "VegetationAsset" => strict(&[
+            "id",
+            "kind",
+            "height",
+            "material",
+            "stemMaterial",
+            "trunkMaterial",
+            "foliageMaterial",
+            "density",
+            "branchLevels",
+            "seed",
+            "lod",
+            "wind",
+            "collision",
+        ]),
+        "CompoundAsset" => strict(&["id", "rig", "materialSeed"]),
         "Instance" => strict(&[
             "id",
             "asset",
+            "bone",
             "position",
             "rotation",
             "scale",
@@ -1879,6 +2139,20 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "horizonLock",
             "horizon_lock",
             "hiddenBones",
+            "depthOfField",
+            "depth_of_field",
+            "focusTarget",
+            "focus_target",
+            "focusDistance",
+            "focus_distance",
+            "focusOffset",
+            "focus_offset",
+            "focalLength",
+            "focal_length",
+            "fStop",
+            "f_stop",
+            "maxBlur",
+            "max_blur",
         ]),
         "Anchor" => strict(&[
             "id",
@@ -1959,6 +2233,27 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "whiteBalance",
             "white_balance",
             "contrast",
+        ]),
+        "AtmosphereFog" => strict(&[
+            "id",
+            "mode",
+            "color",
+            "density",
+            "start",
+            "end",
+            "baseHeight",
+            "base_height",
+            "heightFalloff",
+            "height_falloff",
+            "scattering",
+            "affectSky",
+            "affect_sky",
+            "boundsMin",
+            "bounds_min",
+            "boundsMax",
+            "bounds_max",
+            "edgeFeather",
+            "edge_feather",
         ]),
         "EnvironmentDebug" | "PhysicsDebug" => strict(&[
             "axes",
@@ -2239,6 +2534,10 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Fill" => strict(&["slot"]),
         "Use" => open(&["id", "ref"]),
         "Vary" => open(&["property", "values", "range", "choose"]),
+        "ActionLibrary" => strict(&["id", "src", "actions"]),
+        "ContactSurface" => strict(&[
+            "id", "source", "kind", "plane", "position", "normal", "forward", "bounds", "margin",
+        ]),
         "Action" => open(&[
             "id",
             "source",
@@ -2259,6 +2558,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "x",
             "y",
             "z",
+            "position",
             "rotation",
             "rotationX",
             "rotationY",
@@ -2272,8 +2572,12 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "bend",
             "turn",
             "opacity",
+            "interpolation",
+            "inTangent",
+            "outTangent",
         ]),
         "IK" => open(&[
+            "id",
             "root",
             "mid",
             "end",
@@ -2319,6 +2623,8 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "syncMarker",
             "sync_marker",
             "ground",
+            "contactTargets",
+            "contact_targets",
             "contactCorrection",
             "contact_correction",
             "groundOffset",
@@ -2361,7 +2667,10 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         ]),
         "Skeleton" => strict(&[
             "id",
+            "space",
             "profile",
+            "sourceRig",
+            "source_rig",
             "height",
             "facing",
             "symmetryAxis",
@@ -2927,6 +3236,8 @@ const KNOWN_TAGS: &[&str] = &[
     "ModelAsset",
     "MaterialAsset",
     "PrimitiveAsset",
+    "TerrainAsset",
+    "VegetationAsset",
     "CompoundAsset",
     "Instance",
     "AudioAsset",
@@ -2944,6 +3255,7 @@ const KNOWN_TAGS: &[&str] = &[
     "Physics",
     "Camera3D",
     "Anchor",
+    "AtmosphereFog",
     "EnvironmentLight",
     "DirectionalLight",
     "PointLight",
@@ -3022,6 +3334,7 @@ const KNOWN_TAGS: &[&str] = &[
     "Use",
     "Variants",
     "Vary",
+    "ActionLibrary",
     "Action",
     "Pose",
     "Marker",
@@ -3196,9 +3509,28 @@ const ALL_KNOWN_ATTRIBUTES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthoringStatus, motionloom_analyze_script_json, motionloom_dsl_schema_json,
-        motionloom_showcase_schema_json,
+        AuthoringStatus, analyze_motionloom_script_for_target, motionloom_analyze_script_json,
+        motionloom_dsl_schema_json, motionloom_showcase_schema_json,
     };
+
+    #[test]
+    fn atmosphere_fog_and_camera_optics_are_known_authoring_schema() {
+        let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Scene id="main">
+    <Timeline><Track><Sequence duration="1s"><Layer>
+      <CompositeGroup space="3d">
+        <AtmosphereFog id="mist" mode="height" color="#BFD9C8" density="0.02" start="2" end="30" baseHeight="0.4" heightFalloff="0.2" scattering="0.1" affectSky="true" boundsMin={[-4,0,-8]} boundsMax={[4,6,-1]} edgeFeather="0.75" />
+        <Camera3D id="portrait" position={[0,1,5]} target={[0,1,0]} depthOfField="true" focusDistance="5" focusOffset="0" focalLength="50" fStop="2.8" maxBlur="8" />
+      </CompositeGroup>
+    </Layer></Sequence></Track></Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##;
+        let value: serde_json::Value =
+            serde_json::from_str(&motionloom_analyze_script_json(script)).unwrap();
+        assert_eq!(value["summary"]["unknownTags"], 0);
+        assert_eq!(value["summary"]["ignoredAttributes"], 0);
+    }
 
     #[test]
     fn report_exposes_ignored_attributes_and_llm_repair_suggestions() {
@@ -3328,6 +3660,29 @@ mod tests {
     }
 
     #[test]
+    fn complete_schema_exposes_action_curve_and_ik_metadata() {
+        let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
+        let attributes_for = |tag: &str| {
+            value["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["tag"] == tag)
+                .unwrap_or_else(|| panic!("missing {tag} schema"))["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect::<Vec<_>>()
+        };
+        let bone = attributes_for("Bone");
+        for attribute in ["interpolation", "inTangent", "outTangent"] {
+            assert!(bone.contains(&attribute), "missing Bone.{attribute}");
+        }
+        assert!(attributes_for("IK").contains(&"id"), "missing IK.id");
+    }
+
+    #[test]
     fn dynamic_body_rejects_competing_transform_animation() {
         let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
   <Assets>
@@ -3384,6 +3739,155 @@ mod tests {
 </Graph>"##;
         let report = super::analyze_motionloom_script(script);
         assert_eq!(report.status, AuthoringStatus::Clean);
+    }
+
+    #[test]
+    fn solid_terrain_model_is_a_cross_backend_ground_provider() {
+        let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" colorSpace="linear-srgb" />
+    <MaterialAsset id="soil" shading="pbr" baseColor="#615544" />
+    <TerrainAsset id="terrain" heightMap="height" size={[10,10]} heightScale="2"
+                  material="soil" collision="solid" />
+    <ModelAsset id="hero_asset" src="hero.glb" />
+  </Assets>
+  <Action id="walk" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="hips" rotationX="0" />
+    </Pose>
+    <Pose t="1s">
+      <Bone id="hips" rotationX="0" />
+    </Pose>
+    <Contact id="foot" effector="foot_l" target="ground" from="0" to="1" mode="lock" />
+  </Action>
+  <ApplyAction target="hero" action="walk" ground="terrain_model"
+               contactCorrection="auto" />
+  <Scene id="main">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup id="world" space="3d" depth="true">
+              <Model id="terrain_model" asset="terrain" />
+              <Model id="hero" asset="hero_asset" collision="kinematic" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="hero" property="positionZ">
+    <Key time="0s" value="2" /><Key time="1s" value="-2" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"##;
+        let native = analyze_motionloom_script_for_target(script, "native-webgpu");
+        let wasm = analyze_motionloom_script_for_target(script, "wasm-webgpu");
+        assert!(
+            native.parse_succeeded && native.compile_succeeded,
+            "{native:#?}"
+        );
+        assert!(wasm.parse_succeeded && wasm.compile_succeeded, "{wasm:#?}");
+        assert_eq!(native.diagnostics, wasm.diagnostics);
+        assert!(
+            !native
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "ACTION_GROUND_SURFACE_NOT_FOUND" })
+        );
+    }
+
+    #[test]
+    fn moving_humanoid_without_kinematic_collision_warns_on_solid_terrain() {
+        let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" colorSpace="linear-srgb" />
+    <MaterialAsset id="soil" shading="pbr" baseColor="#615544" />
+    <TerrainAsset id="terrain" heightMap="height" size={[10,10]} heightScale="2"
+                  material="soil" collision="solid" />
+    <ModelAsset id="hero_asset" src="hero.glb" />
+  </Assets>
+  <Action id="walk" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s">
+      <Bone id="hips" rotationX="0" />
+    </Pose>
+    <Pose t="1s">
+      <Bone id="hips" rotationX="0" />
+    </Pose>
+  </Action>
+  <ApplyAction target="hero" action="walk" />
+  <Scene id="main">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup id="world" space="3d" depth="true">
+              <Model id="terrain_model" asset="terrain" />
+              <Model id="hero" asset="hero_asset" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="hero" property="positionZ">
+    <Key time="0s" value="2" /><Key time="1s" value="-2" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"##;
+        let report = analyze_motionloom_script_for_target(script, "native-webgpu");
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "MOVING_HUMANOID_TERRAIN_COLLISION_DISABLED"
+                    && diagnostic.node_id.as_deref() == Some("hero")
+                    && diagnostic.suggestions[0].replacement.as_deref() == Some("kinematic")
+            }),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn semantic_contact_diagnostics_report_missing_source_and_binding() {
+        let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <ModelAsset id="hero_asset" src="hero.glb" />
+  </Assets>
+  <Action id="sit" skeleton="humanoid_v1" duration="1s">
+    <Contact id="pelvis_seat" effector="pelvis" target="seat" from="0" to="1" mode="surface" weight="1" />
+    <Pose t="0s">
+      <Bone id="hips" rotationX="0" />
+    </Pose>
+    <Pose t="1s">
+      <Bone id="hips" rotationX="0" />
+    </Pose>
+  </Action>
+  <ContactSurface id="seat" source="missing_bench" kind="seat" plane="top" />
+  <ApplyAction target="hero" action="sit" ground="floor" contactCorrection="auto" />
+  <Scene id="main">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup id="world" space="3d" depth="true">
+              <Model id="hero" asset="hero_asset" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##;
+        let report = analyze_motionloom_script_for_target(script, "native-webgpu");
+        assert!(report.parse_succeeded, "{report:#?}");
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CONTACT_SURFACE_SOURCE_NOT_FOUND"
+                && diagnostic.node_id.as_deref() == Some("seat")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "ACTION_CONTACT_TARGET_UNBOUND"
+                && diagnostic.node_id.as_deref() == Some("hero")
+        }));
     }
 
     #[test]

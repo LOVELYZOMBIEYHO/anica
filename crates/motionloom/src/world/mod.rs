@@ -5,6 +5,8 @@ pub mod model;
 pub mod model_inspection;
 pub mod primitive;
 pub mod render;
+pub mod terrain;
+pub mod vegetation;
 
 pub use dsl::{is_world_graph_script, parse_world_graph_script};
 pub use gltf_loader::{
@@ -13,20 +15,28 @@ pub use gltf_loader::{
 };
 pub use model::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldApplyAction,
-    WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera,
-    WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldColorManagement,
-    WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind, WorldLighting, WorldMaterial,
-    WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldPresent,
-    WorldProfileRetarget, WorldRetarget, WorldRetargetMap, WorldSpritePlayback, WorldTime,
+    WorldAtmosphereFog, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
+    WorldCamera, WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldColorManagement,
+    WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind,
+    WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
+    WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetarget, WorldRetargetMap,
+    WorldSpritePlayback, WorldTime,
 };
 pub(crate) use model::{WorldAnimationAsset, WorldConstraint};
 pub use model_inspection::{
-    BodyBasisProposal, BoneAxisProposal, EnvironmentAnchorProposal, EnvironmentCoordinateProfile,
-    EnvironmentInspectionDiagnostic, EnvironmentSurfaceProposal, GlbEnvironmentInspectionReport,
-    GlbSkeletonInspectionReport, HumanoidBoneProposal, JointAlternative, ModelInspectionDiagnostic,
-    ModelInspectionError, RestPoseProposal, SemanticAxisProposal, inspect_glb_environment_bytes,
-    inspect_glb_environment_json, inspect_glb_environment_path, inspect_glb_skeleton_bytes,
-    inspect_glb_skeleton_json, inspect_glb_skeleton_path,
+    BodyBasisProposal, BoneAxisProposal, DetectedHumanoidRig, EnvironmentAnchorProposal,
+    EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic, EnvironmentSurfaceProposal,
+    GlbEnvironmentInspectionReport, GlbHumanoidProfileInspectionReport,
+    GlbSkeletonInspectionReport, HumanoidActionCompatibilityReport, HumanoidBoneProposal,
+    JointAlternative, ModelInspectionDiagnostic, ModelInspectionError, RestPoseProposal,
+    SemanticAxisProposal, inspect_glb_environment_bytes, inspect_glb_environment_json,
+    inspect_glb_environment_path, inspect_glb_humanoid_profile_bytes,
+    inspect_glb_humanoid_profile_json, inspect_glb_skeleton_bytes, inspect_glb_skeleton_json,
+    inspect_glb_skeleton_path, inspect_humanoid_action_compatibility,
+};
+pub use render::pose_diagnostics::{
+    ActorPoseDiagnostic, JointPoseDiagnostic, PoseDiagnosticError, diagnose_world_actor_pose,
+    evaluate_world_actor_rig,
 };
 pub use render::{
     CharacterDesignGpuViewport, CharacterDesignViewportFrame, Scene3DFrameProfile,

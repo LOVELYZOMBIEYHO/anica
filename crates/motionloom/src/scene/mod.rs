@@ -5,6 +5,7 @@ pub mod composition;
 pub mod domain;
 pub mod drawable;
 pub mod dsl;
+pub mod editor_actions;
 pub mod editor_keyframes;
 pub mod error;
 pub mod model;

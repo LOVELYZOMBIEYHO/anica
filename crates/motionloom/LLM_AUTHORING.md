@@ -311,6 +311,28 @@ remain shared. Prefer one ImageAsset/MaterialAsset reused by many instances;
 duplicating image declarations with different source strings prevents source
 identity sharing.
 
+Use `VegetationAsset` for bounded procedural plants, then place it with normal
+`Model` nodes. V1 kinds are `tree`, `shrub`, `grass`, `flower`, `fern`, and
+`deadwood`:
+
+```xml
+<VegetationAsset id="oak" kind="tree" height="7"
+  trunkMaterial="bark" foliageMaterial="leaf_atlas"
+  density="24" branchLevels="3" seed="20"
+  lod="auto" wind="true" collision="solid" />
+<VegetationAsset id="ferns" kind="fern" height="0.8"
+  material="fern_atlas" density="18" seed="77" lod="auto" wind="true" />
+```
+
+Trees and shrubs require `trunkMaterial` and `foliageMaterial`. Grass and fern
+require `material`; flower requires `material` and may set `stemMaterial`;
+deadwood requires `trunkMaterial`. Only tree and deadwood accept
+`collision="solid"`. `density` controls geometry within one asset; do not use
+it as a world scatter count. Reuse one asset with multiple Model nodes instead
+of duplicating declarations. Keep generated leaf, grass, flower, and fern
+atlases transparent and reference them through alpha-mask PBR MaterialAssets.
+Existing asset kinds require no migration; VegetationAsset is opt-in.
+
 For architectural glass, water, or transparent plastic, prefer physical
 transmission over lowering base-colour alpha:
 
@@ -361,8 +383,14 @@ as a floating-point mip chain; LDR inputs are converted from display gamma.
                  distance="0.35" softness="0.6" />
   <ColorManagement id="grade" toneMapping="aces" exposure="1"
                    whiteBalance="5600" contrast="1.06" />
-  <Camera3D position={[6,4,8]} target={[0,1,0]} fov="38" />
-  <Model asset="hero" castShadow="true" receiveShadow="true" />
+  <AtmosphereFog id="mist" mode="height" color="#BFD9C8"
+                 density="0.018" start="3" end="34"
+                 baseHeight="0.35" heightFalloff="0.12"
+                 scattering="0.1" affectSky="true" />
+  <Camera3D position={[6,4,8]} target={[0,1,0]} fov="38"
+            depthOfField="true" focusTarget="@hero_model"
+            focalLength="50" fStop="2.8" maxBlur="8" />
+  <Model id="hero_model" asset="hero" castShadow="true" receiveShadow="true" />
 </CompositeGroup>
 ```
 
@@ -378,6 +406,28 @@ Lighting and grading values such as `rotationY`, `intensity`, `exposure`,
 `whiteBalance`, and `contrast` are registered `AnimationTarget` channels.
 Query the animation property schema before writing keys rather than inventing
 properties.
+
+`AtmosphereFog` is world-owned: use `linear`, `exp`, or `height` mode and keep
+density low for bright outdoor scenes. Omit `boundsMin` and `boundsMax` for the
+legacy global medium. Provide both to confine fog to a world-space box; use
+`edgeFeather` to soften its boundary. A camera outside the box can still see
+fog along rays that pass through it, so indoor-to-outdoor shots do not require
+a screen mask or a timeline switch.
+
+```xml
+<AtmosphereFog mode="exp" color="#668FA8" density="0.045"
+               boundsMin={[-20,-2,-30]} boundsMax={[20,20,-3.2]}
+               edgeFeather="1.5" affectSky="true" />
+```
+
+This is an additive `0.1.x` extension: existing tags without bounds keep their
+previous result. Before, local fog required an approximate compositing mask;
+now the optional bounds provide depth-aware world-space confinement.
+
+Depth of field is camera-owned and is a real depth-buffer post pass.
+`focusTarget` accepts an Anchor or Model reference; otherwise the camera target
+distance is used. Omit `depthOfField` to preserve the zero-cost sharp render
+path.
 
 ### Deterministic humanoid traversal
 
@@ -466,7 +516,7 @@ For a vault, roll, jump, or climb, put semantic markers on the executable
 `Action` and align them to environment anchors through `ApplyAction`:
 
 ```xml
-<Action id="vault" source="vault_clip" sourceProfile="mixamo_humanoid"
+<Action id="vault" source="vault_clip" sourceProfile="fbx_humanoid"
         skeleton="humanoid_v1" duration="3s">
   <Marker id="takeoff" role="takeoff" time="0.6s" />
   <Marker id="contact" role="contact" time="1.4s" />
@@ -594,7 +644,8 @@ remain valid.
 
 For a reusable kneel, plant, brace, or hand-contact interval, declare
 normalized clip-phase contacts inside the executable `Action`, then bind the
-semantic `ground` target to a concrete Scene `Surface` at application time:
+semantic `ground` target to a concrete Scene `Surface`, or to the Model id of
+a `TerrainAsset collision="solid"`, at application time:
 
 ```xml
 <Action id="repair_kneel" source="character_clips" clip="Fixing_Kneeling">
@@ -610,12 +661,37 @@ semantic `ground` target to a concrete Scene `Surface` at application time:
 
 Contact percentages refer to the imported GLB clip's normalized time, not the
 Graph or ApplyAction duration. `contactCorrection="auto"` is opt-in and
-requires both a `ground` Surface binding and at least one `<Contact />` on the
-referenced Action. The deterministic solver corrects the actor root first,
+requires both a `ground` binding and at least one `<Contact />` on the
+referenced Action. Use `collision="kinematic"` on a moving humanoid Model when
+solid terrain is present. The deterministic solver corrects the actor root first,
 then applies only small residual two-bone IK adjustments to distal hands and
 feet. Knee and elbow contacts use root correction because they are middle
 joints, not two-bone IK endpoints. Actions without contacts retain their
 existing behavior.
+
+For sitting, lying, leaning, or other prop-relative support, do not resize the
+prop to hide mesh penetration. Declare a semantic `ContactSurface` and bind the
+Action target slot:
+
+```xml
+<ContactSurface id="bench_seat" source="bench_seat_model" kind="seat"
+                plane="top" forward={[0,0,1]} bounds={[2.8,0.72]}
+                margin="0.02" />
+<Action id="sit" skeleton="humanoid_v1" duration="2s">
+  <Pose t="0s">...</Pose>
+  <Contact id="pelvis_seat" effector="pelvis" target="seat"
+           from="62%" to="100%" mode="surface" weight="1" />
+</Action>
+<ApplyAction target="character" action="sit" contactCorrection="auto"
+             contactTargets={{ seat: "bench_seat" }} />
+```
+
+Use `source` as a Scene Model id, not an asset id. Prefer `plane="top"` for a
+PrimitiveAsset seat. Use explicit `position`, `normal`, and `forward` when the
+support is imported geometry. Keep `ground` alongside `contactTargets` when
+feet must also follow terrain. A persistent seated idle should author the seat
+Contact from `0` to `1`; the solver then keeps support active at direct seeks
+and Action boundaries.
 
 `Track space="world"` is a valid 2D Scene coordinate mode.
 
@@ -744,6 +820,20 @@ inspection reports no clips, use Actions or IK instead.
 
 ### Reusable external humanoid motion and multi-model staging
 
+For large Action Editor output, prefer a standalone `ActionLibrary` document
+instead of pasting thousands of Pose keys into the scene:
+
+```xml
+<ActionLibrary id="performance" src="actions/performance.motionloom"
+               actions={["formal_bow","kneel_down","stand_up"]} />
+<ApplyAction target="character_a" action="performance.formal_bow" />
+```
+
+Use the declaration id as a namespace. Do not invent `ActionAsset`, do not put
+`ActionLibrary` inside `<Assets>`, and do not reference an unlisted library
+Action. The library file contains an `ActionLibrary` root with authored
+`Action` children; v1 intentionally excludes AnimationAsset-backed Actions.
+
 Use `AnimationAsset` only as a low-level raw clip container. Wrap it in an
 executable `Action`; `ApplyAction.action` always references the `Action` id and
 never an `AnimationAsset` id. The target `Model` supplies geometry, materials,
@@ -757,7 +847,7 @@ and its mapped skeleton:
 
 <Action id="sneak_walk"
         source="sneak_walk_source"
-        sourceProfile="mixamo_humanoid"
+        sourceProfile="fbx_humanoid"
         clip="Sneak Walk"
         skeleton="humanoid_v1" />
 
@@ -774,7 +864,7 @@ and its mapped skeleton:
              face="character_b" />
 ```
 
-`sourceProfile="mixamo_humanoid"` canonicalizes common Mixamo joint names on
+`sourceProfile="fbx_humanoid"` canonicalizes common namespaced humanoid joint names on
 the motion source. `motionloom_humanoid_v1` is the clean built-in target profile;
 custom `ModelProfile` mappings remain available for non-standard GLBs.
 `rootMotion="match_target"` follows the named Anchor over the authored action

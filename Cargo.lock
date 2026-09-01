@@ -19,6 +19,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
+name = "adler"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f26201604c87b1e01bd3d98f8d5d9a8fcbb815e8cedb41ffccbeb4bf593a35fe"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1940,6 +1946,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6893be161f67561d1f69f722c833ae63499918531713941e50ce9b1c2a95ead"
 dependencies = [
  "draco-core",
+ "miniz_oxide 0.6.2",
  "thiserror 2.0.18",
 ]
 
@@ -2210,7 +2217,7 @@ dependencies = [
  "bit_field",
  "half",
  "lebe",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "rayon-core",
  "smallvec",
  "zune-inflate",
@@ -2286,7 +2293,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -4285,6 +4292,15 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b275950c28b37e794e8c55d88aeb5e139d0ce23fdbbeda68f8d7174abdf9e8fa"
+dependencies = [
+ "adler",
+]
+
+[[package]]
+name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
@@ -4353,6 +4369,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "ureq 2.12.1",
  "url",
@@ -4364,6 +4381,20 @@ dependencies = [
  "windows 0.61.3",
  "winit",
  "x11rb",
+]
+
+[[package]]
+name = "motionloom-action-tool"
+version = "0.1.0"
+dependencies = [
+ "draco-io",
+ "motionloom",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ufbx",
 ]
 
 [[package]]
@@ -5621,7 +5652,7 @@ dependencies = [
  "crc32fast",
  "fdeflate",
  "flate2",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -5634,7 +5665,7 @@ dependencies = [
  "crc32fast",
  "fdeflate",
  "flate2",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -8126,6 +8157,15 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ufbx"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6d09c5c5a8ce72ad7853b9c92c2b0aae0a4ae0167055f2ddaabecd7e9bec870"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

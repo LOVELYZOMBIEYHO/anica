@@ -49,6 +49,9 @@ pub struct WorldLighting {
     pub contact_shadow_softness: f32,
     #[serde(default)]
     pub color_management: WorldColorManagement,
+    /// Optional world-space atmospheric fog. None keeps the previous shader result.
+    #[serde(default)]
+    pub atmosphere_fog: Option<WorldAtmosphereFog>,
 }
 
 impl Default for WorldLighting {
@@ -62,8 +65,29 @@ impl Default for WorldLighting {
             contact_shadow_distance: default_world_contact_distance(),
             contact_shadow_softness: default_world_contact_softness(),
             color_management: WorldColorManagement::default(),
+            atmosphere_fog: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldAtmosphereFog {
+    pub mode: String,
+    pub color: [f32; 3],
+    pub density: f32,
+    pub start: f32,
+    pub end: f32,
+    pub base_height: f32,
+    pub height_falloff: f32,
+    pub scattering: f32,
+    pub affect_sky: bool,
+    /// Finite world-space bounds enable local fog; None retains global fog.
+    #[serde(default)]
+    pub bounds_min: Option<[f32; 3]>,
+    #[serde(default)]
+    pub bounds_max: Option<[f32; 3]>,
+    #[serde(default)]
+    pub edge_feather: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -246,6 +270,17 @@ pub struct WorldCamera {
     pub zoom: String,
     pub fov: String,
     pub orthographic_scale: Option<String>,
+    /// Optional camera optics. None retains the no-post-process fast path.
+    #[serde(default)]
+    pub depth_of_field: Option<WorldDepthOfField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldDepthOfField {
+    pub focus_distance: String,
+    pub focal_length_mm: String,
+    pub f_stop: String,
+    pub max_blur_px: String,
 }
 
 impl Default for WorldCamera {
@@ -271,6 +306,7 @@ impl Default for WorldCamera {
             zoom: "1".to_string(),
             fov: "35".to_string(),
             orthographic_scale: None,
+            depth_of_field: None,
         }
     }
 }
@@ -294,6 +330,13 @@ pub struct WorldActor {
     /// Typed procedural geometry bypasses external asset resolution.
     #[serde(default)]
     pub primitive: Option<crate::dsl::PrimitiveAssetNode>,
+    /// Heightfield terrain uses the same retained PBR mesh path as primitives.
+    #[serde(default)]
+    pub terrain: Option<crate::dsl::TerrainAssetNode>,
+    /// Procedural vegetation retains its generation and wind metadata beside
+    /// the actor while sharing the normal PBR mesh pipeline.
+    #[serde(default)]
+    pub vegetation: Option<crate::dsl::VegetationAssetNode>,
     pub path_style: WorldPathStyle,
     pub hide_meshes: Vec<String>,
     pub hide_materials: Vec<String>,
@@ -525,6 +568,14 @@ pub struct WorldActionBone {
     pub turn: Option<String>,
     pub scale: Option<String>,
     pub opacity: Option<String>,
+    /// Interpolation from this key to the next key. Omission preserves the
+    /// original linear Action behavior.
+    #[serde(default)]
+    pub interpolation: Option<String>,
+    #[serde(default)]
+    pub in_tangent: Option<String>,
+    #[serde(default)]
+    pub out_tangent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

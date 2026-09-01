@@ -13,7 +13,7 @@ mod fonts;
 pub(crate) use assets::scene_asset_relative_suffixes;
 pub use assets::{clear_scene_asset_roots, set_scene_asset_roots};
 pub(crate) use assets::{
-    default_world_asset_root, load_rgba_image_source, load_svg_source,
+    default_world_asset_root, load_rgba_image_source, load_svg_source, load_utf8_text_source,
     resolve_local_scene_asset_path,
 };
 

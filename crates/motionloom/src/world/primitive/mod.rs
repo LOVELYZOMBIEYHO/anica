@@ -3,6 +3,7 @@
 // crates/motionloom/src/world/primitive/mod.rs
 
 mod box_mesh;
+mod capsule_mesh;
 mod cone_mesh;
 mod cylinder_mesh;
 mod plane_mesh;
@@ -48,6 +49,12 @@ pub fn generate_primitive_mesh_textured(
             segments,
             rings,
         } => sphere_mesh::generate(&mut builder, *radius, *segments, *rings),
+        PrimitiveGeometry::Capsule {
+            radius,
+            height,
+            segments,
+            rings,
+        } => capsule_mesh::generate(&mut builder, *radius, *height, *segments, *rings),
         PrimitiveGeometry::Plane { size, segments } => {
             plane_mesh::generate(&mut builder, *size, *segments)
         }
@@ -76,6 +83,10 @@ pub fn primitive_bounds(geometry: &PrimitiveGeometry) -> ([f32; 3], [f32; 3]) {
         PrimitiveGeometry::Sphere { radius, .. } => {
             ([-radius, -radius, -radius], [*radius, *radius, *radius])
         }
+        PrimitiveGeometry::Capsule { radius, height, .. } => (
+            [-radius, -height * 0.5, -radius],
+            [*radius, height * 0.5, *radius],
+        ),
         PrimitiveGeometry::Plane { size, .. } => (
             [-size[0] * 0.5, 0.0, -size[1] * 0.5],
             [size[0] * 0.5, 0.0, size[1] * 0.5],
@@ -225,6 +236,18 @@ fn hash_geometry(geometry: &PrimitiveGeometry, hash: &mut u64) {
             hash_bytes(hash, &segments.to_le_bytes());
             hash_bytes(hash, &rings.to_le_bytes());
         }
+        PrimitiveGeometry::Capsule {
+            radius,
+            height,
+            segments,
+            rings,
+        } => {
+            hash_bytes(hash, &[6]);
+            hash_bytes(hash, &radius.to_bits().to_le_bytes());
+            hash_bytes(hash, &height.to_bits().to_le_bytes());
+            hash_bytes(hash, &segments.to_le_bytes());
+            hash_bytes(hash, &rings.to_le_bytes());
+        }
         PrimitiveGeometry::Plane { size, segments } => {
             hash_bytes(hash, &[3]);
             size.iter()
@@ -261,7 +284,7 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 }
 
 #[derive(Default)]
-pub(super) struct MeshBuilder {
+pub(crate) struct MeshBuilder {
     positions: Vec<[f32; 3]>,
     normals: Vec<Option<[f32; 3]>>,
     texcoords: Vec<Option<[f32; 2]>>,
@@ -269,7 +292,7 @@ pub(super) struct MeshBuilder {
 }
 
 impl MeshBuilder {
-    pub(super) fn vertex(&mut self, position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> u32 {
+    pub(crate) fn vertex(&mut self, position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> u32 {
         let index = self.positions.len() as u32;
         self.positions.push(position);
         self.normals.push(Some(normal));
@@ -277,7 +300,7 @@ impl MeshBuilder {
         index
     }
 
-    pub(super) fn triangle(&mut self, a: u32, b: u32, c: u32) {
+    pub(crate) fn triangle(&mut self, a: u32, b: u32, c: u32) {
         self.indices.extend([a, b, c]);
     }
 
@@ -299,10 +322,15 @@ impl MeshBuilder {
         self.triangle(a, b, c);
     }
 
-    fn finish(
+    fn finish(self, asset: &PrimitiveAssetNode, texture_set: PrimitiveTextureSet) -> GlbMeshData {
+        self.finish_with_bounds(asset, texture_set, primitive_bounds(&asset.geometry))
+    }
+
+    pub(crate) fn finish_with_bounds(
         mut self,
         asset: &PrimitiveAssetNode,
         texture_set: PrimitiveTextureSet,
+        bounds: ([f32; 3], [f32; 3]),
     ) -> GlbMeshData {
         apply_material_uvs(asset, &self.positions, &self.normals, &mut self.texcoords);
         let triangles = self
@@ -315,7 +343,7 @@ impl MeshBuilder {
                 mesh_node: None,
             })
             .collect();
-        let (bounds_min, bounds_max) = primitive_bounds(&asset.geometry);
+        let (bounds_min, bounds_max) = bounds;
         let vertex_count = self.positions.len();
         let material_definition = asset.material_definition.as_ref();
         let mut textures = Vec::new();
@@ -662,6 +690,17 @@ mod tests {
                     segments: 8,
                 },
                 8 * 6,
+                [-2.0, -3.0, -2.0],
+                [2.0, 3.0, 2.0],
+            ),
+            (
+                PrimitiveGeometry::Capsule {
+                    radius: 2.0,
+                    height: 6.0,
+                    segments: 8,
+                    rings: 8,
+                },
+                432,
                 [-2.0, -3.0, -2.0],
                 [2.0, 3.0, 2.0],
             ),

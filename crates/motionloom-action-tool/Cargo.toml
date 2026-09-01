@@ -1,0 +1,25 @@
+[package]
+name = "motionloom-action-tool"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Offline FBX and glTF to canonical MotionLoom Action authoring tool."
+
+[dependencies]
+motionloom = { path = "../motionloom" }
+draco-io = { version = "0.3.0", default-features = false, features = ["fbx-reader", "compression"] }
+tempfile = "3.24.0"
+thiserror = "2.0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ufbx = "=0.10.1"
+
+[lib]
+name = "motionloom_action_tool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "motionloom-action-tool"
+path = "src/main.rs"

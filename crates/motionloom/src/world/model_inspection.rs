@@ -8,12 +8,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use super::gltf_loader::{
     GlbLoadError, GlbMeshData, GlbNodeData, load_glb_animation_data, load_glb_mesh_data,
-    parse_glb_animation_data, parse_glb_mesh_data,
+    parse_glb_animation_data, parse_glb_mesh_data, parse_gltf_json_value,
 };
+use super::{WorldAction, WorldModelProfile};
 
 const REPORT_VERSION: u32 = 1;
 const EPSILON: f32 = 1.0e-5;
@@ -47,6 +49,37 @@ pub struct GlbSkeletonInspectionReport {
     pub manual_review_required: bool,
     pub diagnostics: Vec<ModelInspectionDiagnostic>,
     pub profile_dsl: String,
+}
+
+/// Additive rig-family detection returned by the opt-in humanoid profile
+/// inspector. The legacy skeleton inspection JSON remains unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedHumanoidRig {
+    pub family: String,
+    pub label: String,
+    pub confidence: f32,
+    pub mapping_source: String,
+    pub matched_bone_count: usize,
+    pub core_bone_count: usize,
+    pub evidence: Vec<String>,
+}
+
+/// Rig-aware profile proposal. Flattening preserves the familiar skeleton
+/// report shape while adding one `detectedRig` field for newer hosts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlbHumanoidProfileInspectionReport {
+    pub detected_rig: DetectedHumanoidRig,
+    #[serde(flatten)]
+    pub skeleton: GlbSkeletonInspectionReport,
+}
+
+#[derive(Debug, Clone)]
+struct PreferredBoneMapping {
+    node_index: usize,
+    confidence: f32,
+    evidence: String,
 }
 
 /// Semantic proposal for a static 3D environment. This deliberately reuses
@@ -687,6 +720,67 @@ pub struct ModelInspectionDiagnostic {
     pub canonical_bone: Option<String>,
 }
 
+/// Static compatibility result for one portable Action and one declared model
+/// profile. This never changes playback; editors use it to explain degradation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanoidActionCompatibilityReport {
+    pub action_id: String,
+    pub profile_id: String,
+    pub full_fidelity: bool,
+    pub missing_required_bones: Vec<String>,
+    pub missing_action_bones: Vec<String>,
+}
+
+/// Compare Action bone usage with the canonical mappings declared by a model
+/// profile. Optional bones only become fidelity requirements when keyed.
+pub fn inspect_humanoid_action_compatibility(
+    action: &WorldAction,
+    profile: &WorldModelProfile,
+) -> HumanoidActionCompatibilityReport {
+    let mapped = profile
+        .retarget
+        .as_ref()
+        .map(|retarget| {
+            retarget
+                .maps
+                .iter()
+                .map(|mapping| mapping.to.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let used = action
+        .poses
+        .iter()
+        .flat_map(|pose| pose.bones.iter().map(|bone| bone.id.as_str()))
+        .chain(
+            action
+                .iks
+                .iter()
+                .flat_map(|ik| [ik.root.as_str(), ik.mid.as_str(), ik.end.as_str()]),
+        )
+        .collect::<HashSet<_>>();
+    let mut missing_required_bones = HUMANOID_BONES
+        .iter()
+        .filter(|bone| is_core_bone(bone.id) && !mapped.contains(bone.id))
+        .map(|bone| bone.id.to_string())
+        .collect::<Vec<_>>();
+    let mut missing_action_bones = used
+        .into_iter()
+        .filter(|bone| !mapped.contains(*bone))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    missing_required_bones.sort();
+    missing_action_bones.sort();
+    HumanoidActionCompatibilityReport {
+        action_id: action.id.clone(),
+        profile_id: profile.id.clone(),
+        full_fidelity: missing_required_bones.is_empty() && missing_action_bones.is_empty(),
+        missing_required_bones,
+        missing_action_bones,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CanonicalBoneSpec {
     id: &'static str,
@@ -717,6 +811,17 @@ struct BodyBasis {
     confidence: f32,
 }
 
+macro_rules! finger_bone {
+    ($id:literal, $parent:literal, $segment:literal, $side:expr) => {
+        CanonicalBoneSpec {
+            id: $id,
+            parent: Some($parent),
+            aliases: &[$segment],
+            side: Some($side),
+        }
+    };
+}
+
 const HUMANOID_BONES: &[CanonicalBoneSpec] = &[
     CanonicalBoneSpec {
         id: "hips",
@@ -727,18 +832,24 @@ const HUMANOID_BONES: &[CanonicalBoneSpec] = &[
     CanonicalBoneSpec {
         id: "spine",
         parent: Some("hips"),
-        aliases: &["spine", "spine1", "waist"],
+        aliases: &["spine", "spine01", "waist"],
         side: None,
     },
     CanonicalBoneSpec {
         id: "chest",
         parent: Some("spine"),
-        aliases: &["chest", "upperchest", "spine2", "spine3", "torso"],
+        aliases: &["chest", "spine1", "spine02", "torso"],
+        side: None,
+    },
+    CanonicalBoneSpec {
+        id: "upper_chest",
+        parent: Some("chest"),
+        aliases: &["upperchest", "spine2", "spine03", "spine3"],
         side: None,
     },
     CanonicalBoneSpec {
         id: "neck",
-        parent: Some("chest"),
+        parent: Some("upper_chest"),
         aliases: &["neck"],
         side: None,
     },
@@ -750,7 +861,7 @@ const HUMANOID_BONES: &[CanonicalBoneSpec] = &[
     },
     CanonicalBoneSpec {
         id: "shoulder_l",
-        parent: Some("chest"),
+        parent: Some("upper_chest"),
         aliases: &["shoulder", "clavicle", "collar"],
         side: Some(Side::Left),
     },
@@ -774,7 +885,7 @@ const HUMANOID_BONES: &[CanonicalBoneSpec] = &[
     },
     CanonicalBoneSpec {
         id: "shoulder_r",
-        parent: Some("chest"),
+        parent: Some("upper_chest"),
         aliases: &["shoulder", "clavicle", "collar"],
         side: Some(Side::Right),
     },
@@ -844,7 +955,427 @@ const HUMANOID_BONES: &[CanonicalBoneSpec] = &[
         aliases: &["toe", "toes", "ball"],
         side: Some(Side::Right),
     },
+    finger_bone!("thumb_1_l", "hand_l", "thumb1", Side::Left),
+    finger_bone!("thumb_2_l", "thumb_1_l", "thumb2", Side::Left),
+    finger_bone!("thumb_3_l", "thumb_2_l", "thumb3", Side::Left),
+    finger_bone!("index_1_l", "hand_l", "index1", Side::Left),
+    finger_bone!("index_2_l", "index_1_l", "index2", Side::Left),
+    finger_bone!("index_3_l", "index_2_l", "index3", Side::Left),
+    finger_bone!("middle_1_l", "hand_l", "middle1", Side::Left),
+    finger_bone!("middle_2_l", "middle_1_l", "middle2", Side::Left),
+    finger_bone!("middle_3_l", "middle_2_l", "middle3", Side::Left),
+    finger_bone!("ring_1_l", "hand_l", "ring1", Side::Left),
+    finger_bone!("ring_2_l", "ring_1_l", "ring2", Side::Left),
+    finger_bone!("ring_3_l", "ring_2_l", "ring3", Side::Left),
+    finger_bone!("pinky_1_l", "hand_l", "pinky1", Side::Left),
+    finger_bone!("pinky_2_l", "pinky_1_l", "pinky2", Side::Left),
+    finger_bone!("pinky_3_l", "pinky_2_l", "pinky3", Side::Left),
+    finger_bone!("thumb_1_r", "hand_r", "thumb1", Side::Right),
+    finger_bone!("thumb_2_r", "thumb_1_r", "thumb2", Side::Right),
+    finger_bone!("thumb_3_r", "thumb_2_r", "thumb3", Side::Right),
+    finger_bone!("index_1_r", "hand_r", "index1", Side::Right),
+    finger_bone!("index_2_r", "index_1_r", "index2", Side::Right),
+    finger_bone!("index_3_r", "index_2_r", "index3", Side::Right),
+    finger_bone!("middle_1_r", "hand_r", "middle1", Side::Right),
+    finger_bone!("middle_2_r", "middle_1_r", "middle2", Side::Right),
+    finger_bone!("middle_3_r", "middle_2_r", "middle3", Side::Right),
+    finger_bone!("ring_1_r", "hand_r", "ring1", Side::Right),
+    finger_bone!("ring_2_r", "ring_1_r", "ring2", Side::Right),
+    finger_bone!("ring_3_r", "ring_2_r", "ring3", Side::Right),
+    finger_bone!("pinky_1_r", "hand_r", "pinky1", Side::Right),
+    finger_bone!("pinky_2_r", "pinky_1_r", "pinky2", Side::Right),
+    finger_bone!("pinky_3_r", "pinky_2_r", "pinky3", Side::Right),
 ];
+
+fn detect_humanoid_rig(
+    document: &Value,
+    nodes: &[GlbNodeData],
+) -> (DetectedHumanoidRig, HashMap<String, PreferredBoneMapping>) {
+    if let Some(preferred) = vrm1_mappings(document, nodes).filter(|map| !map.is_empty()) {
+        return detected_rig(
+            "vrm_1",
+            "VRM 1.0",
+            1.0,
+            "metadata",
+            vec!["VRMC_vrm humanoid metadata".to_string()],
+            preferred,
+        );
+    }
+    if let Some(preferred) = vrm0_mappings(document, nodes).filter(|map| !map.is_empty()) {
+        return detected_rig(
+            "vrm_0",
+            "VRM 0.x",
+            1.0,
+            "metadata",
+            vec!["VRM humanoid metadata".to_string()],
+            preferred,
+        );
+    }
+
+    let preferred = known_humanoid_name_mappings(nodes);
+    let core_count = preferred.keys().filter(|bone| is_core_bone(bone)).count();
+    let generator = document
+        .get("asset")
+        .and_then(|asset| asset.get("generator"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let ready_player_me = generator.contains("ready player me")
+        || generator.contains("readyplayerme")
+        || document.get("extras").is_some_and(|extras| {
+            extras
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("ready player me")
+        });
+    let mixamo_namespace = nodes
+        .iter()
+        .filter_map(|node| node.name.as_deref())
+        .any(|name| name.to_ascii_lowercase().contains("mixamorig"));
+    let hierarchy_score = known_mapping_hierarchy_score(&preferred, nodes);
+    let enough_known_bones = core_count >= 12 && hierarchy_score >= 0.72;
+
+    if ready_player_me && enough_known_bones {
+        return detected_rig(
+            "ready_player_me",
+            "Ready Player Me",
+            0.97,
+            "preset",
+            vec![
+                format!("asset generator: {}", generator),
+                format!("known humanoid hierarchy {:.0}%", hierarchy_score * 100.0),
+            ],
+            preferred,
+        );
+    }
+    if mixamo_namespace && enough_known_bones {
+        return detected_rig(
+            "mixamo",
+            "Mixamo",
+            0.98,
+            "preset",
+            vec![
+                "mixamorig namespace".to_string(),
+                format!("known humanoid hierarchy {:.0}%", hierarchy_score * 100.0),
+            ],
+            preferred,
+        );
+    }
+    if enough_known_bones {
+        return detected_rig(
+            "mixamo_compatible",
+            "Mixamo-compatible humanoid",
+            0.90,
+            "preset",
+            vec![format!(
+                "known humanoid names and hierarchy {:.0}%",
+                hierarchy_score * 100.0
+            )],
+            preferred,
+        );
+    }
+
+    (
+        DetectedHumanoidRig {
+            family: "generic_humanoid".to_string(),
+            label: "Generic humanoid".to_string(),
+            confidence: 0.5,
+            mapping_source: "heuristic".to_string(),
+            matched_bone_count: 0,
+            core_bone_count: 0,
+            evidence: vec![
+                "No declared or known rig signature; using geometry and names".to_string(),
+            ],
+        },
+        HashMap::new(),
+    )
+}
+
+fn detected_rig(
+    family: &str,
+    label: &str,
+    confidence: f32,
+    mapping_source: &str,
+    evidence: Vec<String>,
+    preferred: HashMap<String, PreferredBoneMapping>,
+) -> (DetectedHumanoidRig, HashMap<String, PreferredBoneMapping>) {
+    let core_bone_count = preferred.keys().filter(|bone| is_core_bone(bone)).count();
+    (
+        DetectedHumanoidRig {
+            family: family.to_string(),
+            label: label.to_string(),
+            confidence,
+            mapping_source: mapping_source.to_string(),
+            matched_bone_count: preferred.len(),
+            core_bone_count,
+            evidence,
+        },
+        preferred,
+    )
+}
+
+fn vrm1_mappings(
+    document: &Value,
+    nodes: &[GlbNodeData],
+) -> Option<HashMap<String, PreferredBoneMapping>> {
+    let bones = document
+        .pointer("/extensions/VRMC_vrm/humanoid/humanBones")?
+        .as_object()?;
+    let mut out = HashMap::new();
+    for (vrm_bone, declaration) in bones {
+        let Some(canonical) = canonical_vrm_bone(vrm_bone, true) else {
+            continue;
+        };
+        let Some(node_index) = declaration.get("node").and_then(Value::as_u64) else {
+            continue;
+        };
+        insert_declared_mapping(
+            &mut out,
+            nodes,
+            canonical,
+            node_index as usize,
+            1.0,
+            "VRM 1.0 humanoid metadata",
+        );
+    }
+    Some(out)
+}
+
+fn vrm0_mappings(
+    document: &Value,
+    nodes: &[GlbNodeData],
+) -> Option<HashMap<String, PreferredBoneMapping>> {
+    let bones = document
+        .pointer("/extensions/VRM/humanoid/humanBones")?
+        .as_array()?;
+    let mut out = HashMap::new();
+    for declaration in bones {
+        let Some(vrm_bone) = declaration.get("bone").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(canonical) = canonical_vrm_bone(vrm_bone, false) else {
+            continue;
+        };
+        let Some(node_index) = declaration.get("node").and_then(Value::as_u64) else {
+            continue;
+        };
+        insert_declared_mapping(
+            &mut out,
+            nodes,
+            canonical,
+            node_index as usize,
+            1.0,
+            "VRM 0.x humanoid metadata",
+        );
+    }
+    Some(out)
+}
+
+fn insert_declared_mapping(
+    out: &mut HashMap<String, PreferredBoneMapping>,
+    nodes: &[GlbNodeData],
+    canonical: &str,
+    node_index: usize,
+    confidence: f32,
+    evidence: &str,
+) {
+    if nodes
+        .get(node_index)
+        .and_then(|node| node.name.as_ref())
+        .is_some()
+    {
+        out.insert(
+            canonical.to_string(),
+            PreferredBoneMapping {
+                node_index,
+                confidence,
+                evidence: evidence.to_string(),
+            },
+        );
+    }
+}
+
+fn known_humanoid_name_mappings(nodes: &[GlbNodeData]) -> HashMap<String, PreferredBoneMapping> {
+    let mut out = HashMap::new();
+    for node in nodes {
+        let Some(name) = node.name.as_deref() else {
+            continue;
+        };
+        let Some(canonical) = canonical_known_rig_bone(name) else {
+            continue;
+        };
+        out.entry(canonical.to_string())
+            .or_insert_with(|| PreferredBoneMapping {
+                node_index: node.index,
+                confidence: 0.98,
+                evidence: format!("known humanoid rig joint '{name}'"),
+            });
+    }
+    out
+}
+
+fn canonical_known_rig_bone(raw: &str) -> Option<String> {
+    let suffix = raw.rsplit([':', '|']).next().unwrap_or(raw);
+    let compact = suffix
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let canonical = match compact.as_str() {
+        "hips" | "pelvis" => "hips",
+        "spine" | "spine01" => "spine",
+        "spine1" | "spine02" | "chest" => "chest",
+        "spine2" | "spine03" | "upperchest" => "upper_chest",
+        "neck" | "neck01" => "neck",
+        "head" => "head",
+        "leftshoulder" | "claviclel" => "shoulder_l",
+        "leftarm" | "leftupperarm" | "upperarml" => "upper_arm_l",
+        "leftforearm" | "leftlowerarm" | "lowerarml" => "forearm_l",
+        "lefthand" | "handl" => "hand_l",
+        "rightshoulder" | "clavicler" => "shoulder_r",
+        "rightarm" | "rightupperarm" | "upperarmr" => "upper_arm_r",
+        "rightforearm" | "rightlowerarm" | "lowerarmr" => "forearm_r",
+        "righthand" | "handr" => "hand_r",
+        "leftupleg" | "leftupperleg" | "thighl" => "upper_leg_l",
+        "leftleg" | "leftlowerleg" | "calfl" => "lower_leg_l",
+        "leftfoot" | "footl" => "foot_l",
+        "lefttoebase" | "lefttoes" | "balll" => "toe_l",
+        "rightupleg" | "rightupperleg" | "thighr" => "upper_leg_r",
+        "rightleg" | "rightlowerleg" | "calfr" => "lower_leg_r",
+        "rightfoot" | "footr" => "foot_r",
+        "righttoebase" | "righttoes" | "ballr" => "toe_r",
+        _ => return canonical_known_finger(&compact),
+    };
+    Some(canonical.to_string())
+}
+
+fn canonical_known_finger(compact: &str) -> Option<String> {
+    let (side, rest) = compact
+        .strip_prefix("lefthand")
+        .or_else(|| compact.strip_prefix("left"))
+        .map(|rest| ("l", rest))
+        .or_else(|| {
+            compact
+                .strip_prefix("righthand")
+                .or_else(|| compact.strip_prefix("right"))
+                .map(|rest| ("r", rest))
+        })?;
+    let (finger, segment) = ["thumb", "index", "middle", "ring", "pinky", "little"]
+        .into_iter()
+        .find_map(|finger| {
+            let segment = rest.strip_prefix(finger)?;
+            Some((if finger == "little" { "pinky" } else { finger }, segment))
+        })?;
+    let segment = match segment {
+        "1" | "proximal" => 1,
+        "2" | "intermediate" => 2,
+        "3" | "distal" => 3,
+        _ => return None,
+    };
+    Some(format!("{finger}_{segment}_{side}"))
+}
+
+fn canonical_vrm_bone(raw: &str, vrm1: bool) -> Option<&'static str> {
+    Some(match raw {
+        "hips" => "hips",
+        "spine" => "spine",
+        "chest" => "chest",
+        "upperChest" => "upper_chest",
+        "neck" => "neck",
+        "head" => "head",
+        "leftShoulder" => "shoulder_l",
+        "leftUpperArm" => "upper_arm_l",
+        "leftLowerArm" => "forearm_l",
+        "leftHand" => "hand_l",
+        "rightShoulder" => "shoulder_r",
+        "rightUpperArm" => "upper_arm_r",
+        "rightLowerArm" => "forearm_r",
+        "rightHand" => "hand_r",
+        "leftUpperLeg" => "upper_leg_l",
+        "leftLowerLeg" => "lower_leg_l",
+        "leftFoot" => "foot_l",
+        "leftToes" => "toe_l",
+        "rightUpperLeg" => "upper_leg_r",
+        "rightLowerLeg" => "lower_leg_r",
+        "rightFoot" => "foot_r",
+        "rightToes" => "toe_r",
+        "leftThumbMetacarpal" if vrm1 => "thumb_1_l",
+        "leftThumbProximal" => {
+            if vrm1 {
+                "thumb_2_l"
+            } else {
+                "thumb_1_l"
+            }
+        }
+        "leftThumbIntermediate" => "thumb_2_l",
+        "leftThumbDistal" => "thumb_3_l",
+        "leftIndexProximal" => "index_1_l",
+        "leftIndexIntermediate" => "index_2_l",
+        "leftIndexDistal" => "index_3_l",
+        "leftMiddleProximal" => "middle_1_l",
+        "leftMiddleIntermediate" => "middle_2_l",
+        "leftMiddleDistal" => "middle_3_l",
+        "leftRingProximal" => "ring_1_l",
+        "leftRingIntermediate" => "ring_2_l",
+        "leftRingDistal" => "ring_3_l",
+        "leftLittleProximal" => "pinky_1_l",
+        "leftLittleIntermediate" => "pinky_2_l",
+        "leftLittleDistal" => "pinky_3_l",
+        "rightThumbMetacarpal" if vrm1 => "thumb_1_r",
+        "rightThumbProximal" => {
+            if vrm1 {
+                "thumb_2_r"
+            } else {
+                "thumb_1_r"
+            }
+        }
+        "rightThumbIntermediate" => "thumb_2_r",
+        "rightThumbDistal" => "thumb_3_r",
+        "rightIndexProximal" => "index_1_r",
+        "rightIndexIntermediate" => "index_2_r",
+        "rightIndexDistal" => "index_3_r",
+        "rightMiddleProximal" => "middle_1_r",
+        "rightMiddleIntermediate" => "middle_2_r",
+        "rightMiddleDistal" => "middle_3_r",
+        "rightRingProximal" => "ring_1_r",
+        "rightRingIntermediate" => "ring_2_r",
+        "rightRingDistal" => "ring_3_r",
+        "rightLittleProximal" => "pinky_1_r",
+        "rightLittleIntermediate" => "pinky_2_r",
+        "rightLittleDistal" => "pinky_3_r",
+        _ => return None,
+    })
+}
+
+fn known_mapping_hierarchy_score(
+    preferred: &HashMap<String, PreferredBoneMapping>,
+    nodes: &[GlbNodeData],
+) -> f32 {
+    let mut checked = 0usize;
+    let mut valid = 0usize;
+    for spec in HUMANOID_BONES {
+        let Some(parent) = spec.parent else {
+            continue;
+        };
+        let (Some(child), Some(parent)) = (preferred.get(spec.id), preferred.get(parent)) else {
+            continue;
+        };
+        checked += 1;
+        let mut cursor = nodes.get(child.node_index).and_then(|node| node.parent);
+        while let Some(index) = cursor {
+            if index == parent.node_index {
+                valid += 1;
+                break;
+            }
+            cursor = nodes.get(index).and_then(|node| node.parent);
+        }
+    }
+    if checked == 0 {
+        0.0
+    } else {
+        valid as f32 / checked as f32
+    }
+}
 
 /// Inspect a local GLB and propose a `humanoid_v1` profile without changing the model.
 pub fn inspect_glb_skeleton_path(
@@ -866,6 +1397,36 @@ pub fn inspect_glb_skeleton_bytes(
     inspect_mesh_skeleton(&mesh, label)
 }
 
+/// Inspect a browser/local GLB using declared VRM humanoid metadata first,
+/// known Mixamo-compatible signatures second, and the existing geometry/name
+/// heuristic for every unresolved bone. This is a new opt-in API; the legacy
+/// skeleton inspection contract above is intentionally untouched.
+pub fn inspect_glb_humanoid_profile_bytes(
+    bytes: &[u8],
+    asset_label: impl AsRef<str>,
+) -> Result<GlbHumanoidProfileInspectionReport, ModelInspectionError> {
+    let label = asset_label.as_ref();
+    let source_path = PathBuf::from(label);
+    let document = parse_gltf_json_value(&source_path, bytes)?;
+    let mesh = parse_glb_animation_data(&source_path, bytes)?;
+    let (detected_rig, preferred) = detect_humanoid_rig(&document, &mesh.nodes);
+    let skeleton = inspect_mesh_skeleton_with_preferred(&mesh, label, &preferred)?;
+    Ok(GlbHumanoidProfileInspectionReport {
+        detected_rig,
+        skeleton,
+    })
+}
+
+/// Stable JSON wrapper for [`inspect_glb_humanoid_profile_bytes`].
+pub fn inspect_glb_humanoid_profile_json(
+    bytes: &[u8],
+    asset_label: impl AsRef<str>,
+) -> Result<String, ModelInspectionError> {
+    let report = inspect_glb_humanoid_profile_bytes(bytes, asset_label)?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|source| ModelInspectionError::Serialize { source })
+}
+
 /// Return the skeleton inspection report as stable, machine-readable JSON.
 pub fn inspect_glb_skeleton_json(
     bytes: &[u8],
@@ -879,6 +1440,14 @@ pub fn inspect_glb_skeleton_json(
 fn inspect_mesh_skeleton(
     mesh: &GlbMeshData,
     asset_label: &str,
+) -> Result<GlbSkeletonInspectionReport, ModelInspectionError> {
+    inspect_mesh_skeleton_with_preferred(mesh, asset_label, &HashMap::new())
+}
+
+fn inspect_mesh_skeleton_with_preferred(
+    mesh: &GlbMeshData,
+    asset_label: &str,
+    preferred: &HashMap<String, PreferredBoneMapping>,
 ) -> Result<GlbSkeletonInspectionReport, ModelInspectionError> {
     let skin = mesh
         .skin
@@ -914,7 +1483,21 @@ fn inspect_mesh_skeleton(
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
 
-        let Some(best) = candidates.first().cloned() else {
+        let declared = preferred.get(spec.id).and_then(|mapping| {
+            if !joint_indices.contains(&mapping.node_index)
+                || mapped_nodes.contains(&mapping.node_index)
+            {
+                return None;
+            }
+            let node = mesh.nodes.get(mapping.node_index)?;
+            Some(Candidate {
+                node_index: mapping.node_index,
+                name: node.name.clone()?,
+                score: mapping.confidence,
+                evidence: vec![mapping.evidence.clone()],
+            })
+        });
+        let Some(best) = declared.clone().or_else(|| candidates.first().cloned()) else {
             diagnostics.push(ModelInspectionDiagnostic {
                 severity: if is_core_bone(spec.id) { "error" } else { "warning" }.to_string(),
                 code: "humanoid_bone_unmapped".to_string(),
@@ -925,7 +1508,7 @@ fn inspect_mesh_skeleton(
             continue;
         };
 
-        if best.score < 0.42 {
+        if declared.is_none() && best.score < 0.42 {
             diagnostics.push(ModelInspectionDiagnostic {
                 severity: "warning".to_string(),
                 code: "humanoid_bone_low_confidence".to_string(),
@@ -934,8 +1517,12 @@ fn inspect_mesh_skeleton(
                 canonical_bone: Some(spec.id.to_string()),
             });
         }
-        let second_score = candidates.get(1).map_or(0.0, |candidate| candidate.score);
-        if best.score - second_score < 0.12 && second_score > 0.35 {
+        let second_score = candidates
+            .iter()
+            .filter(|candidate| candidate.node_index != best.node_index)
+            .next()
+            .map_or(0.0, |candidate| candidate.score);
+        if declared.is_none() && best.score - second_score < 0.12 && second_score > 0.35 {
             diagnostics.push(ModelInspectionDiagnostic {
                 severity: "warning".to_string(),
                 code: "humanoid_bone_ambiguous".to_string(),
@@ -955,7 +1542,7 @@ fn inspect_mesh_skeleton(
             evidence: best.evidence,
             alternatives: candidates
                 .iter()
-                .skip(1)
+                .filter(|candidate| candidate.node_index != best.node_index)
                 .take(3)
                 .map(|candidate| JointAlternative {
                     source_joint: candidate.name.clone(),
@@ -1143,20 +1730,11 @@ fn is_descendant(mut node_index: usize, ancestor: usize, nodes: &[GlbNodeData]) 
 }
 
 fn is_core_bone(id: &str) -> bool {
-    matches!(
-        id,
-        "hips"
-            | "spine"
-            | "head"
-            | "upper_arm_l"
-            | "forearm_l"
-            | "upper_arm_r"
-            | "forearm_r"
-            | "upper_leg_l"
-            | "lower_leg_l"
-            | "upper_leg_r"
-            | "lower_leg_r"
-    )
+    !id.starts_with("thumb_")
+        && !id.starts_with("index_")
+        && !id.starts_with("middle_")
+        && !id.starts_with("ring_")
+        && !id.starts_with("pinky_")
 }
 
 fn infer_body_basis(
@@ -1389,12 +1967,15 @@ fn propose_axes(
                     "flexes the child segment toward character forward",
                 )
             })
-        } else if matches!(spec.id, "spine" | "chest" | "neck" | "head") {
+        } else if matches!(spec.id, "spine" | "chest" | "upper_chest" | "neck" | "head") {
             Some(axis_alignment(axes, basis.right, "body bend axis"))
         } else {
             None
         };
-        let turn = if matches!(spec.id, "hips" | "spine" | "chest" | "neck" | "head") {
+        let turn = if matches!(
+            spec.id,
+            "hips" | "spine" | "chest" | "upper_chest" | "neck" | "head"
+        ) {
             Some(axis_alignment(axes, basis.up, "body vertical turn axis"))
         } else {
             None
@@ -1616,7 +2197,8 @@ fn canonical_child(id: &str) -> Option<&'static str> {
     Some(match id {
         "hips" => "spine",
         "spine" => "chest",
-        "chest" => "neck",
+        "chest" => "upper_chest",
+        "upper_chest" => "neck",
         "neck" => "head",
         "shoulder_l" => "upper_arm_l",
         "upper_arm_l" => "forearm_l",
@@ -1630,6 +2212,26 @@ fn canonical_child(id: &str) -> Option<&'static str> {
         "upper_leg_r" => "lower_leg_r",
         "lower_leg_r" => "foot_r",
         "foot_r" => "toe_r",
+        "thumb_1_l" => "thumb_2_l",
+        "thumb_2_l" => "thumb_3_l",
+        "index_1_l" => "index_2_l",
+        "index_2_l" => "index_3_l",
+        "middle_1_l" => "middle_2_l",
+        "middle_2_l" => "middle_3_l",
+        "ring_1_l" => "ring_2_l",
+        "ring_2_l" => "ring_3_l",
+        "pinky_1_l" => "pinky_2_l",
+        "pinky_2_l" => "pinky_3_l",
+        "thumb_1_r" => "thumb_2_r",
+        "thumb_2_r" => "thumb_3_r",
+        "index_1_r" => "index_2_r",
+        "index_2_r" => "index_3_r",
+        "middle_1_r" => "middle_2_r",
+        "middle_2_r" => "middle_3_r",
+        "ring_1_r" => "ring_2_r",
+        "ring_2_r" => "ring_3_r",
+        "pinky_1_r" => "pinky_2_r",
+        "pinky_2_r" => "pinky_3_r",
         _ => return None,
     })
 }
@@ -1640,12 +2242,23 @@ fn is_limb(id: &str) -> bool {
         || id.contains("hand")
         || id.contains("foot")
         || id.starts_with("shoulder")
+        || id.starts_with("thumb_")
+        || id.starts_with("index_")
+        || id.starts_with("middle_")
+        || id.starts_with("ring_")
+        || id.starts_with("pinky_")
 }
 fn is_upper_limb(id: &str) -> bool {
     id.starts_with("upper_arm") || id.starts_with("upper_leg")
 }
 fn is_bending_joint(id: &str) -> bool {
-    id.starts_with("forearm") || id.starts_with("lower_leg")
+    id.starts_with("forearm")
+        || id.starts_with("lower_leg")
+        || id.starts_with("thumb_")
+        || id.starts_with("index_")
+        || id.starts_with("middle_")
+        || id.starts_with("ring_")
+        || id.starts_with("pinky_")
 }
 
 fn build_profile_dsl(
@@ -1965,18 +2578,128 @@ mod tests {
         }
     }
 
+    fn named_test_node(index: usize, name: &str, parent: Option<usize>) -> GlbNodeData {
+        let mut node = test_node(index, parent, [0.0, index as f32 * 0.1, 0.0]);
+        node.name = Some(name.to_string());
+        node
+    }
+
+    fn mixamo_test_nodes(prefix: &str) -> Vec<GlbNodeData> {
+        let names_and_parents = [
+            ("Hips", None),
+            ("Spine", Some(0)),
+            ("Spine1", Some(1)),
+            ("Spine2", Some(2)),
+            ("Neck", Some(3)),
+            ("Head", Some(4)),
+            ("LeftShoulder", Some(3)),
+            ("LeftArm", Some(6)),
+            ("LeftForeArm", Some(7)),
+            ("LeftHand", Some(8)),
+            ("RightShoulder", Some(3)),
+            ("RightArm", Some(10)),
+            ("RightForeArm", Some(11)),
+            ("RightHand", Some(12)),
+            ("LeftUpLeg", Some(0)),
+            ("LeftLeg", Some(14)),
+            ("LeftFoot", Some(15)),
+            ("LeftToeBase", Some(16)),
+            ("RightUpLeg", Some(0)),
+            ("RightLeg", Some(18)),
+            ("RightFoot", Some(19)),
+            ("RightToeBase", Some(20)),
+        ];
+        names_and_parents
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, parent))| {
+                named_test_node(index, &format!("{prefix}{name}"), parent)
+            })
+            .collect()
+    }
+
     #[test]
     fn normalizes_blender_joint_suffixes() {
         assert_eq!(normalize_name("Left arm_20"), "left arm 20");
         assert_eq!(detect_side(&["left", "arm"], "leftarm"), Some(Side::Left));
         assert_eq!(
-            detect_side(
-                &["mixamorig", "leftshoulder", "032"],
-                "mixamorigleftshoulder032"
-            ),
+            detect_side(&["source", "leftshoulder", "032"], "sourceleftshoulder032"),
             Some(Side::Left)
         );
         assert_eq!(detect_side(&["shoulder"], "shoulder"), None);
+    }
+
+    #[test]
+    fn vrm1_metadata_is_authoritative_for_rig_detection() {
+        let nodes = vec![
+            named_test_node(0, "J_Bip_C_Hips", None),
+            named_test_node(1, "J_Bip_L_UpperLeg", Some(0)),
+            named_test_node(2, "J_Bip_L_LowerLeg", Some(1)),
+        ];
+        let document = serde_json::json!({
+            "extensions": {
+                "VRMC_vrm": {
+                    "humanoid": {
+                        "humanBones": {
+                            "hips": { "node": 0 },
+                            "leftUpperLeg": { "node": 1 },
+                            "leftLowerLeg": { "node": 2 }
+                        }
+                    }
+                }
+            }
+        });
+        let (rig, mappings) = detect_humanoid_rig(&document, &nodes);
+        assert_eq!(rig.family, "vrm_1");
+        assert_eq!(rig.mapping_source, "metadata");
+        assert_eq!(mappings["upper_leg_l"].node_index, 1);
+    }
+
+    #[test]
+    fn vrm0_metadata_is_authoritative_for_rig_detection() {
+        let nodes = vec![
+            named_test_node(0, "J_Bip_C_Hips", None),
+            named_test_node(1, "J_Bip_R_UpperLeg", Some(0)),
+            named_test_node(2, "J_Bip_R_LowerLeg", Some(1)),
+        ];
+        let document = serde_json::json!({
+            "extensions": {
+                "VRM": {
+                    "humanoid": {
+                        "humanBones": [
+                            { "bone": "hips", "node": 0 },
+                            { "bone": "rightUpperLeg", "node": 1 },
+                            { "bone": "rightLowerLeg", "node": 2 }
+                        ]
+                    }
+                }
+            }
+        });
+        let (rig, mappings) = detect_humanoid_rig(&document, &nodes);
+        assert_eq!(rig.family, "vrm_0");
+        assert_eq!(rig.mapping_source, "metadata");
+        assert_eq!(mappings["lower_leg_r"].node_index, 2);
+    }
+
+    #[test]
+    fn mixamo_namespace_and_hierarchy_select_known_preset() {
+        let nodes = mixamo_test_nodes("mixamorig:");
+        let (rig, mappings) = detect_humanoid_rig(&serde_json::json!({}), &nodes);
+        assert_eq!(rig.family, "mixamo");
+        assert_eq!(rig.mapping_source, "preset");
+        assert_eq!(mappings["forearm_r"].node_index, 12);
+        assert!(rig.core_bone_count >= 12);
+    }
+
+    #[test]
+    fn ready_player_me_generator_labels_mixamo_compatible_hierarchy() {
+        let nodes = mixamo_test_nodes("");
+        let document = serde_json::json!({
+            "asset": { "generator": "Ready Player Me Avatar API" }
+        });
+        let (rig, _) = detect_humanoid_rig(&document, &nodes);
+        assert_eq!(rig.family, "ready_player_me");
+        assert_eq!(rig.mapping_source, "preset");
     }
 
     #[test]
@@ -2067,5 +2790,32 @@ mod tests {
         let basis = infer_body_basis(&resolved, &matrices, &mut diagnostics);
         assert!(basis.forward[2] > 0.99);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn optional_bone_is_required_only_when_action_uses_it() {
+        let maps = HUMANOID_BONES
+            .iter()
+            .filter(|bone| is_core_bone(bone.id))
+            .map(|bone| format!("<Map from=\"{}\" to=\"{}\" />", bone.id, bone.id))
+            .collect::<String>();
+        let script = format!(
+            r##"<Graph fps={{30}} duration="1s" size={{[64,64]}}>
+  <ModelProfile id="target" kind="3d" model="model" preset="humanoid_v1">
+    <Retarget preset="humanoid_v1">{maps}</Retarget>
+  </ModelProfile>
+  <Action id="gesture" skeleton="humanoid_v1" duration="1s">
+    <Pose t="0s"><Bone id="index_1_l" bend="20" /></Pose>
+  </Action>
+  <World id="stage"><Background color="#000000" /></World>
+  <Present from="stage" />
+</Graph>"##
+        );
+        let graph = crate::world::parse_world_graph_script(&script).expect("compatibility graph");
+        let report =
+            inspect_humanoid_action_compatibility(&graph.actions[0], &graph.model_profiles[0]);
+        assert!(report.missing_required_bones.is_empty());
+        assert_eq!(report.missing_action_bones, ["index_1_l"]);
+        assert!(!report.full_fidelity);
     }
 }
