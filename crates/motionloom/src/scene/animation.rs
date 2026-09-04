@@ -436,6 +436,14 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
         editor_control: "nodeReference",
         node_kinds: &["Scene", "CompositeGroup"],
     },
+    AnimationPropertyDescriptor {
+        path: "renderStyle",
+        value_type: AnimationValueType::Discrete,
+        interpolation: AnimationInterpolation::Step,
+        unit: "renderStyleId",
+        editor_control: "resourceReference",
+        node_kinds: &["Scene"],
+    },
 ];
 
 /// Resolve a canonical property path, including dynamic Process parameter paths.

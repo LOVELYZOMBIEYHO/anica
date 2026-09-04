@@ -403,6 +403,15 @@ pub fn motionloom_analyze_script_json(script: &str) -> String {
     analyze_script_json(script)
 }
 
+/// Inspect the Scene style request and compiler fallbacks without a GPU.
+#[wasm_bindgen]
+pub fn motionloom_render_style_json(script: &str, scene_id: &str) -> Result<String, JsValue> {
+    let graph = crate::dsl::parse_graph_script(script).map_err(|e| js_error(e.to_string()))?;
+    let report = crate::render_style::resolve_scene_render_style(&graph, scene_id)
+        .map_err(|e| js_error(e.to_string()))?;
+    serde_json::to_string_pretty(&report).map_err(|e| js_error(e.to_string()))
+}
+
 /// Analyze one DSL revision for a concrete renderer such as `wasm-webgpu`.
 #[wasm_bindgen]
 pub fn motionloom_analyze_script_for_target_json(script: &str, target: &str) -> String {
@@ -1025,6 +1034,18 @@ impl WasmSceneRenderer {
             .render_frame_to_canvas(&self.graph, frame, canvas)
             .await
             .map_err(|err| js_error(err.to_string()))
+    }
+
+    /// Return the retained 3D renderer's latest timing and resource counters.
+    /// Browser hosts can include this non-breaking diagnostic in error reports
+    /// without parsing console output or reading pixels back from the GPU.
+    pub fn last_3d_frame_profile_json(&self) -> Result<String, JsValue> {
+        let profile = self
+            .renderer
+            .as_ref()
+            .map(SceneRenderer::last_3d_frame_profile)
+            .unwrap_or_default();
+        serde_json::to_string(&profile).map_err(|err| js_error(err.to_string()))
     }
 
     /// Draw a solid WebGPU color into the canvas using this renderer's GPU device.

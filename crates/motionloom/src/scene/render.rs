@@ -45,6 +45,8 @@ use crate::scene::backend::sizing::{
     fit_logical_canvas_to_output, graph_logical_render_size, graph_output_size,
     render_size_root_transform,
 };
+#[cfg(target_arch = "wasm32")]
+use crate::scene::compile::scene_nodes_contain_3d_island;
 use crate::scene::compile::{
     graph_has_rich_scene_tree, scene_nodes_contain_image_or_svg, scene_nodes_for_present,
     scene_nodes_require_cpu_scene_compositing,
@@ -239,9 +241,28 @@ fn apply_animation_targets_at_frame(
             }
             _ => animation_target_expression(&target.keys, fps, &target.property)?,
         };
-        apply_animation_property_to_graph(&mut graph, &target.node, &target.property, value);
+        apply_sampled_animation_value(&mut graph, &target.node, &target.property, value)?;
     }
     Ok(Some(graph))
+}
+
+fn apply_sampled_animation_value(
+    graph: &mut GraphScript,
+    node: &str,
+    property: &str,
+    value: String,
+) -> Result<(), MotionLoomSceneRenderError> {
+    if property == "renderStyle" {
+        crate::render_style::apply_scene_style_reference(graph, node, &value).map_err(|error| {
+            MotionLoomSceneRenderError::InvalidExpression {
+                expr: value,
+                message: error.message,
+            }
+        })
+    } else {
+        apply_animation_property_to_graph(graph, node, property, value);
+        Ok(())
+    }
 }
 
 fn animation_target_expression(
@@ -1606,6 +1627,23 @@ fn scene_world_lighting(
     time_sec: f32,
 ) -> Result<WorldLighting, MotionLoomSceneRenderError> {
     let mut lighting = WorldLighting::default();
+    // Style defaults are evaluated before explicit island nodes and their keys.
+    lighting.render_style = composite.render_style.clone();
+    if let Some(style) = &composite.render_style {
+        let p = &style.post;
+        if let Some(v) = &p.tone_mapping {
+            lighting.color_management.tone_mapping = v.clone();
+        }
+        if let Some(v) = p.exposure {
+            lighting.color_management.exposure = v;
+        }
+        if let Some(v) = p.contrast {
+            lighting.color_management.contrast = v;
+        }
+        if let Some(v) = p.white_balance {
+            lighting.color_management.white_balance_kelvin = v;
+        }
+    }
     for node in &composite.nodes_3d {
         match node {
             Scene3DNode::AtmosphereFog(node) => {
@@ -1794,6 +1832,44 @@ fn scene_world_lighting(
             }
             _ => {}
         }
+    }
+    // Presets only supply a key when the island has no explicit lights or IBL.
+    if lighting.lights.is_empty() && lighting.environment.is_none() {
+        if let Some(preset) = composite
+            .render_style
+            .as_ref()
+            .and_then(|s| s.lighting_preset.as_deref())
+        {
+            let (color, intensity, direction) = match preset {
+                "soft_sunlight" => ([1.0, 0.9, 0.72], 3.5, [-0.4, -1.0, -0.35]),
+                "cinematic" => ([1.0, 0.72, 0.48], 4.0, [-0.8, -0.5, -0.4]),
+                "overcast" => ([0.82, 0.9, 1.0], 1.6, [0.0, -1.0, -0.2]),
+                "night" => ([0.32, 0.48, 1.0], 0.8, [-0.3, -1.0, -0.3]),
+                _ => ([1.0; 3], 3.0, [-0.4, -1.0, -0.35]),
+            };
+            lighting.lights.push(WorldLight {
+                id: Some("__ml_style_key".into()),
+                kind: WorldLightKind::Directional,
+                position: [0.0; 3],
+                direction,
+                color,
+                intensity,
+                range: 0.0,
+                inner_cone_degrees: 0.0,
+                outer_cone_degrees: 0.0,
+                width: 0.0,
+                height: 0.0,
+                cast_shadow: true,
+                shadow_strength: 0.8,
+            });
+        }
+    }
+    if composite
+        .render_style
+        .as_ref()
+        .is_some_and(|s| !s.ao_enabled)
+    {
+        lighting.ao_intensity = 0.0;
     }
     lighting.lights.truncate(4);
     Ok(lighting)
@@ -4539,6 +4615,9 @@ fn resolved_primitive_collider_shape(asset: &PrimitiveAssetNode) -> PrimitiveCol
             PrimitiveGeometry::Cylinder { .. } => PrimitiveColliderShape::Cylinder,
             PrimitiveGeometry::Cone { .. } => PrimitiveColliderShape::Cone,
             PrimitiveGeometry::Wedge { .. } => PrimitiveColliderShape::Convex,
+            PrimitiveGeometry::Ellipsoid { .. } => PrimitiveColliderShape::Sphere,
+            PrimitiveGeometry::Frustum { .. } => PrimitiveColliderShape::Convex,
+            PrimitiveGeometry::RoundedBox { .. } => PrimitiveColliderShape::Box,
         }
     } else {
         asset.collision.collider
@@ -5012,6 +5091,9 @@ fn primitive_collision_triangles(
         bevel_segments: 0,
         material_seed: None,
         collision: Default::default(),
+        modifiers: Vec::new(),
+        mesh_build: Default::default(),
+        lod: Default::default(),
     };
     let mesh = crate::world::primitive::generate_primitive_mesh(&collider);
     let mesh_scale = primitive_collision_mesh_scale(asset);
@@ -7043,7 +7125,7 @@ impl SceneFrameRenderer {
                 continue;
             }
             let value = sample_dynamic_animation_value(target, time_sec)?;
-            apply_animation_property_to_graph(&mut resolved, &target.node, &target.property, value);
+            apply_sampled_animation_value(&mut resolved, &target.node, &target.property, value)?;
         }
         Ok(Some(Arc::new(resolved)))
     }
@@ -7770,7 +7852,7 @@ impl SceneFrameRenderer {
             || !graph.outputs.is_empty()
             || !graph.layers.is_empty()
             || !graph.world_sources.is_empty();
-        match self.render_frame_to_wgpu_texture(graph, frame).await {
+        let strict_gpu_error = match self.render_frame_to_wgpu_texture(graph, frame).await {
             Ok(texture) => {
                 let native_texture = GpuSceneNativeTexture {
                     texture: texture.texture,
@@ -7792,8 +7874,8 @@ impl SceneFrameRenderer {
                     ),
                 });
             }
-            Err(_) => {}
-        }
+            Err(err) => err.to_string(),
+        };
 
         let fps = graph.fps.max(1.0);
         let duration_sec = (graph.duration_ms as f32 / 1000.0).max(1.0 / fps);
@@ -7858,8 +7940,27 @@ impl SceneFrameRenderer {
                 .insert(precompose.id.clone(), precompose);
         }
 
-        self.render_scene_tree_frame_to_canvas(graph, time_norm, time_sec, canvas)
-            .await
+        let contains_3d = scene_nodes_for_present(graph).is_some_and(scene_nodes_contain_3d_island);
+        let fallback_result = self
+            .render_scene_tree_frame_to_canvas(graph, time_norm, time_sec, canvas)
+            .await;
+        if fallback_result.is_ok() && contains_3d {
+            let profile = self.scene_3d_renderer.last_frame_profile();
+            if profile.draw_calls == 0 {
+                return Err(MotionLoomSceneRenderError::GpuRender {
+                    message: format!(
+                        "WASM 3D render produced zero draw calls after the strict GPU path failed: {strict_gpu_error}. resource profile: mesh_cache={}, static_draw_plans={}, gpu_resources={}, textures={}, geometry={}, render_targets={}",
+                        profile.mesh_cache_entries,
+                        profile.static_draw_plans,
+                        profile.gpu_resource_entries,
+                        profile.gpu_texture_resources,
+                        profile.gpu_geometry_resources,
+                        profile.target_pool_size,
+                    ),
+                });
+            }
+        }
+        fallback_result
     }
 
     /// Draw a solid WebGPU color into a browser canvas for surface debugging.
@@ -10474,6 +10575,15 @@ impl SceneFrameRenderer {
         let mut expanded_composite = composite.clone();
         expanded_composite.nodes_3d = expand_scene_volume_repeats(composite, time_norm, time_sec)?;
         let composite = &expanded_composite;
+        // Scale only the 3D island, not the surrounding SVG/text layout.
+        let render_scale = composite
+            .render_style
+            .as_ref()
+            .map_or(1.0, |s| s.render_scale);
+        let island_size = (
+            ((canvas_size.0 as f32 * render_scale).round() as u32).max(1),
+            ((canvas_size.1 as f32 * render_scale).round() as u32).max(1),
+        );
         self.ensure_gpu_compositor_size(canvas_size.0.max(1), canvas_size.1.max(1))
             .await?;
         let mut camera = WorldCamera::default();
@@ -10877,8 +10987,15 @@ impl SceneFrameRenderer {
                                     crate::simulation::model::RigidBodyShape::Cylinder
                                 }
                                 crate::dsl::PrimitiveGeometry::Cone { .. }
-                                | crate::dsl::PrimitiveGeometry::Wedge { .. } => {
+                                | crate::dsl::PrimitiveGeometry::Wedge { .. }
+                                | crate::dsl::PrimitiveGeometry::Frustum { .. } => {
                                     crate::simulation::model::RigidBodyShape::ConvexHull
+                                }
+                                crate::dsl::PrimitiveGeometry::Ellipsoid { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Sphere
+                                }
+                                crate::dsl::PrimitiveGeometry::RoundedBox { .. } => {
+                                    crate::simulation::model::RigidBodyShape::Box
                                 }
                                 crate::dsl::PrimitiveGeometry::Plane { .. } => {
                                     crate::simulation::model::RigidBodyShape::Box
@@ -11778,7 +11895,7 @@ impl SceneFrameRenderer {
             duration_ms,
             duration_explicit: true,
             size: canvas_size,
-            render_size: Some(canvas_size),
+            render_size: Some(island_size),
             model_profiles: std::mem::take(&mut world_model_profiles),
             worlds: vec![WorldNode {
                 id: world_id.clone(),
@@ -22390,6 +22507,9 @@ mod tests {
             bevel_segments: 0,
             material_seed: None,
             collision: crate::dsl::PrimitiveCollisionNode::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         };
         let authored = crate::dsl::ContactSurfaceNode {
             id: "seat".to_string(),
@@ -22822,6 +22942,9 @@ mod tests {
                 size: Some(vec![2.0, 4.0, 6.0]),
                 ..Default::default()
             },
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         };
         let triangles = primitive_collision_triangles(&asset, [1.0, 2.0, 3.0], [0.0; 3], 1.0);
         let minimum = std::array::from_fn::<_, 3, _>(|axis| {
@@ -23040,6 +23163,75 @@ mod tests {
                 .and_then(|composite| composite.active_camera.as_deref()),
             Some("close")
         );
+    }
+
+    #[test]
+    fn scene_render_style_animation_owns_the_exact_cut_frame() {
+        let graph = parse_graph_script(
+            r#"<Graph fps="30" duration="6s" size={[64,64]}>
+  <RenderStyle id="physical">
+    <SurfaceStyle shading="physical" />
+  </RenderStyle>
+  <RenderStyle id="toon">
+    <SurfaceStyle shading="toon" shadingSteps="3" />
+    <PostStyle bloomIntensity="0.1" />
+  </RenderStyle>
+  <Scene id="main" renderStyle="physical">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="6s">
+          <CompositeGroup id="island" space="3d">
+            <Camera3D />
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <AnimationTarget node="main" property="renderStyle">
+    <Key time="0s" value="physical" />
+    <Key time="3s" value="toon" />
+  </AnimationTarget>
+  <Present from="main" />
+</Graph>"#,
+        )
+        .expect("animated RenderStyle graph");
+        let before = apply_animation_targets_at_frame(&graph, 89)
+            .expect("frame before cut")
+            .expect("animated graph");
+        let at_cut = apply_animation_targets_at_frame(&graph, 90)
+            .expect("frame at cut")
+            .expect("animated graph");
+        assert_eq!(before.scenes[0].render_style.as_deref(), Some("physical"));
+        assert_eq!(at_cut.scenes[0].render_style.as_deref(), Some("toon"));
+        assert!(
+            graph
+                .processes
+                .iter()
+                .any(|process| process.id == "__ml_style_bloom_toon"),
+            "animated styles compile their bloom process before the cut"
+        );
+        let SceneNode::Timeline(timeline) = &at_cut.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("composite group");
+        };
+        assert_eq!(
+            group
+                .composite
+                .as_ref()
+                .and_then(|composite| composite.render_style.as_ref())
+                .map(|style| style.shading.as_str()),
+            Some("toon")
+        );
+        assert_eq!(group.process_effects.len(), 1);
+        assert_eq!(group.process_effects[0].process, "__ml_style_bloom_toon");
     }
 
     #[test]

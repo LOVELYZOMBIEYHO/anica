@@ -48,6 +48,7 @@ Use this when the caller expects a scene/composition graph and wants typed
 control over rendering.
 
 `GraphAssetSource`, `MaterialAssetNode`, `PrimitiveAssetNode`, `PrimitiveGeometry`,
+`PrimitiveModifierNode`, `PrimitiveMeshBuildNode`, `PrimitiveLodNode`,
 `PrimitiveCollisionNode`, `TerrainAssetNode`, `VegetationAssetNode`,
 `VegetationKind`, `VegetationLod`, and `CompoundAssetNode` expose the typed asset
 representation used by generated geometry. External GLB, individual
@@ -55,6 +56,9 @@ primitives, and compound primitive assets remain distinct through parsing and
 asset resolution. A resolved PrimitiveAsset retains its referenced PBR
 MaterialAsset so native and WASM world renderers consume the same self-contained
 material definition after CompoundAsset expansion.
+The advanced PrimitiveAsset block is additive: compact self-closing assets
+deserialize with empty modifiers and default build/LOD policies. Native and
+WASM renderers consume the same generated triangle mesh and stable cache key.
 `TerrainAssetNode` retains its resolved height map, optional RGBA blend map,
 and up to four resolved PBR layer definitions. Terrain is an additive
 `GraphAssetSource::Terrain` variant and therefore does not change existing
@@ -737,3 +741,12 @@ WASM exposes the additive `WasmPoseDiagnostics` handle with the same evaluation
 stage. Prefer the stable Scene report when contact, constraints or camera
 projection matter. Existing rendering and editor APIs are unchanged, and the
 DSL remains the authored source of truth.
+
+## Scene visual style inspection
+
+`motionloom::api::resolve_scene_render_style(&graph, scene_id)` returns resolved
+Scene-owned style/quality settings and explicit-node override evidence. The DSL
+remains the source of truth; this JSON is inspection output, not an editing API.
+WASM hosts use `motionloom_render_style_json(script, scene_id)`; CLI hosts can
+use the `render_style_report` example. See [RENDER_STYLE.md](RENDER_STYLE.md) for
+supported settings, precedence, fallback behavior and Rust AST migration notes.

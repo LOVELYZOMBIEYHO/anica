@@ -144,6 +144,9 @@ pub(crate) fn vegetation_collision_triangles(
         bevel_segments: 0,
         material_seed: None,
         collision: PrimitiveCollisionNode::default(),
+        modifiers: Vec::new(),
+        mesh_build: Default::default(),
+        lod: Default::default(),
     };
     let mesh = crate::world::primitive::generate_primitive_mesh(&primitive);
     let mut triangles = crate::world::model_inspection::environment_collision_triangles(&mesh);
@@ -210,6 +213,9 @@ pub(crate) fn vegetation_surface_primitive(
         bevel_segments: 0,
         material_seed: Some(asset.seed),
         collision: PrimitiveCollisionNode::default(),
+        modifiers: Vec::new(),
+        mesh_build: Default::default(),
+        lod: Default::default(),
     }
 }
 

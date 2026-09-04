@@ -119,6 +119,7 @@ mod world;
 pub mod api;
 pub mod experimental;
 pub mod prelude;
+pub mod render_style;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_api;
@@ -160,7 +161,8 @@ pub use dsl::{
     AnimationKeyNode, AnimationTargetNode, ApplyActionNode, BackgroundNode, ContactSurfaceNode,
     GraphAssetKind, GraphAssetNode, GraphAssetSource, GraphScript, ImageNode,
     ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
-    ModelProfileRetargetMapNode, ModelProfileRetargetNode, PrimitiveAssetNode, PrimitiveGeometry,
+    ModelProfileRetargetMapNode, ModelProfileRetargetNode, PrimitiveAssetNode, PrimitiveAxis,
+    PrimitiveGeometry, PrimitiveLodNode, PrimitiveMeshBuildNode, PrimitiveModifierNode,
     ProcessDefinitionNode, SkeletonBoneNode, SkeletonConstraintNode, SkeletonControlNode,
     SkeletonGuideNode, SkeletonLandmarkNode, SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode,
     SkeletonRegionNode, SvgNode, TerrainAssetNode, VegetationAssetNode, VegetationKind,

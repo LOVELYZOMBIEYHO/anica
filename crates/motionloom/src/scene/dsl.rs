@@ -889,6 +889,10 @@ pub(crate) fn parse_scene_root_block(
     resolve_puppet_targets(&mut children)?;
     Ok((
         SceneRootNode {
+            render_style: attr_value(&open_tag, "renderStyle")
+                .map(|v| strip_wrappers(&v).to_string()),
+            render_quality: attr_value(&open_tag, "renderQuality")
+                .map(|v| strip_wrappers(&v).to_string()),
             id,
             size,
             effects,
@@ -2946,6 +2950,9 @@ fn parse_composite_group_block(
                 bevel_segments: 0,
                 material_seed: None,
                 collision: Default::default(),
+                modifiers: Vec::new(),
+                mesh_build: Default::default(),
+                lod: Default::default(),
             };
             nodes_3d.push(Scene3DNode::Model(SceneModel3DNode {
                 id: Some(model_id),
@@ -3710,6 +3717,7 @@ fn parse_composite_group_block(
     let mut group = parse_group_node(&synthetic_group_tag, start + 1, children)?;
     group.process_effects = process_effects;
     group.composite = Some(CompositeGroupConfig {
+        render_style: None,
         space,
         composite_order,
         depth,

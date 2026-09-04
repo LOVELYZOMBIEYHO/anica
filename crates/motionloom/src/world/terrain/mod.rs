@@ -85,20 +85,41 @@ pub fn generate_terrain_mesh_textured(
 
 pub fn terrain_cache_key(asset: &TerrainAssetNode, height_map: &RgbaImage) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    asset.id.hash(&mut hasher);
-    asset.height_map_src.hash(&mut hasher);
-    asset.size.map(f32::to_bits).hash(&mut hasher);
-    asset.height_scale.to_bits().hash(&mut hasher);
-    asset.height_offset.to_bits().hash(&mut hasher);
-    asset.layers.hash(&mut hasher);
-    format!("{:?}", asset.material_definition).hash(&mut hasher);
-    format!("{:?}", asset.layer_definitions).hash(&mut hasher);
-    asset.blend_map_src.hash(&mut hasher);
-    asset.chunks.hash(&mut hasher);
-    asset.lod.hash(&mut hasher);
+    hash_terrain_declaration(asset, &mut hasher);
     height_map.dimensions().hash(&mut hasher);
     height_map.as_raw().hash(&mut hasher);
     PathBuf::from(format!("motionloom-terrain-{:016x}", hasher.finish()))
+}
+
+/// Stable renderer-lifetime key for an immutable remote terrain declaration.
+///
+/// Remote image bytes are expensive to resolve and hash on every frame. The
+/// source URL is already part of the declaration, so the renderer can use this
+/// key to discover an existing generated mesh before fetching the height map.
+/// Local and in-memory sources continue to use `terrain_cache_key`, preserving
+/// their content-revision invalidation behaviour.
+pub fn remote_terrain_cache_key(asset: &TerrainAssetNode) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "remote".hash(&mut hasher);
+    hash_terrain_declaration(asset, &mut hasher);
+    PathBuf::from(format!(
+        "motionloom-remote-terrain-{:016x}",
+        hasher.finish()
+    ))
+}
+
+fn hash_terrain_declaration(asset: &TerrainAssetNode, hasher: &mut impl Hasher) {
+    asset.id.hash(hasher);
+    asset.height_map_src.hash(hasher);
+    asset.size.map(f32::to_bits).hash(hasher);
+    asset.height_scale.to_bits().hash(hasher);
+    asset.height_offset.to_bits().hash(hasher);
+    asset.layers.hash(hasher);
+    format!("{:?}", asset.material_definition).hash(hasher);
+    format!("{:?}", asset.layer_definitions).hash(hasher);
+    asset.blend_map_src.hash(hasher);
+    asset.chunks.hash(hasher);
+    asset.lod.hash(hasher);
 }
 
 fn terrain_chunk_index(
@@ -169,6 +190,9 @@ pub(crate) fn terrain_surface_primitive(asset: &TerrainAssetNode) -> PrimitiveAs
         bevel_segments: 0,
         material_seed: None,
         collision: PrimitiveCollisionNode::default(),
+        modifiers: Vec::new(),
+        mesh_build: Default::default(),
+        lod: Default::default(),
     }
 }
 
@@ -290,6 +314,23 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             4
+        );
+    }
+
+    #[test]
+    fn remote_cache_key_is_stable_and_tracks_the_height_source() {
+        let mut first = terrain();
+        first.height_map_src = Some("https://example.com/height-a.png".into());
+        let mut second = first.clone();
+        assert_eq!(
+            remote_terrain_cache_key(&first),
+            remote_terrain_cache_key(&second)
+        );
+
+        second.height_map_src = Some("https://example.com/height-b.png".into());
+        assert_ne!(
+            remote_terrain_cache_key(&first),
+            remote_terrain_cache_key(&second)
         );
     }
 }

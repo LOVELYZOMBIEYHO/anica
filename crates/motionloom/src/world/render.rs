@@ -37,10 +37,11 @@ use crate::world::gltf_loader::{
     load_glb_animation_data_from_bytes, load_glb_mesh_data, load_glb_mesh_data_from_bytes,
 };
 use crate::world::model::{
-    WorldAction, WorldActionBone, WorldActor, WorldApplyAction, WorldBackgroundFit, WorldBoneAxis,
-    WorldBoneAxisMap, WorldDirectionFrame, WorldDirectionalCharacter, WorldGraph, WorldLightKind,
-    WorldLighting, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay,
-    WorldRetargetMap, WorldSpritePlayback, WorldTime,
+    WorldAction, WorldActionBone, WorldActionPose, WorldActor, WorldApplyAction,
+    WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldDirectionFrame,
+    WorldDirectionalCharacter, WorldGraph, WorldLightKind, WorldLighting, WorldMaterialStyle,
+    WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldRetargetMap, WorldSpritePlayback,
+    WorldTime,
 };
 
 /// Keep native profiling instrumentation out of the browser runtime because
@@ -140,7 +141,7 @@ pub enum WorldRenderError {
 /// GPU execution time remains available from the parent Scene compositor's
 /// timestamp queries; these fields expose work that previously appeared as an
 /// unexplained preview stall before queue submission.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 #[non_exhaustive]
 pub struct Scene3DFrameProfile {
     pub prepare_ms: f64,
@@ -1994,7 +1995,7 @@ impl GpuWorldRenderer {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -2202,7 +2203,7 @@ impl GpuWorldRenderer {
             });
         let lighting_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("anica-motionloom-world-lighting-params"),
-            size: 560,
+            size: 624,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2791,6 +2792,27 @@ impl GpuWorldRenderer {
                 ),
             });
         }
+        // Resize only on quality changes; environment bindings reference this texture.
+        let shadow_size = (lighting.params.surface3[2] as u32)
+            .clamp(128, self.device.limits().max_texture_dimension_2d);
+        if self.shadow_texture.width() != shadow_size {
+            self.shadow_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("motionloom-style-shadow-map"),
+                size: wgpu::Extent3d {
+                    width: shadow_size,
+                    height: shadow_size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.environment_resource = None;
+        }
         let target = self.acquire_target();
         if clear_color.is_none() {
             let background = background.ok_or_else(|| WorldRenderError::GpuRender {
@@ -2813,7 +2835,53 @@ impl GpuWorldRenderer {
             .clone();
         let mut gpu_draws = Vec::<GpuWorldDrawResources>::with_capacity(draw_calls.len());
         let mut active_texture_keys = HashSet::<GpuWorldTextureKey>::new();
+        let mut buffer_writes = 0usize;
+        // Keep authoring order (including coplanar ties); only adjacent compatible
+        // opaque draws coalesce. Transparent and skinned draws remain independent.
+        let mut batches: Vec<(Vec<&GpuWorldDraw>, bool)> = Vec::new();
+        let max_instances = (self.device.limits().max_storage_buffer_binding_size as usize
+            / std::mem::size_of::<GpuWorldParams>())
+        .max(1);
         for draw in draw_calls {
+            let geometry = self.shared_actor_geometry(draw.vertex_signature, &draw.vertices);
+            // Procedural meshes use an identity joint, not necessarily zero weights.
+            // Only identity palettes can safely use the cached undeformed bounds.
+            let rigid = draw
+                .bone_matrices
+                .iter()
+                .all(|matrix| *matrix == mat4_identity());
+            let visible = rigid_draw_visible(
+                if rigid { geometry.rigid_bounds } else { None },
+                draw.params,
+            );
+            let compatible = batches.last().is_some_and(|(batch, previous_visible)| {
+                let previous = batch[0];
+                batch.len() < max_instances
+                    && *previous_visible == visible
+                    && draw.phase == GpuWorldDrawPhase::Opaque
+                    && draw.depth_write
+                    && previous.phase == draw.phase
+                    && previous.depth_write
+                    && previous.resource_key == draw.resource_key
+                    && previous.vertex_signature == draw.vertex_signature
+                    && previous.sort_priority == draw.sort_priority
+                    && previous.texture.signature == draw.texture.signature
+                    && previous.normal_texture.signature == draw.normal_texture.signature
+                    && previous.metallic_roughness_texture.signature
+                        == draw.metallic_roughness_texture.signature
+                    && previous.emissive_texture.signature == draw.emissive_texture.signature
+                    && previous.bone_matrices == draw.bone_matrices
+                    && rigid
+                    && geometry.rigid_bounds.is_some()
+            });
+            if compatible {
+                batches.last_mut().unwrap().0.push(draw);
+            } else {
+                batches.push((vec![draw], visible));
+            }
+        }
+        for (batch, camera_visible) in batches {
+            let draw = batch[0];
             if draw.vertices.is_empty() {
                 continue;
             }
@@ -2898,18 +2966,24 @@ impl GpuWorldRenderer {
                     resource.geometry.vertex_count,
                 )
             };
-            let params_bytes = pack_gpu_world_params(draw.params);
+            let params_bytes: Vec<u8> = batch
+                .iter()
+                .flat_map(|draw| pack_gpu_world_params(draw.params))
+                .collect();
             let bone_bytes = pack_gpu_world_bones(&draw.bone_matrices);
             let bone_buffer_size = bone_bytes.len().max(64) as u64;
             let needs_instance = self
                 .instance_resource_cache
                 .get(&draw.instance_key)
-                .is_none_or(|resource| resource.bone_buffer_size < bone_buffer_size);
+                .is_none_or(|resource| {
+                    resource.bone_buffer_size < bone_buffer_size
+                        || resource.params_buffer_size < params_bytes.len() as u64
+                });
             if needs_instance {
                 let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("anica-motionloom-world-gpu-params"),
                     size: params_bytes.len().max(4) as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
                 let bone_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2960,28 +3034,55 @@ impl GpuWorldRenderer {
                         params_buffer,
                         bone_buffer,
                         bone_buffer_size,
+                        params_buffer_size: params_bytes.len() as u64,
+                        last_params: Vec::new(),
+                        last_bones: Vec::new(),
                         bind_group,
                     },
                 );
             }
             let instance_resource = self
                 .instance_resource_cache
-                .get(&draw.instance_key)
+                .get_mut(&draw.instance_key)
                 .expect("GPU world instance resource inserted before draw");
-            self.queue
-                .write_buffer(&instance_resource.params_buffer, 0, &params_bytes);
-            self.queue
-                .write_buffer(&instance_resource.bone_buffer, 0, &bone_bytes);
+            // Retained buffers need no upload when their exact contents are unchanged.
+            if instance_resource.last_params != params_bytes {
+                buffer_writes += 1;
+                self.queue
+                    .write_buffer(&instance_resource.params_buffer, 0, &params_bytes);
+                instance_resource.last_params = params_bytes;
+            }
+            if instance_resource.last_bones != bone_bytes {
+                buffer_writes += 1;
+                self.queue
+                    .write_buffer(&instance_resource.bone_buffer, 0, &bone_bytes);
+                instance_resource.last_bones = bone_bytes;
+            }
             gpu_draws.push(GpuWorldDrawResources {
                 vertex_buffer,
                 bind_group: instance_resource.bind_group.clone(),
                 vertex_count,
+                instance_count: batch.len() as u32,
+                camera_visible,
                 phase: draw.phase,
                 depth_write: draw.depth_write,
                 sort_priority: draw.sort_priority,
                 camera_depth: draw.camera_depth,
             });
         }
+        // Optional native diagnostics do not change the public profile/DSL contract.
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os("MOTIONLOOM_TRACE_BATCHES").is_some() {
+            eprintln!(
+                "motionloom batches: items={} batches={} camera_batches={} buffer_writes={}",
+                draw_calls.len(),
+                gpu_draws.len(),
+                gpu_draws.iter().filter(|draw| draw.camera_visible).count(),
+                buffer_writes
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = buffer_writes;
         // Opaque draws keep authoring order. Transparent draws follow them and
         // blend from far to near, with priority as an explicit expert override.
         gpu_draws.sort_by(|left, right| match (left.phase, right.phase) {
@@ -3036,7 +3137,7 @@ impl GpuWorldRenderer {
             {
                 shadow_pass.set_bind_group(0, &draw.bind_group, &[]);
                 shadow_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                shadow_pass.draw(0..draw.vertex_count, 0..1);
+                shadow_pass.draw(0..draw.vertex_count, 0..draw.instance_count);
             }
         }
         {
@@ -3083,7 +3184,7 @@ impl GpuWorldRenderer {
             let mut opaque_depth_write_active = true;
             for draw in gpu_draws
                 .iter()
-                .filter(|draw| draw.phase == GpuWorldDrawPhase::Opaque)
+                .filter(|draw| draw.camera_visible && draw.phase == GpuWorldDrawPhase::Opaque)
             {
                 if draw.depth_write != opaque_depth_write_active {
                     if draw.depth_write {
@@ -3095,7 +3196,7 @@ impl GpuWorldRenderer {
                 }
                 pass.set_bind_group(0, &draw.bind_group, &[]);
                 pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                pass.draw(0..draw.vertex_count, 0..1);
+                pass.draw(0..draw.vertex_count, 0..draw.instance_count);
             }
         }
         // Transmissive shaders sample a stable opaque snapshot. Reading the
@@ -3144,7 +3245,7 @@ impl GpuWorldRenderer {
             pass.set_bind_group(1, &lighting_bind_group, &[]);
             for draw in gpu_draws
                 .iter()
-                .filter(|draw| draw.phase != GpuWorldDrawPhase::Opaque)
+                .filter(|draw| draw.camera_visible && draw.phase != GpuWorldDrawPhase::Opaque)
             {
                 match (draw.phase, draw.depth_write) {
                     (GpuWorldDrawPhase::AlphaBlend, false) => {
@@ -3165,10 +3266,12 @@ impl GpuWorldRenderer {
                 }
                 pass.set_bind_group(0, &draw.bind_group, &[]);
                 pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                pass.draw(0..draw.vertex_count, 0..1);
+                pass.draw(0..draw.vertex_count, 0..draw.instance_count);
             }
         }
-        let output_target = if lighting.params.optics0[0] > 0.0 && lighting.params.optics0[3] > 0.0
+        let output_target = if (lighting.params.optics0[0] > 0.0
+            && lighting.params.optics0[3] > 0.0)
+            || lighting.params.surface3[3] > 0.5
         {
             let dof_target = self.acquire_target();
             let dof_view = dof_target.create_view(&wgpu::TextureViewDescriptor::default());
@@ -3414,6 +3517,7 @@ impl GpuWorldRenderer {
         let resource = Arc::new(GpuWorldVertexResource {
             vertex_buffer,
             vertex_count: vertices.len() as u32,
+            rigid_bounds: rigid_vertex_bounds(vertices),
         });
         self.vertex_resource_cache
             .insert(signature, Arc::clone(&resource));
@@ -3519,6 +3623,8 @@ struct GpuWorldDrawResources {
     vertex_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_count: u32,
+    instance_count: u32,
+    camera_visible: bool,
     phase: GpuWorldDrawPhase,
     depth_write: bool,
     sort_priority: i32,
@@ -3566,9 +3672,73 @@ struct GpuWorldActorResource {
     emissive_texture: Arc<GpuWorldTextureResource>,
 }
 
+// Cache undeformed bounds once; the current bone palette gates their use.
+fn rigid_vertex_bounds(vertices: &[GpuWorldVertex]) -> Option<([f32; 3], [f32; 3])> {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for vertex in vertices {
+        for axis in 0..3 {
+            let value = vertex.position[axis];
+            if !value.is_finite() {
+                return None;
+            }
+            min[axis] = min[axis].min(value);
+            max[axis] = max[axis].max(value);
+        }
+    }
+    (!vertices.is_empty()).then_some((min, max))
+}
+
+// Reject only rigid bounds outside a side plane in front of the near plane.
+// Deformation, near-plane intersections and shadow casters are left untouched.
+fn rigid_draw_visible(bounds: Option<([f32; 3], [f32; 3])>, p: GpuWorldParams) -> bool {
+    let Some((min, max)) = bounds else {
+        return true;
+    };
+    if p.vegetation[0] != 0.0 {
+        return true;
+    }
+    let mut outside = [true; 4];
+    for corner in 0..8 {
+        let local = std::array::from_fn(|axis| {
+            let v = if corner & (1 << axis) == 0 {
+                min[axis]
+            } else {
+                max[axis]
+            };
+            (v - p.model[axis]) * p.model[3]
+        });
+        let rotated = quat_rotate_vec3(quat_normalize_xyzw(p.actor_rotation), local);
+        let rel: [f32; 3] =
+            std::array::from_fn(|axis| rotated[axis] + p.actor[axis] - p.camera0[axis]);
+        let dot = |basis: [f32; 4]| (0..3).map(|axis| rel[axis] * basis[axis]).sum::<f32>();
+        let x = dot(p.camera1);
+        let y = dot(p.camera2);
+        let z = dot(p.camera3);
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() || z <= p.camera1[3] {
+            return true;
+        }
+        let half_x = z * p.canvas[0] * 0.5 / p.camera0[3];
+        let half_y = z * p.canvas[1] * 0.5 / p.camera0[3];
+        for (index, test) in [
+            x < -half_x - 0.01,
+            x > half_x + 0.01,
+            y < -half_y - 0.01,
+            y > half_y + 0.01,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            outside[index] &= test;
+        }
+    }
+    !outside.into_iter().any(|value| value)
+}
+
 struct GpuWorldVertexResource {
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
+    rigid_bounds: Option<([f32; 3], [f32; 3])>,
 }
 
 struct GpuWorldTextureResource {
@@ -3597,6 +3767,9 @@ struct GpuWorldInstanceResource {
     params_buffer: wgpu::Buffer,
     bone_buffer: wgpu::Buffer,
     bone_buffer_size: u64,
+    params_buffer_size: u64,
+    last_params: Vec<u8>,
+    last_bones: Vec<u8>,
     bind_group: wgpu::BindGroup,
 }
 
@@ -3675,7 +3848,7 @@ fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
 }
 
 fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(560);
+    let mut out = Vec::with_capacity(624);
     for vector in [
         params.environment0,
         params.environment1,
@@ -3696,6 +3869,10 @@ fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8> {
         params.shadow1,
         params.shadow2,
         params.shadow3,
+        params.surface0,
+        params.surface1,
+        params.surface2,
+        params.surface3,
     ] {
         for value in vector {
             out.extend_from_slice(&value.to_ne_bytes());
@@ -3817,6 +3994,10 @@ struct Lighting {
     shadow1: vec4<f32>,
     shadow2: vec4<f32>,
     shadow3: vec4<f32>,
+    surface0: vec4<f32>,
+    surface1: vec4<f32>,
+    surface2: vec4<f32>,
+    surface3: vec4<f32>,
     lights: array<Light, 4>,
 };
 
@@ -3844,9 +4025,12 @@ struct VertexOut {
     @location(4) tangent: vec3<f32>,
     @location(5) bitangent: vec3<f32>,
     @location(6) hidden_weight: f32,
+    @location(7) @interpolate(flat) instance_id: u32,
 };
 
-@group(0) @binding(0) var<uniform> params: Params;
+// Each invocation selects its own packed instance; fragment selection is flat.
+@group(0) @binding(0) var<storage, read> instance_params: array<Params>;
+var<private> params: Params;
 @group(0) @binding(1) var<storage, read> bones: BoneMatrices;
 @group(0) @binding(2) var actor_texture: texture_2d<f32>;
 @group(0) @binding(3) var actor_sampler: sampler;
@@ -3899,6 +4083,9 @@ fn sample_shadow(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     }
     let texel = 1.0 / vec2<f32>(textureDimensions(shadow_texture));
     let bias = lighting.shadow3.w * (1.0 + 2.0 * (1.0 - abs(normal.y)));
+    if (lighting.surface3.y > 0.5) {
+        return mix(1.0, textureSampleCompareLevel(shadow_texture, shadow_sampler, coordinate.xy, coordinate.z - bias), lighting.color1.w);
+    }
     var visibility = 0.0;
     for (var y = -1; y <= 1; y = y + 1) {
         for (var x = -1; x <= 1; x = x + 1) {
@@ -3960,7 +4147,8 @@ fn vegetation_deform(position: vec3<f32>) -> vec3<f32> {
 }
 
 @vertex
-fn vs_main(input: VertexIn) -> VertexOut {
+fn vs_main(input: VertexIn, @builtin(instance_index) instance_id: u32) -> VertexOut {
+    params = instance_params[instance_id];
     let weight_sum = input.weights.x + input.weights.y + input.weights.z + input.weights.w;
     var skinned = vegetation_deform(input.position);
     var skinned_normal = input.normal;
@@ -4016,6 +4204,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let ndc_z = clamp(1.0 - ((safe_z - params.camera1.w) / (far - params.camera1.w)), 0.0, 1.0);
 
     var out: VertexOut;
+    out.instance_id = instance_id;
     // Preserve camera-space depth in clip-space w. The previous shader wrote
     // already-divided NDC coordinates with w=1, which forced affine varying
     // interpolation and visibly warped material UVs on oblique surfaces.
@@ -4045,7 +4234,8 @@ fn vs_main(input: VertexIn) -> VertexOut {
 }
 
 @vertex
-fn vs_shadow(input: VertexIn) -> @builtin(position) vec4<f32> {
+fn vs_shadow(input: VertexIn, @builtin(instance_index) instance_id: u32) -> @builtin(position) vec4<f32> {
+    params = instance_params[instance_id];
     let weight_sum = input.weights.x + input.weights.y + input.weights.z + input.weights.w;
     var skinned = vegetation_deform(input.position);
     if (weight_sum > 0.000001) {
@@ -4106,6 +4296,19 @@ fn direct_pbr(
     let specular = (distribution * geometry * fresnel) / max(4.0 * n_dot_v * n_dot_l, 0.0001);
     let diffuse_weight = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic);
     let diffuse = diffuse_weight * base_color / 3.14159265;
+    // Art-directed diffuse is calculated per light, not by posterizing pixels.
+    if (lighting.surface0.x > 0.5) {
+        var intensity = clamp((dot(normal, light) + lighting.surface0.z) / (1.0 + lighting.surface0.z), 0.0, 1.0);
+        if (lighting.surface0.x > 1.5 && lighting.surface0.x < 2.5) {
+            let steps = max(lighting.surface0.y, 2.0);
+            intensity = floor(intensity * (steps - 1.0) + 0.5) / (steps - 1.0);
+        }
+        return (base_color / 3.14159265 * intensity + specular * lighting.surface1.y * n_dot_l) * radiance;
+    }
+    if (lighting.surface1.y != 1.0 || lighting.surface0.z != 0.0) {
+        let wrapped = clamp((dot(normal, light) + lighting.surface0.z) / (1.0 + lighting.surface0.z), 0.0, 1.0);
+        return (diffuse * wrapped + specular * lighting.surface1.y * n_dot_l) * radiance;
+    }
     return (diffuse + specular) * radiance * n_dot_l;
 }
 
@@ -4126,6 +4329,9 @@ fn white_balance(color: vec3<f32>, kelvin: f32) -> vec3<f32> {
 fn display_transform(color: vec3<f32>) -> vec3<f32> {
     var adjusted = white_balance(max(color * lighting.color0.x, vec3<f32>(0.0)), lighting.color0.y);
     adjusted = (adjusted - vec3<f32>(0.18)) * lighting.color0.z + vec3<f32>(0.18);
+    if (lighting.surface1.w != 1.0) {
+        adjusted = mix(vec3<f32>(dot(adjusted, vec3<f32>(0.2126,0.7152,0.0722))), adjusted, lighting.surface1.w);
+    }
     var mapped = adjusted;
     if (lighting.color0.w > 1.5) {
         mapped = aces_fitted(adjusted);
@@ -4232,10 +4438,18 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         sampled.rgb * input.color.rgb * params.material4.rgb,
         vec3<f32>(0.0), vec3<f32>(1.0)
     );
-    let base_color = pow(base_srgb, vec3<f32>(2.2));
+    var base_color = pow(base_srgb, vec3<f32>(2.2));
+    if (lighting.surface3.x != 1.0) {
+        base_color = max(mix(vec3<f32>(dot(base_color, vec3<f32>(0.2126,0.7152,0.0722))), base_color, lighting.surface3.x), vec3<f32>(0.0));
+    }
     let mr_sample = textureSample(metallic_roughness_texture, actor_sampler, uv);
-    let metallic = clamp(params.material0.x * mr_sample.b, 0.0, 1.0);
-    let roughness = clamp(params.material0.y * mr_sample.g, 0.045, 1.0);
+    var metallic = clamp(params.material0.x * mr_sample.b, 0.0, 1.0);
+    var roughness = clamp(params.material0.y * mr_sample.g + lighting.surface1.z, 0.045, 1.0);
+    if (lighting.surface0.x > 2.5) {
+        base_color = vec3<f32>(0.55,0.48,0.40);
+        metallic = 0.0;
+        roughness = 0.85;
+    }
 
     let geometric_normal = normalize(input.normal);
     let tangent = normalize(input.tangent - geometric_normal * dot(input.tangent, geometric_normal));
@@ -4293,9 +4507,10 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let contact = 1.0 - lighting.color1.x *
         (1.0 - smoothstep(0.0, max(lighting.color1.y, 0.001), max(input.world_position.y, 0.0))) *
         (0.45 + 0.55 * (1.0 - lighting.color1.z));
-    let diffuse_ambient = base_color * (1.0 - metallic) * diffuse_environment;
-    let specular_ambient = environment_fresnel * specular_environment;
+    let diffuse_ambient = base_color * (1.0 - metallic) * diffuse_environment * lighting.surface2.rgb * lighting.surface2.w;
+    let specular_ambient = environment_fresnel * specular_environment * lighting.surface1.y;
     lit += (diffuse_ambient + specular_ambient) * ao * contact;
+    lit += base_color * lighting.surface0.w * pow(1.0 - n_dot_v, lighting.surface1.x);
 
     let emissive_sample = pow(
         clamp(textureSample(emissive_texture, actor_sampler, uv).rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
@@ -4337,11 +4552,13 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    params = instance_params[input.instance_id];
     return shade_surface(input);
 }
 
 @fragment
 fn fs_transmissive(input: VertexOut) -> @location(0) vec4<f32> {
+    params = instance_params[input.instance_id];
     if (input.hidden_weight > 0.01) {
         discard;
     }
@@ -4466,6 +4683,10 @@ struct Lighting {
     shadow1: vec4<f32>,
     shadow2: vec4<f32>,
     shadow3: vec4<f32>,
+    surface0: vec4<f32>,
+    surface1: vec4<f32>,
+    surface2: vec4<f32>,
+    surface3: vec4<f32>,
     lights: array<Light, 4>,
 };
 
@@ -4494,12 +4715,35 @@ fn view_distance(depth: f32) -> f32 {
 }
 
 fn circle_of_confusion(distance: f32, image_height: f32) -> f32 {
+    if (lighting.optics0.x <= 0.0 || lighting.optics0.w <= 0.0) { return 0.0; }
     let focus = max(lighting.optics0.x, 0.05);
     let focal = clamp(lighting.optics0.y * 0.001, 0.001, focus * 0.95);
     let aperture = focal / max(lighting.optics0.z, 0.7);
     let sensor_coc = abs(aperture * focal * (focus - distance) /
         max(distance * (focus - focal), 0.000001));
     return clamp(sensor_coc / 0.024 * image_height, 0.0, lighting.optics0.w);
+}
+
+// FXAA resolves high-contrast edges without temporal history or extra buffers.
+fn antialiased_color(uv: vec2<f32>) -> vec4<f32> {
+    let center = textureSampleLevel(scene_color, scene_sampler, uv, 0.0);
+    if (lighting.surface3.w < 0.5) { return center; }
+    let texel = 1.0 / vec2<f32>(textureDimensions(scene_color));
+    let nw = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(-1.0,-1.0) * texel, 0.0).rgb;
+    let ne = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(1.0,-1.0) * texel, 0.0).rgb;
+    let sw = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(-1.0,1.0) * texel, 0.0).rgb;
+    let se = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(1.0,1.0) * texel, 0.0).rgb;
+    let luma = vec3<f32>(0.299,0.587,0.114);
+    let a = dot(nw,luma); let b = dot(ne,luma); let c = dot(sw,luma); let d = dot(se,luma); let m = dot(center.rgb,luma);
+    let lo = min(m,min(min(a,b),min(c,d))); let hi = max(m,max(max(a,b),max(c,d)));
+    if (hi - lo < max(0.0312, hi * 0.125)) { return center; }
+    var direction = vec2<f32>(-((a+b)-(c+d)), (a+c)-(b+d));
+    let reduce = max((a+b+c+d)*0.03125,0.0078125);
+    direction = clamp(direction / (min(abs(direction.x),abs(direction.y))+reduce),vec2<f32>(-8.0),vec2<f32>(8.0))*texel;
+    let rgb_a = 0.5*(textureSampleLevel(scene_color,scene_sampler,uv-direction/6.0,0.0).rgb + textureSampleLevel(scene_color,scene_sampler,uv+direction/6.0,0.0).rgb);
+    let rgb_b = rgb_a*0.5+0.25*(textureSampleLevel(scene_color,scene_sampler,uv-direction*0.5,0.0).rgb+textureSampleLevel(scene_color,scene_sampler,uv+direction*0.5,0.0).rgb);
+    let lb = dot(rgb_b,luma);
+    return vec4<f32>(select(rgb_b,rgb_a,lb<lo || lb>hi),center.a);
 }
 
 @fragment
@@ -4509,7 +4753,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let center_depth = textureLoad(scene_depth, pixel, 0);
     let center_distance = view_distance(center_depth);
     let radius_px = circle_of_confusion(center_distance, dimensions.y);
-    let center = textureSample(scene_color, scene_sampler, input.uv);
+    // Explicit LOD keeps the sample legal inside the depth-dependent branch
+    // below. Browser WebGPU enforces derivative-uniformity more strictly than
+    // native Metal; implicit `textureSample` there can invalidate the DoF pass
+    // even though the preceding 3D render completed successfully.
+    let center = antialiased_color(input.uv);
     if (radius_px < 0.35) {
         return center;
     }
@@ -4539,7 +4787,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let depth_weight = exp(-separation * 6.0);
         let coc_weight = smoothstep(0.0, 1.0, sample_coc + radius_px);
         let weight = max(depth_weight * coc_weight, 0.001);
-        accumulated += textureSample(scene_color, scene_sampler, sample_uv).rgb * weight;
+        accumulated += textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0).rgb * weight;
         total_weight += weight;
     }
     return vec4<f32>(accumulated / total_weight, center.a);
@@ -7985,26 +8233,7 @@ fn action_pose_transform(
     if action.poses.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut poses = action.poses.iter().collect::<Vec<_>>();
-    poses.sort_by(|a, b| a.t.total_cmp(&b.t));
-    let first = poses[0];
-    let last = *poses.last().expect("poses is not empty");
-    let (before, after) = if action_time_sec <= first.t {
-        (first, first)
-    } else if action_time_sec >= last.t {
-        (last, last)
-    } else {
-        let mut pair = (first, first);
-        for window in poses.windows(2) {
-            let a = window[0];
-            let b = window[1];
-            if action_time_sec >= a.t && action_time_sec <= b.t {
-                pair = (a, b);
-                break;
-            }
-        }
-        pair
-    };
+    let (before, after) = action_pose_pair(&action.poses, action_time_sec);
     let linear_alpha = if (after.t - before.t).abs() <= f32::EPSILON {
         0.0
     } else {
@@ -8037,6 +8266,26 @@ fn action_pose_transform(
         out.insert(id.to_string(), transform);
     }
     Ok(out)
+}
+
+/// Find the authored window without allocating, sorting, or scanning every prior pose.
+fn action_pose_pair(
+    poses: &[WorldActionPose],
+    action_time_sec: f32,
+) -> (&WorldActionPose, &WorldActionPose) {
+    let first = &poses[0];
+    let last = poses.last().expect("poses is not empty");
+    if action_time_sec <= first.t {
+        return (first, first);
+    }
+    if action_time_sec >= last.t {
+        return (last, last);
+    }
+
+    // Strict `<` preserves the legacy exact-key behavior: key t is the end
+    // of the preceding interpolation window rather than the next window.
+    let after_index = poses.partition_point(|pose| pose.t < action_time_sec);
+    (&poses[after_index - 1], &poses[after_index])
 }
 
 /// Apply per-key interpolation without changing the legacy linear default.
@@ -9559,6 +9808,10 @@ struct GpuWorldLighting {
 
 #[derive(Debug, Clone, Copy)]
 struct GpuWorldLightingParams {
+    surface0: [f32; 4],
+    surface1: [f32; 4],
+    surface2: [f32; 4],
+    surface3: [f32; 4],
     environment0: [f32; 4],
     environment1: [f32; 4],
     environment2: [f32; 4],
@@ -9680,6 +9933,53 @@ impl GpuWorldLightingParams {
                 )
             };
         Self {
+            // Disabled styles use exact legacy-neutral multipliers.
+            surface0: lighting
+                .render_style
+                .as_ref()
+                .map_or([0.0, 3.0, 0.0, 0.0], |s| {
+                    [
+                        match s.shading.as_str() {
+                            "stylized" => 1.0,
+                            "toon" => 2.0,
+                            "clay" => 3.0,
+                            _ => 0.0,
+                        },
+                        s.shading_steps as f32,
+                        s.diffuse_wrap,
+                        s.rim_light,
+                    ]
+                }),
+            surface1: lighting
+                .render_style
+                .as_ref()
+                .map_or([3.0, 1.0, 0.0, 1.0], |s| {
+                    [
+                        s.rim_power,
+                        s.specular,
+                        s.roughness_bias,
+                        s.post.saturation.unwrap_or(1.0),
+                    ]
+                }),
+            surface2: lighting.render_style.as_ref().map_or([1.0; 4], |s| {
+                [
+                    s.ambient_color[0],
+                    s.ambient_color[1],
+                    s.ambient_color[2],
+                    s.ambient_intensity,
+                ]
+            }),
+            surface3: lighting
+                .render_style
+                .as_ref()
+                .map_or([1.0, 0.0, 1536.0, 0.0], |s| {
+                    [
+                        s.surface_saturation,
+                        s.hard_shadows as u8 as f32,
+                        s.shadow_resolution as f32,
+                        (s.anti_aliasing == "fxaa") as u8 as f32,
+                    ]
+                }),
             // x intensity, y rotation, z mip count, w environment present.
             environment0: [
                 environment.map_or(1.0, |env| env.intensity),
@@ -9841,7 +10141,7 @@ struct GpuWorldStaticDraw {
     bounds: ([f32; 3], [f32; 3]),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct GpuWorldParams {
     canvas: [f32; 4],
     model: [f32; 4],
@@ -11675,6 +11975,16 @@ fn load_cached_actor_mesh<'a>(
             .height_map_src
             .as_deref()
             .unwrap_or(terrain.height_map.as_str());
+        let remote_source_key = is_remote_world_asset_source(height_source)
+            .then(|| crate::world::terrain::remote_terrain_cache_key(terrain));
+        if let Some(source_key) = remote_source_key.as_ref() {
+            if mesh_cache.contains_key(source_key) {
+                let mesh = mesh_cache
+                    .get(source_key)
+                    .expect("remote terrain mesh found before render");
+                return Ok((source_key.clone(), mesh));
+            }
+        }
         let height_texture = load_cached_primitive_texture(
             asset_root,
             actor.path_style,
@@ -11689,7 +11999,8 @@ fn load_cached_actor_mesh<'a>(
             height_texture.rgba.as_ref().clone(),
         )
         .expect("decoded terrain height map has complete RGBA pixels");
-        let source_key = crate::world::terrain::terrain_cache_key(terrain, &height_map);
+        let source_key = remote_source_key
+            .unwrap_or_else(|| crate::world::terrain::terrain_cache_key(terrain, &height_map));
         if !mesh_cache.contains_key(&source_key) {
             let texture_set = load_terrain_texture_set(
                 asset_root,
@@ -12173,6 +12484,33 @@ fn load_cached_glb_animation_resolved<'a>(
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    #[test]
+    fn rigid_visibility_is_conservative_at_camera_edges() {
+        let mut p = super::GpuWorldParams::default();
+        p.canvas = [100.0, 100.0, 50.0, 50.0];
+        p.camera0 = [0.0, 0.0, 0.0, 50.0];
+        p.camera1 = [1.0, 0.0, 0.0, 0.1];
+        p.camera2 = [0.0, 1.0, 0.0, 100.0];
+        p.camera3 = [0.0, 0.0, 1.0, 0.0];
+        p.model[3] = 1.0;
+        p.actor_rotation[3] = 1.0;
+        let bounds = Some(([-0.5; 3], [0.5; 3]));
+        p.actor[2] = 5.0;
+        assert!(super::rigid_draw_visible(bounds, p));
+        p.actor[0] = 20.0;
+        assert!(!super::rigid_draw_visible(bounds, p));
+        p.actor[2] = 0.0;
+        assert!(super::rigid_draw_visible(bounds, p));
+        p.actor[2] = 5.0;
+        p.vegetation[0] = 1.0;
+        assert!(super::rigid_draw_visible(bounds, p));
+        assert!(super::rigid_draw_visible(None, p));
+        assert_eq!(
+            super::pack_gpu_world_params(p).len(),
+            std::mem::size_of::<super::GpuWorldParams>()
+        );
+    }
+
     use std::{
         collections::HashMap,
         fs,
@@ -12226,7 +12564,7 @@ mod tests {
         assert_eq!(params.fog3, [-4.0, 0.0, -8.0, 1.0]);
         assert_eq!(params.fog4, [4.0, 6.0, -1.0, 0.75]);
         assert_eq!(params.optics0, [5.0, 50.0, 2.8, 8.0]);
-        assert_eq!(super::pack_gpu_world_lighting(params).len(), 560);
+        assert_eq!(super::pack_gpu_world_lighting(params).len(), 624);
     }
 
     #[test]
@@ -12472,6 +12810,21 @@ mod tests {
         validator
             .validate(&module)
             .expect("world PBR WGSL must validate");
+    }
+
+    #[test]
+    fn world_dof_shader_is_webgpu_derivative_safe() {
+        let module = wgpu::naga::front::wgsl::parse_str(super::WGPU_WORLD_DOF_SHADER)
+            .expect("world DoF WGSL must parse");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("world DoF WGSL must validate");
+        assert!(super::WGPU_WORLD_DOF_SHADER.contains("textureSampleLevel"));
+        assert!(!super::WGPU_WORLD_DOF_SHADER.contains("textureSample(scene_color"));
     }
 
     #[test]
@@ -13128,6 +13481,25 @@ mod tests {
         assert!((super::world_action_key_mix(Some(&ease), None, 0.25) - 0.15625).abs() < 0.0001);
         let curved = super::world_action_key_mix(Some(&bezier), Some(&incoming), 0.5);
         assert!((curved - 0.75).abs() < 0.0001, "curved={curved}");
+    }
+
+    #[test]
+    fn binary_action_pose_lookup_preserves_legacy_boundaries() {
+        let pose = |t| crate::world::WorldActionPose {
+            t,
+            label: None,
+            bones: Vec::new(),
+        };
+        let poses = vec![pose(0.0), pose(0.25), pose(0.75), pose(1.0)];
+
+        let pair = super::action_pose_pair(&poses, -0.1);
+        assert_eq!((pair.0.t, pair.1.t), (0.0, 0.0));
+        let pair = super::action_pose_pair(&poses, 0.25);
+        assert_eq!((pair.0.t, pair.1.t), (0.0, 0.25));
+        let pair = super::action_pose_pair(&poses, 0.5);
+        assert_eq!((pair.0.t, pair.1.t), (0.25, 0.75));
+        let pair = super::action_pose_pair(&poses, 1.0);
+        assert_eq!((pair.0.t, pair.1.t), (1.0, 1.0));
     }
 
     #[test]

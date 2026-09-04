@@ -33,6 +33,9 @@ pub struct WorldGraph {
 /// Internal lighting payload shared by Scene3DRenderer and the retained GPU renderer.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorldLighting {
+    /// Resolved Scene art direction; None keeps the legacy WGSL path.
+    #[serde(default)]
+    pub render_style: Option<crate::render_style::ResolvedSceneRenderStyle>,
     #[serde(default)]
     pub environment: Option<WorldEnvironmentLighting>,
     #[serde(default)]
@@ -57,6 +60,7 @@ pub struct WorldLighting {
 impl Default for WorldLighting {
     fn default() -> Self {
         Self {
+            render_style: None,
             environment: None,
             lights: Vec::new(),
             ao_intensity: default_world_ao_intensity(),

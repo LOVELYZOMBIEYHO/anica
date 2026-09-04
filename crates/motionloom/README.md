@@ -1,5 +1,8 @@
 # MotionLoom
 
+Scene-owned visual style resources are documented in [RENDER_STYLE.md](RENDER_STYLE.md).
+Use `<Scene renderStyle="id" renderQuality="id">`; legacy Scenes need no changes.
+
 MotionLoom is an agent-native motion graphics and compositing engine for Rust
 and WebAssembly. It turns a portable text DSL into deterministic 2D, 2.5D,
 true-3D, and GPU effect compositions.
@@ -148,9 +151,35 @@ Reusable generated 3D geometry uses typed assets:
 ```
 
 `PrimitiveAsset` supports `box`, `sphere`, `capsule`, `plane`, `cylinder`,
-`cone`, and `wedge`. It shares the normal Model PBR, lighting, shadow, bounds, cache, and
-physics paths. The former encoded `motionloom:box` ModelAsset source has been
-removed.
+`cone`, `wedge`, `ellipsoid`, `frustum`, and `roundedBox`. It shares the normal
+Model PBR, lighting, shadow, bounds, cache, and physics paths. The former
+encoded `motionloom:box` ModelAsset source has been removed.
+
+Existing self-closing assets remain the compact form. Advanced procedural
+assets can use a block without changing the meaning of any existing field:
+
+```xml
+<PrimitiveAsset id="sculpture" shape="ellipsoid"
+                radii={[0.8,1.2,0.55]} material="copper">
+  <Modifiers>
+    <Taper axis="y" start="1.08" end="0.78" />
+    <Twist axis="y" angle="12" />
+    <Bend axis="x" angle="-6" pivot={[0,0,0]} />
+    <Subdivision levels="1" />
+    <Smooth angle="76" />
+    <WeightedNormals strength="0.85" keepSharpEdges="true" />
+  </Modifiers>
+  <MeshBuild topology="quads" triangulation="shortestDiagonal"
+             quality="high" maxTriangles="10000" />
+  <LOD mode="auto" levels="3" preserveSilhouette="true" />
+</PrimitiveAsset>
+```
+
+Modifier order is authored order and is part of the deterministic asset
+definition. The shared native/WASM mesh compiler applies modifiers and
+triangulates the final runtime mesh. `MeshBuild.maxTriangles` is a hard
+authoring budget. `LOD` records the reusable level policy so distance selection
+can evolve without rewriting the source asset.
 
 Collision is disabled by default. `collision="solid|sensor"` enables it;
 omitted `collider` means `auto`, while an explicit collider shape and size may

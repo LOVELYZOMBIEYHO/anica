@@ -181,6 +181,9 @@ pub struct MotionLoomShowcaseSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MotionLoomAuthoringReport {
+    /// Resolved Scene style requests, independent of any optional GPU host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub render_styles: Vec<crate::render_style::ResolvedSceneRenderStyle>,
     pub report_version: String,
     pub engine_version: String,
     pub target: String,
@@ -243,6 +246,28 @@ pub fn analyze_motionloom_script_for_target(
     if let Some(graph) = graph.as_ref() {
         append_animation_diagnostics(graph, &scanned, &mut diagnostics);
         append_semantic_diagnostics(graph, &scanned, &mut diagnostics);
+        // A requested quality downgrade must be visible to both users and LLMs.
+        for scene in &graph.scenes {
+            if let Ok(report) = crate::render_style::resolve_scene_render_style(graph, &scene.id) {
+                for message in report.fallbacks {
+                    diagnostics.push(AuthoringDiagnostic {
+                        severity: AuthoringDiagnosticSeverity::Warning,
+                        code: "RENDER_STYLE_FALLBACK".into(),
+                        phase: "resolve".into(),
+                        line: find_tag_line(&scanned, "Scene", Some(&scene.id)),
+                        column: 1,
+                        tag: Some("Scene".into()),
+                        node_id: Some(scene.id.clone()),
+                        attribute: Some("renderQuality".into()),
+                        authored_value: scene.render_quality.clone(),
+                        effective_value: None,
+                        message,
+                        effect: "Requested quality uses the reported backend fallback.".into(),
+                        suggestions: vec![],
+                    });
+                }
+            }
+        }
         append_compatibility_diagnostics(script, target, &mut diagnostics);
         match compile_runtime_program(graph.clone()) {
             Ok(_) => compile_succeeded = true,
@@ -267,6 +292,16 @@ pub fn analyze_motionloom_script_for_target(
     let showcase_schema = build_showcase_schema(&scanned, graph.as_ref());
 
     MotionLoomAuthoringReport {
+        render_styles: graph
+            .as_ref()
+            .map(|g| {
+                g.scenes
+                    .iter()
+                    .filter(|s| s.render_style.is_some() || s.render_quality.is_some())
+                    .filter_map(|s| crate::render_style::resolve_scene_render_style(g, &s.id).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
         report_version: REPORT_VERSION.to_string(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         target: target.to_string(),
@@ -360,7 +395,9 @@ pub fn motionloom_dsl_schema_json() -> String {
                             name,
                             attribute_name,
                         ),
-                        supports_animation_target: Some(descriptor.is_some()),
+                        supports_animation_target: Some(
+                            descriptor.is_some() && !is_style_tag(name),
+                        ),
                     }
                 })
                 .collect();
@@ -1330,9 +1367,8 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
             .iter()
             .filter_map(|asset| asset.primitive())
             .map(|asset| {
-                let (bounds_min, bounds_max) =
-                    crate::world::primitive::primitive_bounds(&asset.geometry);
-                let triangles = asset.geometry.triangle_count();
+                let ((bounds_min, bounds_max), triangles) =
+                    crate::world::primitive::generated_primitive_summary(asset);
                 PrimitiveAuthoringSummary {
                     id: asset.id.clone(),
                     shape: asset.geometry.shape_name().to_string(),
@@ -1347,7 +1383,10 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
                         crate::dsl::PrimitiveGeometry::Capsule { .. } => "capsule",
                         crate::dsl::PrimitiveGeometry::Cylinder { .. } => "cylinder",
                         crate::dsl::PrimitiveGeometry::Cone { .. }
-                        | crate::dsl::PrimitiveGeometry::Wedge { .. } => "convex_hull",
+                        | crate::dsl::PrimitiveGeometry::Wedge { .. }
+                        | crate::dsl::PrimitiveGeometry::Frustum { .. } => "convex_hull",
+                        crate::dsl::PrimitiveGeometry::Ellipsoid { .. } => "sphere",
+                        crate::dsl::PrimitiveGeometry::RoundedBox { .. } => "box",
                         crate::dsl::PrimitiveGeometry::Plane { .. } => "static_plane",
                     }
                     .to_string(),
@@ -1406,7 +1445,7 @@ fn build_showcase_schema(
                         format!("{:?}", descriptor.value_type).to_ascii_lowercase()
                     }),
                     supports_inline_expression: supports_inline_expression(&name, &attribute_name),
-                    supports_animation_target: Some(descriptor.is_some()),
+                    supports_animation_target: Some(descriptor.is_some() && !is_style_tag(&name)),
                 }
             })
             .collect();
@@ -1471,9 +1510,16 @@ fn build_showcase_schema(
 
 fn required_attributes(tag: &str) -> Vec<String> {
     let attributes: &[&str] = match tag {
+        "RenderStyle" | "RenderQuality" => &["id"],
+        "Resolution" => &["scale"],
+        "Shadows" => &["resolution"],
+        "AntiAliasing" => &["mode"],
         "Graph" => &["fps", "duration", "size"],
         "RigidBody" => &["id", "target", "dimension", "type"],
         "PrimitiveAsset" => &["id", "shape"],
+        "Taper" => &["axis", "start", "end"],
+        "Bend" | "Twist" => &["axis", "angle"],
+        "Smooth" => &["angle"],
         "TerrainAsset" => &["id", "heightMap", "size"],
         "VegetationAsset" => &["id", "kind", "height"],
         "CompoundAsset" => &["id"],
@@ -1572,6 +1618,21 @@ fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
             vec!["segments", "color"],
         ),
         ("wedge", vec!["id", "shape", "size"], vec!["color"]),
+        (
+            "ellipsoid",
+            vec!["id", "shape", "radii"],
+            vec!["segments", "rings", "color"],
+        ),
+        (
+            "frustum",
+            vec!["id", "shape", "topSize", "bottomSize", "height"],
+            vec!["color"],
+        ),
+        (
+            "roundedBox",
+            vec!["id", "shape", "size", "radius"],
+            vec!["segments", "color"],
+        ),
     ]
     .into_iter()
     .map(|(shape, required, mut optional)| {
@@ -1606,7 +1667,24 @@ fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
     .collect()
 }
 
+fn is_style_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "RenderStyle"
+            | "RenderQuality"
+            | "SurfaceStyle"
+            | "LightingStyle"
+            | "PostStyle"
+            | "Resolution"
+            | "Shadows"
+            | "AntiAliasing"
+    )
+}
+
 fn supports_inline_expression(tag: &str, attribute: &str) -> Option<bool> {
+    if is_style_tag(tag) {
+        return Some(false);
+    }
     if matches!(
         tag,
         "ParticleEmitter"
@@ -2043,6 +2121,9 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "id",
             "shape",
             "size",
+            "radii",
+            "topSize",
+            "bottomSize",
             "radius",
             "height",
             "segments",
@@ -2067,6 +2148,16 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "restitution",
             "density",
         ]),
+        "Modifiers" => strict(&[]),
+        "MeshTransform" => strict(&["translate", "rotate", "scale"]),
+        "Taper" => strict(&["axis", "start", "end"]),
+        "Bend" => strict(&["axis", "angle", "pivot"]),
+        "Twist" => strict(&["axis", "angle"]),
+        "Subdivision" => strict(&["levels"]),
+        "Smooth" => strict(&["angle"]),
+        "WeightedNormals" => strict(&["strength", "keepSharpEdges"]),
+        "MeshBuild" => strict(&["topology", "triangulation", "quality", "maxTriangles"]),
+        "LOD" => strict(&["mode", "levels", "preserveSilhouette"]),
         "TerrainAsset" => strict(&[
             "id",
             "heightMap",
@@ -2106,7 +2197,33 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "materialSeed",
         ]),
         "Background" => strict(&["id", "color"]),
-        "Scene" => strict(&["id", "size"]),
+        "Scene" => strict(&["id", "size", "renderStyle", "renderQuality"]),
+        "RenderStyle" => strict(&["id"]),
+        "RenderQuality" => strict(&["id", "preset"]),
+        "SurfaceStyle" => strict(&[
+            "shading",
+            "shadingSteps",
+            "diffuseWrap",
+            "rimLight",
+            "rimPower",
+            "specular",
+            "roughnessBias",
+            "saturation",
+            "outline",
+        ]),
+        "LightingStyle" => strict(&["preset", "ambientIntensity", "ambientColor", "shadowStyle"]),
+        "PostStyle" => strict(&[
+            "toneMapping",
+            "exposure",
+            "saturation",
+            "contrast",
+            "whiteBalance",
+            "bloomThreshold",
+            "bloomIntensity",
+        ]),
+        "Resolution" => strict(&["scale"]),
+        "Shadows" => strict(&["resolution", "filtering"]),
+        "AntiAliasing" => strict(&["mode"]),
         "Track" => strict(&[
             "id",
             "space",
@@ -2223,7 +2340,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "width",
             "height",
         ]),
-        "AmbientOcclusion" => strict(&["id", "intensity", "radius"]),
+        "AmbientOcclusion" => strict(&["id", "intensity", "radius", "quality"]),
         "ContactShadow" => strict(&["id", "intensity", "distance", "softness"]),
         "ColorManagement" => strict(&[
             "id",
@@ -3229,6 +3346,14 @@ const LAYOUT_ATTRIBUTES: &[&str] = &[
 ];
 
 const KNOWN_TAGS: &[&str] = &[
+    "RenderStyle",
+    "RenderQuality",
+    "SurfaceStyle",
+    "LightingStyle",
+    "PostStyle",
+    "Resolution",
+    "Shadows",
+    "AntiAliasing",
     "Graph",
     "Assets",
     "VideoAsset",
@@ -3236,6 +3361,16 @@ const KNOWN_TAGS: &[&str] = &[
     "ModelAsset",
     "MaterialAsset",
     "PrimitiveAsset",
+    "Modifiers",
+    "MeshTransform",
+    "Taper",
+    "Bend",
+    "Twist",
+    "Subdivision",
+    "Smooth",
+    "WeightedNormals",
+    "MeshBuild",
+    "LOD",
     "TerrainAsset",
     "VegetationAsset",
     "CompoundAsset",

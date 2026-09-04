@@ -41,6 +41,30 @@ pub(crate) fn scene_nodes_contain_image_or_svg(nodes: &[SceneNode]) -> bool {
     })
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn scene_nodes_contain_3d_island(nodes: &[SceneNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        SceneNode::Timeline(timeline) => scene_nodes_contain_3d_island(&timeline.children),
+        SceneNode::Track(track) => scene_nodes_contain_3d_island(&track.children),
+        SceneNode::Sequence(sequence) => scene_nodes_contain_3d_island(&sequence.children),
+        SceneNode::Chain(chain) => scene_nodes_contain_3d_island(&chain.children),
+        SceneNode::Group(group) => {
+            group.composite.as_ref().is_some_and(|composite| {
+                composite.space.eq_ignore_ascii_case("3d") && !composite.nodes_3d.is_empty()
+            }) || scene_nodes_contain_3d_island(&group.children)
+        }
+        SceneNode::Puppet(puppet) => scene_nodes_contain_3d_island(&puppet.children),
+        SceneNode::Part(part) => scene_nodes_contain_3d_island(&part.children),
+        SceneNode::Repeat(repeat) => scene_nodes_contain_3d_island(&repeat.children),
+        SceneNode::Camera(camera) => scene_nodes_contain_3d_island(&camera.children),
+        SceneNode::Character(character) => scene_nodes_contain_3d_island(&character.children),
+        SceneNode::Mask(mask) => scene_nodes_contain_3d_island(&mask.children),
+        SceneNode::Precompose(precompose) => scene_nodes_contain_3d_island(&precompose.children),
+        SceneNode::Layer(layer) => scene_nodes_contain_3d_island(&layer.children),
+        _ => false,
+    })
+}
+
 pub(crate) fn scene_nodes_require_cpu_scene_compositing(nodes: &[SceneNode]) -> bool {
     nodes.iter().any(|node| match node {
         SceneNode::Precompose(_) => true,

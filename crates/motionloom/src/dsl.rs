@@ -39,6 +39,11 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphScript {
+    /// Scene visual resources; absence preserves the legacy renderer.
+    #[serde(default)]
+    pub render_styles: Vec<crate::render_style::RenderStyleNode>,
+    #[serde(default)]
+    pub render_qualities: Vec<crate::render_style::RenderQualityNode>,
     #[serde(skip)]
     pub raw_script: Option<String>,
     pub id: Option<String>,
@@ -320,6 +325,94 @@ pub struct PrimitiveAssetNode {
     pub material_seed: Option<u64>,
     #[serde(default)]
     pub collision: PrimitiveCollisionNode,
+    /// Advanced procedural controls are optional so every existing primitive
+    /// keeps its original geometry and runtime behavior.
+    #[serde(default)]
+    pub modifiers: Vec<PrimitiveModifierNode>,
+    #[serde(default)]
+    pub mesh_build: PrimitiveMeshBuildNode,
+    #[serde(default)]
+    pub lod: PrimitiveLodNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum PrimitiveModifierNode {
+    Transform {
+        translate: [f32; 3],
+        rotate: [f32; 3],
+        scale: [f32; 3],
+    },
+    Taper {
+        axis: PrimitiveAxis,
+        start: f32,
+        end: f32,
+    },
+    Bend {
+        axis: PrimitiveAxis,
+        angle: f32,
+        pivot: [f32; 3],
+    },
+    Twist {
+        axis: PrimitiveAxis,
+        angle: f32,
+    },
+    Subdivision {
+        levels: u32,
+    },
+    Smooth {
+        angle: f32,
+    },
+    WeightedNormals {
+        strength: f32,
+        keep_sharp_edges: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrimitiveAxis {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PrimitiveMeshBuildNode {
+    pub topology: String,
+    pub triangulation: String,
+    pub quality: String,
+    pub max_triangles: Option<u32>,
+}
+
+impl Default for PrimitiveMeshBuildNode {
+    fn default() -> Self {
+        Self {
+            topology: "auto".to_string(),
+            triangulation: "auto".to_string(),
+            quality: "standard".to_string(),
+            max_triangles: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PrimitiveLodNode {
+    pub mode: String,
+    pub levels: u32,
+    pub preserve_silhouette: bool,
+}
+
+impl Default for PrimitiveLodNode {
+    fn default() -> Self {
+        Self {
+            mode: "none".to_string(),
+            levels: 1,
+            preserve_silhouette: true,
+        }
+    }
 }
 
 /// A first-class PBR material reuses the glTF renderer without pretending that
@@ -499,6 +592,21 @@ pub enum PrimitiveGeometry {
     Wedge {
         size: [f32; 3],
     },
+    Ellipsoid {
+        radii: [f32; 3],
+        segments: u32,
+        rings: u32,
+    },
+    Frustum {
+        top_size: [f32; 2],
+        bottom_size: [f32; 2],
+        height: f32,
+    },
+    RoundedBox {
+        size: [f32; 3],
+        radius: f32,
+        segments: u32,
+    },
 }
 
 impl PrimitiveGeometry {
@@ -511,6 +619,9 @@ impl PrimitiveGeometry {
             Self::Cylinder { .. } => "cylinder",
             Self::Cone { .. } => "cone",
             Self::Wedge { .. } => "wedge",
+            Self::Ellipsoid { .. } => "ellipsoid",
+            Self::Frustum { .. } => "frustum",
+            Self::RoundedBox { .. } => "roundedBox",
         }
     }
 
@@ -530,6 +641,14 @@ impl PrimitiveGeometry {
             Self::Cylinder { segments, .. } => (*segments * 4) as usize,
             Self::Cone { segments, .. } => (*segments * 2) as usize,
             Self::Wedge { .. } => 8,
+            Self::Ellipsoid {
+                segments, rings, ..
+            } => (*segments * *rings * 2) as usize,
+            Self::Frustum { .. } => 12,
+            Self::RoundedBox { segments, .. } => {
+                let samples = segments * 2 + 1;
+                (samples * samples * 12) as usize
+            }
         }
     }
 }
@@ -1003,6 +1122,8 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut images = Vec::<ImageNode>::new();
     let mut svgs = Vec::<SvgNode>::new();
     let mut scenes = Vec::<SceneRootNode>::new();
+    let mut render_styles = Vec::new();
+    let mut render_qualities = Vec::new();
     let mut scene_nodes = Vec::<SceneNode>::new();
     let mut model_profiles = Vec::<ModelProfileNode>::new();
     let mut skeletons = Vec::<SkeletonNode>::new();
@@ -1058,6 +1179,26 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         if starts_open_tag(line, "Defs") {
             let (defs, end_ix) = parse_defs_block(&lines, i, &mut brush_ctx)?;
             scene_nodes.push(SceneNode::Defs(defs));
+            i = end_ix + 1;
+            continue;
+        }
+
+        if starts_open_tag(line, "RenderStyle") || starts_open_tag(line, "RenderQuality") {
+            let quality = starts_open_tag(line, "RenderQuality");
+            let (value, end_ix) = crate::render_style::parse_resource(&lines, i, quality)?;
+            if quality {
+                render_qualities.push(serde_json::from_value(value).map_err(|e| {
+                    GraphParseError {
+                        line: i + 1,
+                        message: e.to_string(),
+                    }
+                })?);
+            } else {
+                render_styles.push(serde_json::from_value(value).map_err(|e| GraphParseError {
+                    line: i + 1,
+                    message: e.to_string(),
+                })?);
+            }
             i = end_ix + 1;
             continue;
         }
@@ -1424,7 +1565,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         graph_start_ix + 1,
     )?;
 
-    let graph = GraphScript {
+    let mut graph = GraphScript {
+        render_styles,
+        render_qualities,
         raw_script: Some(input.to_string()),
         id: id.clone(),
         version,
@@ -1460,6 +1603,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         outputs,
         present,
     };
+    crate::render_style::lower(&mut graph)?;
     crate::render_graph::compile_render_pass_dag(&graph)?;
     Ok(graph)
 }
@@ -2574,6 +2718,20 @@ fn parse_assets_block(
             i = end_ix + 1;
             continue;
         }
+        if tag_name == "PrimitiveAsset" {
+            let (primitive, end_ix) = parse_primitive_asset_block(lines, i)?;
+            assets.push(GraphAssetNode {
+                id: primitive.id.clone(),
+                kind,
+                source: GraphAssetSource::Primitive(primitive),
+                decoder: None,
+                color_space: None,
+                profile: None,
+                clip: None,
+            });
+            i = end_ix + 1;
+            continue;
+        }
         let (tag, end_ix) = collect_self_closing_block(lines, i)?;
         if !starts_open_tag(tag.trim(), tag_name) {
             return Err(GraphParseError {
@@ -2591,9 +2749,7 @@ fn parse_assets_block(
             });
         }
         let id = strip_wrappers(&required_attr_value(&tag, "id", i + 1)?).to_string();
-        let source = if tag_name == "PrimitiveAsset" {
-            GraphAssetSource::Primitive(parse_primitive_asset(&tag, &id, i + 1)?)
-        } else if tag_name == "TerrainAsset" {
+        let source = if tag_name == "TerrainAsset" {
             GraphAssetSource::Terrain(parse_terrain_asset(&tag, &id, i + 1)?)
         } else if tag_name == "VegetationAsset" {
             GraphAssetSource::Vegetation(parse_vegetation_asset(&tag, &id, i + 1)?)
@@ -2675,6 +2831,112 @@ fn parse_assets_block(
         });
     }
     Ok((assets, materials, close_ix))
+}
+
+fn parse_primitive_asset_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(PrimitiveAssetNode, usize), GraphParseError> {
+    let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
+    let mut primitive = parse_primitive_asset(&open_tag, &id, start + 1)?;
+    if is_self_closing_tag(&open_tag) {
+        validate_primitive_build_budget(&primitive, start + 1)?;
+        return Ok((primitive, open_end_ix));
+    }
+
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "PrimitiveAsset")?;
+    let mut index = open_end_ix + 1;
+    let mut saw_modifiers = false;
+    let mut saw_mesh_build = false;
+    let mut saw_lod = false;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if starts_open_tag(line, "Modifiers") {
+            if saw_modifiers {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "PrimitiveAsset \"{id}\" may declare only one <Modifiers> block."
+                    ),
+                });
+            }
+            let (modifiers, end_ix) = parse_primitive_modifiers(lines, index, &id)?;
+            primitive.modifiers = modifiers;
+            saw_modifiers = true;
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "MeshBuild") {
+            if saw_mesh_build {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("PrimitiveAsset \"{id}\" may declare only one <MeshBuild />."),
+                });
+            }
+            let (tag, end_ix) = collect_self_closing_block(lines, index)?;
+            primitive.mesh_build = parse_primitive_mesh_build(&tag, &id, index + 1)?;
+            saw_mesh_build = true;
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "LOD") {
+            if saw_lod {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("PrimitiveAsset \"{id}\" may declare only one <LOD />."),
+                });
+            }
+            let (tag, end_ix) = collect_self_closing_block(lines, index)?;
+            primitive.lod = parse_primitive_lod(&tag, &id, index + 1)?;
+            saw_lod = true;
+            index = end_ix + 1;
+            continue;
+        }
+        return Err(GraphParseError {
+            line: index + 1,
+            message: format!(
+                "PrimitiveAsset \"{id}\" accepts <Modifiers>, <MeshBuild />, or <LOD /> children, got: {line}"
+            ),
+        });
+    }
+    validate_primitive_build_budget(&primitive, start + 1)?;
+    Ok((primitive, close_ix))
+}
+
+fn validate_primitive_build_budget(
+    primitive: &PrimitiveAssetNode,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    let subdivision_levels = primitive
+        .modifiers
+        .iter()
+        .filter_map(|modifier| match modifier {
+            PrimitiveModifierNode::Subdivision { levels } => Some(*levels),
+            _ => None,
+        })
+        .sum::<u32>();
+    let multiplier = 4_usize.saturating_pow(subdivision_levels);
+    let estimated = primitive
+        .geometry
+        .triangle_count()
+        .saturating_mul(multiplier);
+    if let Some(max_triangles) = primitive.mesh_build.max_triangles
+        && estimated > max_triangles as usize
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{}\" is estimated to generate {estimated} triangles, exceeding MeshBuild maxTriangles={max_triangles}.",
+                primitive.id
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn parse_compound_asset(
@@ -3622,6 +3884,367 @@ fn parse_vegetation_u32(
         .transpose()
 }
 
+fn parse_primitive_modifiers(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(Vec<PrimitiveModifierNode>, usize), GraphParseError> {
+    let (open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    if is_self_closing_tag(&open_tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" <Modifiers> must contain at least one modifier."
+            ),
+        });
+    }
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Modifiers")?;
+    let mut modifiers = Vec::new();
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        let (tag, end_ix) = collect_self_closing_block(lines, index)?;
+        modifiers.push(parse_primitive_modifier(&tag, asset_id, index + 1)?);
+        index = end_ix + 1;
+    }
+    if modifiers.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" <Modifiers> must contain at least one modifier."
+            ),
+        });
+    }
+    Ok((modifiers, close_ix))
+}
+
+fn parse_primitive_modifier(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<PrimitiveModifierNode, GraphParseError> {
+    let name = [
+        "MeshTransform",
+        "Taper",
+        "Bend",
+        "Twist",
+        "Subdivision",
+        "Smooth",
+        "WeightedNormals",
+    ]
+    .into_iter()
+    .find(|name| starts_open_tag(tag.trim(), name))
+    .ok_or_else(|| GraphParseError {
+        line,
+        message: format!("PrimitiveAsset \"{asset_id}\" has an invalid modifier tag."),
+    })?;
+    let modifier = match name {
+        "MeshTransform" => {
+            validate_primitive_child_attributes(
+                tag,
+                &["translate", "rotate", "scale"],
+                asset_id,
+                line,
+            )?;
+            PrimitiveModifierNode::Transform {
+                translate: parse_optional_primitive_vec::<3>(
+                    tag,
+                    "translate",
+                    asset_id,
+                    line,
+                    false,
+                )?
+                .unwrap_or([0.0; 3]),
+                rotate: parse_optional_primitive_vec::<3>(tag, "rotate", asset_id, line, false)?
+                    .unwrap_or([0.0; 3]),
+                scale: parse_optional_primitive_vec::<3>(tag, "scale", asset_id, line, true)?
+                    .unwrap_or([1.0; 3]),
+            }
+        }
+        "Taper" => {
+            validate_primitive_child_attributes(tag, &["axis", "start", "end"], asset_id, line)?;
+            PrimitiveModifierNode::Taper {
+                axis: parse_primitive_axis(tag, asset_id, line)?,
+                start: parse_positive_primitive_number(tag, "start", asset_id, line)?,
+                end: parse_positive_primitive_number(tag, "end", asset_id, line)?,
+            }
+        }
+        "Bend" => {
+            validate_primitive_child_attributes(tag, &["axis", "angle", "pivot"], asset_id, line)?;
+            PrimitiveModifierNode::Bend {
+                axis: parse_primitive_axis(tag, asset_id, line)?,
+                angle: parse_finite_primitive_number(tag, "angle", asset_id, line)?,
+                pivot: parse_optional_primitive_vec::<3>(tag, "pivot", asset_id, line, false)?
+                    .unwrap_or([0.0; 3]),
+            }
+        }
+        "Twist" => {
+            validate_primitive_child_attributes(tag, &["axis", "angle"], asset_id, line)?;
+            PrimitiveModifierNode::Twist {
+                axis: parse_primitive_axis(tag, asset_id, line)?,
+                angle: parse_finite_primitive_number(tag, "angle", asset_id, line)?,
+            }
+        }
+        "Subdivision" => {
+            validate_primitive_child_attributes(tag, &["levels"], asset_id, line)?;
+            let levels = parse_optional_primitive_u32(tag, "levels", asset_id, line)?.unwrap_or(1);
+            if !(1..=3).contains(&levels) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "PrimitiveAsset \"{asset_id}\" Subdivision levels must be from 1 through 3."
+                    ),
+                });
+            }
+            PrimitiveModifierNode::Subdivision { levels }
+        }
+        "Smooth" => {
+            validate_primitive_child_attributes(tag, &["angle"], asset_id, line)?;
+            let angle = parse_finite_primitive_number(tag, "angle", asset_id, line)?;
+            if !(0.0..=180.0).contains(&angle) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "PrimitiveAsset \"{asset_id}\" Smooth angle must be from 0 through 180 degrees."
+                    ),
+                });
+            }
+            PrimitiveModifierNode::Smooth { angle }
+        }
+        "WeightedNormals" => {
+            validate_primitive_child_attributes(
+                tag,
+                &["strength", "keepSharpEdges"],
+                asset_id,
+                line,
+            )?;
+            let strength =
+                parse_optional_nonnegative_primitive_number(tag, "strength", asset_id, line)?
+                    .unwrap_or(1.0);
+            if strength > 1.0 {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "PrimitiveAsset \"{asset_id}\" WeightedNormals strength must be from zero through one."
+                    ),
+                });
+            }
+            PrimitiveModifierNode::WeightedNormals {
+                strength,
+                keep_sharp_edges: parse_optional_primitive_bool(
+                    tag,
+                    "keepSharpEdges",
+                    asset_id,
+                    line,
+                )?
+                .unwrap_or(true),
+            }
+        }
+        _ => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{asset_id}\" has unknown modifier <{name} />. Use MeshTransform, Taper, Bend, Twist, Subdivision, Smooth, or WeightedNormals."
+                ),
+            });
+        }
+    };
+    Ok(modifier)
+}
+
+fn parse_primitive_mesh_build(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<PrimitiveMeshBuildNode, GraphParseError> {
+    validate_primitive_child_attributes(
+        tag,
+        &["topology", "triangulation", "quality", "maxTriangles"],
+        asset_id,
+        line,
+    )?;
+    let topology = primitive_string_attribute(tag, "topology", "auto");
+    if !matches!(topology.as_str(), "auto" | "triangles" | "quads") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" MeshBuild topology must be auto, triangles, or quads."
+            ),
+        });
+    }
+    let triangulation = primitive_string_attribute(tag, "triangulation", "auto");
+    if !matches!(
+        triangulation.as_str(),
+        "auto" | "shortestdiagonal" | "fixed"
+    ) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" MeshBuild triangulation must be auto, shortestDiagonal, or fixed."
+            ),
+        });
+    }
+    let quality = primitive_string_attribute(tag, "quality", "standard");
+    if !matches!(
+        quality.as_str(),
+        "draft" | "standard" | "high" | "cinematic"
+    ) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" MeshBuild quality must be draft, standard, high, or cinematic."
+            ),
+        });
+    }
+    let max_triangles = parse_optional_primitive_u32(tag, "maxTriangles", asset_id, line)?;
+    if max_triangles == Some(0) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" MeshBuild maxTriangles must be greater than zero."
+            ),
+        });
+    }
+    Ok(PrimitiveMeshBuildNode {
+        topology,
+        triangulation,
+        quality,
+        max_triangles,
+    })
+}
+
+fn parse_primitive_lod(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<PrimitiveLodNode, GraphParseError> {
+    validate_primitive_child_attributes(
+        tag,
+        &["mode", "levels", "preserveSilhouette"],
+        asset_id,
+        line,
+    )?;
+    let mode = primitive_string_attribute(tag, "mode", "none");
+    if !matches!(mode.as_str(), "none" | "auto") {
+        return Err(GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{asset_id}\" LOD mode must be none or auto."),
+        });
+    }
+    let levels = parse_optional_primitive_u32(tag, "levels", asset_id, line)?.unwrap_or(1);
+    if !(1..=8).contains(&levels) {
+        return Err(GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{asset_id}\" LOD levels must be from 1 through 8."),
+        });
+    }
+    Ok(PrimitiveLodNode {
+        mode,
+        levels,
+        preserve_silhouette: parse_optional_primitive_bool(
+            tag,
+            "preserveSilhouette",
+            asset_id,
+            line,
+        )?
+        .unwrap_or(true),
+    })
+}
+
+fn validate_primitive_child_attributes(
+    tag: &str,
+    allowed: &[&str],
+    asset_id: &str,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    for attribute in tag_attribute_names(tag) {
+        if !allowed.contains(&attribute.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{asset_id}\" child does not support attribute \"{attribute}\"."
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_primitive_axis(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<PrimitiveAxis, GraphParseError> {
+    match strip_wrappers(&required_attr_value(tag, "axis", line)?)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "x" => Ok(PrimitiveAxis::X),
+        "y" => Ok(PrimitiveAxis::Y),
+        "z" => Ok(PrimitiveAxis::Z),
+        other => Err(GraphParseError {
+            line,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" modifier axis=\"{other}\" is invalid. Use x, y, or z."
+            ),
+        }),
+    }
+}
+
+fn parse_finite_primitive_number(
+    tag: &str,
+    attribute: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<f32, GraphParseError> {
+    let raw = required_attr_value(tag, attribute, line)?;
+    let value = strip_wrappers(&raw)
+        .parse::<f32>()
+        .map_err(|_| GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{asset_id}\" {attribute} must be a finite number."),
+        })?;
+    if !value.is_finite() {
+        return Err(GraphParseError {
+            line,
+            message: format!("PrimitiveAsset \"{asset_id}\" {attribute} must be a finite number."),
+        });
+    }
+    Ok(value)
+}
+
+fn parse_optional_primitive_bool(
+    tag: &str,
+    attribute: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<Option<bool>, GraphParseError> {
+    attr_value(tag, attribute)
+        .map(
+            |raw| match strip_wrappers(&raw).to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "PrimitiveAsset \"{asset_id}\" {attribute} must be true or false."
+                    ),
+                }),
+            },
+        )
+        .transpose()
+}
+
+fn primitive_string_attribute(tag: &str, attribute: &str, default: &str) -> String {
+    attr_value(tag, attribute)
+        .map(|raw| strip_wrappers(&raw).to_ascii_lowercase())
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn parse_primitive_asset(
     tag: &str,
     id: &str,
@@ -3630,6 +4253,9 @@ fn parse_primitive_asset(
     let shape = strip_wrappers(&required_attr_value(tag, "shape", line)?).to_ascii_lowercase();
     let mut allowed = match shape.as_str() {
         "box" | "wedge" => vec!["id", "shape", "size", "color"],
+        "roundedbox" => vec!["id", "shape", "size", "radius", "segments", "color"],
+        "ellipsoid" => vec!["id", "shape", "radii", "segments", "rings", "color"],
+        "frustum" => vec!["id", "shape", "topSize", "bottomSize", "height", "color"],
         "sphere" => vec!["id", "shape", "radius", "segments", "rings", "color"],
         "capsule" => vec![
             "id", "shape", "radius", "height", "segments", "rings", "color",
@@ -3642,7 +4268,7 @@ fn parse_primitive_asset(
             return Err(GraphParseError {
                 line,
                 message: format!(
-                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, capsule, plane, cylinder, cone, or wedge."
+                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, capsule, plane, cylinder, cone, wedge, ellipsoid, frustum, or roundedBox."
                 ),
             });
         }
@@ -3673,6 +4299,9 @@ fn parse_primitive_asset(
                 "sphere" => "Use radius=\"...\" and optional segments/rings.",
                 "capsule" => "Use radius=\"...\", height=\"...\", and optional segments/rings.",
                 "box" | "wedge" | "plane" => "Use size={...}.",
+                "roundedbox" => "Use size={...}, radius=\"...\", and optional segments.",
+                "ellipsoid" => "Use radii={[x,y,z]} and optional segments/rings.",
+                "frustum" => "Use topSize={[x,z]}, bottomSize={[x,z]}, and height=\"...\".",
                 "cylinder" | "cone" => "Use radius=\"...\", height=\"...\", and optional segments.",
                 _ => unreachable!(),
             };
@@ -3690,6 +4319,24 @@ fn parse_primitive_asset(
         },
         "wedge" => PrimitiveGeometry::Wedge {
             size: parse_primitive_vec::<3>(tag, "size", id, line)?,
+        },
+        "roundedbox" => PrimitiveGeometry::RoundedBox {
+            size: parse_primitive_vec::<3>(tag, "size", id, line)?,
+            radius: parse_positive_primitive_number(tag, "radius", id, line)?,
+            segments: parse_primitive_segments(tag, "segments", 3, id, line)?,
+        },
+        "ellipsoid" => {
+            let segments = parse_primitive_segments(tag, "segments", 40, id, line)?;
+            PrimitiveGeometry::Ellipsoid {
+                radii: parse_primitive_vec::<3>(tag, "radii", id, line)?,
+                segments,
+                rings: parse_primitive_segments(tag, "rings", segments / 2, id, line)?,
+            }
+        }
+        "frustum" => PrimitiveGeometry::Frustum {
+            top_size: parse_primitive_vec::<2>(tag, "topSize", id, line)?,
+            bottom_size: parse_primitive_vec::<2>(tag, "bottomSize", id, line)?,
+            height: parse_positive_primitive_number(tag, "height", id, line)?,
         },
         "plane" => PrimitiveGeometry::Plane {
             size: parse_primitive_vec::<2>(tag, "size", id, line)?,
@@ -3759,6 +4406,29 @@ fn parse_primitive_asset(
             ),
         });
     }
+    if let PrimitiveGeometry::RoundedBox {
+        size,
+        radius,
+        segments,
+    } = &geometry
+    {
+        if *radius * 2.0 >= size.iter().copied().fold(f32::INFINITY, f32::min) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" roundedBox radius must be less than half the smallest dimension."
+                ),
+            });
+        }
+        if !(1..=16).contains(segments) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" roundedBox segments must be from 1 through 16."
+                ),
+            });
+        }
+    }
     if let PrimitiveGeometry::Capsule { radius, height, .. } = &geometry
         && *height < *radius * 2.0
     {
@@ -3781,6 +4451,9 @@ fn parse_primitive_asset(
         bevel_segments,
         material_seed,
         collision,
+        modifiers: Vec::new(),
+        mesh_build: PrimitiveMeshBuildNode::default(),
+        lod: PrimitiveLodNode::default(),
     })
 }
 
@@ -3865,6 +4538,9 @@ fn parse_primitive_collision(
             PrimitiveGeometry::Cylinder { .. } => PrimitiveColliderShape::Cylinder,
             PrimitiveGeometry::Cone { .. } => PrimitiveColliderShape::Cone,
             PrimitiveGeometry::Wedge { .. } => PrimitiveColliderShape::Convex,
+            PrimitiveGeometry::Ellipsoid { .. } => PrimitiveColliderShape::Sphere,
+            PrimitiveGeometry::Frustum { .. } => PrimitiveColliderShape::Convex,
+            PrimitiveGeometry::RoundedBox { .. } => PrimitiveColliderShape::Box,
         }
     } else {
         collider
@@ -4204,7 +4880,7 @@ fn parse_primitive_color(raw: &str, id: &str, line: usize) -> Result<[f32; 4], G
     ])
 }
 
-fn tag_attribute_names(tag: &str) -> Vec<String> {
+pub(crate) fn tag_attribute_names(tag: &str) -> Vec<String> {
     let mut names = Vec::new();
     let bytes = tag.as_bytes();
     let mut index = tag.find(char::is_whitespace).unwrap_or(tag.len());
@@ -8991,6 +9667,94 @@ Font note: this is not a structured XML comment.
         ));
         assert_eq!(sphere.collision.mode, PrimitiveCollisionMode::None);
         assert_eq!(sphere.collision.collider, PrimitiveColliderShape::Auto);
+    }
+
+    #[test]
+    fn primitive_asset_block_parses_advanced_shapes_and_modifiers() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <PrimitiveAsset id="body" shape="ellipsoid" radii={[0.8,1.2,0.55]}
+                    segments="24" rings="12" color="#C87848">
+      <Modifiers>
+        <Taper axis="y" start="1.08" end="0.82" />
+        <Twist axis="y" angle="8" />
+        <Bend axis="x" angle="-5" pivot={[0,0,0]} />
+        <Subdivision levels="1" />
+        <WeightedNormals strength="0.75" keepSharpEdges="true" />
+      </Modifiers>
+      <MeshBuild topology="quads" triangulation="shortestDiagonal"
+                 quality="high" maxTriangles="10000" />
+      <LOD mode="auto" levels="3" preserveSilhouette="true" />
+    </PrimitiveAsset>
+    <PrimitiveAsset id="base" shape="roundedBox" size={[2,0.3,1.2]}
+                    radius="0.08" segments="3" />
+    <PrimitiveAsset id="waist" shape="frustum" topSize={[0.8,0.5]}
+                    bottomSize={[0.6,0.42]} height="0.9" />
+  </Assets>
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>
+"##,
+        )
+        .expect("advanced PrimitiveAsset block");
+        let body = graph.assets[0].primitive().expect("ellipsoid");
+        assert!(matches!(body.geometry, PrimitiveGeometry::Ellipsoid { .. }));
+        assert_eq!(body.modifiers.len(), 5);
+        assert_eq!(body.mesh_build.topology, "quads");
+        assert_eq!(body.mesh_build.quality, "high");
+        assert_eq!(body.lod.levels, 3);
+        assert!(matches!(
+            graph.assets[1].primitive().expect("rounded box").geometry,
+            PrimitiveGeometry::RoundedBox { .. }
+        ));
+        assert!(matches!(
+            graph.assets[2].primitive().expect("frustum").geometry,
+            PrimitiveGeometry::Frustum { .. }
+        ));
+    }
+
+    #[test]
+    fn primitive_asset_block_enforces_triangle_budget() {
+        let error = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <PrimitiveAsset id="too_dense" shape="sphere" radius="1" segments="32" rings="16">
+      <Modifiers>
+        <Subdivision levels="2" />
+      </Modifiers>
+      <MeshBuild maxTriangles="100" />
+    </PrimitiveAsset>
+  </Assets>
+  <Scene id="canvas">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect x="0" y="0" width="1" height="1" color="#000000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="canvas" />
+</Graph>
+"##,
+        )
+        .expect_err("triangle budget must reject an oversized build");
+        assert!(error.message.contains("exceeding MeshBuild maxTriangles"));
     }
 
     #[test]

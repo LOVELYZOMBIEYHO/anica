@@ -6,13 +6,14 @@ mod box_mesh;
 mod capsule_mesh;
 mod cone_mesh;
 mod cylinder_mesh;
+mod frustum_mesh;
 mod plane_mesh;
 mod sphere_mesh;
 mod wedge_mesh;
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
-use crate::dsl::{PrimitiveAssetNode, PrimitiveGeometry};
+use crate::dsl::{PrimitiveAssetNode, PrimitiveAxis, PrimitiveGeometry, PrimitiveModifierNode};
 use crate::world::gltf_loader::{
     GlbAlphaMode, GlbDepthWriteMode, GlbMaterialData, GlbMeshData, GlbTextureData, GlbTriangle,
 };
@@ -30,12 +31,19 @@ pub fn generate_primitive_mesh(asset: &PrimitiveAssetNode) -> GlbMeshData {
     generate_primitive_mesh_textured(asset, PrimitiveTextureSet::default())
 }
 
+/// Inspect the compiled result rather than estimating advanced modifiers from
+/// the base shape alone.
+pub fn generated_primitive_summary(asset: &PrimitiveAssetNode) -> (([f32; 3], [f32; 3]), usize) {
+    let mesh = generate_primitive_mesh(asset);
+    ((mesh.bounds_min, mesh.bounds_max), mesh.indices.len() / 3)
+}
+
 /// Generate a primitive and attach already-resolved PBR textures to its glTF-like mesh.
 pub fn generate_primitive_mesh_textured(
     asset: &PrimitiveAssetNode,
     texture_set: PrimitiveTextureSet,
 ) -> GlbMeshData {
-    let mut builder = MeshBuilder::default();
+    let mut builder = MeshBuilder::for_asset(asset);
     match &asset.geometry {
         PrimitiveGeometry::Box { size } if asset.bevel_radius > 0.0 => box_mesh::generate_beveled(
             &mut builder,
@@ -69,7 +77,26 @@ pub fn generate_primitive_mesh_textured(
             segments,
         } => cone_mesh::generate(&mut builder, *radius, *height, *segments),
         PrimitiveGeometry::Wedge { size } => wedge_mesh::generate(&mut builder, *size),
+        PrimitiveGeometry::Ellipsoid {
+            radii,
+            segments,
+            rings,
+        } => {
+            sphere_mesh::generate(&mut builder, 1.0, *segments, *rings);
+            builder.scale_geometry(*radii);
+        }
+        PrimitiveGeometry::Frustum {
+            top_size,
+            bottom_size,
+            height,
+        } => frustum_mesh::generate(&mut builder, *top_size, *bottom_size, *height),
+        PrimitiveGeometry::RoundedBox {
+            size,
+            radius,
+            segments,
+        } => box_mesh::generate_beveled(&mut builder, *size, *radius, *segments),
     }
+    builder.apply_modifiers(&asset.modifiers);
     builder.finish(asset, texture_set)
 }
 
@@ -96,6 +123,23 @@ pub fn primitive_bounds(geometry: &PrimitiveGeometry) -> ([f32; 3], [f32; 3]) {
             [-radius, -height * 0.5, -radius],
             [*radius, height * 0.5, *radius],
         ),
+        PrimitiveGeometry::Ellipsoid { radii, .. } => (radii.map(|value| -value), *radii),
+        PrimitiveGeometry::Frustum {
+            top_size,
+            bottom_size,
+            height,
+        } => {
+            let half_x = top_size[0].max(bottom_size[0]) * 0.5;
+            let half_z = top_size[1].max(bottom_size[1]) * 0.5;
+            (
+                [-half_x, -height * 0.5, -half_z],
+                [half_x, height * 0.5, half_z],
+            )
+        }
+        PrimitiveGeometry::RoundedBox { size, .. } => {
+            let half = size.map(|value| value * 0.5);
+            (half.map(|value| -value), half)
+        }
     }
 }
 
@@ -105,6 +149,18 @@ pub fn primitive_geometry_cache_key(asset: &PrimitiveAssetNode) -> u64 {
     hash_geometry(&asset.geometry, &mut hash);
     hash_bytes(&mut hash, &asset.bevel_radius.to_bits().to_le_bytes());
     hash_bytes(&mut hash, &asset.bevel_segments.to_le_bytes());
+    hash_modifiers(&mut hash, &asset.modifiers);
+    hash_bytes(&mut hash, asset.mesh_build.topology.as_bytes());
+    hash_bytes(&mut hash, asset.mesh_build.triangulation.as_bytes());
+    hash_bytes(&mut hash, asset.mesh_build.quality.as_bytes());
+    hash_bytes(
+        &mut hash,
+        &asset
+            .mesh_build
+            .max_triangles
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
     if let Some(material) = &asset.material_definition {
         // Projection changes base vertex UVs; scale/rotation/variation remain
         // material/instance data and must not split geometry identity.
@@ -272,6 +328,45 @@ fn hash_geometry(geometry: &PrimitiveGeometry, hash: &mut u64) {
             hash_bytes(hash, &height.to_bits().to_le_bytes());
             hash_bytes(hash, &segments.to_le_bytes());
         }
+        PrimitiveGeometry::Ellipsoid {
+            radii,
+            segments,
+            rings,
+        } => {
+            hash_bytes(hash, &[7]);
+            hash_f32s(hash, radii);
+            hash_bytes(hash, &segments.to_le_bytes());
+            hash_bytes(hash, &rings.to_le_bytes());
+        }
+        PrimitiveGeometry::Frustum {
+            top_size,
+            bottom_size,
+            height,
+        } => {
+            hash_bytes(hash, &[8]);
+            hash_f32s(hash, top_size);
+            hash_f32s(hash, bottom_size);
+            hash_bytes(hash, &height.to_bits().to_le_bytes());
+        }
+        PrimitiveGeometry::RoundedBox {
+            size,
+            radius,
+            segments,
+        } => {
+            hash_bytes(hash, &[9]);
+            hash_f32s(hash, size);
+            hash_bytes(hash, &radius.to_bits().to_le_bytes());
+            hash_bytes(hash, &segments.to_le_bytes());
+        }
+    }
+}
+
+fn hash_modifiers(hash: &mut u64, modifiers: &[PrimitiveModifierNode]) {
+    for modifier in modifiers {
+        // JSON is only used as a stable typed byte representation for cache identity.
+        if let Ok(serialized) = serde_json::to_vec(modifier) {
+            hash_bytes(hash, &serialized);
+        }
     }
 }
 
@@ -289,9 +384,17 @@ pub(crate) struct MeshBuilder {
     normals: Vec<Option<[f32; 3]>>,
     texcoords: Vec<Option<[f32; 2]>>,
     indices: Vec<u32>,
+    shortest_quad_diagonal: bool,
 }
 
 impl MeshBuilder {
+    fn for_asset(asset: &PrimitiveAssetNode) -> Self {
+        Self {
+            shortest_quad_diagonal: asset.mesh_build.triangulation == "shortestdiagonal",
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn vertex(&mut self, position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> u32 {
         let index = self.positions.len() as u32;
         self.positions.push(position);
@@ -311,8 +414,15 @@ impl MeshBuilder {
             self.vertex(vertices[2], normal, [1.0, 1.0]),
             self.vertex(vertices[3], normal, [0.0, 1.0]),
         ];
-        self.triangle(ids[0], ids[1], ids[2]);
-        self.triangle(ids[0], ids[2], ids[3]);
+        let diagonal_02 = squared_distance(vertices[0], vertices[2]);
+        let diagonal_13 = squared_distance(vertices[1], vertices[3]);
+        if self.shortest_quad_diagonal && diagonal_13 < diagonal_02 {
+            self.triangle(ids[0], ids[1], ids[3]);
+            self.triangle(ids[1], ids[2], ids[3]);
+        } else {
+            self.triangle(ids[0], ids[1], ids[2]);
+            self.triangle(ids[0], ids[2], ids[3]);
+        }
     }
 
     pub(super) fn triangle_face(&mut self, vertices: [[f32; 3]; 3], normal: [f32; 3]) {
@@ -323,7 +433,239 @@ impl MeshBuilder {
     }
 
     fn finish(self, asset: &PrimitiveAssetNode, texture_set: PrimitiveTextureSet) -> GlbMeshData {
-        self.finish_with_bounds(asset, texture_set, primitive_bounds(&asset.geometry))
+        let bounds = mesh_bounds(&self.positions);
+        self.finish_with_bounds(asset, texture_set, bounds)
+    }
+
+    fn scale_geometry(&mut self, scale: [f32; 3]) {
+        for position in &mut self.positions {
+            for axis in 0..3 {
+                position[axis] *= scale[axis];
+            }
+        }
+        for normal in self.normals.iter_mut().flatten() {
+            for axis in 0..3 {
+                normal[axis] /= scale[axis];
+            }
+            *normal = normalize(*normal);
+        }
+    }
+
+    fn apply_modifiers(&mut self, modifiers: &[PrimitiveModifierNode]) {
+        for modifier in modifiers {
+            match modifier {
+                PrimitiveModifierNode::Transform {
+                    translate,
+                    rotate,
+                    scale,
+                } => self.transform(*translate, *rotate, *scale),
+                PrimitiveModifierNode::Taper { axis, start, end } => {
+                    self.taper(*axis, *start, *end)
+                }
+                PrimitiveModifierNode::Bend { axis, angle, pivot } => {
+                    self.bend(*axis, *angle, *pivot)
+                }
+                PrimitiveModifierNode::Twist { axis, angle } => self.twist(*axis, *angle),
+                PrimitiveModifierNode::Subdivision { levels } => {
+                    for _ in 0..*levels {
+                        self.subdivide();
+                    }
+                }
+                PrimitiveModifierNode::Smooth { angle } => self.smooth_normals(*angle, 1.0, false),
+                PrimitiveModifierNode::WeightedNormals {
+                    strength,
+                    keep_sharp_edges,
+                } => {
+                    let angle = if *keep_sharp_edges { 60.0 } else { 180.0 };
+                    self.smooth_normals(angle, *strength, true)
+                }
+            }
+        }
+    }
+
+    fn transform(&mut self, translate: [f32; 3], rotate: [f32; 3], scale: [f32; 3]) {
+        for position in &mut self.positions {
+            *position = rotate_euler(
+                [
+                    position[0] * scale[0],
+                    position[1] * scale[1],
+                    position[2] * scale[2],
+                ],
+                rotate,
+            );
+            for axis in 0..3 {
+                position[axis] += translate[axis];
+            }
+        }
+        for normal in self.normals.iter_mut().flatten() {
+            *normal = normalize(rotate_euler(
+                [
+                    normal[0] / scale[0],
+                    normal[1] / scale[1],
+                    normal[2] / scale[2],
+                ],
+                rotate,
+            ));
+        }
+    }
+
+    fn taper(&mut self, axis: PrimitiveAxis, start: f32, end: f32) {
+        let axis = axis_index(axis);
+        let (min, max) = coordinate_range(&self.positions, axis);
+        let span = (max - min).max(f32::EPSILON);
+        for position in &mut self.positions {
+            let ratio = ((position[axis] - min) / span).clamp(0.0, 1.0);
+            let factor = start + (end - start) * ratio;
+            for other in 0..3 {
+                if other != axis {
+                    position[other] *= factor;
+                }
+            }
+        }
+        self.recalculate_face_normals();
+    }
+
+    fn bend(&mut self, axis: PrimitiveAxis, angle: f32, pivot: [f32; 3]) {
+        let deform_axis = axis_index(axis);
+        let rotation_axis = if deform_axis == 2 { 0 } else { 2 };
+        let (min, max) = coordinate_range(&self.positions, deform_axis);
+        let span = (max - min).max(f32::EPSILON);
+        for position in &mut self.positions {
+            let ratio = (position[deform_axis] - min) / span - 0.5;
+            let rotation = axis_rotation(rotation_axis, angle * ratio);
+            let local = [
+                position[0] - pivot[0],
+                position[1] - pivot[1],
+                position[2] - pivot[2],
+            ];
+            let bent = rotate_euler(local, rotation);
+            *position = [bent[0] + pivot[0], bent[1] + pivot[1], bent[2] + pivot[2]];
+        }
+        self.recalculate_face_normals();
+    }
+
+    fn twist(&mut self, axis: PrimitiveAxis, angle: f32) {
+        let axis = axis_index(axis);
+        let (min, max) = coordinate_range(&self.positions, axis);
+        let span = (max - min).max(f32::EPSILON);
+        for position in &mut self.positions {
+            let ratio = (position[axis] - min) / span - 0.5;
+            *position = rotate_around_axis(*position, axis, angle * ratio);
+        }
+        self.recalculate_face_normals();
+    }
+
+    fn subdivide(&mut self) {
+        let old_positions = std::mem::take(&mut self.positions);
+        let old_normals = std::mem::take(&mut self.normals);
+        let old_texcoords = std::mem::take(&mut self.texcoords);
+        let old_indices = std::mem::take(&mut self.indices);
+        for triangle in old_indices.chunks_exact(3) {
+            let mut vertices = [[0.0; 3]; 3];
+            let mut normals = [[0.0; 3]; 3];
+            let mut uvs = [[0.0; 2]; 3];
+            for corner in 0..3 {
+                let source = triangle[corner] as usize;
+                vertices[corner] = old_positions[source];
+                normals[corner] = old_normals[source].unwrap_or([0.0, 1.0, 0.0]);
+                uvs[corner] = old_texcoords[source].unwrap_or([0.0; 2]);
+            }
+            let mids = [
+                midpoint_vertex(vertices[0], vertices[1]),
+                midpoint_vertex(vertices[1], vertices[2]),
+                midpoint_vertex(vertices[2], vertices[0]),
+            ];
+            let mid_normals = [
+                normalize(midpoint_vertex(normals[0], normals[1])),
+                normalize(midpoint_vertex(normals[1], normals[2])),
+                normalize(midpoint_vertex(normals[2], normals[0])),
+            ];
+            let mid_uvs = [
+                midpoint_uv(uvs[0], uvs[1]),
+                midpoint_uv(uvs[1], uvs[2]),
+                midpoint_uv(uvs[2], uvs[0]),
+            ];
+            for corners in [
+                [
+                    (vertices[0], normals[0], uvs[0]),
+                    (mids[0], mid_normals[0], mid_uvs[0]),
+                    (mids[2], mid_normals[2], mid_uvs[2]),
+                ],
+                [
+                    (mids[0], mid_normals[0], mid_uvs[0]),
+                    (vertices[1], normals[1], uvs[1]),
+                    (mids[1], mid_normals[1], mid_uvs[1]),
+                ],
+                [
+                    (mids[2], mid_normals[2], mid_uvs[2]),
+                    (mids[1], mid_normals[1], mid_uvs[1]),
+                    (vertices[2], normals[2], uvs[2]),
+                ],
+                [
+                    (mids[0], mid_normals[0], mid_uvs[0]),
+                    (mids[1], mid_normals[1], mid_uvs[1]),
+                    (mids[2], mid_normals[2], mid_uvs[2]),
+                ],
+            ] {
+                let ids = corners.map(|(position, normal, uv)| self.vertex(position, normal, uv));
+                self.triangle(ids[0], ids[1], ids[2]);
+            }
+        }
+    }
+
+    fn recalculate_face_normals(&mut self) {
+        for triangle in self.indices.chunks_exact(3) {
+            let a = self.positions[triangle[0] as usize];
+            let b = self.positions[triangle[1] as usize];
+            let c = self.positions[triangle[2] as usize];
+            let normal = triangle_normal(a, b, c);
+            for index in triangle {
+                self.normals[*index as usize] = Some(normal);
+            }
+        }
+    }
+
+    fn smooth_normals(&mut self, angle: f32, strength: f32, area_weighted: bool) {
+        let mut accumulated = HashMap::<[i64; 3], [f32; 3]>::new();
+        for triangle in self.indices.chunks_exact(3) {
+            let cross = triangle_cross(
+                self.positions[triangle[0] as usize],
+                self.positions[triangle[1] as usize],
+                self.positions[triangle[2] as usize],
+            );
+            let normal = if area_weighted {
+                cross
+            } else {
+                normalize(cross)
+            };
+            for index in triangle {
+                let entry = accumulated
+                    .entry(position_key(self.positions[*index as usize]))
+                    .or_insert([0.0; 3]);
+                for axis in 0..3 {
+                    entry[axis] += normal[axis];
+                }
+            }
+        }
+        let cosine_limit = angle.to_radians().cos();
+        for (index, normal) in self.normals.iter_mut().enumerate() {
+            let original = normal.unwrap_or([0.0, 1.0, 0.0]);
+            let smooth = normalize(
+                *accumulated
+                    .get(&position_key(self.positions[index]))
+                    .unwrap_or(&original),
+            );
+            let target = if dot(original, smooth) >= cosine_limit {
+                smooth
+            } else {
+                original
+            };
+            *normal = Some(normalize([
+                original[0] + (target[0] - original[0]) * strength,
+                original[1] + (target[1] - original[1]) * strength,
+                original[2] + (target[2] - original[2]) * strength,
+            ]));
+        }
     }
 
     pub(crate) fn finish_with_bounds(
@@ -450,6 +792,116 @@ fn apply_material_uvs(
     }
 }
 
+fn mesh_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for position in positions {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position[axis]);
+            max[axis] = max[axis].max(position[axis]);
+        }
+    }
+    if positions.is_empty() {
+        ([0.0; 3], [0.0; 3])
+    } else {
+        (min, max)
+    }
+}
+
+fn axis_index(axis: PrimitiveAxis) -> usize {
+    match axis {
+        PrimitiveAxis::X => 0,
+        PrimitiveAxis::Y => 1,
+        PrimitiveAxis::Z => 2,
+    }
+}
+
+fn coordinate_range(positions: &[[f32; 3]], axis: usize) -> (f32, f32) {
+    positions.iter().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(min, max), position| (min.min(position[axis]), max.max(position[axis])),
+    )
+}
+
+fn axis_rotation(axis: usize, angle: f32) -> [f32; 3] {
+    let mut rotation = [0.0; 3];
+    rotation[axis] = angle;
+    rotation
+}
+
+fn rotate_around_axis(value: [f32; 3], axis: usize, angle: f32) -> [f32; 3] {
+    rotate_euler(value, axis_rotation(axis, angle))
+}
+
+fn rotate_euler(mut value: [f32; 3], rotation: [f32; 3]) -> [f32; 3] {
+    let (sin_x, cos_x) = rotation[0].to_radians().sin_cos();
+    value = [
+        value[0],
+        value[1] * cos_x - value[2] * sin_x,
+        value[1] * sin_x + value[2] * cos_x,
+    ];
+    let (sin_y, cos_y) = rotation[1].to_radians().sin_cos();
+    value = [
+        value[0] * cos_y + value[2] * sin_y,
+        value[1],
+        -value[0] * sin_y + value[2] * cos_y,
+    ];
+    let (sin_z, cos_z) = rotation[2].to_radians().sin_cos();
+    [
+        value[0] * cos_z - value[1] * sin_z,
+        value[0] * sin_z + value[1] * cos_z,
+        value[2],
+    ]
+}
+
+fn normalize(value: [f32; 3]) -> [f32; 3] {
+    let length = value
+        .iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt();
+    if length <= f32::EPSILON {
+        [0.0, 1.0, 0.0]
+    } else {
+        value.map(|component| component / length)
+    }
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    normalize(triangle_cross(a, b, c))
+}
+
+fn triangle_cross(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ]
+}
+
+fn midpoint_vertex(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|axis| (a[axis] + b[axis]) * 0.5)
+}
+
+fn midpoint_uv(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    std::array::from_fn(|axis| (a[axis] + b[axis]) * 0.5)
+}
+
+fn position_key(position: [f32; 3]) -> [i64; 3] {
+    // Quantization welds duplicate face vertices without changing authored positions.
+    position.map(|value| (value * 100_000.0).round() as i64)
+}
+
+fn squared_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +959,9 @@ mod tests {
             bevel_segments: 3,
             material_seed: Some(seed),
             collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         }
     }
 
@@ -524,6 +979,9 @@ mod tests {
             bevel_segments: 0,
             material_seed: None,
             collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         };
         let mesh = generate_primitive_mesh(&asset);
         assert_eq!(mesh.positions.len(), 24);
@@ -536,6 +994,57 @@ mod tests {
                 .flatten()
                 .all(|uv| uv.iter().all(|v| (0.0..=1.0).contains(v)))
         );
+    }
+
+    #[test]
+    fn advanced_shape_modifiers_compile_to_finite_shared_mesh_data() {
+        let asset = PrimitiveAssetNode {
+            id: "advanced_ellipsoid".into(),
+            geometry: PrimitiveGeometry::Ellipsoid {
+                radii: [0.8, 1.2, 0.55],
+                segments: 16,
+                rings: 8,
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: Default::default(),
+            modifiers: vec![
+                PrimitiveModifierNode::Taper {
+                    axis: PrimitiveAxis::Y,
+                    start: 1.1,
+                    end: 0.75,
+                },
+                PrimitiveModifierNode::Twist {
+                    axis: PrimitiveAxis::Y,
+                    angle: 12.0,
+                },
+                PrimitiveModifierNode::Subdivision { levels: 1 },
+                PrimitiveModifierNode::Smooth { angle: 80.0 },
+            ],
+            mesh_build: Default::default(),
+            lod: Default::default(),
+        };
+        let mesh = generate_primitive_mesh(&asset);
+        assert_eq!(mesh.indices.len() / 3, asset.geometry.triangle_count() * 4);
+        assert!(
+            mesh.positions
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            mesh.normals
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(mesh.bounds_min[1] < -1.1);
+        assert!(mesh.bounds_max[1] > 1.1);
     }
 
     #[test]
@@ -555,6 +1064,9 @@ mod tests {
             bevel_segments: 0,
             material_seed: None,
             collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         };
         let b = PrimitiveAssetNode {
             id: "b".into(),
@@ -566,6 +1078,9 @@ mod tests {
             bevel_segments: 0,
             material_seed: None,
             collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         };
         assert_eq!(primitive_cache_key(&a), primitive_cache_key(&b));
     }
@@ -633,6 +1148,9 @@ mod tests {
             bevel_segments: 3,
             material_seed: None,
             collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
         };
         let mesh = generate_primitive_mesh(&asset);
         assert!(mesh.indices.len() > 36);
@@ -724,6 +1242,9 @@ mod tests {
                 bevel_segments: 0,
                 material_seed: None,
                 collision: Default::default(),
+                modifiers: Vec::new(),
+                mesh_build: Default::default(),
+                lod: Default::default(),
             };
             let mesh = generate_primitive_mesh(&asset);
             assert_eq!(

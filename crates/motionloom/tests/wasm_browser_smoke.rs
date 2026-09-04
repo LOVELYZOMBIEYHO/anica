@@ -44,6 +44,16 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    fn scene_render_style_resolver_matches_native_contract() {
+        let script = COLOR_SCENE.replace("  <Scene id=\"stage\">", "  <RenderStyle id=\"toon\">\n<SurfaceStyle shading=\"toon\" shadingSteps=\"4\" />\n</RenderStyle>\n<Scene id=\"stage\" renderStyle=\"toon\">");
+        let json = motionloom::wasm_api::motionloom_render_style_json(&script, "stage").unwrap();
+        let result: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(result["shading"], "toon");
+        assert_eq!(result["shadingSteps"], 4);
+        assert!(motionloom::wasm_api::motionloom_render_style_json(&script, "missing").is_err());
+    }
+
+    #[wasm_bindgen_test]
     fn parse_summary_returns_scene() {
         let summary = motionloom_parse_summary(COLOR_SCENE).expect("parse summary");
         assert!(summary.starts_with("scene graph"));

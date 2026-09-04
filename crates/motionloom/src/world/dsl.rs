@@ -638,6 +638,8 @@ fn parse_action_block(block: &str) -> Result<WorldAction, GraphParseError> {
             message: "Action requires at least one <Pose> block.".to_string(),
         });
     }
+    // Runtime sampling relies on one canonical order and can then use binary lookup.
+    poses.sort_by(|a, b| a.t.total_cmp(&b.t));
     Ok(WorldAction {
         id: required_attr_value(open, "id", line)?,
         skeleton: required_attr_value(open, "skeleton", line)?,
@@ -727,14 +729,11 @@ fn parse_apply_action_node(block: &str) -> Result<WorldApplyAction, GraphParseEr
         duration_ms: attr_value(block, "duration")
             .map(|raw| parse_duration_ms(&raw, line, "ApplyAction.duration"))
             .transpose()?,
-        root_motion: attr_value(block, "rootMotion")
-            .or_else(|| attr_value(block, "root_motion")),
+        root_motion: attr_value(block, "rootMotion").or_else(|| attr_value(block, "root_motion")),
         destination: attr_value(block, "destination"),
         face: attr_value(block, "face"),
-        sync_group: attr_value(block, "syncGroup")
-            .or_else(|| attr_value(block, "sync_group")),
-        sync_marker: attr_value(block, "syncMarker")
-            .or_else(|| attr_value(block, "sync_marker")),
+        sync_group: attr_value(block, "syncGroup").or_else(|| attr_value(block, "sync_group")),
+        sync_marker: attr_value(block, "syncMarker").or_else(|| attr_value(block, "sync_marker")),
     })
 }
 
@@ -1530,6 +1529,29 @@ mod tests {
         assert_eq!(first.out_tangent.as_deref(), Some("1.5"));
         assert_eq!(second.in_tangent.as_deref(), Some("-0.5"));
         assert_eq!(second.interpolation, None);
+    }
+
+    #[test]
+    fn parses_action_poses_into_runtime_time_order() {
+        let graph = parse_world_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <World id="stage"><Actor id="hero" model="hero.glb" /></World>
+  <Action id="ordered" skeleton="humanoid_v1" duration="1s">
+    <Pose t="1s"><Bone id="hips" y="1" /></Pose>
+    <Pose t="0s"><Bone id="hips" y="0" /></Pose>
+    <Pose t="0.5s"><Bone id="hips" y="0.5" /></Pose>
+  </Action>
+  <ApplyAction target="hero" action="ordered" />
+  <Present from="stage" />
+</Graph>"##,
+        )
+        .expect("world action pose ordering");
+        let times = graph.actions[0]
+            .poses
+            .iter()
+            .map(|pose| pose.t)
+            .collect::<Vec<_>>();
+        assert_eq!(times, [0.0, 0.5, 1.0]);
     }
 
     #[test]

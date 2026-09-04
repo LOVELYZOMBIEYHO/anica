@@ -69,6 +69,9 @@
 //! assert!(bloom.is_some());
 //! ```
 
+pub use crate::render_style::{
+    RenderQualityNode, RenderStyleNode, ResolvedSceneRenderStyle, resolve_scene_render_style,
+};
 pub use crate::{
     ANIMATION_PROPERTY_DESCRIPTORS, ActionLibraryNode, ActorVisibilityObservation,
     AnimationCapabilityReport, AnimationDiagnostic, AnimationDiagnosticSeverity,
@@ -80,7 +83,8 @@ pub use crate::{
     GraphAssetSource, GraphParseError, GraphScript, MemoryAssetResolver, MotionLoomAuthoringReport,
     MotionLoomDocument, MotionLoomError, MotionLoomRenderProgress, MotionLoomSceneRenderError,
     MotionLoomShowcaseSchema, PathAssetResolver, PenetrationObservation, PrimitiveAssetNode,
-    PrimitiveAuthoringSummary, PrimitiveGeometry, ProcessCategory, ProcessEffectDefinition,
+    PrimitiveAuthoringSummary, PrimitiveAxis, PrimitiveGeometry, PrimitiveLodNode,
+    PrimitiveMeshBuildNode, PrimitiveModifierNode, ProcessCategory, ProcessEffectDefinition,
     ProcessGraph, ProjectedJointObservation, RenderPassDag, RenderPassDagEdge, RenderPassDagKind,
     RenderPassDagNode, RenderPassSpace, RootGraphError, RuntimeCompileError, RuntimeFrameOutput,
     RuntimeProcessEffectInstance, RuntimeProcessParamValue, RuntimeProgram, SceneGpuTexture,
