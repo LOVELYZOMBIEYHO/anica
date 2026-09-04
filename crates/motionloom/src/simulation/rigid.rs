@@ -1507,8 +1507,8 @@ mod tests {
         }];
         let output = sample_rigid_bodies_3d(&inputs, 0.0, 1.0 / 120.0, 8, [0.0, -9.81, 0.0]);
         let expected = quat_from_euler_degrees(authored);
-        for axis in 0..4 {
-            assert!((output[0].orientation[axis] - expected[axis]).abs() < 1.0e-6);
+        for (axis, expected_component) in expected.into_iter().enumerate() {
+            assert!((output[0].orientation[axis] - expected_component).abs() < 1.0e-6);
         }
     }
 

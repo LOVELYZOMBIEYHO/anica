@@ -143,6 +143,10 @@ pub struct GraphAssetNode {
 /// A Graph asset is either externally resolved data or typed engine geometry.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep public asset constructors source-compatible; boxing changes the Rust API."
+)]
 pub enum GraphAssetSource {
     External { src: String },
     Primitive(PrimitiveAssetNode),
@@ -3528,7 +3532,7 @@ fn parse_terrain_asset(
         });
     }
     let blend_map = attr_value(tag, "blendMap").map(|value| strip_wrappers(&value).to_string());
-    if blend_map.is_some() != !layers.is_empty() {
+    if blend_map.is_some() == layers.is_empty() {
         return Err(GraphParseError {
             line,
             message: format!("TerrainAsset \"{id}\" must declare layers and blendMap together."),
@@ -4702,7 +4706,7 @@ fn parse_primitive_vec_value<const N: usize>(
     line: usize,
     positive: bool,
 ) -> Result<[f32; N], GraphParseError> {
-    let value = strip_wrappers(&raw).trim();
+    let value = strip_wrappers(raw).trim();
     let value = value
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))

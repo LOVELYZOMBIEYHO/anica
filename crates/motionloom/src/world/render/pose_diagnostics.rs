@@ -501,7 +501,7 @@ pub(crate) fn diagnostic_axis_effectiveness(
         effective,
         applied_at_stage: (semantic_effective || rest_effective)
             .then_some(BonePoseStage::ProfileCalibratedRest),
-        bypassed_by: (!semantic_effective && !declared_is_rest_only(&axis))
+        bypassed_by: (!semantic_effective && !declared_is_rest_only(axis))
             .then(|| format!("{driver:?}")),
     }
 }

@@ -1626,9 +1626,11 @@ fn scene_world_lighting(
     time_norm: f32,
     time_sec: f32,
 ) -> Result<WorldLighting, MotionLoomSceneRenderError> {
-    let mut lighting = WorldLighting::default();
     // Style defaults are evaluated before explicit island nodes and their keys.
-    lighting.render_style = composite.render_style.clone();
+    let mut lighting = WorldLighting {
+        render_style: composite.render_style.clone(),
+        ..WorldLighting::default()
+    };
     if let Some(style) = &composite.render_style {
         let p = &style.post;
         if let Some(v) = &p.tone_mapping {
@@ -3043,6 +3045,9 @@ fn motionloom_wasm_loaded_font_family(font_family: Option<&str>, text: &str) -> 
     Family::Name("Noto Sans CJK TC")
 }
 
+// Cached world-space axis-aligned environment bounds.
+type EnvironmentBounds = ([f32; 3], [f32; 3]);
+
 struct SceneFrameRenderer {
     profile: SceneRenderProfile,
     asset_resolver: Arc<dyn AssetResolver>,
@@ -3101,7 +3106,7 @@ struct SceneFrameRenderer {
     environment_node_cache: HashMap<String, HashMap<String, [f32; 3]>>,
     /// Renderer-space bounds (after GLB node transforms) used to normalize
     /// semantic nodes exactly like the 3D actor shader normalizes geometry.
-    environment_bounds_cache: HashMap<String, Option<([f32; 3], [f32; 3])>>,
+    environment_bounds_cache: HashMap<String, Option<EnvironmentBounds>>,
     /// Walkable transformed GLB triangles. This is the reusable spatial input
     /// for raycast grounding; it is decoded once rather than once per frame.
     environment_triangle_cache:
@@ -4856,6 +4861,10 @@ fn scene_rotate_by_quaternion(value: [f32; 3], q: [f32; 4]) -> [f32; 3] {
     ]
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep skeleton, playback timing and contact inputs explicit at the rig sampling boundary."
+)]
 fn sample_compound_rig(
     skeleton: &crate::scene::dsl::SkeletonNode,
     action: Option<(
@@ -5309,12 +5318,11 @@ fn reachable_environment_height(
     const DENSE_SUPPORT_LIMIT: usize = 4_096;
     let mut dense_height = None::<f32>;
     for environment in environments {
-        if environment.triangles.len() > DENSE_SUPPORT_LIMIT {
-            if let Some(height) = raycast_environment_height(environment, x, z, None)
-                && dense_height.is_none_or(|current| height > current)
-            {
-                dense_height = Some(height);
-            }
+        if environment.triangles.len() > DENSE_SUPPORT_LIMIT
+            && let Some(height) = raycast_environment_height(environment, x, z, None)
+            && dense_height.is_none_or(|current| height > current)
+        {
+            dense_height = Some(height);
         }
     }
     let supports = environments
@@ -6000,6 +6008,16 @@ fn action_contact_effector_radius(effector: &str, actor_scale: f32) -> f32 {
     }
 }
 
+// Preserve the former min/max fallback for NaN durations while bounding valid feathers.
+fn contact_feather(duration: f32, maximum: f32) -> f32 {
+    let feather = duration * 0.2;
+    if feather.is_nan() {
+        maximum
+    } else {
+        feather.clamp(0.001, maximum)
+    }
+}
+
 fn smoothstep01(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     value * value * (3.0 - 2.0 * value)
@@ -6012,7 +6030,7 @@ fn action_contact_phase_envelope(from: f32, to: f32, phase: f32) -> f32 {
     if phase < from || phase > to || to <= from {
         return 0.0;
     }
-    let feather = ((to - from) * 0.2).min(0.035).max(0.001);
+    let feather = contact_feather(to - from, 0.035);
     let entering = smoothstep01((phase - from) / feather);
     let leaving = smoothstep01((to - phase) / feather);
     entering.min(leaving)
@@ -6042,7 +6060,7 @@ fn action_contact_lock_time_sec(
     } else {
         0.0
     };
-    let feather = ((contact_to - contact_from) * 0.2).min(0.035).max(0.001);
+    let feather = contact_feather(contact_to - contact_from, 0.035);
     let lock_phase = (contact_from + feather).min(contact_to);
     let lock_action_time = cycle_start + lock_phase * action_duration_sec;
     Some(apply_start_sec + lock_action_time / speed)
@@ -6212,7 +6230,7 @@ fn action_surface_contact_envelope(
     if contact.from <= f32::EPSILON {
         return 1.0;
     }
-    let feather = ((contact.to - contact.from) * 0.2).min(0.08).max(0.001);
+    let feather = contact_feather(contact.to - contact.from, 0.08);
     ((phase - contact.from) / feather).clamp(0.0, 1.0)
 }
 
@@ -6291,6 +6309,10 @@ fn automatic_humanoid_supports(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The deterministic solver keeps authored, motion and support state separate."
+)]
 fn solve_humanoid_root_frame(
     frame: &crate::world::render::Scene3DHumanoidFrame,
     authored_root: [f32; 3],
@@ -10559,6 +10581,10 @@ impl SceneFrameRenderer {
     /// texture. The island is composited by the same Scene pass ordering as
     /// every 2D Layer, so this bridge does not reintroduce a public `<World>`
     /// render family.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The render boundary carries independent frame, target and timing inputs."
+    )]
     async fn render_scene_3d_composite(
         &mut self,
         composite: &CompositeGroupConfig,
@@ -21810,6 +21836,27 @@ fn scene_bool(value: &str) -> bool {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    #[test]
+    fn contact_feather_preserves_legacy_bounds_and_nan_fallback() {
+        // Lint cleanup must not change semantic contact blending at numerical boundaries.
+        for maximum in [0.035_f32, 0.08] {
+            for duration in [
+                f32::NAN,
+                f32::NEG_INFINITY,
+                -1.0,
+                0.0,
+                0.001,
+                0.1,
+                1.0,
+                f32::INFINITY,
+            ] {
+                let upper = (duration * 0.2).min(maximum);
+                let expected = upper.max(0.001);
+                assert_eq!(super::contact_feather(duration, maximum), expected);
+            }
+        }
+    }
+
     use crate::asset::MemoryAssetResolver;
     use crate::parse_graph_script;
     use crate::scene::drawable::{
@@ -22531,8 +22578,10 @@ mod tests {
         );
         assert!((surface.origin[1] - 1.04).abs() < 1.0e-6);
         assert_eq!(surface.origin[2], -0.54);
-        let mut frame = crate::world::render::Scene3DHumanoidFrame::default();
-        frame.actor_scale = 1.0;
+        let mut frame = crate::world::render::Scene3DHumanoidFrame {
+            actor_scale: 1.0,
+            ..Default::default()
+        };
         frame.rig_metrics.body_height = 0.9;
         frame.joints.insert("hips".to_string(), [0.0, 1.2, 0.0]);
         let pelvis = super::semantic_contact_point(&frame, "pelvis", &surface)

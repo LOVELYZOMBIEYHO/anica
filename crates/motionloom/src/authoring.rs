@@ -1529,7 +1529,7 @@ fn required_attributes(tag: &str) -> Vec<String> {
         _ => &[],
     };
     attributes
-        .into_iter()
+        .iter()
         .map(|attribute| (*attribute).to_string())
         .collect()
 }

@@ -1120,12 +1120,15 @@ fn scene_node_id(node: &SceneNode) -> Option<&str> {
     }
 }
 
+// Parsed roots retain separate pre- and post-composite effect lists.
+type ParsedSceneRoots = (Vec<SceneNode>, Vec<SceneEffectRef>, Vec<SceneEffectRef>);
+
 fn parse_scene_root_nodes(
     lines: &[&str],
     start: usize,
     end: usize,
     brush_ctx: &mut BrushParseContext,
-) -> Result<(Vec<SceneNode>, Vec<SceneEffectRef>, Vec<SceneEffectRef>), GraphParseError> {
+) -> Result<ParsedSceneRoots, GraphParseError> {
     let mut nodes = Vec::<SceneNode>::new();
     let mut effects = Vec::<SceneEffectRef>::new();
     let mut post_effects = Vec::<SceneEffectRef>::new();

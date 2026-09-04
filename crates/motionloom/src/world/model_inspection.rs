@@ -503,9 +503,9 @@ fn detect_horizontal_environment_surfaces(
         group.area += area;
         group.triangles += 1;
         for point in points {
-            for axis in 0..3 {
-                group.bounds_min[axis] = group.bounds_min[axis].min(point[axis]);
-                group.bounds_max[axis] = group.bounds_max[axis].max(point[axis]);
+            for (axis, coordinate) in point.into_iter().enumerate() {
+                group.bounds_min[axis] = group.bounds_min[axis].min(coordinate);
+                group.bounds_max[axis] = group.bounds_max[axis].max(coordinate);
             }
         }
     }
@@ -1519,8 +1519,7 @@ fn inspect_mesh_skeleton_with_preferred(
         }
         let second_score = candidates
             .iter()
-            .filter(|candidate| candidate.node_index != best.node_index)
-            .next()
+            .find(|candidate| candidate.node_index != best.node_index)
             .map_or(0.0, |candidate| candidate.score);
         if declared.is_none() && best.score - second_score < 0.12 && second_score > 0.35 {
             diagnostics.push(ModelInspectionDiagnostic {
@@ -1635,7 +1634,7 @@ fn score_candidate(
         let alias_compact = alias.replace(' ', "");
         let current: f32 = if compact == alias_compact {
             0.82
-        } else if tokens.iter().any(|token| *token == *alias) {
+        } else if tokens.contains(alias) {
             0.74
         } else if compact.contains(&alias_compact) {
             0.62
@@ -1699,11 +1698,7 @@ fn normalize_name(name: &str) -> String {
             output.push(' ');
         }
     }
-    output
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn detect_side(tokens: &[&str], compact: &str) -> Option<Side> {
@@ -1779,7 +1774,7 @@ fn infer_body_basis(
     .into_iter()
     .flatten()
     .filter_map(|direction| reject(direction, up).and_then(normalize))
-    .reduce(|left, right| add(left, right))
+    .reduce(add)
     .and_then(normalize);
     let (forward, facing_confidence) = if let Some(toe_forward) = toe_forward {
         let sign = if dot(lateral_forward, toe_forward) >= 0.0 {

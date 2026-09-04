@@ -389,7 +389,7 @@ fn generate_tree(
                 center,
                 width,
                 width * 1.35,
-                random.range(0.0, 6.283),
+                random.range(0.0, std::f32::consts::TAU),
                 random_atlas_cell(random, 4, 4),
             );
         }
@@ -489,7 +489,7 @@ fn generate_flowers(
             top,
             asset.height * 0.13,
             asset.height * 0.13,
-            random.range(0.0, 6.283),
+            random.range(0.0, std::f32::consts::TAU),
             random_atlas_cell(random, 4, 4),
         );
     }

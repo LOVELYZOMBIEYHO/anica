@@ -829,6 +829,22 @@ fn format_bounds3(min: [f32; 3], max: [f32; 3]) -> String {
     )
 }
 
+// Preparation and actor assembly keep their existing tuple layout at internal call sites.
+type PreparedGpuFrame = (
+    Option<RgbaImage>,
+    u32,
+    u32,
+    Vec<GpuWorldDraw>,
+    Option<GpuGroundGridParams>,
+    GpuWorldLighting,
+);
+type ActorGpuDrawBuild = (
+    Vec<GpuWorldDraw>,
+    ActorBuildStages,
+    Vec<Scene3DEditorJointProjection>,
+    Vec<crate::rig_diagnostics::RigEvaluationReport>,
+);
+
 pub struct WorldFrameRenderer {
     asset_resolver: Arc<dyn AssetResolver>,
     image_cache: HashMap<PathBuf, RgbaImage>,
@@ -1429,6 +1445,10 @@ impl WorldFrameRenderer {
     }
 
     /// Build CPU-authored background and cached GLB draws before GPU submission.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preparation receives independent debug, background and material options."
+    )]
     fn prepare_gpu_frame(
         &mut self,
         graph: &WorldGraph,
@@ -1438,17 +1458,7 @@ impl WorldFrameRenderer {
         ground_grid_debug: bool,
         material_overrides: &[WorldMaterialTextureOverride],
         include_cpu_background: bool,
-    ) -> Result<
-        (
-            Option<RgbaImage>,
-            u32,
-            u32,
-            Vec<GpuWorldDraw>,
-            Option<GpuGroundGridParams>,
-            GpuWorldLighting,
-        ),
-        WorldRenderError,
-    > {
+    ) -> Result<PreparedGpuFrame, WorldRenderError> {
         let (width, height) = graph.output_size();
         let width = width.max(1);
         let height = height.max(1);
@@ -3656,7 +3666,7 @@ fn gpu_world_material_depth_write(
     material: Option<&GlbMaterialData>,
     phase: GpuWorldDrawPhase,
 ) -> bool {
-    material.map_or(true, |material| match material.depth_write {
+    material.is_none_or(|material| match material.depth_write {
         GlbDepthWriteMode::Enabled => true,
         GlbDepthWriteMode::Disabled => false,
         GlbDepthWriteMode::Auto => phase == GpuWorldDrawPhase::Opaque,
@@ -5657,6 +5667,10 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Debug projections share the renderer caches and resolved scene context."
+)]
 fn draw_actor_debug_projections(
     canvas: &mut RgbaImage,
     graph: &WorldGraph,
@@ -5758,15 +5772,7 @@ fn build_actor_gpu_draws(
     gpu_static_draw_cache: &mut HashMap<GpuWorldStaticPlanKey, Vec<GpuWorldStaticDraw>>,
     skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
     material_overrides: &[WorldMaterialTextureOverride],
-) -> Result<
-    (
-        Vec<GpuWorldDraw>,
-        ActorBuildStages,
-        Vec<Scene3DEditorJointProjection>,
-        Vec<crate::rig_diagnostics::RigEvaluationReport>,
-    ),
-    WorldRenderError,
-> {
+) -> Result<ActorGpuDrawBuild, WorldRenderError> {
     let camera_zoom = eval_number(&world.camera.zoom, 1.0, time)?.max(0.05);
     let camera_view = perspective_camera_view(world, width, height, time)?;
     let mut draws = Vec::new();
@@ -6740,14 +6746,14 @@ fn actor_joint_matrices(
     let strategy = if let Some(strategy) = skinning_strategy_cache.get(&cache_key).copied() {
         strategy
     } else {
-        let candidates = skinning_matrix_candidates(mesh, skin, mesh_node, &global_matrices);
+        let candidates = skinning_matrix_candidates(mesh, skin, mesh_node, global_matrices);
         let strategy =
             choose_skinning_matrix_candidate(mesh, mesh_node, candidates).unwrap_or_default();
         skinning_strategy_cache.insert(cache_key, strategy);
         strategy
     };
     let mut joint_matrices =
-        matrices_for_skinning_strategy(mesh, skin, mesh_node, &global_matrices, strategy);
+        matrices_for_skinning_strategy(mesh, skin, mesh_node, global_matrices, strategy);
     if joint_matrices.is_empty() {
         joint_matrices.push(mat4_identity());
     }
@@ -12294,6 +12300,10 @@ fn terrain_blend_weights(pixel: &[u8], layer_count: usize) -> Vec<f32> {
     weights
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Texture sampling requires independent UV, size, wrap and fallback inputs."
+)]
 fn terrain_texture_pixel(
     texture: Option<&GlbTextureData>,
     x: u32,
@@ -12486,12 +12496,14 @@ fn load_cached_glb_animation_resolved<'a>(
 mod tests {
     #[test]
     fn rigid_visibility_is_conservative_at_camera_edges() {
-        let mut p = super::GpuWorldParams::default();
-        p.canvas = [100.0, 100.0, 50.0, 50.0];
-        p.camera0 = [0.0, 0.0, 0.0, 50.0];
-        p.camera1 = [1.0, 0.0, 0.0, 0.1];
-        p.camera2 = [0.0, 1.0, 0.0, 100.0];
-        p.camera3 = [0.0, 0.0, 1.0, 0.0];
+        let mut p = super::GpuWorldParams {
+            canvas: [100.0, 100.0, 50.0, 50.0],
+            camera0: [0.0, 0.0, 0.0, 50.0],
+            camera1: [1.0, 0.0, 0.0, 0.1],
+            camera2: [0.0, 1.0, 0.0, 100.0],
+            camera3: [0.0, 0.0, 1.0, 0.0],
+            ..Default::default()
+        };
         p.model[3] = 1.0;
         p.actor_rotation[3] = 1.0;
         let bounds = Some(([-0.5; 3], [0.5; 3]));

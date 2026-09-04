@@ -516,9 +516,9 @@ impl MeshBuilder {
         for position in &mut self.positions {
             let ratio = ((position[axis] - min) / span).clamp(0.0, 1.0);
             let factor = start + (end - start) * ratio;
-            for other in 0..3 {
+            for (other, coordinate) in position.iter_mut().enumerate() {
                 if other != axis {
-                    position[other] *= factor;
+                    *coordinate *= factor;
                 }
             }
         }

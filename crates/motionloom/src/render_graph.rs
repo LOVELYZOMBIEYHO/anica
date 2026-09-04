@@ -104,6 +104,10 @@ impl<'a> DagBuilder<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The compiler passes distinct effect-chain routing and output settings explicitly."
+    )]
     fn effect_chain(
         &mut self,
         prefix: &str,

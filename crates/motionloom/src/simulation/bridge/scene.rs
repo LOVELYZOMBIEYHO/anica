@@ -263,9 +263,9 @@ fn sample_rigid_bodies_2d(states: &mut [RigidBodyState2D<'_>], time: f32) {
                     };
                     let linear_decay = (-state.body.linear_damping * dt).exp();
                     let angular_decay = (-state.body.angular_damping * dt).exp();
-                    for axis in 0..2 {
+                    for (axis, acceleration) in gravity.into_iter().enumerate() {
                         state.velocity[axis] =
-                            (state.velocity[axis] + gravity[axis] * dt) * linear_decay;
+                            (state.velocity[axis] + acceleration * dt) * linear_decay;
                         state.position[axis] += state.velocity[axis] * dt;
                     }
                     state.angular_velocity *= angular_decay;
@@ -343,9 +343,9 @@ fn resolve_rigid_body_2d_pair(states: &mut [RigidBodyState2D<'_>], a: usize, b: 
         return;
     }
     let correction = overlap[axis] / inverse_mass_sum;
-    for component in 0..2 {
-        a.position[component] -= normal[component] * correction * inverse_mass_a;
-        b.position[component] += normal[component] * correction * inverse_mass_b;
+    for (component, direction) in normal.into_iter().enumerate() {
+        a.position[component] -= direction * correction * inverse_mass_a;
+        b.position[component] += direction * correction * inverse_mass_b;
     }
 
     let relative_velocity = [b.velocity[0] - a.velocity[0], b.velocity[1] - a.velocity[1]];
@@ -355,9 +355,9 @@ fn resolve_rigid_body_2d_pair(states: &mut [RigidBodyState2D<'_>], a: usize, b: 
     }
     let restitution = a.body.restitution.min(b.body.restitution);
     let impulse = -(1.0 + restitution) * normal_speed / inverse_mass_sum;
-    for component in 0..2 {
-        a.velocity[component] -= normal[component] * impulse * inverse_mass_a;
-        b.velocity[component] += normal[component] * impulse * inverse_mass_b;
+    for (component, direction) in normal.into_iter().enumerate() {
+        a.velocity[component] -= direction * impulse * inverse_mass_a;
+        b.velocity[component] += direction * impulse * inverse_mass_b;
     }
 
     let tangent = [-normal[1], normal[0]];
@@ -365,9 +365,9 @@ fn resolve_rigid_body_2d_pair(states: &mut [RigidBodyState2D<'_>], a: usize, b: 
     let friction = (a.body.friction * b.body.friction).sqrt();
     let friction_impulse =
         (-tangent_speed / inverse_mass_sum).clamp(-impulse * friction, impulse * friction);
-    for component in 0..2 {
-        a.velocity[component] -= tangent[component] * friction_impulse * inverse_mass_a;
-        b.velocity[component] += tangent[component] * friction_impulse * inverse_mass_b;
+    for (component, direction) in tangent.into_iter().enumerate() {
+        a.velocity[component] -= direction * friction_impulse * inverse_mass_a;
+        b.velocity[component] += direction * friction_impulse * inverse_mass_b;
     }
 }
 
