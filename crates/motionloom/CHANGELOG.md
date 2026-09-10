@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- BREAKING: rename the universal explicit mesh DSL to `MeshAsset`, `Vertex`,
+  and `Face`. The previous subdivision-specific tag names are rejected rather
+  than treated as aliases. `MeshAsset` defaults to `subdivision="0"`, supports
+  levels 0–2, and accepts `subdivisionScheme="catmullClark"`. The underlying
+  polygon cage, UV interpolation, renderer, and GLB export logic are unchanged.
+
+- BREAKING: replace flat Eye iris/lid styling fields with an optional nested
+  Iris and repeatable Eyeliner components. Eye Texture now maps to the generated
+  convex sclera instead of a flat whole-eye card; old fields are rejected.
+  Iris supports Eye-local position, circle/ellipse/square geometry, and a geometry
+  scale separate from its Texture UV transform.
+  Eye position Z now moves only the eyeball and Iris; Eyeliner stays on the lid,
+  while socketDepth exclusively controls the surrounding orbital skin. This
+  prevents rectangular skin extrusion.
+
+- Add parametric FaceLayout Eyebrow ribbons with optional nested Texture and
+  head-material fallback. Replace S86's explicit eyebrow cards with components.
+
+- BREAKING: remove flat FaceLayout attributes. Use explicit Eye, Nose, Mouth,
+  and Ear children with unique IDs and component-local Texture bindings.
+  Migrate S85/S86 sources; see FACE_COMPONENTS.md for coordinate conventions
+  and current front-surface generator limits.
+
+- Replace the eye-specific explicit cage DSL with generic polygon mesh nodes.
+- Add `HeadAsset topology="facialCage|explicit"`, a versioned Rust facial-cage
+  generator, reusable profiled-surface internals, cage inspection APIs, and the
+  corresponding WASM export.
+- Remove `EyeAsset`, `EyeVertex`, and `EyeFace` without a compatibility parser.
+
+## Unreleased
+
+- Added HairDefaults, HairGuide numeric overrides/root normal, and HairMirror.
+  Fixed accumulated roll, curved-card normals, uneven curve sampling and tip
+  closure. Existing scripts parse, but corrected hair geometry and mesh/UV hashes
+  change. Rust HairGuideNode gains an optional normal field. See HAIR_CARDS.md.
+
+- Added experimental camera-independent geometry snapshots, UV diagnostic
+  images/reports and static GLB byte export. Scene model lowering is shared with
+  rendering. Source DSL and its cameras remain intact; see GEOMETRY_TOOLING.md.
+
+- Improved native/WebGPU immediate 3D materials without new DSL settings:
+  semantic material mipmaps with 8x anisotropic filtering, independent material
+  AO affecting indirect light, and RGBA16Float intermediate rendering through
+  transparency and depth of field before the final display curve. Graph output
+  size and RGBA8 Scene composition remain unchanged. See
+  [immediate preview notes](IMMEDIATE_PREVIEW.md) for scope and measurements.
+
+- Breaking DSL and Rust API change: removed the `RenderQuality` resource,
+  `Scene.renderQuality`, and all resolved quality fields. Old DSL and serialized
+  graph JSON are rejected. Immediate native and WASM rendering now use the Graph
+  render size, a fixed 1536 shadow map, existing analytic ambient occlusion, and
+  no quality-selected anti-aliasing. Use Graph `renderSize` to request larger
+  output dimensions.
+
 - Extended the existing `Repeat` tag with deterministic
   `mode="volume"` inside 3D CompositeGroups. A regular Model template can now
   populate bounded world space with seeded phase, velocity, lifetime, respawn,
@@ -109,6 +163,10 @@
 - Added Layout padding, independent gaps, alignment, justification, and layoutSpan.
 - Migration: existing Component, Repeat, and Layout scripts keep their previous
   defaults and require no changes; the new child tags and attributes are opt-in.
+- Added `FaceLayout.noseHeight` as an absolute face-space Y coordinate, allowing
+  eye and nose placement to be edited independently. Existing scripts that omit
+  it retain their previous generated nose position; new scripts should author it
+  explicitly when independent facial editing is required.
 
 ## 0.1.0
 
@@ -121,3 +179,7 @@ Initial public MotionLoom crate release.
 - Provides process/effect runtime evaluation and a process catalog for host UI integration.
 - Provides preview APIs for MotionLoom-owned wgpu textures, caller-owned wgpu targets, and platform preview surfaces.
 - Exposes `motionloom::api` as the recommended stable integration surface.
+
+- Added an experimental read-only MeshAsset edit snapshot with runtime camera
+  projection, exposed to WASM for source-preserving vertex editing in the landing
+  page's Model editing (MeshAsset only) panel. HeadAsset remains parametric.

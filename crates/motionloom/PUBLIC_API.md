@@ -1,5 +1,9 @@
 # MotionLoom Main Public API
 
+Experimental geometry authoring APIs (`extract_scene_geometry`,
+`extract_scene_geometry_with_resolver`, `check_scene_uvs`, `export_scene_glb`)
+are documented in [GEOMETRY_TOOLING.md](GEOMETRY_TOOLING.md).
+
 This document lists the recommended public API surface for applications and
 open-source users integrating MotionLoom as a standalone Rust crate.
 
@@ -745,8 +749,79 @@ DSL remains the authored source of truth.
 ## Scene visual style inspection
 
 `motionloom::api::resolve_scene_render_style(&graph, scene_id)` returns resolved
-Scene-owned style/quality settings and explicit-node override evidence. The DSL
+Scene-owned visual style settings and explicit-node override evidence. The DSL
 remains the source of truth; this JSON is inspection output, not an editing API.
 WASM hosts use `motionloom_render_style_json(script, scene_id)`; CLI hosts can
 use the `render_style_report` example. See [RENDER_STYLE.md](RENDER_STYLE.md) for
-supported settings, precedence, fallback behavior and Rust AST migration notes.
+supported settings, precedence, immediate-render defaults and the breaking
+migration.
+
+### Head reference fitting
+
+`motionloom::api::head_fitting` provides opt-in typed/JSON multi-view head
+authoring, bounded parameter fitting, reviewed source patches and CPU comparison
+overlays. See [Head reference fitting](HEAD_REFERENCE_FITTING.md) for the contract,
+WASM exports, CLI examples and geometry limitations. Existing DSL/runtime behavior
+is unchanged.
+
+### Subdivision and facial control cages
+
+`ControlCageNode` stores `positions`, `uvs`, `pinned`, `faces` and
+`subdivision`. `Vertex` accepts optional `uv={[u,v]}`;
+when omitted, the parser retains the previous position-derived UV. The DSL parser validates finite positions,
+index ranges, distinct face vertices, edge winding and at most two incident
+faces per edge. Open boundaries are allowed for reusable patches; weld to host
+skin by sharing vertex indices in the same cage. Limit: 30,000 control vertices
+and faces each; subdivision levels 0–2. The renderer uses the same procedural
+mesh cache in native/WASM; positions, UVs, topology, pin states and subdivision all
+participate in its key. Normals are recalculated from the final mesh and relaxed
+without moving vertices. This does not implement Blender crease weights,
+shrinkwrap, automatic boolean union, blinking or skinning controls.
+
+UV face points, edge points and movable control vertices use the same subdivision
+weights as geometry. Pinned geometry stays fixed while its UVs remain explicitly
+authored, so fitted silhouettes can receive atlas textures without changing shape.
+
+Use `MeshAsset` for arbitrary explicit meshes,
+`HeadAsset topology="explicit"` for a semantic head with a complete `HeadCage`,
+or `HeadAsset topology="facialCage"` for a compact versioned Rust-generated
+cage. `api::generated_control_cage` and `api::inspect_control_cage` expose the
+resolved topology without rendering. WASM offers
+`motionloom_inspect_control_cage_json`. The removed `EyeAsset`, `EyeVertex`, and
+`EyeFace` names are a deliberate breaking change.
+
+`MeshAsset` defaults to `subdivision="0"`. Levels 1–2 select Catmull–Clark;
+`subdivisionScheme="catmullClark"` is accepted explicitly. `Vertex` and `Face`
+replace the former subdivision-specific child names without changing the mesh IR.
+
+FaceLayoutNode contains eyes, eyebrows, noses, mouths, and ears vectors. Each
+component owns its position, dimensions, and optional FaceTextureNode.
+EyebrowNode exposes width, thickness, arch, and tilt. EyeNode owns an optional
+sclera texture, optional IrisNode, and repeatable EyelinerNode values. IrisNode
+exposes Eye-local position, circle/ellipse/square shape, geometry scale, radius,
+pupil radius, and an independent texture. Flat FaceLayout fields are removed.
+See [Face components](FACE_COMPONENTS.md) for migration.
+
+## Audio timeline API
+
+`motionloom::api` exports `AudioClipNode`, `AudioKeyNode`, `AudioTargetNode`,
+`AudioTimelinePlan`, `AudioMixer`, `AudioError`, and `compile_audio_plan`.
+Native-only `PreparedAudio` and `prepare_audio` reuse host FFmpeg decoding.
+`GraphScript` adds default-empty audio_clips/audio_targets; existing serialized
+graphs deserialize unchanged. Rust consumers using exhaustive struct literals
+must initialize these fields. VideoEncoder signatures are unchanged.
+See [AUDIO.md](AUDIO.md) for sample-accurate semantics and adapter boundaries.
+
+### Mesh editor projection (experimental)
+
+`experimental::mesh_edit_snapshot(&graph, model_id, frame).await` returns the
+MeshAsset's authored positions/faces and the evaluated view-space affine basis,
+camera center, focal length and near plane. It uses the runtime animation
+compiler, CompositeGroup preparation and actual draw uniforms. The read-only
+WASM transport is `motionloom_mesh_edit_snapshot_json(script, model_id, frame)`.
+The editor writes selected positions back into the source DSL; no mutation DSL
+or new mesh syntax is introduced. Only MeshAsset models are accepted.
+
+The initial editor supports rigid Model transforms in CompositeGroup and X-ray
+control-cage selection. Nonidentity 2D Group transforms/deformations are rejected.
+The API does not expose final subdivided vertices as editable source vertices.

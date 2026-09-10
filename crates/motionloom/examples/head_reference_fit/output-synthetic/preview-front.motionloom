@@ -1,0 +1,24 @@
+<Graph fps={30} duration="1s" size={[512,512]}>
+<Assets>
+<MaterialAsset id="clay" baseColor="#C8B8AD" roughness="0.75" />
+<HeadAsset material="clay" id="demo_head" archetype="humanoid" symmetry="x" segments="48" rings="32">
+<HeadShape size={[0.9994999766349792,1.399999976158142,1.0994999408721924]} forehead="1" cheekWidth="1" jawWidth="1" chinLength="0" chinRoundness="0.5" />
+<HeadMorph headWidth="1" headHeight="1" headDepth="1" />
+</HeadAsset>
+</Assets>
+<Background color="#17202D" />
+<Scene id="head_fit_review">
+<Timeline>
+<Track id="head_fit_track" space="3d">
+<Sequence from="0s" duration="1s">
+<CompositeGroup id="head_fit_stage" space="3d" depth="true">
+<Camera3D position={[0,0,3.3600001]} target={[0,0,0]} fov="34" />
+<DirectionalLight direction={[-0.4,-0.6,-1]} intensity="2.2" />
+<Model id="head_fit_model" asset="demo_head" />
+</CompositeGroup>
+</Sequence>
+</Track>
+</Timeline>
+</Scene>
+<Present from="head_fit_review" />
+</Graph>

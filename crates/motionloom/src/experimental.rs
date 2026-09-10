@@ -7,6 +7,10 @@
 //! These APIs are public for tooling and Anica integration, but they are not the
 //! recommended starting point for general MotionLoom users.
 
+#[path = "geometry/mod.rs"]
+pub mod geometry;
+pub use geometry::*;
+
 pub use crate::{
     CharacterDesignGpuViewport, CharacterDesignViewportFrame, GlbLoadError, GlbMeshData,
     GlbMetadata, GlbNodeData, HumanoidActionCompatibilityReport, MotionLoomWorldError, WorldAction,
@@ -30,6 +34,11 @@ pub use crate::world::gltf_loader::{
     GlbAnimationValues, GlbSkinData, GlbSkinJointData, load_glb_animation_data,
     load_glb_animation_data_from_bytes, load_glb_mesh_data_from_bytes,
     load_glb_metadata_from_bytes,
+};
+pub use crate::world::model::{WorldNativeSkin, WorldNativeSkinSegment, WorldNativeWeightRegion};
+pub use crate::world::primitive::{
+    NativeSkinDiagnostics, apply_native_skin_to_mesh, diagnose_native_skinned_primitive,
+    generate_primitive_mesh, native_skin_diagnostics_json, native_skinned_primitive_cache_key,
 };
 pub use crate::world::render::pose_diagnostics::{
     ActorPoseDiagnostic, JointPoseDiagnostic, PoseDiagnosticError, diagnose_world_actor_pose,
@@ -85,3 +94,10 @@ pub mod text {
         prepare_text_layout_for_value,
     };
 }
+
+// Control cages expose topology for advanced authoring without a separate renderer.
+pub use crate::world::primitive::{generated_control_cage, inspect_control_cage};
+pub use crate::{ControlCageInspection, ControlCageNode};
+
+// Read-only MeshAsset editing projection shared with WASM.
+pub use crate::scene::render::mesh_edit_snapshot;

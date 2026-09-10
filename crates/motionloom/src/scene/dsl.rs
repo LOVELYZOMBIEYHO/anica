@@ -883,6 +883,12 @@ pub(crate) fn parse_scene_root_block(
         .as_deref()
         .map(|v| parse_size(v, start + 1, "size"))
         .transpose()?;
+    if attr_value(&open_tag, "renderQuality").is_some() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "Scene does not support the renderQuality attribute".into(),
+        });
+    }
     let mut child_ctx = brush_ctx.clone();
     let (mut children, effects, post_effects) =
         parse_scene_root_nodes(lines, open_end_ix + 1, close_ix, &mut child_ctx)?;
@@ -890,8 +896,6 @@ pub(crate) fn parse_scene_root_block(
     Ok((
         SceneRootNode {
             render_style: attr_value(&open_tag, "renderStyle")
-                .map(|v| strip_wrappers(&v).to_string()),
-            render_quality: attr_value(&open_tag, "renderQuality")
                 .map(|v| strip_wrappers(&v).to_string()),
             id,
             size,
@@ -3314,6 +3318,7 @@ fn parse_composite_group_block(
                 if starts_open_tag(lines[j].trim(), "MaterialBinding") {
                     let (binding, binding_end_ix) = collect_self_closing_block(lines, j)?;
                     material_bindings.push(SceneMaterialBindingNode {
+                        cel: crate::render_style::parse_cel_material(&binding, j + 1)?,
                         material: strip_wrappers(&required_attr_value(
                             &binding,
                             "material",

@@ -107,6 +107,8 @@ pub(crate) struct WgpuSceneCompositor {
     light_sweep_pipeline: wgpu::ComputePipeline,
     spectral_energy_bind_group_layout: wgpu::BindGroupLayout,
     spectral_energy_pipeline: wgpu::ComputePipeline,
+    surface_pipeline: Option<crate::process::procedural_surface::SurfacePipeline>,
+    surface_textures: Vec<std::sync::Arc<wgpu::Texture>>,
     downsample_bind_group_layout: wgpu::BindGroupLayout,
     downsample_pipeline: wgpu::ComputePipeline,
     bloom_bind_group_layout: wgpu::BindGroupLayout,
@@ -1655,6 +1657,8 @@ impl WgpuSceneCompositor {
             light_sweep_pipeline,
             spectral_energy_bind_group_layout,
             spectral_energy_pipeline,
+            surface_pipeline: None,
+            surface_textures: Vec::new(),
             downsample_bind_group_layout,
             downsample_pipeline,
             bloom_bind_group_layout,
@@ -3246,6 +3250,49 @@ impl WgpuSceneCompositor {
         );
         self.submit_encoder_with_keepalive(encoder, keepalive);
         drop(uniform_buffer);
+        Ok(GpuSceneNativeTexture {
+            texture: dst,
+            width,
+            height,
+            _keepalive_textures: vec![input.texture.clone()],
+        })
+    }
+
+    /// Cache the pipeline and reuse outputs once earlier frame references are released.
+    pub(crate) fn apply_gpu_surface_texture(
+        &mut self,
+        input: &GpuSceneNativeTexture,
+        values: &[f32; 32],
+    ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+        let width = input.width;
+        let height = input.height;
+        if self.surface_pipeline.is_none() {
+            self.surface_pipeline = Some(crate::process::procedural_surface::SurfacePipeline::new(
+                &self.device,
+            ));
+        }
+        self.surface_textures
+            .retain(|t| t.width() == width && t.height() == height);
+        let dst = if let Some(texture) = self
+            .surface_textures
+            .iter()
+            .find(|t| std::sync::Arc::strong_count(t) == 1)
+        {
+            texture.clone()
+        } else {
+            let texture =
+                std::sync::Arc::new(Self::make_canvas_texture(&self.device, width, height));
+            self.surface_textures.push(texture.clone());
+            texture
+        };
+        let bytes = crate::process::procedural_surface::surface_bytes(values);
+        let uniform = self.make_post_uniform_buffer(&bytes);
+        let mut encoder = self.frame_encoder("procedural-surface-encoder");
+        self.surface_pipeline
+            .as_ref()
+            .expect("initialized surface pipeline")
+            .encode(&self.device, &mut encoder, &input.texture, &dst, &uniform);
+        self.submit_encoder_with_keepalive(encoder, WgpuDispatchKeepalive::default());
         Ok(GpuSceneNativeTexture {
             texture: dst,
             width,

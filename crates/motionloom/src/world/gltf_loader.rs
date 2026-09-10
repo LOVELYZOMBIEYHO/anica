@@ -109,6 +109,8 @@ pub struct GlbMaterialData {
     pub metallic_roughness_texture: Option<usize>,
     pub normal_texture: Option<usize>,
     pub normal_scale: f32,
+    pub occlusion_texture: Option<usize>,
+    pub occlusion_strength: f32,
     pub emissive_texture: Option<usize>,
     pub emissive_factor: [f32; 3],
     pub emissive_strength: f32,
@@ -139,6 +141,8 @@ impl Default for GlbMaterialData {
             metallic_roughness_texture: None,
             normal_texture: None,
             normal_scale: 1.0,
+            occlusion_texture: None,
+            occlusion_strength: 1.0,
             emissive_texture: None,
             emissive_factor: [0.0, 0.0, 0.0],
             emissive_strength: 1.0,
@@ -1119,6 +1123,17 @@ fn read_materials(chunks: &GlbChunks) -> Vec<GlbMaterialData> {
                             out.base_color_texture = Some(texture);
                         }
                     }
+                    // AO is independent of albedo and only attenuates indirect lighting.
+                    out.occlusion_texture = material
+                        .get("occlusionTexture")
+                        .and_then(|value| value.get("index"))
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize);
+                    out.occlusion_strength = material
+                        .get("occlusionTexture")
+                        .and_then(|value| value.get("strength"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0) as f32;
                     out.emissive_texture = material
                         .get("emissiveTexture")
                         .and_then(|tex| json_usize(tex, "index"));
@@ -2160,6 +2175,7 @@ mod tests {
                         "metallicRoughnessTexture": { "index": 4 }
                     },
                     "normalTexture": { "index": 5, "scale": 0.65 },
+                    "occlusionTexture": { "index": 7, "strength": 0.4 },
                     "emissiveTexture": { "index": 6 },
                     "emissiveFactor": [0.1, 0.2, 0.3],
                     "extensions": {
@@ -2186,6 +2202,8 @@ mod tests {
         assert_eq!(material.name.as_deref(), Some("black_glass"));
         assert_eq!(material.metallic_roughness_texture, Some(4));
         assert_eq!(material.normal_texture, Some(5));
+        assert_eq!(material.occlusion_texture, Some(7));
+        assert_eq!(material.occlusion_strength, 0.4);
         assert_eq!(material.emissive_texture, Some(6));
         assert_eq!(material.metallic_factor, 0.72);
         assert_eq!(material.roughness_factor, 0.18);

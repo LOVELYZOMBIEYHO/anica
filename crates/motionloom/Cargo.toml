@@ -59,6 +59,7 @@ wasm-bindgen-test = "0.3.50"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 winit = "0.30"
+rodio = "0.19"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2 = "0.6"

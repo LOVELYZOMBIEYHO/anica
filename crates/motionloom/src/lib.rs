@@ -128,15 +128,17 @@ pub use asset::{AssetResolver, AssetSource, MemoryAssetResolver, PathAssetResolv
 pub use authoring::{
     AuthoringDiagnostic, AuthoringDiagnosticSeverity, AuthoringStatus, AuthoringSuggestion,
     AuthoringSummary, EffectiveGraphSummary, MotionLoomAuthoringReport, MotionLoomShowcaseSchema,
-    PrimitiveAuthoringSummary, ShowcaseAttributeSchema, ShowcaseTagSchema,
-    ShowcaseTagVariantSchema, analyze_motionloom_script, analyze_motionloom_script_for_target,
-    motionloom_analyze_script_for_target_json, motionloom_analyze_script_json,
-    motionloom_dsl_schema_json, motionloom_showcase_schema_json,
+    PrimitiveAuthoringSummary, PrimitiveControlPointSummary, ShowcaseAttributeSchema,
+    ShowcaseTagSchema, ShowcaseTagVariantSchema, analyze_motionloom_script,
+    analyze_motionloom_script_for_target, motionloom_analyze_script_for_target_json,
+    motionloom_analyze_script_json, motionloom_dsl_schema_json, motionloom_showcase_schema_json,
 };
 pub use compat::{
     GpuCompatibilityIssue, GpuCompatibilityReport, GpuCompatibilitySeverity,
     GpuCompatibilityTarget, ScenePreviewPath, inspect_gpu_compatibility,
 };
+pub mod audio;
+
 pub use export::{EncodeError, VideoEncoder, VideoFrame, create_encoder};
 pub use render_graph::{
     RenderEffectScope, RenderPassDag, RenderPassDagEdge, RenderPassDagKind, RenderPassDagNode,
@@ -158,15 +160,20 @@ pub use rig_diagnostics::{
 pub use common::keyframe::ScalarKeyframe;
 pub use dsl::{
     ActionBoneNode, ActionContactNode, ActionLibraryNode, ActionNode, ActionPoseNode,
-    AnimationKeyNode, AnimationTargetNode, ApplyActionNode, BackgroundNode, ContactSurfaceNode,
-    GraphAssetKind, GraphAssetNode, GraphAssetSource, GraphScript, ImageNode,
-    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
-    ModelProfileRetargetMapNode, ModelProfileRetargetNode, PrimitiveAssetNode, PrimitiveAxis,
-    PrimitiveGeometry, PrimitiveLodNode, PrimitiveMeshBuildNode, PrimitiveModifierNode,
-    ProcessDefinitionNode, SkeletonBoneNode, SkeletonConstraintNode, SkeletonControlNode,
-    SkeletonGuideNode, SkeletonLandmarkNode, SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode,
-    SkeletonRegionNode, SvgNode, TerrainAssetNode, VegetationAssetNode, VegetationKind,
-    VegetationLod, is_graph_script, parse_action_library_document, parse_graph_script,
+    AnimationKeyNode, AnimationTargetNode, ApplyActionNode, BackgroundNode,
+    CompoundAssetInstanceNode, CompoundAssetNode, ContactSurfaceNode, ControlCageNode, EarNode,
+    EyeNode, EyebrowNode, EyelinerNode, FaceLayoutNode, FaceTextureNode, FacialCageNode,
+    GraphAssetKind, GraphAssetNode, GraphAssetSource, GraphScript, HairGuideNode, HairPointNode,
+    HeadDomeNode, HeadFeatureNode, HeadMorphNode, HeadSectionNode, HeadShapeNode, ImageNode,
+    IrisNode, ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
+    ModelProfileRetargetMapNode, ModelProfileRetargetNode, MouthNode, NativeSkinBindingNode,
+    NativeSkinMode, NativeWeightRegionNode, NoseNode, PrimitiveAssetNode, PrimitiveAxis,
+    PrimitiveGeometry, PrimitiveLodNode, PrimitiveLoftSectionNode, PrimitiveMeshBuildNode,
+    PrimitiveModifierNode, PrimitiveRibbonPointNode, ProcessDefinitionNode, SkeletonBoneNode,
+    SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode, SkeletonLandmarkNode,
+    SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode,
+    TerrainAssetNode, VegetationAssetNode, VegetationKind, VegetationLod, is_graph_script,
+    parse_action_library_document, parse_graph_script,
 };
 pub use error::{GraphParseError, MotionLoomError, RootGraphError, RuntimeCompileError};
 pub use preview::{
@@ -283,23 +290,26 @@ pub use shot_validation::{
     shot_validation_sample_frames,
 };
 pub use world::error::{MotionLoomWorldError, WorldAssetError, WorldError, WorldParseError};
+pub use world::primitive::{ControlCageInspection, generated_control_cage, inspect_control_cage};
 pub use world::{
     ActorPoseDiagnostic, BodyBasisProposal, BoneAxisProposal, CharacterDesignGpuViewport,
     CharacterDesignViewportFrame, DetectedHumanoidRig, EnvironmentAnchorProposal,
     EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic, EnvironmentSurfaceProposal,
     GlbEnvironmentInspectionReport, GlbHumanoidProfileInspectionReport, GlbLoadError, GlbMeshData,
-    GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HumanoidActionCompatibilityReport,
-    HumanoidBoneProposal, JointAlternative, JointPoseDiagnostic, ModelInspectionDiagnostic,
-    ModelInspectionError, PoseDiagnosticError, RestPoseProposal, Scene3DFrameProfile,
-    SemanticAxisProposal, WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor,
-    WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
-    WorldCamera, WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldFrameRenderer,
-    WorldGpuDiagnostics, WorldGraph, WorldLighting, WorldMaterial, WorldMaterialStyle,
-    WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget,
-    WorldRenderError, WorldRenderProgress, WorldRetarget, WorldRetargetMap, WorldSpritePlayback,
-    WorldTime, diagnose_world_actor_pose, diagnose_world_glb_gpu_plan,
-    diagnose_world_graph_actor_gpu_frame, evaluate_world_actor_rig, inspect_glb_environment_bytes,
-    inspect_glb_environment_json, inspect_glb_environment_path, inspect_glb_humanoid_profile_bytes,
+    GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HeadBounds, HeadComparisonReport,
+    HeadFitProposal, HumanoidActionCompatibilityReport, HumanoidBoneProposal, JointAlternative,
+    JointPoseDiagnostic, ModelInspectionDiagnostic, ModelInspectionError, PoseDiagnosticError,
+    RestPoseProposal, Scene3DFrameProfile, SemanticAxisProposal, WorldAction, WorldActionBone,
+    WorldActionIk, WorldActionPose, WorldActor, WorldApplyAction, WorldBackground,
+    WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera, WorldCameraControl,
+    WorldCameraMode, WorldCameraProjection, WorldFrameRenderer, WorldGpuDiagnostics, WorldGraph,
+    WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
+    WorldPlay, WorldPresent, WorldProfileRetarget, WorldRenderError, WorldRenderProgress,
+    WorldRetarget, WorldRetargetMap, WorldSpritePlayback, WorldTime,
+    compare_glb_head_to_head_asset_json, compare_glb_head_to_head_asset_path,
+    diagnose_world_actor_pose, diagnose_world_glb_gpu_plan, diagnose_world_graph_actor_gpu_frame,
+    evaluate_world_actor_rig, inspect_glb_environment_bytes, inspect_glb_environment_json,
+    inspect_glb_environment_path, inspect_glb_head_path, inspect_glb_humanoid_profile_bytes,
     inspect_glb_humanoid_profile_json, inspect_glb_skeleton_bytes, inspect_glb_skeleton_json,
     inspect_glb_skeleton_path, inspect_humanoid_action_compatibility, is_world_graph_script,
     load_glb_mesh_data, load_glb_metadata, parse_glb_mesh_data, parse_glb_metadata,
@@ -370,3 +380,10 @@ mod tests {
         assert!((value - 0.5).abs() < 0.001);
     }
 }
+
+// Opt-in authoring tools do not participate in frame rendering.
+pub mod head_fitting;
+
+// Native hosts can attach prepared audio while retaining the VideoEncoder interface.
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::export::FfmpegVideoEncoder;

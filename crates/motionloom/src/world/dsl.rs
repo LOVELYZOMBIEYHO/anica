@@ -455,11 +455,13 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
         Some(parsed_plays.remove(0))
     };
     Ok(WorldActor {
+        cel_materials: Vec::new(),
         id: required_attr_value(open, "id", line)?,
         model: required_attr_value(open, "model", line)?,
         primitive: None,
         terrain: None,
         vegetation: None,
+        native_skin: None,
         path_style: parse_path_style_attr(open, line)?,
         hide_meshes: parse_name_list_attr(open, "hideMeshes"),
         hide_materials: parse_name_list_attr(open, "hideMaterials"),

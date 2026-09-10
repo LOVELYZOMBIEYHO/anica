@@ -1,7 +1,15 @@
 # MotionLoom
 
+Experimental [geometry tooling](GEOMETRY_TOOLING.md) provides UV inspection and
+camera-free static GLB export directly from existing Scene DSL.
+
 Scene-owned visual style resources are documented in [RENDER_STYLE.md](RENDER_STYLE.md).
-Use `<Scene renderStyle="id" renderQuality="id">`; legacy Scenes need no changes.
+Cel Shading adds controllable geometry outlines and per-model material-slot
+controls; see the Cel extension and its documented limitations in that guide.
+Use `<Scene renderStyle="id">`; Scenes without a style keep the renderer defaults.
+Immediate GPU preview uses semantic material mipmaps, independent material AO,
+and HDR intermediates without additional DSL settings; see
+[scope and validation](IMMEDIATE_PREVIEW.md).
 
 MotionLoom is an agent-native motion graphics and compositing engine for Rust
 and WebAssembly. It turns a portable text DSL into deterministic 2D, 2.5D,
@@ -57,6 +65,27 @@ is enabled by default.
 
 Video export requires an FFmpeg binary supplied by the host. Parsing,
 single-frame rendering, preview, and PNG sequence export do not require FFmpeg.
+
+### GPU buffer policy
+
+Native preview devices request the selected adapter's advertised
+`max_buffer_size` instead of wgpu's portable 256 MiB default. MotionLoom keeps
+actual geometry allocations smaller: imported triangle data is rebuilt as
+indexed geometry and split at 128 MiB boundaries before upload. Identical model
+instances continue to share retained geometry and texture resources.
+
+Hosts may cap the requested device limit with `MOTIONLOOM_MAX_BUFFER_MIB`, and
+may tune the per-allocation target with `MOTIONLOOM_VERTEX_CHUNK_MIB`. Both are
+optional positive integer MiB values. For example, this exercises a portable
+device limit while forcing smaller chunks:
+
+```sh
+MOTIONLOOM_MAX_BUFFER_MIB=256 MOTIONLOOM_VERTEX_CHUNK_MIB=64 \
+  cargo run --release -p motionloom --example wgpu_live_preview -- scene.motionloom
+```
+
+The adapter limit remains the hardware ceiling; an environment value cannot
+raise it. Chunking is automatic and does not change the MotionLoom DSL.
 
 ## Quick Start
 
@@ -191,6 +220,12 @@ and emissive texture slots. `color` remains a multiplicative tint. Box bevels
 are visual-only and preserve authored bounds; auto collision still uses the
 unbeveled canonical box. `materialSeed` adds deterministic per-instance UV
 variation without moving collision surfaces.
+
+`HeadAsset` is an additive procedural model asset for continuous cranium and
+facial geometry. `HeadShape` is species-neutral, `FaceLayout` is optional, and
+generic mirrored `HeadFeature` fields support humanoid, feline, canine, dragon,
+or custom anatomy. `HeadMorph` varies proportions without rewriting features.
+It uses the same retained native/WASM mesh and material path as primitives.
 
 Heightfield ground is an additive typed asset and uses the same Model/PBR path:
 
@@ -527,6 +562,9 @@ fallback or renderer-capability report.
 
 ## Documentation
 
+- [Hair cards authoring](HAIR_CARDS.md): shared defaults, root normals, mirrored
+  guides, absolute roll, curved normals, and closed tapered tips.
+
 - [LLM Authoring Guide](LLM_AUTHORING.md) — DSL rules and agent repair protocol
 - [Public API](PUBLIC_API.md) — supported Rust integration surface
 - [Changelog](CHANGELOG.md) — release history
@@ -543,3 +581,52 @@ the native or WASM target used for testing.
 ## License
 
 MotionLoom is available under the [Apache License 2.0](../../LICENSE).
+
+### Head reference fitting
+
+`motionloom::api::head_fitting` provides opt-in typed/JSON multi-view head
+authoring, bounded parameter fitting, reviewed source patches and CPU comparison
+overlays. See [Head reference fitting](HEAD_REFERENCE_FITTING.md) for the contract,
+WASM exports, CLI examples and geometry limitations. Existing DSL/runtime behavior
+is unchanged.
+
+### Subdivision and facial cages
+
+`MeshAsset` accepts a connected polygon cage using
+`Vertex position={[x,y,z]}` (with optional `uv={[u,v]}` and
+`pinned="true"`) and `Face indices={[a,b,c,d]}`. Indices are
+zero-based in declaration order; triangles and quads are supported. Native and
+WASM share Catmull–Clark tessellation (`subdivision="0|1|2"`, default 0 for
+`MeshAsset`). Set `subdivisionScheme="catmullClark"` explicitly when useful for
+authoring clarity. Pin the
+surrounding head vertices when fitting orbital or lip rings so subdivision does
+not change the accepted silhouette. Shared indices join the socket to the skin.
+Eye generates a convex sclera surface; optional Iris and repeatable Eyeliner
+children add independently textured geometry.
+Authored UVs use the same Catmull–Clark interpolation as positions and feed the
+standard `MaterialAsset baseColorTexture` path. Omitting `uv` preserves the
+position-derived coordinates used before this addition.
+`HeadAsset topology="explicit"` contains the same representation in `HeadCage`.
+`HeadAsset topology="facialCage"` uses compact, semantic `HeadProfile`,
+`HeadDome`, `FaceLayout`, and `FacialCage` declarations; Rust expands them to the
+same control-cage IR on native and WASM. This is not automatic retopology or a
+facial rig. See [Facial and subdivision cages](FACIAL_CAGES.md),
+[PUBLIC_API.md](PUBLIC_API.md), and S86 for both authoring levels.
+`FaceLayout` contains explicit `Eye`, `Eyebrow`, `Nose`, `Mouth`, and `Ear` components.
+`Eyebrow` generates a curved ribbon from position, width, thickness, arch, and
+tilt; optional nested `Texture` follows it, otherwise it inherits head material.
+Eye owns an optional sclera Texture, one optional Iris, and repeatable Eyeliner
+children. Iris is omitted for eyes that intentionally have no iris. Iris position
+is Eye-local; shape accepts circle, ellipse, or square, and its scale reshapes the
+generated geometry independently from nested Texture UV transforms.
+Each component owns its position and dimensions. Nested `Texture asset="..."`
+follows that component's generated surface. Flat FaceLayout attributes are
+removed and rejected. See [Face components](FACE_COMPONENTS.md).
+
+### Audio editing
+
+Add `AudioClip` regions referencing `AudioAsset`, then animate `gainDb`, `pan`, or
+`playbackRate` using `AudioTarget` with the existing `Key time/frame/value/ease`
+syntax. Native video export mixes through the existing FFmpeg path; the browser
+uses the shared WASM mixer, Web Audio playback, and Mediabunny/WebCodecs AV export.
+See [AUDIO.md](AUDIO.md) for syntax, timing, migration, host integration and limits.

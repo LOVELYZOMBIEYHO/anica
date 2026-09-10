@@ -20,8 +20,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::dsl::{
-    GraphAssetKind, GraphAssetSource, GraphScript, PrimitiveAssetNode, PrimitiveColliderShape,
-    PrimitiveCollisionMode, PrimitiveGeometry, ProcessDefinitionNode,
+    GraphAssetKind, GraphAssetSource, GraphScript, NativeSkinMode, PrimitiveAssetNode,
+    PrimitiveColliderShape, PrimitiveCollisionMode, PrimitiveGeometry, ProcessDefinitionNode,
 };
 use crate::process::model::{PassNode, PassParam};
 use crate::process::runtime::{
@@ -1511,6 +1511,7 @@ use crate::scene::text::{
 use crate::scene::timeline::{
     eval_repeat_count, scene_layer_source_time, scene_sequence_local_time,
 };
+use crate::world::model::{WorldNativeSkin, WorldNativeSkinSegment, WorldNativeWeightRegion};
 use crate::world::render::Scene3DRenderer;
 use crate::world::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldAnimationAsset,
@@ -1866,13 +1867,6 @@ fn scene_world_lighting(
             });
         }
     }
-    if composite
-        .render_style
-        .as_ref()
-        .is_some_and(|s| !s.ao_enabled)
-    {
-        lighting.ao_intensity = 0.0;
-    }
     lighting.lights.truncate(4);
     Ok(lighting)
 }
@@ -2003,8 +1997,34 @@ where
             return Err(MotionLoomSceneRenderError::Cancelled);
         }
 
+        // The encoder drops first on error, releasing the WAV before scratch cleanup on Windows.
+        let soundtrack = if graph.audio_clips.is_empty() {
+            None
+        } else {
+            let mut plan = crate::audio::compile_audio_plan(graph)
+                .map_err(crate::export::EncodeError::from)?;
+            for asset in &mut plan.assets {
+                if !asset.src.contains("://") {
+                    asset.src = crate::scene::resource::resolve_local_scene_asset_path(&asset.src)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+            Some(
+                crate::audio::prepare_audio(
+                    ffmpeg_bin,
+                    plan,
+                    Path::new("."),
+                    total_frames as f64 / fps as f64,
+                )
+                .map_err(crate::export::EncodeError::from)?,
+            )
+        };
         let mut encoder =
             FfmpegVideoEncoder::new(ffmpeg_bin, output_path).with_encoder_args(encoder_args);
+        if let Some(audio) = &soundtrack {
+            encoder = encoder.with_audio_path(audio.path());
+        }
         encoder.begin(w, h, fps)?;
 
         for frame in 0..total_frames {
@@ -2178,6 +2198,13 @@ pub async fn render_scene_graph_frame_with_cpu_inputs(
 pub struct SceneRenderer {
     inner: SceneFrameRenderer,
 }
+
+#[path = "geometry_snapshot.rs"]
+mod geometry_snapshot;
+#[path = "mesh_edit.rs"]
+mod mesh_edit;
+pub(crate) use geometry_snapshot::extract_geometry_snapshot;
+pub use mesh_edit::mesh_edit_snapshot;
 
 fn enrich_scene_rig_evaluation(graph: &GraphScript, report: &mut crate::RigEvaluationReport) {
     let time_ms = (report.time_sec.max(0.0) * 1000.0).round() as u64;
@@ -4623,6 +4650,11 @@ fn resolved_primitive_collider_shape(asset: &PrimitiveAssetNode) -> PrimitiveCol
             PrimitiveGeometry::Ellipsoid { .. } => PrimitiveColliderShape::Sphere,
             PrimitiveGeometry::Frustum { .. } => PrimitiveColliderShape::Convex,
             PrimitiveGeometry::RoundedBox { .. } => PrimitiveColliderShape::Box,
+            PrimitiveGeometry::Loft { .. }
+            | PrimitiveGeometry::Ribbon { .. }
+            | PrimitiveGeometry::HairCards { .. }
+            | PrimitiveGeometry::HeadSurface { .. }
+            | PrimitiveGeometry::Mesh { .. } => PrimitiveColliderShape::Convex,
         }
     } else {
         asset.collision.collider
@@ -4765,6 +4797,90 @@ struct CompoundRigTransform {
     position: [f32; 3],
     rotation: [f32; 4],
     scale: f32,
+}
+
+fn compound_native_skin_segment(
+    bone_id: &str,
+    bones: &[(String, Option<String>)],
+    rest: &HashMap<String, CompoundRigTransform>,
+) -> Option<WorldNativeSkinSegment> {
+    let joint = u16::try_from(bones.iter().position(|(id, _)| id == bone_id)?).ok()?;
+    let bone = rest.get(bone_id)?;
+    let child = bones
+        .iter()
+        .find(|(_, parent)| parent.as_deref() == Some(bone_id))
+        .and_then(|(id, _)| rest.get(id));
+    let parent = bones
+        .iter()
+        .find(|(id, _)| id == bone_id)
+        .and_then(|(_, parent)| parent.as_deref())
+        .and_then(|id| rest.get(id));
+    let (start, end) = child
+        .map(|child| (bone.position, child.position))
+        .or_else(|| parent.map(|parent| (parent.position, bone.position)))
+        .unwrap_or((bone.position, bone.position));
+    Some(WorldNativeSkinSegment { joint, start, end })
+}
+
+fn compound_skin_matrix(current: CompoundRigTransform, rest: CompoundRigTransform) -> [f32; 16] {
+    let rest_rotation = normalize_scene_quaternion(rest.rotation);
+    let current_rotation = normalize_scene_quaternion(current.rotation);
+    let inverse_rest = [
+        -rest_rotation[0],
+        -rest_rotation[1],
+        -rest_rotation[2],
+        rest_rotation[3],
+    ];
+    let scale = current.scale / rest.scale.abs().max(1.0e-6);
+    let transform_vector = |value: [f32; 3]| {
+        scene_rotate_by_quaternion(
+            scene_rotate_by_quaternion(value, inverse_rest).map(|part| part * scale),
+            current_rotation,
+        )
+    };
+    let x = transform_vector([1.0, 0.0, 0.0]);
+    let y = transform_vector([0.0, 1.0, 0.0]);
+    let z = transform_vector([0.0, 0.0, 1.0]);
+    let transformed_rest = [
+        x[0] * rest.position[0] + y[0] * rest.position[1] + z[0] * rest.position[2],
+        x[1] * rest.position[0] + y[1] * rest.position[1] + z[1] * rest.position[2],
+        x[2] * rest.position[0] + y[2] * rest.position[1] + z[2] * rest.position[2],
+    ];
+    let translation: [f32; 3] =
+        std::array::from_fn(|axis| current.position[axis] - transformed_rest[axis]);
+    [
+        x[0],
+        x[1],
+        x[2],
+        0.0,
+        y[0],
+        y[1],
+        y[2],
+        0.0,
+        z[0],
+        z[1],
+        z[2],
+        0.0,
+        translation[0],
+        translation[1],
+        translation[2],
+        1.0,
+    ]
+}
+
+fn scene_mat4_identity() -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
+}
+
+fn normalize_scene_quaternion(value: [f32; 4]) -> [f32; 4] {
+    let length = value.iter().map(|part| part * part).sum::<f32>().sqrt();
+    if length > 1.0e-8 {
+        value.map(|part| part / length)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
 }
 
 fn action_bone_x(bone: &crate::scene::dsl::ActionBoneNode) -> Option<&String> {
@@ -10585,7 +10701,7 @@ impl SceneFrameRenderer {
         clippy::too_many_arguments,
         reason = "The render boundary carries independent frame, target and timing inputs."
     )]
-    async fn render_scene_3d_composite(
+    fn prepare_scene_3d_composite(
         &mut self,
         composite: &CompositeGroupConfig,
         frame: u32,
@@ -10594,24 +10710,21 @@ impl SceneFrameRenderer {
         canvas_size: (u32, u32),
         time_norm: f32,
         time_sec: f32,
-    ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+    ) -> Result<
+        (
+            WorldGraph,
+            std::path::PathBuf,
+            Vec<crate::world::render::WorldMaterialTextureOverride>,
+        ),
+        MotionLoomSceneRenderError,
+    > {
         self.last_rig_contact_evaluations.clear();
         // Expand universal volume instances before the established 3D bridge
         // resolves anchors, surfaces, lighting, and ordinary Model actors.
         let mut expanded_composite = composite.clone();
         expanded_composite.nodes_3d = expand_scene_volume_repeats(composite, time_norm, time_sec)?;
         let composite = &expanded_composite;
-        // Scale only the 3D island, not the surrounding SVG/text layout.
-        let render_scale = composite
-            .render_style
-            .as_ref()
-            .map_or(1.0, |s| s.render_scale);
-        let island_size = (
-            ((canvas_size.0 as f32 * render_scale).round() as u32).max(1),
-            ((canvas_size.1 as f32 * render_scale).round() as u32).max(1),
-        );
-        self.ensure_gpu_compositor_size(canvas_size.0.max(1), canvas_size.1.max(1))
-            .await?;
+        let island_size = canvas_size;
         let mut camera = WorldCamera::default();
         let mut active_scene_camera = None;
         let mut actors = Vec::new();
@@ -11025,6 +11138,13 @@ impl SceneFrameRenderer {
                                 }
                                 crate::dsl::PrimitiveGeometry::Plane { .. } => {
                                     crate::simulation::model::RigidBodyShape::Box
+                                }
+                                crate::dsl::PrimitiveGeometry::Loft { .. }
+                                | crate::dsl::PrimitiveGeometry::Ribbon { .. }
+                                | crate::dsl::PrimitiveGeometry::HairCards { .. }
+                                | crate::dsl::PrimitiveGeometry::HeadSurface { .. }
+                                | crate::dsl::PrimitiveGeometry::Mesh { .. } => {
+                                    crate::simulation::model::RigidBodyShape::ConvexHull
                                 }
                             })
                         }),
@@ -11472,7 +11592,7 @@ impl SceneFrameRenderer {
                             .unwrap_or(eval_scene_number(&node.scale, time_norm, time_sec)?);
                         let exposure =
                             eval_scene_number(&node.exposure, time_norm, time_sec)?.to_string();
-                        let rig_transforms = compound
+                        let rig_sample = compound
                             .rig
                             .as_deref()
                             .and_then(|rig_id| {
@@ -11493,7 +11613,7 @@ impl SceneFrameRenderer {
                                         let world_action = action.and_then(|(action, _)| {
                                             self.prepared_scene_world_actions.get(&action.id)
                                         });
-                                        sample_compound_rig(
+                                        let current = sample_compound_rig(
                                             skeleton,
                                             action,
                                             world_action,
@@ -11502,11 +11622,31 @@ impl SceneFrameRenderer {
                                             frame,
                                             fps,
                                             duration_ms,
-                                        )
+                                        )?;
+                                        let rest = sample_compound_rig(
+                                            skeleton,
+                                            None,
+                                            None,
+                                            0.0,
+                                            0.0,
+                                            0,
+                                            fps,
+                                            duration_ms,
+                                        )?;
+                                        Ok::<_, MotionLoomSceneRenderError>((
+                                            current,
+                                            rest,
+                                            skeleton
+                                                .bones
+                                                .iter()
+                                                .map(|bone| (bone.id.clone(), bone.parent.clone()))
+                                                .collect::<Vec<_>>(),
+                                        ))
                                     })
                             })
-                            .transpose()?
-                            .unwrap_or_default();
+                            .transpose()?;
+                        let (rig_transforms, rest_rig_transforms, rig_bones) =
+                            rig_sample.unwrap_or_default();
                         let parent_rotation = rotation_quaternion
                             .unwrap_or_else(|| scene_quaternion_from_euler(rotation));
                         for instance in compound.instances {
@@ -11534,6 +11674,158 @@ impl SceneFrameRenderer {
                                     )
                                 })
                             });
+                            if instance.skin == NativeSkinMode::Smooth
+                                && let (Some(binding), Some(primary_bone)) =
+                                    (compound.skin_binding.as_ref(), instance.bone.as_deref())
+                                && let Some(primary_rest) =
+                                    rest_rig_transforms.get(primary_bone).copied()
+                            {
+                                let mut influence_ids = instance.influences.clone();
+                                if influence_ids.is_empty() {
+                                    influence_ids.push(primary_bone.to_string());
+                                    if let Some(parent) = rig_bones
+                                        .iter()
+                                        .find(|(id, _)| id == primary_bone)
+                                        .and_then(|(_, parent)| parent.clone())
+                                    {
+                                        influence_ids.push(parent);
+                                    }
+                                    influence_ids.extend(
+                                        rig_bones
+                                            .iter()
+                                            .filter(|(_, parent)| {
+                                                parent.as_deref() == Some(primary_bone)
+                                            })
+                                            .map(|(id, _)| id.clone()),
+                                    );
+                                }
+                                influence_ids.extend(
+                                    binding
+                                        .weight_regions
+                                        .iter()
+                                        .filter(|region| region.instance == instance.id)
+                                        .map(|region| region.bone.clone()),
+                                );
+                                influence_ids.sort();
+                                influence_ids.dedup();
+                                let candidates = influence_ids
+                                    .iter()
+                                    .filter_map(|bone_id| {
+                                        compound_native_skin_segment(
+                                            bone_id,
+                                            &rig_bones,
+                                            &rest_rig_transforms,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                let weight_regions = binding
+                                    .weight_regions
+                                    .iter()
+                                    .filter(|region| region.instance == instance.id)
+                                    .filter_map(|region| {
+                                        rig_bones
+                                            .iter()
+                                            .position(|(id, _)| id == &region.bone)
+                                            .and_then(|joint| u16::try_from(joint).ok())
+                                            .map(|joint| WorldNativeWeightRegion {
+                                                joint,
+                                                center: region.center,
+                                                radius: region.radius,
+                                                strength: region.strength,
+                                                replace: region.operation == "replace",
+                                            })
+                                    })
+                                    .collect();
+                                let joint_matrices = rig_bones
+                                    .iter()
+                                    .map(|(bone_id, _)| {
+                                        let current = rig_transforms.get(bone_id).copied();
+                                        let rest = rest_rig_transforms.get(bone_id).copied();
+                                        match (current, rest) {
+                                            (Some(current), Some(rest)) => {
+                                                compound_skin_matrix(current, rest)
+                                            }
+                                            _ => scene_mat4_identity(),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                let mesh_offset = scene_rotate_by_quaternion(
+                                    instance.position.map(|value| value * primary_rest.scale),
+                                    primary_rest.rotation,
+                                );
+                                let child_id = format!("{actor_id}::{}", instance.id);
+                                if let Some(rig) = compound.rig.as_ref() {
+                                    compound_actor_bones.insert(
+                                        child_id.clone(),
+                                        (actor_id.clone(), rig.clone(), primary_bone.to_string()),
+                                    );
+                                }
+                                actors.push(WorldActor {
+                                    cel_materials: Vec::new(),
+                                    id: child_id,
+                                    model: primitive.id.clone(),
+                                    primitive: Some(primitive),
+                                    terrain: None,
+                                    vegetation: None,
+                                    native_skin: Some(WorldNativeSkin {
+                                        mesh_position: add_scene_vec3(
+                                            primary_rest.position,
+                                            mesh_offset,
+                                        ),
+                                        mesh_rotation: scene_quaternion_mul(
+                                            primary_rest.rotation,
+                                            scene_quaternion_from_euler(instance.rotation),
+                                        ),
+                                        mesh_scale: primary_rest.scale * instance.scale,
+                                        candidates,
+                                        weight_regions,
+                                        joint_matrices,
+                                        joint_names: rig_bones
+                                            .iter()
+                                            .map(|(id, _)| id.clone())
+                                            .collect(),
+                                        joint_positions: rig_bones
+                                            .iter()
+                                            .map(|(id, _)| {
+                                                rig_transforms
+                                                    .get(id)
+                                                    .map_or([0.0; 3], |transform| {
+                                                        transform.position
+                                                    })
+                                            })
+                                            .collect(),
+                                        max_influences: binding.max_influences,
+                                        falloff: binding.falloff,
+                                        normalize: binding.normalize,
+                                    }),
+                                    path_style: WorldPathStyle::Relative,
+                                    hide_meshes: Vec::new(),
+                                    hide_materials: Vec::new(),
+                                    camera_hidden_bones: Vec::new(),
+                                    profile: None,
+                                    rig: None,
+                                    retarget: None,
+                                    x: position[0].to_string(),
+                                    y: position[1].to_string(),
+                                    z: position[2].to_string(),
+                                    yaw: "0".to_string(),
+                                    pitch: "0".to_string(),
+                                    roll: "0".to_string(),
+                                    rotation_quaternion: Some(parent_rotation),
+                                    scale: actor_scale.to_string(),
+                                    scale_mode: "none".to_string(),
+                                    opacity: "1".to_string(),
+                                    material: Some(WorldMaterial {
+                                        style: WorldMaterialStyle::Pbr,
+                                        outline: false,
+                                        outline_width: "0".to_string(),
+                                        exposure: exposure.clone(),
+                                    }),
+                                    play: None,
+                                    plays: Vec::new(),
+                                });
+                                continue;
+                            }
                             let bone = instance
                                 .bone
                                 .as_deref()
@@ -11576,11 +11868,13 @@ impl SceneFrameRenderer {
                                 );
                             }
                             actors.push(WorldActor {
+                                cel_materials: Vec::new(),
                                 id: child_id,
                                 model: primitive.id.clone(),
                                 primitive: Some(primitive),
                                 terrain: None,
                                 vegetation: None,
+                                native_skin: None,
                                 path_style: WorldPathStyle::Relative,
                                 hide_meshes: Vec::new(),
                                 hide_materials: Vec::new(),
@@ -11821,10 +12115,21 @@ impl SceneFrameRenderer {
                     };
                     actors.push(WorldActor {
                         id: actor_id,
+                        cel_materials: node.material_bindings.iter().map(|binding| {
+                            let mut resolved = binding.clone();
+                            if let Some(id) = &binding.cel.control_map {
+                                resolved.cel.control_map = Some(self.image_asset_sources.get(id).cloned()
+                                    .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
+                                        message: format!("celControlMap references missing ImageAsset '{id}'"),
+                                    })?);
+                            }
+                            Ok(resolved)
+                        }).collect::<Result<Vec<_>, MotionLoomSceneRenderError>>()?,
                         model: src,
                         primitive,
                         terrain,
                         vegetation,
+                        native_skin: None,
                         path_style: WorldPathStyle::Relative,
                         hide_meshes: Vec::new(),
                         hide_materials: Vec::new(),
@@ -13039,6 +13344,32 @@ impl SceneFrameRenderer {
                 world.camera = camera;
             }
         }
+        Ok((world_graph, world_asset_root, material_overrides))
+    }
+
+    // Rendering and asset inspection share model lowering and frame evaluation.
+    #[allow(clippy::too_many_arguments)]
+    async fn render_scene_3d_composite(
+        &mut self,
+        composite: &CompositeGroupConfig,
+        frame: u32,
+        fps: f32,
+        duration_ms: u64,
+        canvas_size: (u32, u32),
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<GpuSceneNativeTexture, MotionLoomSceneRenderError> {
+        self.ensure_gpu_compositor_size(canvas_size.0.max(1), canvas_size.1.max(1))
+            .await?;
+        let (world_graph, world_asset_root, material_overrides) = self.prepare_scene_3d_composite(
+            composite,
+            frame,
+            fps,
+            duration_ms,
+            canvas_size,
+            time_norm,
+            time_sec,
+        )?;
         let frame = self
             .scene_3d_renderer
             .render_frame_to_gpu_texture_with_material_overrides(
@@ -14812,8 +15143,79 @@ impl SceneFrameRenderer {
         time_norm: f32,
         time_sec: f32,
     ) -> Result<GraphTextureSource, MotionLoomSceneRenderError> {
+        // Procedural surfaces are GPU-only and must never silently disappear on CPU.
+        if matches!(
+            crate::process::effect_kind::resolve_process_effect(&pass.effect),
+            Some(crate::process::effect_kind::ProcessEffect::ProceduralSurface)
+        ) {
+            if self.profile.uses_gpu_compositor()
+                && let Some(GraphTextureSource::Gpu(texture)) = inputs.first()
+            {
+                let values = crate::process::procedural_surface::surface_values(
+                    pass,
+                    [texture.width, texture.height],
+                    time_norm,
+                    time_sec,
+                )
+                .map_err(|error| MotionLoomSceneRenderError::GpuRender {
+                    message: error.to_string(),
+                })?;
+                self.ensure_gpu_compositor_size(texture.width, texture.height)
+                    .await?;
+                let compositor = self.gpu_compositor.as_mut().ok_or_else(|| {
+                    MotionLoomSceneRenderError::GpuRender {
+                        message: "procedural_surface GPU compositor unavailable".into(),
+                    }
+                })?;
+                return Ok(GraphTextureSource::Gpu(
+                    compositor.apply_gpu_surface_texture(texture, &values)?,
+                ));
+            }
+            return Err(MotionLoomSceneRenderError::GpuRender {
+                message:
+                    "procedural_surface requires GPU rendering; CPU fallback is not implemented"
+                        .into(),
+            });
+        }
         let effect = pass.effect.to_ascii_lowercase();
         if effect == "over" || effect == "composite.over" {
+            // Keep independently generated plates and authored titles on the GPU.
+            if self.profile.uses_gpu_compositor()
+                && inputs
+                    .iter()
+                    .all(|input| matches!(input, GraphTextureSource::Gpu(_)))
+            {
+                let layers = inputs
+                    .iter()
+                    .map(|input| {
+                        let GraphTextureSource::Gpu(texture) = input else {
+                            unreachable!()
+                        };
+                        GpuSceneTextureLayer {
+                            source: GpuSceneTextureSource::Gpu(texture.clone()),
+                            transform: Affine2::identity(),
+                            projected_quad: None,
+                            opacity: 1.0,
+                            blend: SceneBlendMode::Normal,
+                            pick_id: 0,
+                            matte: None,
+                            primitive_index: 0,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(GraphTextureSource::Gpu(first)) = inputs.first() {
+                    self.ensure_gpu_compositor_size(first.width, first.height)
+                        .await?;
+                    let compositor = self.gpu_compositor.as_mut().ok_or_else(|| {
+                        MotionLoomSceneRenderError::GpuRender {
+                            message: "GPU compositor unavailable for over".into(),
+                        }
+                    })?;
+                    return Ok(GraphTextureSource::Gpu(
+                        compositor.render_scene_content_to_texture(&[], &layers, [0, 0, 0, 0])?,
+                    ));
+                }
+            }
             let mut cpu_images = Vec::with_capacity(inputs.len());
             for input in inputs {
                 cpu_images.push(self.graph_source_to_cpu(input).await?);
@@ -21874,26 +22276,27 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        EnvironmentTriangleSpatialIndex, HumanoidColliderProfile, HumanoidContactSample,
-        KinematicControllerConfig, MotionLoomSceneRenderError, ResolvedSceneGround,
-        ResolvedSceneSurface, SceneFrameRenderer, ScenePlatformPreviewSurface, ScenePreviewBackend,
-        ScenePreviewPixelFormat, ScenePreviewSurface, ScenePreviewSurfaceOptions, SceneRenderError,
-        SceneRenderProfile, SceneRenderer, action_collider_profile, action_contact_phase_envelope,
-        active_compound_rig_action, apply_animation_targets_at_frame,
-        collect_material_binding_scene_ids, combine_humanoid_contact_samples,
-        deterministic_gravity_displacement, eval_text_box_padding, eval_text_font_weight,
-        eval_text_render_scale, eval_text_tracking_em, expand_scene_volume_repeats,
-        global_process_liveness, graph_logical_render_size, graph_output_size,
-        graph_requires_scene_resource, humanoid_collision_spheres,
-        humanoid_collision_spheres_for_profile, load_environment_bounds,
-        match_target_action_position, native_capsule_collision_spheres, parse_scene_fixed_step,
-        primitive_collision_triangles, primitive_rigid_collider_spec, probe_humanoid_ground,
-        raycast_environment_height, reachable_environment_height, render_size_root_transform,
-        resolve_humanoid_kinematic_controller, sample_compound_rig, scene_apply_action_is_active,
-        scene_ground_contact_target, scene_material_texture_cache_key, scene_nodes_for_present,
-        scene_surface_contains_xz, semantic_box_triangles, semantic_surface_triangles,
-        skeleton_bone_is_descendant, solve_humanoid_root_frame, sweep_kinematic_spheres,
-        terrain_collision_cache_source, validate_scene_graph,
+        CompoundRigTransform, EnvironmentTriangleSpatialIndex, HumanoidColliderProfile,
+        HumanoidContactSample, KinematicControllerConfig, MotionLoomSceneRenderError,
+        ResolvedSceneGround, ResolvedSceneSurface, SceneFrameRenderer, ScenePlatformPreviewSurface,
+        ScenePreviewBackend, ScenePreviewPixelFormat, ScenePreviewSurface,
+        ScenePreviewSurfaceOptions, SceneRenderError, SceneRenderProfile, SceneRenderer,
+        action_collider_profile, action_contact_phase_envelope, active_compound_rig_action,
+        apply_animation_targets_at_frame, collect_material_binding_scene_ids,
+        combine_humanoid_contact_samples, compound_skin_matrix, deterministic_gravity_displacement,
+        eval_text_box_padding, eval_text_font_weight, eval_text_render_scale,
+        eval_text_tracking_em, expand_scene_volume_repeats, global_process_liveness,
+        graph_logical_render_size, graph_output_size, graph_requires_scene_resource,
+        humanoid_collision_spheres, humanoid_collision_spheres_for_profile,
+        load_environment_bounds, match_target_action_position, native_capsule_collision_spheres,
+        parse_scene_fixed_step, primitive_collision_triangles, primitive_rigid_collider_spec,
+        probe_humanoid_ground, raycast_environment_height, reachable_environment_height,
+        render_size_root_transform, resolve_humanoid_kinematic_controller, sample_compound_rig,
+        scene_apply_action_is_active, scene_ground_contact_target,
+        scene_material_texture_cache_key, scene_nodes_for_present, scene_surface_contains_xz,
+        semantic_box_triangles, semantic_surface_triangles, skeleton_bone_is_descendant,
+        solve_humanoid_root_frame, sweep_kinematic_spheres, terrain_collision_cache_source,
+        validate_scene_graph,
     };
 
     #[test]
@@ -28527,6 +28930,70 @@ mod tests {
     }
 
     #[test]
+    fn scene_gpu_near_plane_crossing_ground_preserves_foreground() {
+        // A large ground mesh straddles the camera. Clamping its rear vertices
+        // to the near plane used to paint over the car and the horizon.
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={24} duration="1s" size={[128,96]}>
+<Assets>
+<PrimitiveAsset id="ground" shape="box" size={[300,0.2,900]} color="#707070" />
+<PrimitiveAsset id="car" shape="box" size={[2,1,4]} color="#FF0000" />
+</Assets>
+<Background color="#80C0FF" />
+<Scene id="test">
+<Timeline>
+<Track id="world" space="3d">
+<Sequence duration="1s">
+<CompositeGroup space="3d" depth="true">
+<Camera3D position={[0,3,5]} target={[0,0.7,-5]} />
+<DirectionalLight direction={[-0.5,-1,0.5]} intensity="2" />
+<Model asset="ground" position={[0,-0.1,-100]} scaleMode="none" scale="1" />
+<Model asset="car" position={[0,0.5,-5]} scaleMode="none" scale="1" />
+</CompositeGroup>
+</Sequence>
+</Track>
+</Timeline>
+</Scene>
+<Present from="test" />
+</Graph>
+"##,
+        )
+        .expect("near clipping fixture parses");
+        let mut renderer =
+            pollster::block_on(SceneFrameRenderer::new_for_profile(SceneRenderProfile::Gpu));
+        let rendered = match pollster::block_on(renderer.render_frame(&graph, 0)) {
+            Ok(image) => image,
+            Err(MotionLoomSceneRenderError::GpuRender { message })
+                if message.contains("GPU adapter")
+                    || message.contains("graphics adapter")
+                    || message.contains("metal found no adapters") =>
+            {
+                eprintln!("Skipping near-plane GPU test: {message}");
+                return;
+            }
+            Err(err) => panic!("near-plane render failed: {err}"),
+        };
+        let red_pixels = rendered
+            .pixels()
+            .filter(|p| {
+                p[0] > 80
+                    && u16::from(p[0]) > u16::from(p[1]) * 2
+                    && u16::from(p[0]) > u16::from(p[2]) * 2
+            })
+            .count();
+        assert!(
+            red_pixels > 60,
+            "ground occluded foreground: {red_pixels} red pixels"
+        );
+        let sky = rendered.get_pixel(64, 4);
+        assert!(
+            sky[2] > sky[0] && sky[2] > 150,
+            "ground occluded sky: {sky:?}"
+        );
+    }
+
+    #[test]
     fn primitive_asset_3d_island_stays_on_shared_gpu_texture_path() {
         let mut renderer = pollster::block_on(SceneRenderer::new(SceneRenderProfile::Gpu)).unwrap();
         let graph = parse_graph_script(
@@ -29261,5 +29728,35 @@ mod tests {
             "thigh_l",
             "shin_l"
         ));
+    }
+
+    #[test]
+    fn compound_skin_matrix_maps_rest_joint_to_current_joint() {
+        let rest = CompoundRigTransform {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: 1.0,
+        };
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let current = CompoundRigTransform {
+            position: [-2.0, 4.0, 1.0],
+            rotation: [0.0, 0.0, half, half],
+            scale: 2.0,
+        };
+        let matrix = compound_skin_matrix(current, rest);
+        let transform = |point: [f32; 3]| {
+            [
+                matrix[0] * point[0] + matrix[4] * point[1] + matrix[8] * point[2] + matrix[12],
+                matrix[1] * point[0] + matrix[5] * point[1] + matrix[9] * point[2] + matrix[13],
+                matrix[2] * point[0] + matrix[6] * point[1] + matrix[10] * point[2] + matrix[14],
+            ]
+        };
+        let mapped_joint = transform(rest.position);
+        for (mapped, expected) in mapped_joint.into_iter().zip(current.position) {
+            assert!((mapped - expected).abs() < 1.0e-5);
+        }
+        let mapped_tip = transform([1.0, 3.0, 3.0]);
+        assert!((mapped_tip[0] + 4.0).abs() < 1.0e-5);
+        assert!((mapped_tip[1] - 4.0).abs() < 1.0e-5);
     }
 }

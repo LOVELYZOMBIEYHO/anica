@@ -12,11 +12,7 @@ truth; resolver JSON is read-only evidence, not a second authoring format.
   <PostStyle toneMapping="aces" exposure="1.0" saturation="1.15"
              contrast="1.04" bloomThreshold="0.9" bloomIntensity="0.08" />
 </RenderStyle>
-<RenderQuality id="web" preset="web_high">
-  <Shadows resolution="2048" filtering="pcf" />
-  <AntiAliasing mode="fxaa" />
-</RenderQuality>
-<Scene id="forest" renderStyle="anime_bright" renderQuality="web">
+<Scene id="forest" renderStyle="anime_bright">
   <Timeline>
     <!-- Existing Track / Sequence / CompositeGroup space="3d" hierarchy. -->
   </Timeline>
@@ -40,23 +36,19 @@ changes. All identifiers are case-sensitive.
 
 | Child | Supported attributes |
 | --- | --- |
-| SurfaceStyle | shading: physical/stylized/toon/clay; shadingSteps: integer 2–16; diffuseWrap: 0–1; rimLight: 0–4; rimPower: 0.1–32; specular: 0–4; roughnessBias: −1–1; saturation: 0–3; outline: none |
+| SurfaceStyle | shading: physical/stylized/toon/clay/cel; shadingSteps: integer 2–16; diffuseWrap: 0–1; rimLight: 0–4; rimPower: 0.1–32; specular: 0–4; roughnessBias: −1–1; saturation: 0–3; outline: none; shadowThreshold: 0–1; shadowFeather: 0.001–0.5; shadowColor: #RRGGBB |
+| OutlineStyle | enabled: true/false; method: geometry; width: 0–12 output pixels; color: #RRGGBB; distanceMode: screen |
 | LightingStyle | preset: neutral/soft_sunlight/cinematic/overcast/night; ambientIntensity: 0–10; ambientColor: #RRGGBB; shadowStyle: hard/soft |
 | PostStyle | toneMapping: none/reinhard/aces; exposure: 0–32 (existing linear multiplier, **not EV**); saturation: 0–3; contrast: 0–3; whiteBalance: 1000–40000 K; bloomThreshold: 0–32; bloomIntensity: 0–4 |
-| RenderQuality | id; optional preset: web_low/web_high/desktop_high/cinematic |
-| Resolution | scale: 0.25–2; scales the 3D render island only |
-| Shadows | resolution: integer 128–4096; filtering: hard/pcf |
-| AmbientOcclusion (inside RenderQuality) | quality: off/low/medium/high |
-| AntiAliasing | mode: none/fxaa |
 
 Unknown children, unknown attributes, invalid references, duplicate declarations,
 non-finite values and unsupported modes fail before GPU submission. Illustration,
-screen/geometry outlines, LUT assets, style inheritance and local style volumes
+screen-space edge-detection outlines, LUT assets, style inheritance and local style volumes
 are **not V1 features** and are not accepted as no-op settings.
 
 ## Ownership and precedence
 
-- No `renderStyle` and no `renderQuality`: no compiled style payload; legacy path.
+- No `renderStyle`: no compiled style payload; the immediate renderer uses its defaults.
 - Style applies to each 3D CompositeGroup owned by its Scene, including groups
   inside nested timelines, sequences and precomposes. It does not recolor SVG UI.
 - Shared Primitive/Compound/GLB material resources are not rewritten.
@@ -74,43 +66,30 @@ are **not V1 features** and are not accepted as no-op settings.
   before explicitly authored group effects. Explicit Bloom effects compose;
   they do not magically cancel the style Bloom. Set style intensity to zero to
   avoid double Bloom. It uses the existing Bloom pipeline/color convention.
-- RenderQuality overrides quality defaults, never scene geometry or camera.
-  FXAA shares the optics pass; it filters in-focus edges, while out-of-focus
-  regions continue through the existing depth-aware DoF blur.
 
-## Quality reality and portability
+## Immediate renderer behavior
 
-Native WGPU and WASM WebGPU share the same WGSL, uniforms and resolver. Shadow
-maps resize only when the quality changes. Light count remains the existing
-four-light limit. The implementation does not add GI, ray tracing or SSAO.
+Native WGPU and WASM WebGPU share the same WGSL and style resolver. The immediate
+renderer uses one fixed fast path: the Graph render size, a 1536 shadow map,
+existing analytic ambient occlusion, and no quality-driven anti-aliasing pass.
+Light count remains the existing four-light limit. The implementation does not
+add GI, ray tracing or SSAO. The CPU-only preview is not a reference
+implementation of these 3D shader modes.
 
-Existing AO is analytic, not screen-space geometry-aware SSAO. `off` disables it;
-low/medium/high currently use that existing algorithm and produce an explicit
-`RENDER_STYLE_FALLBACK` warning. No quality name pretends to add missing samples.
-
-Presets resolve to concrete values:
-
-| Preset | Island scale | Shadow map | AA | AO |
-| --- | --- | --- | --- | --- |
-| web_low | 0.75 | 512 | none | off |
-| web_high | 1 | 1536 | fxaa | existing |
-| desktop_high | 1 | 2048 | fxaa | existing |
-| cinematic | 1.5 | 4096 | fxaa | existing |
-
-Explicit quality child settings override these preset values. Host render-size
-and device limits still apply. This is not automatic FPS-adaptive quality.
-The CPU-only preview is not a reference implementation of these 3D shader modes.
+Output dimensions belong to Graph `renderSize`, for example
+`<Graph ... size={[1280,720]} renderSize={[2560,1440]}>`. A future host render
+API may choose slower export settings without turning them into scene semantics.
 
 ## Inspection and host integration
 
 Rust: `motionloom::api::resolve_scene_render_style(&graph, scene_id)`.
 WASM: `motionloom_render_style_json(script, scene_id)`.
 CLI: `cargo run -p motionloom --example render_style_report -- file.motionloom scene_id`.
-The existing authoring report also includes `renderStyles` and fallback warnings.
+The existing authoring report also includes `renderStyles`.
 No host needs to rewrite the DSL or introduce JSON controls.
 
-The report contains concrete style/quality defaults, references, fallback
-messages and per-island override evidence. `finalExpression` is the authored
+The report contains concrete style defaults, references and per-island override
+evidence. `finalExpression` is the authored
 override expression, **not a claim about a sampled animation frame**. At render
 time the existing animation evaluator supplies the actual value.
 
@@ -126,20 +105,36 @@ time the existing animation evaluator supplies the actual value.
     "styleValue": 1.0,
     "finalExpression": "1.2",
     "source": "ColorManagement:grade"
-  }],
-  "fallbacks": []
+  }]
 }
 ```
 
-## Compatibility and migration
+## Breaking migration
 
-Before: `<Scene id="main">...` remains valid with no visual migration.
-After: add Graph-level definitions and optional Scene references.
-Existing Effect/ApplyEffect and Camera3D syntax is unchanged.
-Existing serialized graphs deserialize through serde defaults.
-Public AST struct-literal consumers must add the new optional/default fields;
-this is a **Rust AST source-compatibility change**, not a DSL breaking change.
-The recommended stable integration remains parsing DSL through `motionloom::api`.
+The quality resource and Scene quality reference have been removed without a
+compatibility layer. Old DSL and serialized graph JSON now fail parsing.
+
+Before:
+
+```xml
+<RenderQuality id="preview" preset="cinematic">
+  <Resolution scale="2" />
+  <Shadows resolution="4096" filtering="pcf" />
+</RenderQuality>
+<Scene id="main" renderStyle="cinema" renderQuality="preview">...</Scene>
+```
+
+After:
+
+```xml
+<Graph fps="24" duration="10s" size={[1280,720]} renderSize={[2560,1440]}>
+  <Scene id="main" renderStyle="cinema">...</Scene>
+</Graph>
+```
+
+Use `renderSize` only when the output itself needs more pixels. It does not
+promise better lighting, shadows, materials or sampling. Existing
+Effect/ApplyEffect and Camera3D syntax is unchanged.
 
 ## Showcase and validation
 
@@ -157,7 +152,7 @@ Run semantic tests with `cargo test -p motionloom --test render_style`.
 Run the actual GPU comparison with
 `cargo test -p motionloom --test render_style -- --include-ignored`.
 GPU tests assert distinct modes, legacy-neutral output, and unchanged output
-dimensions under island scaling. Browser compilation alone does not certify
+dimensions. Browser compilation alone does not certify
 browser pixel parity; a real WebGPU browser smoke run is required separately.
 
 ### Verification record
@@ -174,6 +169,95 @@ browser pixel parity; a real WebGPU browser smoke run is required separately.
   compile for WASM; the targeted browser test itself compiles successfully.
 - Cross-browser pixel parity is not certified by this smoke test.
 
-The native legacy-default comparison is pixel-exact on the tested host. AO
-quality levels remain the explicitly reported analytic-AO fallback described
-above; this release does not claim new SSAO or illustration/outline support.
+The native legacy-default comparison is pixel-exact on the tested host. That
+original V1 verification does not cover the Cel extension below.
+
+## Cel Shading extension
+
+`cel` is the English DSL name for cel shading (賽璐璐). It is a distinct surface
+mode, not an image-posterization effect. All settings remain in the authored DSL.
+
+```xml
+<RenderStyle id="cel_shading">
+  <SurfaceStyle shading="cel" shadingSteps="3"
+                shadowThreshold="0.5" shadowFeather="0.025"
+                shadowColor="#75658F" specular="0.05" />
+  <OutlineStyle enabled="true" method="geometry" width="2"
+                color="#000000" distanceMode="screen" />
+</RenderStyle>
+<Scene id="main" renderStyle="cel_shading">
+  <!-- Existing timeline and 3D groups. -->
+</Scene>
+```
+
+Cel defaults to a 1.5-pixel black outline. Other shading modes default to no
+outline; explicitly adding OutlineStyle enables it independently. Width zero
+or enabled=false disables it. Legacy SurfaceStyle outline=none is retained;
+combining it with OutlineStyle enabled=true is rejected.
+
+The first authored light controls the bands; subsequent lights add attenuated
+smooth fill. Ambient illumination and existing shadows still apply. This is
+art-directed lighting, not energy-conserving PBR. Color grading and extreme
+ambient exposure can reduce the visible contrast between bands.
+
+Optional Model material-slot bindings avoid changing shared materials or GLBs:
+
+```xml
+<Model id="hero" asset="character">
+  <MaterialBinding material="*" outlineWidth="2" />
+  <MaterialBinding material="Face" celRole="face" outlineWidth="0.5"
+                   celShadowColor="#B87E87" celControlMap="face_control" />
+  <MaterialBinding material="Hair" celRole="hair" hairHighlight="0.3"
+                   celControlMap="hair_control" />
+</Model>
+```
+
+Exact, case-sensitive slot names override the wildcard. Missing slots and
+duplicates produce rendering errors. outlineWidth accepts 0–12 pixels,
+celShadowColor accepts #RRGGBB, hairHighlight accepts 0–2. Roles are body/skin/hair/face.
+Skin currently uses the same band calculation, with separately authored shadow
+color; hair adds a tangent-aligned highlight band. Correct UVs/tangents and model
+design matter: this does not automatically turn an arbitrary GLB into an anime
+character. celControlMap references an ordinary ImageAsset; missing IDs fail.
+Use linear-srgb for data textures. No GLB file is modified.
+
+Control-map channels: R multiplies outline width (0 disables, 1 full width);
+G stores a normalized face shadow-threshold/SDF ramp; B multiplies the hair
+highlight. A is reserved. Without a map, R and B default to one. The face role
+requires a map, uses G instead of normal-derived bands, mirrors U with key-light
+side, and keeps the backlit face in shadow. It assumes model bind-space +Z
+forward and +X right, deformed by the same skin matrices as the face. Assets
+with a different facing convention need corresponding authored model/UV setup.
+This is a normalized artist-authored threshold map, not a geometric distance
+field generated from a face mesh. The S84 map is an illustrative procedural ramp,
+not a production anime face texture.
+
+The outline pass reuses skinned geometry, instance buffers and textures.
+Completed opaque depth occludes outlines; no CPU skinning or per-frame mesh
+regeneration is added. Width scales with island resolution to remain in final
+output pixels. Additional outlines add a GPU pass and draw submissions; they
+are not free. The material-width override cannot re-enable a globally disabled
+outline.
+
+### Current boundaries
+
+- Opaque geometry only; blended/transmissive materials do not receive outlines.
+  Opaque materials ignore texture alpha, including solid-color fallback textures.
+  Masked materials discard alpha below max(alphaCutoff, 0.99); actor fades below
+  0.99 suppress outlines. This is not a complete alpha-card/hair silhouette solution.
+- A separate cached outline-normal channel welds coincident positions with
+  identical skin weights within each material/mesh chunk. Lighting normals stay
+  untouched. Different material boundaries, disconnected shells and unusual
+  topology can still require asset-side cleanup.
+- Width maps sample the vertex UV at mip zero; fine mask detail needs enough
+  geometry. Face maps require authored UVs and the documented facing convention.
+- Hair highlights are a basic tangent band, not a dedicated anisotropic hair BRDF.
+- CPU preview is not the reference for this GPU feature.
+
+S84 is a new 20-second comparison: Physical, Toon, Cel with outlines, Cel without
+outlines, then camera distance/occlusion with an animated CC0 Character1.
+No existing showcase is modified for this extension.
+
+Verification is recorded in S84's README. Browser timing is render/readback wall
+time, not GPU utilization or sustained FPS. The report's overrides list includes
+per-model Cel MaterialBinding settings as read-only evidence.

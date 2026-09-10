@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1.0",
+  "measurement": "mesh triangle coverage; 128x128 CPU mask over [-1,1]^2; distances/head height; pixels via aligned reference height; Y up; +Z face; +X anatomical left; front u=X, left u=-Z, right u=Z, back u=-X; no implicit image mirroring",
+  "valid": true,
+  "diagnostics": [
+    {
+      "severity": "info",
+      "code": "ORTHOGRAPHIC_ONLY",
+      "message": "Requires aligned orthographic views with pitch/yaw corrected externally. Hair and occluded anatomy are not head surface observations. imageId is opaque host data."
+    }
+  ]
+}

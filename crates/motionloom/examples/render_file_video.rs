@@ -20,13 +20,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "tools/runtime/current/macos/ffmpeg/bin/ffmpeg".to_string());
 
     let script = fs::read_to_string(&path)?;
-    if let Some(parent) = PathBuf::from(&path).parent() {
-        set_scene_asset_roots(vec![parent.to_path_buf()]);
-    }
+    let asset_root = PathBuf::from(&path)
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    set_scene_asset_roots(vec![asset_root.clone()]);
     pollster::block_on(render_motionloom_document_to_video_with_progress(
         &ffmpeg,
         &script,
-        "examples/motionloom/world",
+        &asset_root,
         &output,
         profile,
         15,

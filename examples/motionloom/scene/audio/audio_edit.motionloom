@@ -1,0 +1,30 @@
+<Graph fps="30" duration="6s" size={[640,360]}>
+  <Assets>
+    <AudioAsset id="tone" src="audio-edit-tone.wav" />
+  </Assets>
+  <AudioClip id="intro" asset="tone" from="0.5s" duration="2s" />
+  <AudioClip id="repeat" asset="tone" from="3s" duration="2.5s" sourceIn="1s" sourceOut="2s" loop="true" />
+  <AudioTarget node="intro" property="gainDb">
+    <Key time="0.5s" value="-60" />
+    <Key time="0.75s" value="0" />
+    <Key time="2.25s" value="0" />
+    <Key time="2.5s" value="-60" />
+  </AudioTarget>
+  <AudioTarget node="repeat" property="pan">
+    <Key time="3s" value="-1" />
+    <Key time="5.5s" value="1" ease="ease_in_out" />
+  </AudioTarget>
+  <Scene id="main">
+    <Timeline>
+<Track id="track">
+<Sequence from="0s" duration="6s">
+      <Rect id="card" width="640" height="360" color="#16192a" />
+      <Text value="AUDIO EDIT TEST" x="40" y="70" fontSize="38" color="#ffffff" />
+      <Text value="0.5s: fade in / 2.5s: silence" x="40" y="145" fontSize="22" color="#b9ff39" />
+      <Text value="3s: loop / pan left to right" x="40" y="195" fontSize="22" color="#b9ff39" />
+    </Sequence>
+</Track>
+</Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>

@@ -3,6 +3,7 @@
 // crates/motionloom/examples/wgpu_live_preview.rs
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -17,8 +18,11 @@ use motionloom::{
     PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,
     PreviewInteractionNode, Scene3DFrameProfile, SceneCpuFrameProfile,
     WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewPreloadSession,
-    WgpuPreviewQuality, parse_graph_script,
+    WgpuPreviewQuality,
+    api::{PreparedAudio, compile_audio_plan, prepare_audio},
+    parse_graph_script,
 };
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -66,6 +70,22 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     return textureSample(scene_tex, scene_sampler, in.uv);
 }
 "#;
+
+// Native previews follow the selected adapter by default, matching DCC tools
+// that query the active graphics backend. An optional cap supports CI and
+// memory-constrained hosts without patching wgpu.
+fn preview_required_limits(adapter_limits: wgpu::Limits) -> wgpu::Limits {
+    let configured_max = std::env::var("MOTIONLOOM_MAX_BUFFER_MIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .and_then(|value| value.checked_mul(1024 * 1024));
+    let mut required = wgpu::Limits::default();
+    required.max_buffer_size = configured_max
+        .unwrap_or(adapter_limits.max_buffer_size)
+        .min(adapter_limits.max_buffer_size);
+    required
+}
 
 fn aspect_fit_viewport(
     surface_width: u32,
@@ -271,6 +291,59 @@ impl PreviewEventBroadcaster {
     }
 }
 
+struct NativeAudioPreview {
+    // Keeping the prepared mix alive also keeps its scratch WAV on disk.
+    prepared: PreparedAudio,
+    _stream: OutputStream,
+    _handle: OutputStreamHandle,
+    sink: Sink,
+}
+
+impl NativeAudioPreview {
+    fn from_graph(graph: &motionloom::GraphScript, source: &str) -> Result<Option<Self>, String> {
+        if graph.audio_clips.is_empty() {
+            return Ok(None);
+        }
+        let plan = compile_audio_plan(graph).map_err(|err| err.to_string())?;
+        let root = local_scene_asset_root_for_source(source)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let ffmpeg = std::env::var("ANICA_FFMPEG_PATH")
+            .or_else(|_| std::env::var("ANICA_FFMPEG"))
+            .unwrap_or_else(|_| "ffmpeg".to_string());
+        let prepared = prepare_audio(&ffmpeg, plan, &root, graph.duration_ms as f64 / 1000.0)
+            .map_err(|err| format!("failed to prepare preview audio: {err}"))?;
+        let (stream, handle) = OutputStream::try_default()
+            .map_err(|err| format!("failed to open the default audio output: {err}"))?;
+        let sink = Sink::try_new(&handle)
+            .map_err(|err| format!("failed to create the preview audio sink: {err}"))?;
+        let mut preview = Self {
+            prepared,
+            _stream: stream,
+            _handle: handle,
+            sink,
+        };
+        preview.seek_to(Duration::ZERO)?;
+        Ok(Some(preview))
+    }
+
+    fn seek_to(&mut self, position: Duration) -> Result<(), String> {
+        let file = File::open(self.prepared.path())
+            .map_err(|err| format!("failed to open prepared preview audio: {err}"))?;
+        let source = Decoder::new(BufReader::new(file))
+            .map_err(|err| format!("failed to decode prepared preview audio: {err}"))?
+            .repeat_infinite();
+        self.sink.clear();
+        self.sink.append(source);
+        self.sink.play();
+        if position > Duration::ZERO {
+            self.sink
+                .try_seek(position)
+                .map_err(|err| format!("failed to seek preview audio: {err}"))?;
+        }
+        Ok(())
+    }
+}
+
 struct LivePreviewApp {
     script_source: String,
     base_script: String,
@@ -308,6 +381,7 @@ struct LivePreviewApp {
     last_stats_at: Instant,
     print_stats_enabled: bool,
     auto_advance: bool,
+    audio_preview: Option<NativeAudioPreview>,
     host_mode: bool,
     host_events: Option<PreviewEventBroadcaster>,
     controller_process_id: Option<u32>,
@@ -405,6 +479,13 @@ impl LivePreviewApp {
         let fps = graph.fps.max(1.0);
         let total_frames =
             (((graph.duration_ms as f32 / 1000.0).max(1.0 / fps) * fps).round() as u32).max(1);
+        let audio_preview = match NativeAudioPreview::from_graph(&graph, &script_source) {
+            Ok(audio_preview) => audio_preview,
+            Err(err) => {
+                eprintln!("native audio preview unavailable: {err}");
+                None
+            }
+        };
 
         Ok(Self {
             script_source,
@@ -449,6 +530,7 @@ impl LivePreviewApp {
             last_stats_at: Instant::now(),
             print_stats_enabled,
             auto_advance,
+            audio_preview,
             host_mode,
             host_events,
             controller_process_id: None,
@@ -545,6 +627,14 @@ impl LivePreviewApp {
         self.script_source = source.unwrap_or_else(|| "preview-host-script".to_string());
         self.base_script = script;
         self.base_graph = graph;
+        self.audio_preview =
+            match NativeAudioPreview::from_graph(&self.base_graph, &self.script_source) {
+                Ok(audio_preview) => audio_preview,
+                Err(err) => {
+                    eprintln!("native audio preview unavailable: {err}");
+                    None
+                }
+            };
         self.adaptive_quality.set_target_fps(fps);
         self.overrides.clear();
         self.pending_preload = preview_feature_enabled("MOTIONLOOM_PREVIEW_PRELOAD", true);
@@ -692,6 +782,18 @@ impl LivePreviewApp {
         self.playback_started_at = Instant::now();
         self.playback_start_frame = self.frame;
         self.next_redraw_at = Instant::now();
+        let fps = self
+            .graph
+            .as_ref()
+            .map(|graph| graph.fps)
+            .unwrap_or(self.base_graph.fps)
+            .max(1.0);
+        if let Some(audio_preview) = self.audio_preview.as_mut()
+            && let Err(err) =
+                audio_preview.seek_to(Duration::from_secs_f64(self.frame as f64 / fps as f64))
+        {
+            eprintln!("native audio preview seek failed: {err}");
+        }
     }
 
     fn update_frame_from_wall_clock(&mut self) {
@@ -1290,11 +1392,12 @@ impl LivePreviewApp {
         } else {
             wgpu::Features::empty()
         };
+        let required_limits = preview_required_limits(adapter.limits());
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("motionloom-live-preview-device"),
                 required_features,
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             }))?;

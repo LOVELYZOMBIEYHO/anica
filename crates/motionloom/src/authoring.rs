@@ -13,7 +13,7 @@ use crate::dsl::{GraphAssetKind, GraphScript, parse_graph_script};
 use crate::process::runtime::compile_runtime_program;
 use crate::scene::animation::{AnimationDiagnosticSeverity, inspect_animation_targets};
 
-const REPORT_VERSION: &str = "1.0";
+const REPORT_VERSION: &str = "2.0";
 const SCHEMA_VERSION: &str = "1.0";
 
 /// Overall repair state for one authored script.
@@ -121,6 +121,23 @@ pub struct PrimitiveAuthoringSummary {
     pub triangles: usize,
     pub estimated_gpu_bytes: usize,
     pub inferred_auto_collider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_points: Vec<PrimitiveControlPointSummary>,
+}
+
+/// Read-only geometry handles let editors visualize procedural character assets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveControlPointSummary {
+    pub kind: String,
+    pub index: usize,
+    pub position: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roll: Option<f32>,
 }
 
 /// One attribute observed in a showcase, enriched with known engine capability data.
@@ -246,28 +263,7 @@ pub fn analyze_motionloom_script_for_target(
     if let Some(graph) = graph.as_ref() {
         append_animation_diagnostics(graph, &scanned, &mut diagnostics);
         append_semantic_diagnostics(graph, &scanned, &mut diagnostics);
-        // A requested quality downgrade must be visible to both users and LLMs.
-        for scene in &graph.scenes {
-            if let Ok(report) = crate::render_style::resolve_scene_render_style(graph, &scene.id) {
-                for message in report.fallbacks {
-                    diagnostics.push(AuthoringDiagnostic {
-                        severity: AuthoringDiagnosticSeverity::Warning,
-                        code: "RENDER_STYLE_FALLBACK".into(),
-                        phase: "resolve".into(),
-                        line: find_tag_line(&scanned, "Scene", Some(&scene.id)),
-                        column: 1,
-                        tag: Some("Scene".into()),
-                        node_id: Some(scene.id.clone()),
-                        attribute: Some("renderQuality".into()),
-                        authored_value: scene.render_quality.clone(),
-                        effective_value: None,
-                        message,
-                        effect: "Requested quality uses the reported backend fallback.".into(),
-                        suggestions: vec![],
-                    });
-                }
-            }
-        }
+        append_native_skin_diagnostics(graph, &scanned, &mut diagnostics);
         append_compatibility_diagnostics(script, target, &mut diagnostics);
         match compile_runtime_program(graph.clone()) {
             Ok(_) => compile_succeeded = true,
@@ -297,7 +293,7 @@ pub fn analyze_motionloom_script_for_target(
             .map(|g| {
                 g.scenes
                     .iter()
-                    .filter(|s| s.render_style.is_some() || s.render_quality.is_some())
+                    .filter(|s| s.render_style.is_some())
                     .filter_map(|s| crate::render_style::resolve_scene_render_style(g, &s.id).ok())
                     .collect()
             })
@@ -313,6 +309,70 @@ pub fn analyze_motionloom_script_for_target(
         diagnostics,
         effective_graph,
         showcase_schema,
+    }
+}
+
+fn append_native_skin_diagnostics(
+    graph: &GraphScript,
+    tags: &[ScannedTag],
+    diagnostics: &mut Vec<AuthoringDiagnostic>,
+) {
+    for compound in graph.assets.iter().filter_map(|asset| asset.compound()) {
+        let Some(binding) = compound.skin_binding.as_ref() else {
+            continue;
+        };
+        for instance in compound
+            .instances
+            .iter()
+            .filter(|instance| instance.skin == crate::dsl::NativeSkinMode::Smooth)
+        {
+            let effective_influences = if instance.influences.is_empty() {
+                "primary bone + parent + direct children".to_string()
+            } else {
+                instance.influences.join(", ")
+            };
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Info,
+                code: "NATIVE_SMOOTH_SKIN".to_string(),
+                phase: "skin-binding".to_string(),
+                line: find_tag_line(tags, "Instance", Some(&instance.id)),
+                column: 1,
+                tag: Some("Instance".to_string()),
+                node_id: Some(format!("{}::{}", compound.id, instance.id)),
+                attribute: Some("skin".to_string()),
+                authored_value: Some("smooth".to_string()),
+                effective_value: Some(effective_influences),
+                message: format!(
+                    "Native smooth skin uses automatic distance weights (max {}, falloff {}).",
+                    binding.max_influences, binding.falloff
+                ),
+                effect: "Primitive vertices are retained in rest space; playback uploads only the joint palette."
+                    .to_string(),
+                suggestions: Vec::new(),
+            });
+        }
+        if !binding.weight_regions.is_empty() {
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Info,
+                code: "NATIVE_WEIGHT_REGIONS".to_string(),
+                phase: "skin-binding".to_string(),
+                line: find_tag_line(tags, "SkinBinding", None),
+                column: 1,
+                tag: Some("SkinBinding".to_string()),
+                node_id: Some(compound.id.clone()),
+                attribute: None,
+                authored_value: Some(binding.weight_regions.len().to_string()),
+                effective_value: Some(binding.weight_regions.len().to_string()),
+                message: format!(
+                    "Native smooth skin applies {} local weight regions.",
+                    binding.weight_regions.len()
+                ),
+                effect:
+                    "Regional add/replace adjustments are baked once into retained vertex weights."
+                        .to_string(),
+                suggestions: Vec::new(),
+            });
+        }
     }
 }
 
@@ -652,6 +712,92 @@ fn append_semantic_diagnostics(
 
     // Primitive diagnostics expose costly tessellation and unsafe plane physics with repairs.
     for asset in graph.assets.iter().filter_map(|asset| asset.primitive()) {
+        let geometry_detail = match &asset.geometry {
+            crate::dsl::PrimitiveGeometry::Loft { sections, .. } => Some((
+                "PRIMITIVE_LOFT",
+                format!("Loft compiles {} ordered cross-sections.", sections.len()),
+            )),
+            crate::dsl::PrimitiveGeometry::Ribbon { points, .. } => Some((
+                "PRIMITIVE_RIBBON",
+                format!("Ribbon compiles {} stable path points.", points.len()),
+            )),
+            crate::dsl::PrimitiveGeometry::HairCards { guides, .. } => Some((
+                "HAIR_CARDS",
+                format!(
+                    "Hair groom compiles {} reusable guides into retained card geometry.",
+                    guides.len()
+                ),
+            )),
+            crate::dsl::PrimitiveGeometry::Mesh { cage } => Some((
+                "CONTROL_CAGE",
+                format!(
+                    "Welded cage: {} vertices, {} faces, {} pinned vertices; Catmull-Clark level {}.",
+                    cage.positions.len(),
+                    cage.faces.len(),
+                    cage.pinned.iter().filter(|&&p| p).count(),
+                    cage.subdivision
+                ),
+            )),
+            crate::dsl::PrimitiveGeometry::HeadSurface {
+                archetype,
+                features,
+                face_layout,
+                ..
+            } => Some((
+                "HEAD_SURFACE",
+                format!(
+                    "Head surface uses archetype {archetype}, {} explicit fields, and {} face-layout helper.",
+                    features.len(),
+                    usize::from(face_layout.is_some())
+                ),
+            )),
+            _ => None,
+        };
+        if let Some((code, message)) = geometry_detail {
+            let triangles = crate::world::primitive::generated_primitive_summary(asset).1;
+            diagnostics.push(AuthoringDiagnostic {
+                severity: AuthoringDiagnosticSeverity::Info,
+                code: code.to_string(),
+                phase: "asset-validation".to_string(),
+                line: {
+                    let primitive_line = find_tag_line(tags, "PrimitiveAsset", Some(&asset.id));
+                    if primitive_line == 0 {
+                        let hair_line = find_tag_line(tags, "HairAsset", Some(&asset.id));
+                        if hair_line == 0 {
+                            if matches!(asset.geometry, crate::dsl::PrimitiveGeometry::Mesh { .. })
+                            {
+                                find_tag_line(tags, "MeshAsset", Some(&asset.id))
+                            } else {
+                                find_tag_line(tags, "HeadAsset", Some(&asset.id))
+                            }
+                        } else {
+                            hair_line
+                        }
+                    } else {
+                        primitive_line
+                    }
+                },
+                column: 1,
+                tag: Some(
+                    match asset.geometry {
+                        crate::dsl::PrimitiveGeometry::HairCards { .. } => "HairAsset",
+                        crate::dsl::PrimitiveGeometry::HeadSurface { .. } => "HeadAsset",
+                        crate::dsl::PrimitiveGeometry::Mesh { .. } => "MeshAsset",
+                        _ => "PrimitiveAsset",
+                    }
+                    .to_string(),
+                ),
+                node_id: Some(asset.id.clone()),
+                attribute: Some("shape".to_string()),
+                authored_value: Some(asset.geometry.shape_name().to_string()),
+                effective_value: Some(format!("{triangles} triangles")),
+                message,
+                effect:
+                    "Geometry is generated once and retained by the native/WASM GPU mesh cache."
+                        .to_string(),
+                suggestions: Vec::new(),
+            });
+        }
         let tessellation = match &asset.geometry {
             crate::dsl::PrimitiveGeometry::Sphere {
                 segments, rings, ..
@@ -661,17 +807,40 @@ fn append_semantic_diagnostics(
             } => (*segments).max(*rings),
             crate::dsl::PrimitiveGeometry::Plane { segments, .. }
             | crate::dsl::PrimitiveGeometry::Cylinder { segments, .. }
-            | crate::dsl::PrimitiveGeometry::Cone { segments, .. } => *segments,
+            | crate::dsl::PrimitiveGeometry::Cone { segments, .. }
+            | crate::dsl::PrimitiveGeometry::Loft { segments, .. } => *segments,
+            crate::dsl::PrimitiveGeometry::HairCards {
+                length_segments,
+                width_segments,
+                ..
+            } => (*length_segments).max(*width_segments),
+            crate::dsl::PrimitiveGeometry::HeadSurface {
+                topology,
+                facial_cage: Some(cage),
+                ..
+            } if topology == "facialcage" => cage.segments,
+            crate::dsl::PrimitiveGeometry::HeadSurface {
+                segments, rings, ..
+            } => (*segments).max(*rings),
             _ => 0,
         };
         if tessellation > 128 {
+            let tessellation_tag = match &asset.geometry {
+                crate::dsl::PrimitiveGeometry::HeadSurface {
+                    topology,
+                    facial_cage: Some(_),
+                    ..
+                } if topology == "facialcage" => "FacialCage",
+                crate::dsl::PrimitiveGeometry::HeadSurface { .. } => "HeadAsset",
+                _ => "PrimitiveAsset",
+            };
             diagnostics.push(AuthoringDiagnostic {
                 severity: AuthoringDiagnosticSeverity::Warning,
                 code: "PRIMITIVE_HIGH_TESSELLATION".to_string(),
                 phase: "asset-validation".to_string(),
-                line: find_tag_line(tags, "PrimitiveAsset", Some(&asset.id)),
+                line: find_tag_line(tags, tessellation_tag, None),
                 column: 1,
-                tag: Some("PrimitiveAsset".to_string()),
+                tag: Some(tessellation_tag.to_string()),
                 node_id: Some(asset.id.clone()),
                 attribute: Some("segments".to_string()),
                 authored_value: Some(tessellation.to_string()),
@@ -1117,9 +1286,16 @@ fn append_semantic_diagnostics(
         }
     }
 
-    // Video and audio declarations are valid assets but do not yet create playable Scene nodes.
+    // Video declarations and unplaced audio declarations do not create playable output.
+    let placed_audio_assets = graph
+        .audio_clips
+        .iter()
+        .map(|clip| clip.asset.as_str())
+        .collect::<BTreeSet<_>>();
     for asset in &graph.assets {
-        if matches!(asset.kind, GraphAssetKind::Video | GraphAssetKind::Audio) {
+        let is_unplaced_audio =
+            asset.kind == GraphAssetKind::Audio && !placed_audio_assets.contains(asset.id.as_str());
+        if asset.kind == GraphAssetKind::Video || is_unplaced_audio {
             let kind = match asset.kind {
                 GraphAssetKind::Video => "VideoAsset",
                 GraphAssetKind::Audio => "AudioAsset",
@@ -1388,8 +1564,65 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
                         crate::dsl::PrimitiveGeometry::Ellipsoid { .. } => "sphere",
                         crate::dsl::PrimitiveGeometry::RoundedBox { .. } => "box",
                         crate::dsl::PrimitiveGeometry::Plane { .. } => "static_plane",
+                        crate::dsl::PrimitiveGeometry::Loft { .. }
+                        | crate::dsl::PrimitiveGeometry::Ribbon { .. }
+                        | crate::dsl::PrimitiveGeometry::HairCards { .. }
+                        | crate::dsl::PrimitiveGeometry::HeadSurface { .. }
+                        | crate::dsl::PrimitiveGeometry::Mesh { .. } => "convex_hull",
                     }
                     .to_string(),
+                    control_points: match &asset.geometry {
+                        crate::dsl::PrimitiveGeometry::Loft { sections, .. } => sections
+                            .iter()
+                            .enumerate()
+                            .map(|(index, section)| PrimitiveControlPointSummary {
+                                kind: "section".to_string(),
+                                index,
+                                position: [section.offset[0], section.at, section.offset[1]],
+                                width: Some(section.width),
+                                depth: Some(section.depth),
+                                roll: Some(section.rotation),
+                            })
+                            .collect(),
+                        crate::dsl::PrimitiveGeometry::Ribbon { points, .. } => points
+                            .iter()
+                            .enumerate()
+                            .map(|(index, point)| PrimitiveControlPointSummary {
+                                kind: "path_point".to_string(),
+                                index,
+                                position: point.position,
+                                width: point.width,
+                                depth: point.thickness,
+                                roll: Some(point.roll),
+                            })
+                            .collect(),
+                        crate::dsl::PrimitiveGeometry::HairCards { guides, .. } => guides
+                            .iter()
+                            .flat_map(|guide| &guide.points)
+                            .enumerate()
+                            .map(|(index, point)| PrimitiveControlPointSummary {
+                                kind: "hair_point".to_string(),
+                                index,
+                                position: point.position,
+                                width: Some(point.width),
+                                depth: Some(point.camber),
+                                roll: Some(point.roll),
+                            })
+                            .collect(),
+                        crate::dsl::PrimitiveGeometry::HeadSurface { features, .. } => features
+                            .iter()
+                            .enumerate()
+                            .map(|(index, feature)| PrimitiveControlPointSummary {
+                                kind: format!("head_feature:{}", feature.kind),
+                                index,
+                                position: feature.center,
+                                width: Some(feature.size[0]),
+                                depth: Some(feature.amount),
+                                roll: None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    },
                 }
             })
             .collect(),
@@ -1510,19 +1743,36 @@ fn build_showcase_schema(
 
 fn required_attributes(tag: &str) -> Vec<String> {
     let attributes: &[&str] = match tag {
-        "RenderStyle" | "RenderQuality" => &["id"],
-        "Resolution" => &["scale"],
-        "Shadows" => &["resolution"],
-        "AntiAliasing" => &["mode"],
+        "RenderStyle" => &["id"],
         "Graph" => &["fps", "duration", "size"],
         "RigidBody" => &["id", "target", "dimension", "type"],
         "PrimitiveAsset" => &["id", "shape"],
+        "HairAsset" => &["id", "material"],
+        "HeadAsset" => &["id", "material", "archetype"],
+        "MeshAsset" => &["id", "material"],
+        // Vertex is also used by 2D MeshTopology, so context parsers enforce its required fields.
+        "Vertex" => &[],
+        "Face" => &["indices"],
+        "FacialCage" | "HeadProfile" | "HeadCage" => &[],
+        "HeadSection" => &["id", "at", "width", "frontDepth", "backDepth"],
+        "HeadDome" => &["start", "top", "centerDepth", "frontRadius", "backRadius"],
+        "HeadShape" => &["size"],
+        "HeadFeature" => &["id", "kind", "center", "size"],
+        "HairGroup" | "HairGuide" | "HairCards" => &["id"],
+        "HairPoint" => &["position"],
+        "HairMirror" => &["id", "source", "axis"],
+        "HairLOD" => &["representation"],
+        "Section" => &["at", "width", "depth"],
+        "Ribbon" => &["width"],
+        "PathPoint" => &["position"],
+        "WeightRegion" => &["instance", "bone", "center", "radius"],
         "Taper" => &["axis", "start", "end"],
         "Bend" | "Twist" => &["axis", "angle"],
         "Smooth" => &["angle"],
         "TerrainAsset" => &["id", "heightMap", "size"],
         "VegetationAsset" => &["id", "kind", "height"],
         "CompoundAsset" => &["id"],
+        "SkinBinding" => &[],
         "MaterialAsset" => &["id"],
         "ActionLibrary" => &["id", "src", "actions"],
         "Instance" => &["asset"],
@@ -1670,14 +1920,7 @@ fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
 fn is_style_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "RenderStyle"
-            | "RenderQuality"
-            | "SurfaceStyle"
-            | "LightingStyle"
-            | "PostStyle"
-            | "Resolution"
-            | "Shadows"
-            | "AntiAliasing"
+        "RenderStyle" | "SurfaceStyle" | "OutlineStyle" | "LightingStyle" | "PostStyle"
     )
 }
 
@@ -2148,6 +2391,130 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "restitution",
             "density",
         ]),
+        "HairAsset" => strict(&[
+            "id",
+            "material",
+            "bindBone",
+            "space",
+            "defaultRepresentation",
+            "seed",
+        ]),
+        "HairGroom" | "HairRepresentations" => strict(&[]),
+        "HairGroup" => strict(&["id", "role"]),
+        "HairGuide" => strict(&[
+            "id",
+            "normal",
+            "width",
+            "radius",
+            "camber",
+            "roll",
+            "stiffness",
+        ]),
+        "HairDefaults" => strict(&["width", "radius", "camber", "roll", "stiffness"]),
+        "HairMirror" => strict(&["id", "source", "axis"]),
+        "HairPoint" => strict(&["position", "width", "radius", "camber", "roll", "stiffness"]),
+        "HairCards" => strict(&[
+            "id",
+            "lengthSegments",
+            "widthSegments",
+            "thickness",
+            "crossSection",
+            "tipShape",
+        ]),
+        "HairLOD" => strict(&["representation"]),
+        "MeshAsset" => strict(&["id", "material", "subdivision", "subdivisionScheme"]),
+        // The authoring schema is tag-based; accept both 3D MeshAsset and 2D MeshTopology fields.
+        "Vertex" => strict(&["position", "uv", "pinned", "id", "x", "y"]),
+        "Face" => strict(&["indices"]),
+        "HeadAsset" => strict(&[
+            "id",
+            "material",
+            "archetype",
+            "variant",
+            "bindBone",
+            "symmetry",
+            "segments",
+            "rings",
+            "seed",
+            "topology",
+        ]),
+        "FacialCage" => strict(&[
+            "generatorVersion",
+            "segments",
+            "profileSegments",
+            "samplesPerSection",
+            "subdivision",
+            "orbitalRings",
+            "mouthRings",
+            "preserveProfile",
+            "uvMode",
+        ]),
+        "HeadProfile" => strict(&[]),
+        "HeadCage" => strict(&["subdivision"]),
+        "HeadSection" => strict(&["id", "at", "width", "frontDepth", "backDepth"]),
+        "HeadDome" => strict(&[
+            "start",
+            "top",
+            "centerDepth",
+            "frontRadius",
+            "backRadius",
+            "samples",
+        ]),
+        "HeadShape" => strict(&[
+            "size",
+            "forehead",
+            "cheekWidth",
+            "jawWidth",
+            "chinLength",
+            "chinRoundness",
+        ]),
+        "FaceLayout" => strict(&[]),
+        "Eyebrow" => strict(&["id", "position", "width", "thickness", "arch", "tilt"]),
+        "Eye" => strict(&[
+            "id",
+            "position",
+            "width",
+            "opening",
+            "tilt",
+            "socketWidth",
+            "socketHeight",
+            "socketDepth",
+        ]),
+        "Iris" => strict(&["id", "position", "shape", "scale", "radius", "pupilRadius"]),
+        "Eyeliner" => strict(&[
+            "id",
+            "edge",
+            "thickness",
+            "span",
+            "taper",
+            "extension",
+            "tipLift",
+        ]),
+        "Nose" => strict(&["id", "position", "length", "width", "projection"]),
+        "Mouth" => strict(&[
+            "id",
+            "position",
+            "width",
+            "opening",
+            "upperLip",
+            "lowerLip",
+            "muzzleLength",
+            "muzzleWidth",
+        ]),
+        "Ear" => strict(&["id", "position", "width", "height", "depth"]),
+        "HeadFeature" => strict(&[
+            "id", "kind", "center", "size", "amount", "falloff", "mirror",
+        ]),
+        "HeadMorph" => strict(&[
+            "headWidth",
+            "headHeight",
+            "headDepth",
+            "faceWidth",
+            "faceHeight",
+            "jawWidth",
+            "muzzleLength",
+            "featureScale",
+        ]),
         "Modifiers" => strict(&[]),
         "MeshTransform" => strict(&["translate", "rotate", "scale"]),
         "Taper" => strict(&["axis", "start", "end"]),
@@ -2158,6 +2525,10 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "WeightedNormals" => strict(&["strength", "keepSharpEdges"]),
         "MeshBuild" => strict(&["topology", "triangulation", "quality", "maxTriangles"]),
         "LOD" => strict(&["mode", "levels", "preserveSilhouette"]),
+        "Loft" => strict(&["closed", "capStart", "capEnd", "segments"]),
+        "Section" => strict(&["at", "width", "depth", "profile", "offset", "rotation"]),
+        "Ribbon" => strict(&["width", "thickness", "facing", "capStart", "capEnd"]),
+        "PathPoint" => strict(&["position", "width", "thickness", "roll"]),
         "TerrainAsset" => strict(&[
             "id",
             "heightMap",
@@ -2187,6 +2558,16 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "collision",
         ]),
         "CompoundAsset" => strict(&["id", "rig", "materialSeed"]),
+        "SkinBinding" => strict(&["mode", "maxInfluences", "falloff", "normalize"]),
+        "WeightRegion" => strict(&[
+            "instance",
+            "bone",
+            "center",
+            "radius",
+            "strength",
+            "operation",
+        ]),
+        "Mirror" => strict(&["axis", "suffix"]),
         "Instance" => strict(&[
             "id",
             "asset",
@@ -2195,12 +2576,16 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "rotation",
             "scale",
             "materialSeed",
+            "skin",
+            "influences",
         ]),
         "Background" => strict(&["id", "color"]),
-        "Scene" => strict(&["id", "size", "renderStyle", "renderQuality"]),
+        "Scene" => strict(&["id", "size", "renderStyle"]),
         "RenderStyle" => strict(&["id"]),
-        "RenderQuality" => strict(&["id", "preset"]),
         "SurfaceStyle" => strict(&[
+            "shadowThreshold",
+            "shadowFeather",
+            "shadowColor",
             "shading",
             "shadingSteps",
             "diffuseWrap",
@@ -2212,6 +2597,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "outline",
         ]),
         "LightingStyle" => strict(&["preset", "ambientIntensity", "ambientColor", "shadowStyle"]),
+        "OutlineStyle" => strict(&["enabled", "method", "color", "width", "distanceMode"]),
         "PostStyle" => strict(&[
             "toneMapping",
             "exposure",
@@ -2221,9 +2607,6 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "bloomThreshold",
             "bloomIntensity",
         ]),
-        "Resolution" => strict(&["scale"]),
-        "Shadows" => strict(&["resolution", "filtering"]),
-        "AntiAliasing" => strict(&["mode"]),
         "Track" => strict(&[
             "id",
             "space",
@@ -2437,7 +2820,16 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "size",
             "color",
         ]),
-        "MaterialBinding" => strict(&["material", "definition", "texture"]),
+        "MaterialBinding" => strict(&[
+            "material",
+            "definition",
+            "texture",
+            "celRole",
+            "outlineWidth",
+            "celShadowColor",
+            "hairHighlight",
+            "celControlMap",
+        ]),
         "Play" => strict(&[
             "clip",
             "loop",
@@ -2477,7 +2869,19 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Shadow" => strict(&["id", "x", "y", "blur", "color", "opacity"]),
         "Repeat" => open(REPEAT_ATTRIBUTES),
         "Layout" => open(LAYOUT_ATTRIBUTES),
-        "AnimationTarget" => strict(&["node", "property"]),
+        "AudioClip" => strict(&[
+            "id",
+            "asset",
+            "from",
+            "duration",
+            "sourceIn",
+            "sourceOut",
+            "loop",
+            "gainDb",
+            "pan",
+            "playbackRate",
+        ]),
+        "AudioTarget" | "AnimationTarget" => strict(&["node", "property"]),
         "Key" => strict(&["time", "frame", "value", "ease"]),
         "ParticleEmitter" => strict(&[
             "id", "target", "x", "y", "rate", "lifetime", "velocity", "gravity", "radius", "color",
@@ -2629,7 +3033,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "glass",
             "dispersion",
         ]),
-        "Texture" => open(&["id", "src"]),
+        "Texture" => open(&["id", "src", "asset", "offset", "scale", "rotation"]),
         "Noise" => open(&[
             "id",
             "kind",
@@ -3089,6 +3493,11 @@ const TEXT_ATTRIBUTES: &[&str] = &[
     "fontSize",
     "font_size",
     "size",
+    "capStart",
+    "capEnd",
+    "suffix",
+    "instance",
+    "operation",
     "renderScale",
     "render_scale",
     "antialias",
@@ -3347,13 +3756,10 @@ const LAYOUT_ATTRIBUTES: &[&str] = &[
 
 const KNOWN_TAGS: &[&str] = &[
     "RenderStyle",
-    "RenderQuality",
     "SurfaceStyle",
+    "OutlineStyle",
     "LightingStyle",
     "PostStyle",
-    "Resolution",
-    "Shadows",
-    "AntiAliasing",
     "Graph",
     "Assets",
     "VideoAsset",
@@ -3361,6 +3767,35 @@ const KNOWN_TAGS: &[&str] = &[
     "ModelAsset",
     "MaterialAsset",
     "PrimitiveAsset",
+    "HairAsset",
+    "HairGroom",
+    "HairGroup",
+    "HairGuide",
+    "HairDefaults",
+    "HairMirror",
+    "HairPoint",
+    "HairRepresentations",
+    "HairCards",
+    "HairLOD",
+    "HeadAsset",
+    "FacialCage",
+    "HeadProfile",
+    "HeadSection",
+    "HeadDome",
+    "HeadCage",
+    "MeshAsset",
+    "Face",
+    "HeadShape",
+    "FaceLayout",
+    "Eye",
+    "Iris",
+    "Eyeliner",
+    "Nose",
+    "Mouth",
+    "Ear",
+    "Eyebrow",
+    "HeadFeature",
+    "HeadMorph",
     "Modifiers",
     "MeshTransform",
     "Taper",
@@ -3371,11 +3806,20 @@ const KNOWN_TAGS: &[&str] = &[
     "WeightedNormals",
     "MeshBuild",
     "LOD",
+    "Loft",
+    "Section",
+    "Ribbon",
+    "PathPoint",
     "TerrainAsset",
     "VegetationAsset",
     "CompoundAsset",
+    "SkinBinding",
+    "WeightRegion",
+    "Mirror",
     "Instance",
     "AudioAsset",
+    "AudioClip",
+    "AudioTarget",
     "AnimationAsset",
     "Background",
     "Scene",
@@ -3639,6 +4083,41 @@ const ALL_KNOWN_ATTRIBUTES: &[&str] = &[
     "targetY",
     "targetZ",
     "preset",
+    "topology",
+    "subdivision",
+    "subdivisionScheme",
+    "uv",
+    "pinned",
+    "indices",
+    "generatorVersion",
+    "profileSegments",
+    "samplesPerSection",
+    "orbitalRings",
+    "mouthRings",
+    "preserveProfile",
+    "uvMode",
+    "frontDepth",
+    "backDepth",
+    "centerDepth",
+    "frontRadius",
+    "backRadius",
+    "samples",
+    "socketWidth",
+    "arch",
+    "socketHeight",
+    "socketDepth",
+    "pupilRadius",
+    "edge",
+    "span",
+    "taper",
+    "extension",
+    "tipLift",
+    "opening",
+    "tilt",
+    "upperLip",
+    "lowerLip",
+    "muzzleLength",
+    "muzzleWidth",
 ];
 
 #[cfg(test)]
@@ -3663,6 +4142,70 @@ mod tests {
 </Graph>"##;
         let value: serde_json::Value =
             serde_json::from_str(&motionloom_analyze_script_json(script)).unwrap();
+        assert_eq!(value["summary"]["unknownTags"], 0);
+        assert_eq!(value["summary"]["ignoredAttributes"], 0);
+    }
+
+    #[test]
+    fn native_smooth_skin_reports_effective_gpu_binding() {
+        let script = r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="limb" shape="capsule" radius="0.1" height="0.5" />
+    <CompoundAsset id="hero" rig="rig">
+      <SkinBinding mode="automatic" maxInfluences="3" falloff="2.25" normalize="true" />
+      <Instance id="arm" asset="limb" bone="arm" skin="smooth"
+                influences={["root","arm"]} />
+    </CompoundAsset>
+  </Assets>
+  <Skeleton id="rig" space="3d">
+    <Bone id="root" position={[0,0,0]} />
+    <Bone id="arm" parent="root" position={[0,1,0]} />
+  </Skeleton>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##;
+        let value: serde_json::Value =
+            serde_json::from_str(&motionloom_analyze_script_json(script)).unwrap();
+        let diagnostic = value["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["code"] == "NATIVE_SMOOTH_SKIN")
+            .expect("smooth skin diagnostic");
+        assert_eq!(value["parseSucceeded"], true);
+        assert_eq!(diagnostic["nodeId"], "hero::arm");
+        assert_eq!(diagnostic["effectiveValue"], "root, arm");
+        assert!(
+            diagnostic["effect"]
+                .as_str()
+                .unwrap()
+                .contains("joint palette")
+        );
+    }
+
+    #[test]
+    fn native_character_geometry_is_known_to_authoring_schema() {
+        let script = r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="coat" shape="loft">
+      <Loft segments="12">
+        <Section at="-0.5" width="0.7" depth="0.4" />
+        <Section at="0.5" width="0.8" depth="0.4" />
+      </Loft>
+    </PrimitiveAsset>
+    <PrimitiveAsset id="hair" shape="ribbon">
+      <Ribbon width="0.2">
+        <PathPoint position={[0,0,0]} />
+        <PathPoint position={[0,-0.5,0]} />
+      </Ribbon>
+    </PrimitiveAsset>
+  </Assets>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##;
+        let value: serde_json::Value =
+            serde_json::from_str(&motionloom_analyze_script_json(script)).unwrap();
+        assert_eq!(value["parseSucceeded"], true, "{value:#}");
         assert_eq!(value["summary"]["unknownTags"], 0);
         assert_eq!(value["summary"]["ignoredAttributes"], 0);
     }
@@ -3874,6 +4417,44 @@ mod tests {
 </Graph>"##;
         let report = super::analyze_motionloom_script(script);
         assert_eq!(report.status, AuthoringStatus::Clean);
+    }
+
+    #[test]
+    fn audio_asset_placed_by_audio_clip_is_not_host_only() {
+        let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
+  <Assets>
+    <AudioAsset id="score" src="score.ogg" />
+  </Assets>
+  <AudioClip id="music" asset="score" from="0s" duration="1s" />
+  <AudioTarget node="music" property="gainDb">
+    <Key time="0s" value="-12" />
+    <Key time="1s" value="-60" />
+  </AudioTarget>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <Rect width="320" height="180" color="#000" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"##;
+        let report = super::analyze_motionloom_script(script);
+        assert!(
+            report.parse_succeeded && report.compile_succeeded,
+            "{report:#?}"
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "HOST_ONLY_ASSET"),
+            "{report:#?}"
+        );
     }
 
     #[test]

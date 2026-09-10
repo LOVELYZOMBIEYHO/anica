@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "1.0",
+  "date": "2026-09-05",
+  "headTests": {
+    "passed": 13,
+    "failed": 0,
+    "command": "cargo test -p motionloom --lib head_ --offline"
+  },
+  "wasmParity": {
+    "status": "passed",
+    "tolerance": 2e-06,
+    "nativeBefore": 0.06293539185108006,
+    "wasmBefore": 0.06293539185108006,
+    "nativeAfter": 0.0005656687024256341,
+    "wasmAfter": 0.0005656687024256341
+  },
+  "limits": [
+    "Sparse manually estimated turnaround annotations do not establish likeness.",
+    "Back view has no measurable visible landmarks.",
+    "CPU silhouette metrics are separate from GPU review renders."
+  ],
+  "turnaround": {
+    "before": 0.14369752753111517,
+    "after": 0.138843759533827,
+    "stopReason": "iteration_limit",
+    "sourceUnchanged": true,
+    "wasmParityTolerance": 2e-06,
+    "gpuViews": [
+      "front",
+      "left",
+      "back",
+      "three-quarter"
+    ]
+  }
+}

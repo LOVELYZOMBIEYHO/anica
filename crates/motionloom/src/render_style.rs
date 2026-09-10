@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenderStyleNode {
+    pub outline: Option<OutlineStyleNode>,
     pub id: String,
     pub surface: Option<SurfaceStyleNode>,
     pub lighting: Option<LightingStyleNode>,
@@ -21,6 +22,9 @@ pub struct RenderStyleNode {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SurfaceStyleNode {
+    pub shadow_threshold: Option<f32>,
+    pub shadow_feather: Option<f32>,
+    pub shadow_color: Option<String>,
     pub shading: Option<String>,
     pub shading_steps: Option<u32>,
     pub diffuse_wrap: Option<f32>,
@@ -30,6 +34,75 @@ pub struct SurfaceStyleNode {
     pub roughness_bias: Option<f32>,
     pub saturation: Option<f32>,
     pub outline: Option<String>,
+}
+
+/// Screen-width geometry outlines are independent of the base material.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutlineStyleNode {
+    pub enabled: Option<bool>,
+    pub method: Option<String>,
+    pub color: Option<String>,
+    pub width: Option<f32>,
+    pub distance_mode: Option<String>,
+}
+
+/// Optional material-slot controls travel with the actor, never rewrite a GLB.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CelMaterialSettings {
+    pub control_map: Option<String>,
+    pub role: Option<String>,
+    pub outline_width: Option<f32>,
+    pub shadow_color: Option<String>,
+    pub hair_highlight: Option<f32>,
+}
+
+pub(crate) fn parse_cel_material(
+    tag: &str,
+    line: usize,
+) -> Result<CelMaterialSettings, GraphParseError> {
+    let scalar = |key: &str| -> Result<Option<f32>, GraphParseError> {
+        attr_value(tag, key)
+            .map(|v| {
+                strip_wrappers(&v)
+                    .parse::<f32>()
+                    .map_err(|_| GraphParseError {
+                        line,
+                        message: format!("{key} must be a number"),
+                    })
+            })
+            .transpose()
+    };
+    let settings = CelMaterialSettings {
+        control_map: attr_value(tag, "celControlMap").map(|v| strip_wrappers(&v).to_owned()),
+        role: attr_value(tag, "celRole").map(|v| strip_wrappers(&v).to_owned()),
+        shadow_color: attr_value(tag, "celShadowColor").map(|v| strip_wrappers(&v).to_owned()),
+        outline_width: scalar("outlineWidth")?,
+        hair_highlight: scalar("hairHighlight")?,
+    };
+    one_of(
+        settings.role.as_deref(),
+        &["body", "skin", "hair", "face"],
+        "celRole",
+    )?;
+    range(settings.outline_width, 0.0, 12.0, "outlineWidth")?;
+    range(settings.hair_highlight, 0.0, 2.0, "hairHighlight")?;
+    if let Some(c) = &settings.shadow_color {
+        color(c)?;
+    }
+    if settings.role.as_deref() == Some("face") && settings.control_map.is_none() {
+        return Err(GraphParseError {
+            line,
+            message: "celRole=face requires celControlMap (ImageAsset id)".into(),
+        });
+    }
+    Ok(settings)
+}
+
+pub(crate) fn cel_color(value: &str) -> [f32; 3] {
+    // Authored colors have already passed validation.
+    color(value).unwrap_or([0.4, 0.37, 0.5])
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -53,46 +126,35 @@ pub struct PostStyleNode {
     pub bloom_intensity: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RenderQualityNode {
-    pub id: String,
-    pub preset: Option<String>,
-    pub resolution: Option<ResolutionQuality>,
-    pub shadows: Option<ShadowQuality>,
-    pub ambient_occlusion: Option<AoQuality>,
-    pub anti_aliasing: Option<AntiAliasingQuality>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResolutionQuality {
-    pub scale: f32,
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedCelStyle {
+    pub shadow_threshold: f32,
+    pub shadow_feather: f32,
+    pub shadow_color: [f32; 3],
+    pub outline_width: f32,
+    pub outline_color: [f32; 3],
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ShadowQuality {
-    pub resolution: u32,
-    pub filtering: Option<String>,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AoQuality {
-    pub quality: String,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AntiAliasingQuality {
-    pub mode: String,
+impl Default for ResolvedCelStyle {
+    fn default() -> Self {
+        Self {
+            shadow_threshold: 0.5,
+            shadow_feather: 0.025,
+            shadow_color: [0.4, 0.37, 0.5],
+            outline_width: 0.0,
+            outline_color: [0.0; 3],
+        }
+    }
 }
 
 /// A serializable report, not an alternative authoring source of truth.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedSceneRenderStyle {
+    #[serde(default)]
+    pub cel: ResolvedCelStyle,
     pub scene_id: String,
     pub style_id: Option<String>,
-    pub quality_id: Option<String>,
     pub shading: String,
     pub shading_steps: u32,
     pub diffuse_wrap: f32,
@@ -106,11 +168,6 @@ pub struct ResolvedSceneRenderStyle {
     pub hard_shadows: bool,
     pub lighting_preset: Option<String>,
     pub post: PostStyleNode,
-    pub shadow_resolution: u32,
-    pub ao_enabled: bool,
-    pub render_scale: f32,
-    pub anti_aliasing: String,
-    pub fallbacks: Vec<String>,
     /// Explicit nodes own their complete setting group, including defaults.
     pub overrides: Vec<RenderStyleOverride>,
 }
@@ -148,7 +205,11 @@ fn attributes<T: serde::de::DeserializeOwned>(
         let value = raw
             .parse::<serde_json::Number>()
             .map(serde_json::Value::Number)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            .unwrap_or_else(|_| match raw {
+                "true" if key == "enabled" => serde_json::Value::Bool(true),
+                "false" if key == "enabled" => serde_json::Value::Bool(false),
+                _ => serde_json::Value::String(raw.to_string()),
+            });
         values.insert(key, value);
     }
     serde_json::from_value(serde_json::Value::Object(values)).map_err(|e| GraphParseError {
@@ -160,13 +221,8 @@ fn attributes<T: serde::de::DeserializeOwned>(
 pub(crate) fn parse_resource(
     lines: &[&str],
     start: usize,
-    quality: bool,
 ) -> Result<(serde_json::Value, usize), GraphParseError> {
-    let name = if quality {
-        "RenderQuality"
-    } else {
-        "RenderStyle"
-    };
+    let name = "RenderStyle";
     let (open, end) = crate::dsl::collect_tag_block(lines, start, '>', false)?;
     let mut root: serde_json::Value = attributes(&open, start + 1)?;
     let id = root.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -194,14 +250,11 @@ pub(crate) fn parse_resource(
             .split_whitespace()
             .next()
             .unwrap_or("");
-        let field = match (quality, child) {
-            (false, "SurfaceStyle") => "surface",
-            (false, "LightingStyle") => "lighting",
-            (false, "PostStyle") => "post",
-            (true, "Resolution") => "resolution",
-            (true, "Shadows") => "shadows",
-            (true, "AmbientOcclusion") => "ambientOcclusion",
-            (true, "AntiAliasing") => "antiAliasing",
+        let field = match child {
+            "SurfaceStyle" => "surface",
+            "OutlineStyle" => "outline",
+            "LightingStyle" => "lighting",
+            "PostStyle" => "post",
             _ => return Err(error(format!("Unsupported {name} child {child}"))),
         };
         if root.get(field).is_some() {
@@ -236,8 +289,8 @@ fn color(value: &str) -> Result<[f32; 3], GraphParseError> {
     let hex = value
         .strip_prefix('#')
         .filter(|v| v.len() == 6)
-        .ok_or_else(|| error("ambientColor must be #RRGGBB"))?;
-    let n = u32::from_str_radix(hex, 16).map_err(|_| error("Invalid ambientColor"))?;
+        .ok_or_else(|| error("Style color must be #RRGGBB"))?;
+    let n = u32::from_str_radix(hex, 16).map_err(|_| error("Invalid style color"))?;
     Ok([
         ((n >> 16) & 255) as f32 / 255.0,
         ((n >> 8) & 255) as f32 / 255.0,
@@ -245,8 +298,7 @@ fn color(value: &str) -> Result<[f32; 3], GraphParseError> {
     ])
 }
 
-/// Resolve one Scene without changing the authored graph. GPU capability
-/// fallbacks are explicit; quality never silently chooses another art style.
+/// Resolve one Scene without changing the authored graph.
 pub fn resolve_scene_render_style(
     graph: &GraphScript,
     scene_id: &str,
@@ -267,17 +319,6 @@ pub fn resolve_scene_render_style(
                 .ok_or_else(|| error(format!("Scene {scene_id}: unknown RenderStyle {id}")))
         })
         .transpose()?;
-    let quality = scene
-        .render_quality
-        .as_ref()
-        .map(|id| {
-            graph
-                .render_qualities
-                .iter()
-                .find(|q| &q.id == id)
-                .ok_or_else(|| error(format!("Scene {scene_id}: unknown RenderQuality {id}")))
-        })
-        .transpose()?;
     let empty_surface = SurfaceStyleNode::default();
     let s = style
         .and_then(|s| s.surface.as_ref())
@@ -287,11 +328,35 @@ pub fn resolve_scene_render_style(
         .and_then(|s| s.lighting.as_ref())
         .unwrap_or(&empty_lighting);
     let shading = s.shading.as_deref().unwrap_or("physical");
-    let stylized = shading == "stylized" || shading == "toon";
+    let stylized = matches!(shading, "stylized" | "toon" | "cel");
+    let outline = style.and_then(|style| style.outline.as_ref());
+    let outline_enabled = outline
+        .and_then(|o| o.enabled)
+        .unwrap_or(shading == "cel" && s.outline.as_deref() != Some("none"));
+    let cel = ResolvedCelStyle {
+        shadow_threshold: s.shadow_threshold.unwrap_or(0.5),
+        shadow_feather: s.shadow_feather.unwrap_or(0.025),
+        shadow_color: s
+            .shadow_color
+            .as_deref()
+            .map(color)
+            .transpose()?
+            .unwrap_or([0.4, 0.37, 0.5]),
+        outline_width: if outline_enabled {
+            outline.and_then(|o| o.width).unwrap_or(1.5)
+        } else {
+            0.0
+        },
+        outline_color: outline
+            .and_then(|o| o.color.as_deref())
+            .map(color)
+            .transpose()?
+            .unwrap_or([0.0; 3]),
+    };
     let mut r = ResolvedSceneRenderStyle {
+        cel,
         scene_id: scene_id.into(),
         style_id: scene.render_style.clone(),
-        quality_id: scene.render_quality.clone(),
         shading: shading.into(),
         shading_steps: s.shading_steps.unwrap_or(3),
         diffuse_wrap: s.diffuse_wrap.unwrap_or(if stylized { 0.15 } else { 0.0 }),
@@ -310,15 +375,6 @@ pub fn resolve_scene_render_style(
         hard_shadows: l.shadow_style.as_deref() == Some("hard"),
         lighting_preset: l.preset.clone(),
         post: style.and_then(|s| s.post.clone()).unwrap_or_default(),
-        shadow_resolution: quality
-            .and_then(|q| q.shadows.as_ref())
-            .map_or(1536, |q| q.resolution),
-        ao_enabled: quality
-            .and_then(|q| q.ambient_occlusion.as_ref())
-            .is_none_or(|q| q.quality != "off"),
-        render_scale: 1.0,
-        anti_aliasing: "none".into(),
-        fallbacks: vec![],
         overrides: vec![],
     };
     // Reports expose the same concrete defaults used by the runtime.
@@ -332,53 +388,6 @@ pub fn resolve_scene_render_style(
     r.post.saturation.get_or_insert(1.0);
     r.post.bloom_threshold.get_or_insert(0.9);
     r.post.bloom_intensity.get_or_insert(0.0);
-    if let Some(q) = quality {
-        // Presets resolve to concrete knobs, never device brand names.
-        match q.preset.as_deref() {
-            Some("web_low") => {
-                r.render_scale = 0.75;
-                r.shadow_resolution = 512;
-                r.ao_enabled = false;
-            }
-            Some("web_high") => {
-                r.shadow_resolution = 1536;
-                r.anti_aliasing = "fxaa".into();
-            }
-            Some("desktop_high") => {
-                r.shadow_resolution = 2048;
-                r.anti_aliasing = "fxaa".into();
-            }
-            Some("cinematic") => {
-                r.shadow_resolution = 4096;
-                r.render_scale = 1.5;
-                r.anti_aliasing = "fxaa".into();
-            }
-            _ => {}
-        }
-        if let Some(v) = &q.shadows {
-            r.shadow_resolution = v.resolution;
-        }
-        if let Some(v) = &q.ambient_occlusion {
-            r.ao_enabled = v.quality != "off";
-        }
-        if let Some(v) = &q.resolution {
-            r.render_scale = v.scale;
-        }
-        if let Some(v) = &q.anti_aliasing {
-            r.anti_aliasing = v.mode.clone();
-        }
-        if let Some(v) = &q.ambient_occlusion {
-            if v.quality != "off" {
-                r.fallbacks.push(format!(
-                    "AO {} requested; using existing analytic AO, not SSAO",
-                    v.quality
-                ));
-            }
-        }
-        if let Some(filtering) = q.shadows.as_ref().and_then(|v| v.filtering.as_deref()) {
-            r.hard_shadows = filtering == "hard";
-        }
-    }
     collect_overrides(&scene.children, &mut r);
     Ok(r)
 }
@@ -408,6 +417,24 @@ fn collect_overrides(nodes: &[SceneNode], r: &mut ResolvedSceneRenderStyle) {
                         });
                     }
                     for n in &c.nodes_3d {
+                        if let Scene3DNode::Model(model) = n {
+                            for binding in &model.material_bindings {
+                                if binding.cel != CelMaterialSettings::default() {
+                                    r.overrides.push(RenderStyleOverride {
+                                        island_id: g.id.clone(),
+                                        property: "cel.material".into(),
+                                        style_value: serde_json::json!(r.cel),
+                                        final_expression: serde_json::json!(binding.cel)
+                                            .to_string(),
+                                        source: format!(
+                                            "MaterialBinding:{}:{}",
+                                            model.id.as_deref().unwrap_or("anonymous"),
+                                            binding.material
+                                        ),
+                                    });
+                                }
+                            }
+                        }
                         if let Scene3DNode::ColorManagement(v) = n {
                             for (name, value, final_expression) in [
                                 (
@@ -475,7 +502,7 @@ pub(crate) fn validate(graph: &GraphScript) -> Result<(), GraphParseError> {
         if let Some(s) = &s.surface {
             one_of(
                 s.shading.as_deref(),
-                &["physical", "stylized", "toon", "clay"],
+                &["physical", "stylized", "toon", "clay", "cel"],
                 "shading",
             )?;
             one_of(s.outline.as_deref(), &["none"], "outline (V1)")?;
@@ -489,6 +516,32 @@ pub(crate) fn validate(graph: &GraphScript) -> Result<(), GraphParseError> {
                 (s.saturation, 0.0, 3.0, "saturation"),
             ] {
                 range(v, min, max, name)?;
+            }
+        }
+        if let Some(surface) = &s.surface {
+            range(surface.shadow_threshold, 0.0, 1.0, "shadowThreshold")?;
+            range(surface.shadow_feather, 0.001, 0.5, "shadowFeather")?;
+            if let Some(c) = &surface.shadow_color {
+                color(c)?;
+            }
+        }
+        if let Some(o) = &s.outline {
+            one_of(o.method.as_deref(), &["geometry"], "outline method")?;
+            one_of(
+                o.distance_mode.as_deref(),
+                &["screen"],
+                "outline distanceMode",
+            )?;
+            range(o.width, 0.0, 12.0, "outline width")?;
+            if let Some(c) = &o.color {
+                color(c)?;
+            }
+            if o.enabled == Some(true)
+                && s.surface.as_ref().and_then(|v| v.outline.as_deref()) == Some("none")
+            {
+                return Err(error(
+                    "OutlineStyle enabled conflicts with SurfaceStyle outline=none",
+                ));
             }
         }
         if let Some(l) = &s.lighting {
@@ -519,36 +572,6 @@ pub(crate) fn validate(graph: &GraphScript) -> Result<(), GraphParseError> {
             ] {
                 range(v, min, max, name)?;
             }
-        }
-    }
-    ids.clear();
-    for q in &graph.render_qualities {
-        if !ids.insert(&q.id) {
-            return Err(error(format!("Duplicate RenderQuality id {}", q.id)));
-        }
-        one_of(
-            q.preset.as_deref(),
-            &["web_low", "web_high", "desktop_high", "cinematic"],
-            "quality preset",
-        )?;
-        if let Some(v) = &q.resolution {
-            range(Some(v.scale), 0.25, 2.0, "render scale")?;
-        }
-        if let Some(v) = &q.shadows {
-            if !(128..=4096).contains(&v.resolution) {
-                return Err(error("Shadow resolution must be 128..4096"));
-            }
-            one_of(v.filtering.as_deref(), &["hard", "pcf"], "shadow filtering")?;
-        }
-        if let Some(v) = &q.ambient_occlusion {
-            one_of(
-                Some(&v.quality),
-                &["off", "low", "medium", "high"],
-                "AO quality",
-            )?;
-        }
-        if let Some(v) = &q.anti_aliasing {
-            one_of(Some(&v.mode), &["none", "fxaa"], "antiAliasing")?;
         }
     }
     for s in &graph.scenes {
@@ -602,7 +625,7 @@ pub(crate) fn lower(graph: &mut GraphScript) -> Result<(), GraphParseError> {
         })
         .collect::<Vec<_>>();
     for (scene, report) in graph.scenes.iter_mut().zip(reports) {
-        if scene.render_style.is_some() || scene.render_quality.is_some() {
+        if scene.render_style.is_some() {
             visit(&mut scene.children, &report);
             if let Some(id) = report.style_id.as_deref().and_then(|style_id| {
                 report

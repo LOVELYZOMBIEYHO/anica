@@ -37,13 +37,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GraphScript {
+    #[serde(default)]
+    pub audio_clips: Vec<crate::audio::AudioClipNode>,
+    #[serde(default)]
+    pub audio_targets: Vec<crate::audio::AudioTargetNode>,
     /// Scene visual resources; absence preserves the legacy renderer.
     #[serde(default)]
     pub render_styles: Vec<crate::render_style::RenderStyleNode>,
-    #[serde(default)]
-    pub render_qualities: Vec<crate::render_style::RenderQualityNode>,
     #[serde(skip)]
     pub raw_script: Option<String>,
     pub id: Option<String>,
@@ -292,7 +294,40 @@ pub struct CompoundAssetNode {
     pub rig: Option<String>,
     #[serde(default)]
     pub material_seed: Option<u64>,
+    /// Optional native skin settings preserve the existing rigid compound path.
+    #[serde(default)]
+    pub skin_binding: Option<NativeSkinBindingNode>,
     pub instances: Vec<CompoundAssetInstanceNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSkinBindingNode {
+    pub mode: String,
+    pub max_influences: u32,
+    pub falloff: f32,
+    pub normalize: bool,
+    #[serde(default)]
+    pub weight_regions: Vec<NativeWeightRegionNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeWeightRegionNode {
+    pub instance: String,
+    pub bone: String,
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub strength: f32,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSkinMode {
+    #[default]
+    Rigid,
+    Smooth,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -307,6 +342,11 @@ pub struct CompoundAssetInstanceNode {
     pub scale: f32,
     #[serde(default)]
     pub material_seed: Option<u64>,
+    /// Smooth is opt-in; omitted instances remain byte-compatible rigid parts.
+    #[serde(default)]
+    pub skin: NativeSkinMode,
+    #[serde(default)]
+    pub influences: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -562,9 +602,66 @@ pub enum PrimitiveColliderShape {
     Mesh,
 }
 
+/// Explicit polygon control cage shared by subdivision surfaces and semantic assets.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlCageNode {
+    pub positions: Vec<[f32; 3]>,
+    #[serde(default)]
+    pub uvs: Vec<[f32; 2]>,
+    pub pinned: Vec<bool>,
+    pub faces: Vec<Vec<u32>>,
+    pub subdivision: u32,
+}
+
+/// One measured horizontal section of a semantic head profile.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadSectionNode {
+    pub id: String,
+    pub at: f32,
+    pub width: f32,
+    pub front_depth: f32,
+    pub back_depth: f32,
+}
+
+/// Analytic crown parameters keep the generated pole smooth and deterministic.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadDomeNode {
+    pub start: f32,
+    pub top: f32,
+    pub center_depth: f32,
+    pub front_radius: f32,
+    pub back_radius: f32,
+    pub samples: u32,
+}
+
+/// Versioned settings for the reusable section/patch facial-cage generator.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FacialCageNode {
+    pub generator_version: u32,
+    pub segments: u32,
+    pub profile_segments: u32,
+    pub samples_per_section: u32,
+    pub subdivision: u32,
+    pub orbital_rings: u32,
+    pub mouth_rings: u32,
+    pub preserve_profile: bool,
+    pub uv_mode: String,
+}
+
+#[path = "dsl_control_cage.rs"]
+mod control_cage_parser;
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "shape")]
 pub enum PrimitiveGeometry {
+    /// Arbitrary explicit triangle/quad mesh with optional Catmull-Clark subdivision.
+    Mesh {
+        cage: ControlCageNode,
+    },
     Box {
         size: [f32; 3],
     },
@@ -611,11 +708,264 @@ pub enum PrimitiveGeometry {
         radius: f32,
         segments: u32,
     },
+    Loft {
+        segments: u32,
+        closed: bool,
+        cap_start: bool,
+        cap_end: bool,
+        sections: Vec<PrimitiveLoftSectionNode>,
+    },
+    Ribbon {
+        width: f32,
+        thickness: f32,
+        cap_start: bool,
+        cap_end: bool,
+        points: Vec<PrimitiveRibbonPointNode>,
+    },
+    /// Guide-authored hair remains representation-neutral even though V1
+    /// compiles it to retained card geometry.
+    HairCards {
+        representation_id: String,
+        bind_bone: Option<String>,
+        space: String,
+        length_segments: u32,
+        width_segments: u32,
+        thickness: f32,
+        cross_section: String,
+        tip_shape: String,
+        guides: Vec<HairGuideNode>,
+    },
+    /// Head surfaces use a species-neutral volume plus optional semantic
+    /// feature fields. Human face helpers are data, not a fixed topology.
+    HeadSurface {
+        archetype: String,
+        variant: Option<String>,
+        bind_bone: Option<String>,
+        symmetry: String,
+        topology: String,
+        segments: u32,
+        rings: u32,
+        head_shape: HeadShapeNode,
+        face_layout: Option<FaceLayoutNode>,
+        facial_cage: Option<FacialCageNode>,
+        head_profile: Vec<HeadSectionNode>,
+        head_dome: Option<HeadDomeNode>,
+        explicit_cage: Option<ControlCageNode>,
+        features: Vec<HeadFeatureNode>,
+        morph: HeadMorphNode,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveLoftSectionNode {
+    pub at: f32,
+    pub width: f32,
+    pub depth: f32,
+    pub profile: String,
+    pub offset: [f32; 2],
+    pub rotation: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveRibbonPointNode {
+    pub position: [f32; 3],
+    pub width: Option<f32>,
+    pub thickness: Option<f32>,
+    pub roll: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HairGuideNode {
+    pub id: String,
+    pub group: String,
+    pub role: String,
+    /// Optional outward root direction, projected onto the root tangent plane.
+    #[serde(default)]
+    pub normal: Option<[f32; 3]>,
+    pub points: Vec<HairPointNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HairPointNode {
+    pub position: [f32; 3],
+    pub width: f32,
+    pub radius: f32,
+    pub camber: f32,
+    pub roll: f32,
+    pub stiffness: f32,
+}
+
+/// Species-neutral cranium and jaw proportions. These values do not assume a
+/// human face and can also describe mammal, reptile, or invented head volumes.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadShapeNode {
+    pub size: [f32; 3],
+    pub forehead: f32,
+    pub cheek_width: f32,
+    pub jaw_width: f32,
+    pub chin_length: f32,
+    pub chin_roundness: f32,
+}
+
+/// Explicit facial components with independent IDs and arbitrary component counts.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaceLayoutNode {
+    pub eyebrows: Vec<EyebrowNode>,
+    pub eyes: Vec<EyeNode>,
+    pub noses: Vec<NoseNode>,
+    pub mouths: Vec<MouthNode>,
+    pub ears: Vec<EarNode>,
+}
+
+/// A surface-attached eyebrow ribbon generated in head-local coordinates.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EyebrowNode {
+    pub id: String,
+    pub position: [f32; 3],
+    pub width: f32,
+    pub thickness: f32,
+    pub arch: f32,
+    pub tilt: f32,
+    pub texture: Option<FaceTextureNode>,
+}
+
+/// Image binding in the owning component's UV space.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FaceTextureNode {
+    pub asset: String,
+    /// Resolved through the same asset resolver as material textures.
+    pub source: Option<String>,
+    pub offset: [f32; 2],
+    pub scale: [f32; 2],
+    pub rotation: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EyeNode {
+    pub id: String,
+    pub position: [f32; 3],
+    pub width: f32,
+    pub opening: f32,
+    pub tilt: f32,
+    pub socket_width: f32,
+    pub socket_height: f32,
+    pub socket_depth: f32,
+    pub texture: Option<FaceTextureNode>,
+    pub iris: Option<IrisNode>,
+    pub eyeliners: Vec<EyelinerNode>,
+}
+
+/// Optional iris disc attached to an eye's generated eyeball.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IrisNode {
+    pub id: String,
+    /// Eye-local offset; X/Y move the iris across the eyeball and Z lifts it.
+    pub position: [f32; 3],
+    pub shape: String,
+    /// Geometry scale applied to radius before the nested Texture transform.
+    pub scale: [f32; 2],
+    pub radius: f32,
+    pub pupil_radius: f32,
+    pub texture: Option<FaceTextureNode>,
+}
+
+/// One independently authored ribbon attached to an upper or lower eyelid edge.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EyelinerNode {
+    pub id: String,
+    pub edge: String,
+    pub thickness: f32,
+    pub span: [f32; 2],
+    pub taper: [f32; 2],
+    pub extension: [f32; 2],
+    pub tip_lift: [f32; 2],
+    pub texture: Option<FaceTextureNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoseNode {
+    pub id: String,
+    pub position: [f32; 3],
+    pub length: f32,
+    pub width: f32,
+    pub projection: f32,
+    pub texture: Option<FaceTextureNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MouthNode {
+    pub id: String,
+    pub position: [f32; 3],
+    pub width: f32,
+    pub opening: f32,
+    pub upper_lip: f32,
+    pub lower_lip: f32,
+    pub muzzle_length: f32,
+    pub muzzle_width: f32,
+    pub texture: Option<FaceTextureNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarNode {
+    pub id: String,
+    pub position: [f32; 3],
+    pub width: f32,
+    pub height: f32,
+    pub depth: f32,
+    pub texture: Option<FaceTextureNode>,
+}
+
+#[path = "dsl_face_layout.rs"]
+mod face_layout_parser;
+
+/// One continuous deformation field on the base head surface. The open string
+/// kind allows future anatomy without changing the serialized representation.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadFeatureNode {
+    pub id: String,
+    pub kind: String,
+    pub center: [f32; 3],
+    pub size: [f32; 3],
+    pub amount: f32,
+    pub offset: [f32; 3],
+    pub falloff: String,
+    pub mirror_x: bool,
+}
+
+/// Non-destructive proportions are kept separate from authored anatomy so one
+/// head definition can be varied without moving every feature by hand.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadMorphNode {
+    pub head_width: f32,
+    pub head_height: f32,
+    pub head_depth: f32,
+    pub face_width: f32,
+    pub face_height: f32,
+    pub jaw_width: f32,
+    pub muzzle_length: f32,
+    pub feature_scale: f32,
 }
 
 impl PrimitiveGeometry {
     pub fn shape_name(&self) -> &'static str {
         match self {
+            Self::Mesh { .. } => "mesh",
             Self::Box { .. } => "box",
             Self::Sphere { .. } => "sphere",
             Self::Capsule { .. } => "capsule",
@@ -626,11 +976,24 @@ impl PrimitiveGeometry {
             Self::Ellipsoid { .. } => "ellipsoid",
             Self::Frustum { .. } => "frustum",
             Self::RoundedBox { .. } => "roundedBox",
+            Self::Loft { .. } => "loft",
+            Self::Ribbon { .. } => "ribbon",
+            Self::HairCards { .. } => "hairCards",
+            Self::HeadSurface { .. } => "headSurface",
         }
     }
 
     pub fn triangle_count(&self) -> usize {
         match self {
+            Self::Mesh { cage } => {
+                if cage.subdivision == 0 {
+                    cage.faces.iter().map(|f| f.len() - 2).sum()
+                } else {
+                    cage.faces.iter().map(Vec::len).sum::<usize>()
+                        * 2
+                        * 4usize.pow(cage.subdivision - 1)
+                }
+            }
             Self::Box { .. } => 12,
             Self::Sphere {
                 segments, rings, ..
@@ -653,6 +1016,33 @@ impl PrimitiveGeometry {
                 let samples = segments * 2 + 1;
                 (samples * samples * 12) as usize
             }
+            Self::Loft {
+                segments,
+                sections,
+                cap_start,
+                cap_end,
+                ..
+            } => {
+                let sides = sections.len().saturating_sub(1) * *segments as usize * 2;
+                sides
+                    + usize::from(*cap_start) * *segments as usize
+                    + usize::from(*cap_end) * *segments as usize
+            }
+            Self::Ribbon { points, .. } => points.len().saturating_sub(1) * 8,
+            Self::HairCards {
+                length_segments,
+                width_segments,
+                guides,
+                ..
+            } => {
+                guides.len()
+                    * (*length_segments as usize * *width_segments as usize * 4
+                        + *length_segments as usize * 4
+                        + *width_segments as usize * 4)
+            }
+            Self::HeadSurface {
+                segments, rings, ..
+            } => (*segments * *rings * 2) as usize,
         }
     }
 }
@@ -1127,7 +1517,6 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut svgs = Vec::<SvgNode>::new();
     let mut scenes = Vec::<SceneRootNode>::new();
     let mut render_styles = Vec::new();
-    let mut render_qualities = Vec::new();
     let mut scene_nodes = Vec::<SceneNode>::new();
     let mut model_profiles = Vec::<ModelProfileNode>::new();
     let mut skeletons = Vec::<SkeletonNode>::new();
@@ -1136,6 +1525,8 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut apply_actions = Vec::<ApplyActionNode>::new();
     let mut contact_surfaces = Vec::<ContactSurfaceNode>::new();
     let mut scene_constraints = Vec::<SceneConstraintNode>::new();
+    let mut audio_clips = Vec::new();
+    let mut audio_targets = Vec::new();
     let mut animation_targets = Vec::<AnimationTargetNode>::new();
     let mut layers = Vec::<LayerNode>::new();
     let mut processes = Vec::<ProcessDefinitionNode>::new();
@@ -1187,22 +1578,19 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
             continue;
         }
 
-        if starts_open_tag(line, "RenderStyle") || starts_open_tag(line, "RenderQuality") {
-            let quality = starts_open_tag(line, "RenderQuality");
-            let (value, end_ix) = crate::render_style::parse_resource(&lines, i, quality)?;
-            if quality {
-                render_qualities.push(serde_json::from_value(value).map_err(|e| {
-                    GraphParseError {
-                        line: i + 1,
-                        message: e.to_string(),
-                    }
-                })?);
-            } else {
-                render_styles.push(serde_json::from_value(value).map_err(|e| GraphParseError {
-                    line: i + 1,
-                    message: e.to_string(),
-                })?);
-            }
+        if starts_open_tag(line, "RenderQuality") {
+            return Err(GraphParseError {
+                line: i + 1,
+                message: "RenderQuality is not supported".into(),
+            });
+        }
+
+        if starts_open_tag(line, "RenderStyle") {
+            let (value, end_ix) = crate::render_style::parse_resource(&lines, i)?;
+            render_styles.push(serde_json::from_value(value).map_err(|e| GraphParseError {
+                line: i + 1,
+                message: e.to_string(),
+            })?);
             i = end_ix + 1;
             continue;
         }
@@ -1286,6 +1674,19 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
             continue;
         }
 
+        // Keep audio separate from visual animation property lowering.
+        if starts_open_tag(line, "AudioClip") {
+            let (tag, end) = collect_self_closing_block(&lines, i)?;
+            audio_clips.push(audio_parser::clip(&tag, i + 1)?);
+            i = end + 1;
+            continue;
+        }
+        if starts_open_tag(line, "AudioTarget") {
+            let (target, end) = audio_parser::target(&lines, i, fps)?;
+            audio_targets.push(target);
+            i = end + 1;
+            continue;
+        }
         if starts_open_tag(line, "AnimationTarget") {
             let (target, end_ix) = parse_animation_target_block(&lines, i, fps)?;
             animation_targets.push(target);
@@ -1570,8 +1971,9 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     )?;
 
     let mut graph = GraphScript {
+        audio_clips,
+        audio_targets,
         render_styles,
-        render_qualities,
         raw_script: Some(input.to_string()),
         id: id.clone(),
         version,
@@ -1607,6 +2009,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         outputs,
         present,
     };
+    crate::audio::compile_audio_plan(&graph)?;
     crate::render_style::lower(&mut graph)?;
     crate::render_graph::compile_render_pass_dag(&graph)?;
     Ok(graph)
@@ -1785,6 +2188,9 @@ pub fn parse_action_library_document(input: &str) -> Result<Vec<ActionNode>, Gra
     }
     Ok(actions)
 }
+
+#[path = "audio/dsl.rs"]
+mod audio_parser;
 
 fn parse_animation_target_block(
     lines: &[&str],
@@ -2076,11 +2482,11 @@ fn validate_graph(
 
     for compound in assets.iter().filter_map(GraphAssetNode::compound) {
         let Some(rig_id) = compound.rig.as_deref() else {
-            if compound
-                .instances
-                .iter()
-                .any(|instance| instance.bone.is_some())
-            {
+            if compound.instances.iter().any(|instance| {
+                instance.bone.is_some()
+                    || instance.skin == NativeSkinMode::Smooth
+                    || !instance.influences.is_empty()
+            }) {
                 return Err(GraphParseError {
                     line,
                     message: format!(
@@ -2120,6 +2526,87 @@ fn validate_graph(
                         compound.id, instance.id, bone, rig_id
                     ),
                 });
+            }
+            if instance.skin == NativeSkinMode::Smooth && compound.skin_binding.is_none() {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "CompoundAsset {} Instance {} uses skin=\"smooth\" but the asset has no SkinBinding.",
+                        compound.id, instance.id
+                    ),
+                });
+            }
+            if instance.skin == NativeSkinMode::Smooth && instance.bone.is_none() {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "CompoundAsset {} Instance {} uses skin=\"smooth\" but has no primary bone.",
+                        compound.id, instance.id
+                    ),
+                });
+            }
+            if !instance.influences.is_empty() && instance.skin != NativeSkinMode::Smooth {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "CompoundAsset {} Instance {} declares influences but does not use skin=\"smooth\".",
+                        compound.id, instance.id
+                    ),
+                });
+            }
+            for influence in &instance.influences {
+                if !skeleton
+                    .bones
+                    .iter()
+                    .any(|candidate| candidate.id == *influence)
+                {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "CompoundAsset {} Instance {} references unknown influence bone {} in rig {}.",
+                            compound.id, instance.id, influence, rig_id
+                        ),
+                    });
+                }
+            }
+        }
+        if let Some(binding) = &compound.skin_binding {
+            for region in &binding.weight_regions {
+                let Some(instance) = compound
+                    .instances
+                    .iter()
+                    .find(|instance| instance.id == region.instance)
+                else {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "CompoundAsset {} WeightRegion references unknown Instance {}.",
+                            compound.id, region.instance
+                        ),
+                    });
+                };
+                if instance.skin != NativeSkinMode::Smooth {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "CompoundAsset {} WeightRegion targets rigid Instance {}.",
+                            compound.id, region.instance
+                        ),
+                    });
+                }
+                if !skeleton
+                    .bones
+                    .iter()
+                    .any(|candidate| candidate.id == region.bone)
+                {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "CompoundAsset {} WeightRegion references unknown bone {} in rig {}.",
+                            compound.id, region.bone, rig_id
+                        ),
+                    });
+                }
             }
         }
     }
@@ -2694,6 +3181,12 @@ fn parse_assets_block(
             (GraphAssetKind::Animation, "AnimationAsset")
         } else if starts_open_tag(line, "PrimitiveAsset") {
             (GraphAssetKind::Model, "PrimitiveAsset")
+        } else if starts_open_tag(line, "HairAsset") {
+            (GraphAssetKind::Model, "HairAsset")
+        } else if starts_open_tag(line, "MeshAsset") {
+            (GraphAssetKind::Model, "MeshAsset")
+        } else if starts_open_tag(line, "HeadAsset") {
+            (GraphAssetKind::Model, "HeadAsset")
         } else if starts_open_tag(line, "TerrainAsset") {
             (GraphAssetKind::Model, "TerrainAsset")
         } else if starts_open_tag(line, "VegetationAsset") {
@@ -2704,7 +3197,7 @@ fn parse_assets_block(
             return Err(GraphParseError {
                 line: i + 1,
                 message: format!(
-                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <PrimitiveAsset>, <TerrainAsset>, <VegetationAsset>, <CompoundAsset>, <MaterialAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
+                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <PrimitiveAsset>, <HairAsset>, <HeadAsset>, <MeshAsset>, <TerrainAsset>, <VegetationAsset>, <CompoundAsset>, <MaterialAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
                 ),
             });
         };
@@ -2728,6 +3221,38 @@ fn parse_assets_block(
                 id: primitive.id.clone(),
                 kind,
                 source: GraphAssetSource::Primitive(primitive),
+                decoder: None,
+                color_space: None,
+                profile: None,
+                clip: None,
+            });
+            i = end_ix + 1;
+            continue;
+        }
+        if tag_name == "HairAsset" {
+            let (hair, end_ix) = parse_hair_asset_block(lines, i)?;
+            assets.push(GraphAssetNode {
+                id: hair.id.clone(),
+                kind,
+                source: GraphAssetSource::Primitive(hair),
+                decoder: None,
+                color_space: None,
+                profile: None,
+                clip: None,
+            });
+            i = end_ix + 1;
+            continue;
+        }
+        if tag_name == "HeadAsset" || tag_name == "MeshAsset" {
+            let (head, end_ix) = if tag_name == "MeshAsset" {
+                control_cage_parser::parse_mesh_asset(lines, i)?
+            } else {
+                parse_head_asset_block(lines, i)?
+            };
+            assets.push(GraphAssetNode {
+                id: head.id.clone(),
+                kind,
+                source: GraphAssetSource::Primitive(head),
                 decoder: None,
                 color_space: None,
                 profile: None,
@@ -2845,6 +3370,17 @@ fn parse_primitive_asset_block(
     let id = strip_wrappers(&required_attr_value(&open_tag, "id", start + 1)?).to_string();
     let mut primitive = parse_primitive_asset(&open_tag, &id, start + 1)?;
     if is_self_closing_tag(&open_tag) {
+        if matches!(
+            primitive.geometry,
+            PrimitiveGeometry::Loft { .. } | PrimitiveGeometry::Ribbon { .. }
+        ) {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "PrimitiveAsset \"{id}\" requires a nested Loft or Ribbon geometry block."
+                ),
+            });
+        }
         validate_primitive_build_budget(&primitive, start + 1)?;
         return Ok((primitive, open_end_ix));
     }
@@ -2854,6 +3390,7 @@ fn parse_primitive_asset_block(
     let mut saw_modifiers = false;
     let mut saw_mesh_build = false;
     let mut saw_lod = false;
+    let mut saw_geometry_block = false;
     while index < close_ix {
         let line = lines[index].trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
@@ -2901,15 +3438,1308 @@ fn parse_primitive_asset_block(
             index = end_ix + 1;
             continue;
         }
+        if starts_open_tag(line, "Loft") {
+            if saw_geometry_block || !matches!(primitive.geometry, PrimitiveGeometry::Loft { .. }) {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "PrimitiveAsset \"{id}\" accepts one <Loft> block only when shape=\"loft\"."
+                    ),
+                });
+            }
+            let (geometry, end_ix) = parse_primitive_loft(lines, index, &id)?;
+            primitive.geometry = geometry;
+            saw_geometry_block = true;
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Ribbon") {
+            if saw_geometry_block || !matches!(primitive.geometry, PrimitiveGeometry::Ribbon { .. })
+            {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "PrimitiveAsset \"{id}\" accepts one <Ribbon> block only when shape=\"ribbon\"."
+                    ),
+                });
+            }
+            let (geometry, end_ix) = parse_primitive_ribbon(lines, index, &id)?;
+            primitive.geometry = geometry;
+            saw_geometry_block = true;
+            index = end_ix + 1;
+            continue;
+        }
         return Err(GraphParseError {
             line: index + 1,
             message: format!(
-                "PrimitiveAsset \"{id}\" accepts <Modifiers>, <MeshBuild />, or <LOD /> children, got: {line}"
+                "PrimitiveAsset \"{id}\" accepts its Loft/Ribbon geometry block, <Modifiers>, <MeshBuild />, or <LOD /> children, got: {line}"
+            ),
+        });
+    }
+    if matches!(
+        primitive.geometry,
+        PrimitiveGeometry::Loft { .. } | PrimitiveGeometry::Ribbon { .. }
+    ) && !saw_geometry_block
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{id}\" requires a matching Loft or Ribbon geometry block."
             ),
         });
     }
     validate_primitive_build_budget(&primitive, start + 1)?;
     Ok((primitive, close_ix))
+}
+
+/// Parse a procedural head as a generic anatomy surface. FaceLayout is an
+/// optional convenience block; custom and creature heads can use only fields.
+fn parse_head_asset_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(PrimitiveAssetNode, usize), GraphParseError> {
+    let (tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    if is_self_closing_tag(&tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "HeadAsset requires a HeadShape child.".to_string(),
+        });
+    }
+    validate_head_attributes(
+        &tag,
+        &[
+            "id",
+            "material",
+            "archetype",
+            "variant",
+            "bindBone",
+            "symmetry",
+            "topology",
+            "segments",
+            "rings",
+            "seed",
+        ],
+        "HeadAsset",
+        start + 1,
+    )?;
+    let id = strip_wrappers(&required_attr_value(&tag, "id", start + 1)?).to_string();
+    let material = strip_wrappers(&required_attr_value(&tag, "material", start + 1)?).to_string();
+    let archetype = strip_wrappers(&required_attr_value(&tag, "archetype", start + 1)?)
+        .trim()
+        .to_ascii_lowercase();
+    if archetype.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HeadAsset \"{id}\" archetype must not be empty."),
+        });
+    }
+    let variant = attr_value(&tag, "variant").map(|raw| strip_wrappers(&raw).to_string());
+    let bind_bone = attr_value(&tag, "bindBone").map(|raw| strip_wrappers(&raw).to_string());
+    let symmetry = primitive_string_attribute(&tag, "symmetry", "x");
+    if !matches!(symmetry.as_str(), "x" | "none") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HeadAsset \"{id}\" symmetry must be x or none."),
+        });
+    }
+    let topology = primitive_string_attribute(&tag, "topology", "procedural");
+    if !matches!(topology.as_str(), "procedural" | "facialcage" | "explicit") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "HeadAsset \"{id}\" topology must be procedural, facialCage, or explicit."
+            ),
+        });
+    }
+    if topology != "procedural"
+        && (attr_value(&tag, "segments").is_some() || attr_value(&tag, "rings").is_some())
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "HeadAsset \"{id}\" segments/rings apply only to procedural topology; use FacialCage segments for facialCage topology."
+            ),
+        });
+    }
+    let segments = parse_optional_primitive_u32(&tag, "segments", &id, start + 1)?.unwrap_or(48);
+    let rings = parse_optional_primitive_u32(&tag, "rings", &id, start + 1)?.unwrap_or(32);
+    let maximum_resolution = 128;
+    if !(12..=maximum_resolution).contains(&segments) || !(8..=maximum_resolution).contains(&rings)
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "HeadAsset \"{id}\" requires segments 12..{maximum_resolution} and rings 8..{maximum_resolution}."
+            ),
+        });
+    }
+    let material_seed = parse_optional_primitive_u64(&tag, "seed", &id, start + 1)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "HeadAsset")?;
+    let mut shape = None;
+    let mut face_layout = None;
+    let mut morph = None;
+    let mut facial_cage = None;
+    let mut head_profile = Vec::new();
+    let mut head_dome = None;
+    let mut explicit_cage = None;
+    let mut features = Vec::new();
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if starts_open_tag(line, "HeadProfile") {
+            if !head_profile.is_empty() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one HeadProfile."),
+                });
+            }
+            let (profile, end_ix) = parse_head_profile(lines, index, &id)?;
+            head_profile = profile;
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "HeadCage") {
+            if explicit_cage.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one HeadCage."),
+                });
+            }
+            let (cage, end_ix) = control_cage_parser::parse_head_cage(lines, index, &id)?;
+            explicit_cage = Some(cage);
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "FaceLayout") {
+            if face_layout.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one FaceLayout."),
+                });
+            }
+            let (layout, end) = face_layout_parser::parse(lines, index, &id)?;
+            face_layout = Some(layout);
+            index = end + 1;
+            continue;
+        }
+        let (child, end_ix) = collect_self_closing_block(lines, index)?;
+        if starts_open_tag(line, "HeadShape") {
+            if shape.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one HeadShape."),
+                });
+            }
+            shape = Some(parse_head_shape(&child, &id, index + 1)?);
+        } else if starts_open_tag(line, "FacialCage") {
+            if facial_cage.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one FacialCage."),
+                });
+            }
+            facial_cage = Some(parse_facial_cage(&child, &id, index + 1)?);
+        } else if starts_open_tag(line, "HeadDome") {
+            if head_dome.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one HeadDome."),
+                });
+            }
+            head_dome = Some(parse_head_dome(&child, &id, index + 1)?);
+        } else if starts_open_tag(line, "HeadMorph") {
+            if morph.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HeadAsset \"{id}\" may contain one HeadMorph."),
+                });
+            }
+            morph = Some(parse_head_morph(&child, &id, index + 1)?);
+        } else if starts_open_tag(line, "HeadFeature") {
+            features.push(parse_head_feature(&child, &id, index + 1)?);
+        } else {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "HeadAsset \"{id}\" accepts HeadShape, FaceLayout, FacialCage, HeadProfile, HeadDome, HeadCage, HeadMorph, and HeadFeature children, got: {line}"
+                ),
+            });
+        }
+        index = end_ix + 1;
+    }
+    let shape = shape.ok_or_else(|| GraphParseError {
+        line: start + 1,
+        message: format!("HeadAsset \"{id}\" requires HeadShape."),
+    })?;
+    match topology.as_str() {
+        "facialcage"
+            if facial_cage.is_none() || head_profile.len() < 2 || face_layout.is_none() =>
+        {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "HeadAsset \"{id}\" facialCage topology requires FacialCage, FaceLayout, and at least two HeadSection children."
+                ),
+            });
+        }
+        "explicit" if explicit_cage.is_none() => {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!("HeadAsset \"{id}\" explicit topology requires HeadCage."),
+            });
+        }
+        "procedural" if facial_cage.is_some() || explicit_cage.is_some() => {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "HeadAsset \"{id}\" procedural topology cannot contain FacialCage or HeadCage."
+                ),
+            });
+        }
+        _ => {}
+    }
+    if topology == "facialcage" {
+        let face = face_layout.as_ref().expect("validated facial cage layout");
+        crate::world::primitive::validate_facial_layout(
+            facial_cage.as_ref().expect("validated settings"),
+            &head_profile,
+            head_dome.as_ref(),
+            face,
+        )
+        .map_err(|error| GraphParseError {
+            line: start + 1,
+            message: format!("HeadAsset \"{id}\": {error}"),
+        })?;
+        let min_y = head_profile.first().expect("validated profile").at;
+        let max_y = head_dome
+            .as_ref()
+            .map(|dome| dome.top)
+            .unwrap_or_else(|| head_profile.last().expect("validated profile").at);
+        let max_half_width = head_profile
+            .iter()
+            .map(|section| section.width * 0.5)
+            .fold(0.0_f32, f32::max);
+        let positive = true;
+        let inside = face.eyes.iter().all(|eye| {
+            eye.position[0].abs() + eye.socket_width * 0.5 < max_half_width
+                && eye.position[1] - eye.socket_height * 0.5 > min_y
+                && eye.position[1] + eye.socket_height * 0.5 < max_y
+        }) && face.mouths.iter().all(|mouth| {
+            mouth.position[0].abs() + (mouth.width * 0.5 * 3.488_372).max(0.08) < max_half_width
+                && mouth.position[1] - (mouth.opening * 0.5 * 14.285_714).max(0.04) > min_y
+                && mouth.position[1] + (mouth.opening * 0.5 * 14.285_714).max(0.04) < max_y
+        });
+        if !positive || !inside {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "HeadAsset \"{id}\" facial features must have positive dimensions and fit inside HeadProfile/HeadDome bounds."
+                ),
+            });
+        }
+    }
+    let mut feature_ids = HashSet::new();
+    if let Some(duplicate) = features
+        .iter()
+        .find(|feature| !feature_ids.insert(feature.id.clone()))
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "HeadAsset \"{id}\" has duplicate HeadFeature id \"{}\".",
+                duplicate.id
+            ),
+        });
+    }
+    let primitive = PrimitiveAssetNode {
+        id,
+        geometry: PrimitiveGeometry::HeadSurface {
+            archetype,
+            variant,
+            bind_bone,
+            symmetry,
+            topology,
+            segments,
+            rings,
+            head_shape: shape,
+            face_layout,
+            facial_cage,
+            head_profile,
+            head_dome,
+            explicit_cage,
+            features,
+            morph: morph.unwrap_or_else(default_head_morph),
+        },
+        color: [1.0; 4],
+        material: Some(material),
+        material_definition: None,
+        bevel_radius: 0.0,
+        bevel_segments: 0,
+        material_seed,
+        collision: PrimitiveCollisionNode::default(),
+        modifiers: Vec::new(),
+        mesh_build: PrimitiveMeshBuildNode::default(),
+        lod: PrimitiveLodNode::default(),
+    };
+    Ok((primitive, close_ix))
+}
+
+fn parse_facial_cage(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<FacialCageNode, GraphParseError> {
+    validate_head_attributes(
+        tag,
+        &[
+            "generatorVersion",
+            "segments",
+            "profileSegments",
+            "samplesPerSection",
+            "subdivision",
+            "orbitalRings",
+            "mouthRings",
+            "preserveProfile",
+            "uvMode",
+        ],
+        "FacialCage",
+        line,
+    )?;
+    let positive = |name: &str, default: u32| {
+        parse_optional_primitive_u32(tag, name, asset_id, line).map(|v| v.unwrap_or(default))
+    };
+    let preserve_profile = primitive_string_attribute(tag, "preserveProfile", "true");
+    if !matches!(preserve_profile.as_str(), "true" | "false") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "HeadAsset \"{asset_id}\" FacialCage preserveProfile must be true or false."
+            ),
+        });
+    }
+    let result = FacialCageNode {
+        generator_version: positive("generatorVersion", 1)?,
+        segments: positive("segments", 96)?,
+        profile_segments: positive("profileSegments", 96)?,
+        samples_per_section: positive("samplesPerSection", 6)?,
+        subdivision: positive("subdivision", 1)?,
+        orbital_rings: positive("orbitalRings", 10)?,
+        mouth_rings: positive("mouthRings", 8)?,
+        preserve_profile: preserve_profile == "true",
+        uv_mode: primitive_string_attribute(tag, "uvMode", "frontBack"),
+    };
+    if result.generator_version != 1
+        || !(12..=256).contains(&result.segments)
+        || !(12..=256).contains(&result.profile_segments)
+        || !(1..=32).contains(&result.samples_per_section)
+        || result.subdivision > 2
+        || !(2..=32).contains(&result.orbital_rings)
+        || !(2..=32).contains(&result.mouth_rings)
+        || !matches!(result.uv_mode.as_str(), "fallbackxy" | "frontback")
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!("HeadAsset \"{asset_id}\" has invalid FacialCage limits."),
+        });
+    }
+    Ok(result)
+}
+
+fn parse_head_dome(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<HeadDomeNode, GraphParseError> {
+    validate_head_attributes(
+        tag,
+        &[
+            "start",
+            "top",
+            "centerDepth",
+            "frontRadius",
+            "backRadius",
+            "samples",
+        ],
+        "HeadDome",
+        line,
+    )?;
+    let result = HeadDomeNode {
+        start: parse_finite_primitive_number(tag, "start", asset_id, line)?,
+        top: parse_finite_primitive_number(tag, "top", asset_id, line)?,
+        center_depth: parse_finite_primitive_number(tag, "centerDepth", asset_id, line)?,
+        front_radius: parse_positive_primitive_number(tag, "frontRadius", asset_id, line)?,
+        back_radius: parse_positive_primitive_number(tag, "backRadius", asset_id, line)?,
+        samples: parse_optional_primitive_u32(tag, "samples", asset_id, line)?.unwrap_or(80),
+    };
+    if result.top <= result.start || !(4..=256).contains(&result.samples) {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "HeadAsset \"{asset_id}\" HeadDome requires top > start and samples 4..256."
+            ),
+        });
+    }
+    Ok(result)
+}
+
+fn parse_head_profile(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(Vec<HeadSectionNode>, usize), GraphParseError> {
+    let (tag, open) = collect_tag_block(lines, start, '>', false)?;
+    validate_head_attributes(&tag, &[], "HeadProfile", start + 1)?;
+    let end = find_matching_close_tag(lines, open + 1, "HeadProfile")?;
+    let mut sections = Vec::new();
+    let mut index = open + 1;
+    while index < end {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("<!--") || line.starts_with("//") {
+            index += 1;
+            continue;
+        }
+        let (child, child_end) = collect_self_closing_block(lines, index)?;
+        if !starts_open_tag(line, "HeadSection") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: "HeadProfile accepts HeadSection children only.".into(),
+            });
+        }
+        validate_head_attributes(
+            &child,
+            &["id", "at", "width", "frontDepth", "backDepth"],
+            "HeadSection",
+            index + 1,
+        )?;
+        sections.push(HeadSectionNode {
+            id: strip_wrappers(&required_attr_value(&child, "id", index + 1)?).into(),
+            at: parse_finite_primitive_number(&child, "at", asset_id, index + 1)?,
+            width: parse_positive_primitive_number(&child, "width", asset_id, index + 1)?,
+            front_depth: parse_finite_primitive_number(&child, "frontDepth", asset_id, index + 1)?,
+            back_depth: parse_finite_primitive_number(&child, "backDepth", asset_id, index + 1)?,
+        });
+        index = child_end + 1;
+    }
+    if sections.windows(2).any(|pair| pair[0].at >= pair[1].at)
+        || sections
+            .iter()
+            .any(|section| section.front_depth <= section.back_depth)
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "HeadAsset \"{asset_id}\" HeadSections must ascend and keep frontDepth > backDepth."
+            ),
+        });
+    }
+    Ok((sections, end))
+}
+
+fn parse_head_shape(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<HeadShapeNode, GraphParseError> {
+    validate_head_attributes(
+        tag,
+        &[
+            "size",
+            "forehead",
+            "cheekWidth",
+            "jawWidth",
+            "chinLength",
+            "chinRoundness",
+        ],
+        "HeadShape",
+        line,
+    )?;
+    Ok(HeadShapeNode {
+        size: parse_primitive_vec::<3>(tag, "size", asset_id, line)?,
+        forehead: parse_optional_positive_primitive_number(tag, "forehead", asset_id, line)?
+            .unwrap_or(1.0),
+        cheek_width: parse_optional_positive_primitive_number(tag, "cheekWidth", asset_id, line)?
+            .unwrap_or(1.0),
+        jaw_width: parse_optional_positive_primitive_number(tag, "jawWidth", asset_id, line)?
+            .unwrap_or(0.78),
+        chin_length: parse_optional_nonnegative_primitive_number(
+            tag,
+            "chinLength",
+            asset_id,
+            line,
+        )?
+        .unwrap_or(0.08),
+        chin_roundness: parse_unit_head_number(tag, "chinRoundness", asset_id, line, 0.7)?,
+    })
+}
+
+fn parse_head_feature(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<HeadFeatureNode, GraphParseError> {
+    validate_head_attributes(
+        tag,
+        &[
+            "id", "kind", "center", "size", "amount", "offset", "falloff", "mirror",
+        ],
+        "HeadFeature",
+        line,
+    )?;
+    let id = strip_wrappers(&required_attr_value(tag, "id", line)?).to_string();
+    let kind = strip_wrappers(&required_attr_value(tag, "kind", line)?)
+        .trim()
+        .to_ascii_lowercase();
+    if kind.is_empty() {
+        return Err(GraphParseError {
+            line,
+            message: format!("HeadAsset \"{asset_id}\" HeadFeature kind must not be empty."),
+        });
+    }
+    let falloff = primitive_string_attribute(tag, "falloff", "smooth");
+    if !matches!(falloff.as_str(), "smooth" | "linear" | "sharp") {
+        return Err(GraphParseError {
+            line,
+            message: format!(
+                "HeadAsset \"{asset_id}\" HeadFeature falloff must be smooth, linear, or sharp."
+            ),
+        });
+    }
+    let mirror = primitive_string_attribute(tag, "mirror", "none");
+    if !matches!(mirror.as_str(), "none" | "x") {
+        return Err(GraphParseError {
+            line,
+            message: format!("HeadAsset \"{asset_id}\" HeadFeature mirror must be none or x."),
+        });
+    }
+    Ok(HeadFeatureNode {
+        id,
+        kind,
+        center: parse_optional_primitive_vec::<3>(tag, "center", asset_id, line, false)?
+            .ok_or_else(|| GraphParseError {
+                line,
+                message: format!("HeadAsset \"{asset_id}\" HeadFeature requires center."),
+            })?,
+        size: parse_primitive_vec::<3>(tag, "size", asset_id, line)?,
+        amount: parse_head_number(tag, "amount", asset_id, line, 0.0)?,
+        offset: parse_optional_primitive_vec::<3>(tag, "offset", asset_id, line, false)?
+            .unwrap_or([0.0; 3]),
+        falloff,
+        mirror_x: mirror == "x",
+    })
+}
+
+fn parse_head_morph(
+    tag: &str,
+    asset_id: &str,
+    line: usize,
+) -> Result<HeadMorphNode, GraphParseError> {
+    validate_head_attributes(
+        tag,
+        &[
+            "headWidth",
+            "headHeight",
+            "headDepth",
+            "faceWidth",
+            "faceHeight",
+            "jawWidth",
+            "muzzleLength",
+            "featureScale",
+        ],
+        "HeadMorph",
+        line,
+    )?;
+    let mut value = default_head_morph();
+    for (attribute, target) in [
+        ("headWidth", &mut value.head_width),
+        ("headHeight", &mut value.head_height),
+        ("headDepth", &mut value.head_depth),
+        ("faceWidth", &mut value.face_width),
+        ("faceHeight", &mut value.face_height),
+        ("jawWidth", &mut value.jaw_width),
+        ("muzzleLength", &mut value.muzzle_length),
+        ("featureScale", &mut value.feature_scale),
+    ] {
+        if let Some(parsed) =
+            parse_optional_positive_primitive_number(tag, attribute, asset_id, line)?
+        {
+            *target = parsed;
+        }
+    }
+    Ok(value)
+}
+
+fn default_head_morph() -> HeadMorphNode {
+    HeadMorphNode {
+        head_width: 1.0,
+        head_height: 1.0,
+        head_depth: 1.0,
+        face_width: 1.0,
+        face_height: 1.0,
+        jaw_width: 1.0,
+        muzzle_length: 1.0,
+        feature_scale: 1.0,
+    }
+}
+
+fn parse_head_number(
+    tag: &str,
+    attribute: &str,
+    asset_id: &str,
+    line: usize,
+    default: f32,
+) -> Result<f32, GraphParseError> {
+    attr_value(tag, attribute)
+        .map(|_| parse_finite_primitive_number(tag, attribute, asset_id, line))
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn parse_unit_head_number(
+    tag: &str,
+    attribute: &str,
+    asset_id: &str,
+    line: usize,
+    default: f32,
+) -> Result<f32, GraphParseError> {
+    let value = parse_head_number(tag, attribute, asset_id, line, default)?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(GraphParseError {
+            line,
+            message: format!("HeadAsset \"{asset_id}\" {attribute} must be from zero through one."),
+        });
+    }
+    Ok(value)
+}
+
+fn validate_head_attributes(
+    tag: &str,
+    allowed: &[&str],
+    tag_name: &str,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    if let Some(attribute) = tag_attribute_names(tag)
+        .into_iter()
+        .find(|attribute| !allowed.contains(&attribute.as_str()))
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!("<{tag_name}> does not support attribute \"{attribute}\"."),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HairCardParseSettings {
+    id: String,
+    length_segments: u32,
+    width_segments: u32,
+    thickness: f32,
+    cross_section: String,
+    tip_shape: String,
+}
+
+/// Parse guide-authored hair separately from PrimitiveAsset so future strand
+/// representations can reuse the same groom without changing authored guides.
+fn parse_hair_asset_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(PrimitiveAssetNode, usize), GraphParseError> {
+    let (tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    if is_self_closing_tag(&tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "HairAsset requires HairGroom and HairRepresentations children.".to_string(),
+        });
+    }
+    validate_hair_attributes(
+        &tag,
+        &[
+            "id",
+            "material",
+            "bindBone",
+            "space",
+            "defaultRepresentation",
+            "seed",
+        ],
+        "HairAsset",
+        start + 1,
+    )?;
+    let id = strip_wrappers(&required_attr_value(&tag, "id", start + 1)?).to_string();
+    let material = strip_wrappers(&required_attr_value(&tag, "material", start + 1)?).to_string();
+    let bind_bone = attr_value(&tag, "bindBone").map(|raw| strip_wrappers(&raw).to_string());
+    let space = attr_value(&tag, "space")
+        .map(|raw| strip_wrappers(&raw).to_ascii_lowercase())
+        .unwrap_or_else(|| "bone_local".to_string());
+    if !matches!(space.as_str(), "bone_local" | "asset_local") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HairAsset \"{id}\" space must be bone_local or asset_local."),
+        });
+    }
+    let default_representation =
+        attr_value(&tag, "defaultRepresentation").map(|raw| strip_wrappers(&raw).to_string());
+    let material_seed = parse_optional_primitive_u64(&tag, "seed", &id, start + 1)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "HairAsset")?;
+    let mut guides = None;
+    let mut cards = None;
+    let mut lod_representation = None;
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if starts_open_tag(line, "HairGroom") {
+            if guides.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HairAsset \"{id}\" may contain one HairGroom."),
+                });
+            }
+            let (parsed, end_ix) = parse_hair_groom(lines, index, &id)?;
+            guides = Some(parsed);
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "HairRepresentations") {
+            if cards.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("HairAsset \"{id}\" may contain one HairRepresentations."),
+                });
+            }
+            let (parsed, end_ix) = parse_hair_representations(lines, index, &id)?;
+            cards = Some(parsed);
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "HairLOD") {
+            let (lod_tag, end_ix) = collect_self_closing_block(lines, index)?;
+            validate_hair_attributes(&lod_tag, &["representation"], "HairLOD", index + 1)?;
+            lod_representation = Some(
+                strip_wrappers(&required_attr_value(&lod_tag, "representation", index + 1)?)
+                    .to_string(),
+            );
+            index = end_ix + 1;
+            continue;
+        }
+        return Err(GraphParseError {
+            line: index + 1,
+            message: format!(
+                "HairAsset \"{id}\" accepts HairGroom, HairRepresentations, and HairLOD children, got: {line}"
+            ),
+        });
+    }
+    let guides = guides.ok_or_else(|| GraphParseError {
+        line: start + 1,
+        message: format!("HairAsset \"{id}\" requires HairGroom."),
+    })?;
+    let cards = cards.ok_or_else(|| GraphParseError {
+        line: start + 1,
+        message: format!("HairAsset \"{id}\" requires a HairCards representation."),
+    })?;
+    for selected in [default_representation.as_ref(), lod_representation.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if selected != &cards.id {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "HairAsset \"{id}\" selects unknown representation \"{selected}\"; V1 provides \"{}\".",
+                    cards.id
+                ),
+            });
+        }
+    }
+    let primitive = PrimitiveAssetNode {
+        id,
+        geometry: PrimitiveGeometry::HairCards {
+            representation_id: cards.id,
+            bind_bone,
+            space,
+            length_segments: cards.length_segments,
+            width_segments: cards.width_segments,
+            thickness: cards.thickness,
+            cross_section: cards.cross_section,
+            tip_shape: cards.tip_shape,
+            guides,
+        },
+        color: [1.0; 4],
+        material: Some(material),
+        material_definition: None,
+        bevel_radius: 0.0,
+        bevel_segments: 0,
+        material_seed,
+        collision: PrimitiveCollisionNode::default(),
+        modifiers: Vec::new(),
+        mesh_build: PrimitiveMeshBuildNode::default(),
+        lod: PrimitiveLodNode::default(),
+    };
+    Ok((primitive, close_ix))
+}
+
+fn parse_hair_groom(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(Vec<HairGuideNode>, usize), GraphParseError> {
+    let (tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    validate_hair_attributes(&tag, &[], "HairGroom", start + 1)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "HairGroom")?;
+    let mut guides = Vec::new();
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "HairGroup") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("HairAsset \"{asset_id}\" HairGroom accepts HairGroup children."),
+            });
+        }
+        let (mut group_guides, end_ix) = parse_hair_group(lines, index, asset_id)?;
+        guides.append(&mut group_guides);
+        index = end_ix + 1;
+    }
+    if guides.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HairAsset \"{asset_id}\" HairGroom requires at least one HairGuide."),
+        });
+    }
+    let mut ids = HashSet::new();
+    if let Some(duplicate) = guides.iter().find(|guide| !ids.insert(guide.id.as_str())) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "HairAsset \"{asset_id}\" has duplicate HairGuide id \"{}\".",
+                duplicate.id
+            ),
+        });
+    }
+    Ok((guides, close_ix))
+}
+
+fn parse_hair_group(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(Vec<HairGuideNode>, usize), GraphParseError> {
+    let (tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    validate_hair_attributes(&tag, &["id", "role"], "HairGroup", start + 1)?;
+    let group = strip_wrappers(&required_attr_value(&tag, "id", start + 1)?).to_string();
+    let role = attr_value(&tag, "role")
+        .map(|raw| strip_wrappers(&raw).to_string())
+        .unwrap_or_else(|| "detail".to_string());
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "HairGroup")?;
+    let mut guides = Vec::new();
+    let mut defaults = HairPointNode {
+        position: [0.0; 3],
+        width: 0.1,
+        radius: 0.003,
+        camber: 0.0,
+        roll: 0.0,
+        stiffness: 1.0,
+    };
+    let mut has_defaults = false;
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if starts_open_tag(line, "HairDefaults") {
+            if has_defaults || !guides.is_empty() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message:
+                        "HairDefaults must appear once before guides or mirrors in its HairGroup."
+                            .into(),
+                });
+            }
+            let (tag, end) = collect_self_closing_block(lines, index)?;
+            validate_hair_attributes(
+                &tag,
+                &["width", "radius", "camber", "roll", "stiffness"],
+                "HairDefaults",
+                index + 1,
+            )?;
+            defaults = parse_hair_point_settings(&tag, &defaults, asset_id, index + 1)?;
+            has_defaults = true;
+            index = end + 1;
+            continue;
+        }
+        if starts_open_tag(line, "HairMirror") {
+            let (tag, end) = collect_self_closing_block(lines, index)?;
+            validate_hair_attributes(&tag, &["id", "source", "axis"], "HairMirror", index + 1)?;
+            let id = strip_wrappers(&required_attr_value(&tag, "id", index + 1)?).to_string();
+            let source =
+                strip_wrappers(&required_attr_value(&tag, "source", index + 1)?).to_string();
+            let axis = required_attr_value(&tag, "axis", index + 1)?;
+            let axis = match strip_wrappers(&axis) {
+                "x" => 0,
+                "y" => 1,
+                "z" => 2,
+                _ => {
+                    return Err(GraphParseError {
+                        line: index + 1,
+                        message: "HairMirror axis must be x, y, or z.".into(),
+                    });
+                }
+            };
+            let original: &HairGuideNode = guides.iter().find(|g: &&HairGuideNode| g.id == source)
+                .ok_or_else(|| GraphParseError { line: index + 1, message: format!("HairMirror {id:?} source {source:?} must name an earlier guide or mirror in the same HairGroup.") })?;
+            let mut mirrored = original.clone();
+            mirrored.id = id;
+            // Reflect a resolved root frame as well as positions; negating roll
+            // compensates for reflection reversing handedness.
+            let a = original.points[0].position;
+            let b = original.points[1].position;
+            let t = hair_unit(std::array::from_fn(|i| b[i] - a[i]));
+            let reference = if t[1].abs() < 0.92 {
+                [0.0, 1.0, 0.0]
+            } else {
+                [0.0, 0.0, 1.0]
+            };
+            let mut normal = original
+                .normal
+                .unwrap_or_else(|| hair_unit(hair_cross(t, hair_unit(hair_cross(reference, t)))));
+            normal[axis] = -normal[axis];
+            mirrored.normal = Some(normal);
+            for point in &mut mirrored.points {
+                point.position[axis] = -point.position[axis];
+                point.roll = -point.roll;
+            }
+            guides.push(mirrored);
+            index = end + 1;
+            continue;
+        }
+        if !starts_open_tag(line, "HairGuide") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "HairGroup \"{group}\" accepts HairDefaults, HairGuide, and HairMirror children."
+                ),
+            });
+        }
+        let (guide, end_ix) = parse_hair_guide(lines, index, asset_id, &group, &role, &defaults)?;
+        guides.push(guide);
+        index = end_ix + 1;
+    }
+    if guides.is_empty() {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HairGroup \"{group}\" requires at least one HairGuide."),
+        });
+    }
+    Ok((guides, close_ix))
+}
+
+// Small local vector helpers keep authoring independent of a rendering math backend.
+fn hair_unit(v: [f32; 3]) -> [f32; 3] {
+    let length = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1.0e-20);
+    v.map(|x| x / length)
+}
+fn hair_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Resolve shared values before parsing points, so expanded guides are self-contained.
+fn parse_hair_point_settings(
+    tag: &str,
+    inherited: &HairPointNode,
+    asset_id: &str,
+    line: usize,
+) -> Result<HairPointNode, GraphParseError> {
+    let mut result = inherited.clone();
+    for (name, slot) in [
+        ("width", &mut result.width),
+        ("radius", &mut result.radius),
+        ("camber", &mut result.camber),
+        ("roll", &mut result.roll),
+        ("stiffness", &mut result.stiffness),
+    ] {
+        if attr_value(tag, name).is_some() {
+            *slot = parse_finite_primitive_number(tag, name, asset_id, line)?;
+        }
+        let valid = match name {
+            "width" => *slot > 0.0,
+            "radius" => *slot >= 0.0,
+            "camber" | "stiffness" => (0.0..=1.0).contains(slot),
+            _ => true,
+        };
+        if !valid {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Hair setting {name} is outside its allowed range (width > 0, radius >= 0, camber/stiffness 0..1)."
+                ),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn parse_hair_guide(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+    group: &str,
+    role: &str,
+    defaults: &HairPointNode,
+) -> Result<(HairGuideNode, usize), GraphParseError> {
+    let (tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    validate_hair_attributes(
+        &tag,
+        &[
+            "id",
+            "normal",
+            "width",
+            "radius",
+            "camber",
+            "roll",
+            "stiffness",
+        ],
+        "HairGuide",
+        start + 1,
+    )?;
+    let id = strip_wrappers(&required_attr_value(&tag, "id", start + 1)?).to_string();
+    let defaults = parse_hair_point_settings(&tag, defaults, asset_id, start + 1)?;
+    let normal = parse_optional_primitive_vec::<3>(&tag, "normal", asset_id, start + 1, false)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "HairGuide")?;
+    let mut points = Vec::new();
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "HairPoint") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("HairGuide \"{id}\" accepts HairPoint children."),
+            });
+        }
+        let (point_tag, end_ix) = collect_self_closing_block(lines, index)?;
+        validate_hair_attributes(
+            &point_tag,
+            &["position", "width", "radius", "camber", "roll", "stiffness"],
+            "HairPoint",
+            index + 1,
+        )?;
+        let width =
+            parse_optional_positive_primitive_number(&point_tag, "width", asset_id, index + 1)?
+                .unwrap_or(defaults.width);
+        let radius =
+            parse_optional_nonnegative_primitive_number(&point_tag, "radius", asset_id, index + 1)?
+                .unwrap_or(defaults.radius);
+        let camber =
+            parse_optional_nonnegative_primitive_number(&point_tag, "camber", asset_id, index + 1)?
+                .unwrap_or(defaults.camber);
+        if camber > 1.0 {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("HairGuide \"{id}\" camber must be from zero through one."),
+            });
+        }
+        let roll = attr_value(&point_tag, "roll")
+            .map(|_| parse_finite_primitive_number(&point_tag, "roll", asset_id, index + 1))
+            .transpose()?
+            .unwrap_or(defaults.roll);
+        let stiffness = parse_optional_nonnegative_primitive_number(
+            &point_tag,
+            "stiffness",
+            asset_id,
+            index + 1,
+        )?
+        .unwrap_or(defaults.stiffness);
+        if stiffness > 1.0 {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("HairGuide \"{id}\" stiffness must be from zero through one."),
+            });
+        }
+        points.push(HairPointNode {
+            position: parse_primitive_vec_value::<3>(
+                &required_attr_value(&point_tag, "position", index + 1)?,
+                "position",
+                asset_id,
+                index + 1,
+                false,
+            )?,
+            width,
+            radius,
+            camber,
+            roll,
+            stiffness,
+        });
+        index = end_ix + 1;
+    }
+    if points.len() < 2 {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HairGuide \"{id}\" requires at least two HairPoints."),
+        });
+    }
+    if points
+        .windows(2)
+        .any(|pair| pair[0].position == pair[1].position)
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("HairGuide \"{id}\" consecutive HairPoints must differ."),
+        });
+    }
+    if let Some(n) = normal {
+        let tangent = hair_unit(std::array::from_fn(|i| {
+            points[1].position[i] - points[0].position[i]
+        }));
+        let cross = hair_cross(hair_unit(n), tangent);
+        if n.iter().map(|x| x * x).sum::<f32>() < 1.0e-12
+            || cross.iter().map(|x| x * x).sum::<f32>() < 1.0e-8
+        {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "HairGuide {id:?} normal must be nonzero and not parallel to its root tangent."
+                ),
+            });
+        }
+    }
+    Ok((
+        HairGuideNode {
+            id,
+            group: group.to_string(),
+            role: role.to_string(),
+            normal,
+            points,
+        },
+        close_ix,
+    ))
+}
+
+fn parse_hair_representations(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(HairCardParseSettings, usize), GraphParseError> {
+    let (tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
+    validate_hair_attributes(&tag, &[], "HairRepresentations", start + 1)?;
+    let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "HairRepresentations")?;
+    let mut cards = None;
+    let mut index = open_end_ix + 1;
+    while index < close_ix {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "HairCards") || cards.is_some() {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "HairAsset \"{asset_id}\" V1 supports exactly one HairCards representation."
+                ),
+            });
+        }
+        let (card_tag, end_ix) = collect_self_closing_block(lines, index)?;
+        validate_hair_attributes(
+            &card_tag,
+            &[
+                "id",
+                "lengthSegments",
+                "widthSegments",
+                "thickness",
+                "crossSection",
+                "tipShape",
+            ],
+            "HairCards",
+            index + 1,
+        )?;
+        let id = strip_wrappers(&required_attr_value(&card_tag, "id", index + 1)?).to_string();
+        let length_segments =
+            parse_optional_primitive_u32(&card_tag, "lengthSegments", asset_id, index + 1)?
+                .unwrap_or(16);
+        let width_segments =
+            parse_optional_primitive_u32(&card_tag, "widthSegments", asset_id, index + 1)?
+                .unwrap_or(4);
+        if !(2..=128).contains(&length_segments) || !(2..=16).contains(&width_segments) {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "HairCards \"{id}\" requires lengthSegments 2..128 and widthSegments 2..16."
+                ),
+            });
+        }
+        let thickness =
+            parse_optional_positive_primitive_number(&card_tag, "thickness", asset_id, index + 1)?
+                .unwrap_or(0.01);
+        let cross_section = primitive_string_attribute(&card_tag, "crossSection", "arched");
+        if !matches!(cross_section.as_str(), "flat" | "arched" | "v_shape") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "HairCards \"{id}\" crossSection must be flat, arched, or v_shape."
+                ),
+            });
+        }
+        let tip_shape = primitive_string_attribute(&card_tag, "tipShape", "point");
+        if !matches!(tip_shape.as_str(), "point" | "round" | "blunt") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("HairCards \"{id}\" tipShape must be point, round, or blunt."),
+            });
+        }
+        cards = Some(HairCardParseSettings {
+            id,
+            length_segments,
+            width_segments,
+            thickness,
+            cross_section,
+            tip_shape,
+        });
+        index = end_ix + 1;
+    }
+    cards
+        .map(|settings| (settings, close_ix))
+        .ok_or_else(|| GraphParseError {
+            line: start + 1,
+            message: format!("HairAsset \"{asset_id}\" HairRepresentations requires HairCards."),
+        })
+}
+
+fn validate_hair_attributes(
+    tag: &str,
+    allowed: &[&str],
+    tag_name: &str,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    if let Some(attribute) = tag_attribute_names(tag)
+        .into_iter()
+        .find(|attribute| !allowed.contains(&attribute.as_str()))
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!("<{tag_name}> does not support attribute \"{attribute}\"."),
+        });
+    }
+    Ok(())
 }
 
 fn validate_primitive_build_budget(
@@ -2943,6 +4773,236 @@ fn validate_primitive_build_budget(
     Ok(())
 }
 
+fn parse_primitive_loft(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(PrimitiveGeometry, usize), GraphParseError> {
+    let (tag, open_end) = collect_tag_block(lines, start, '>', false)?;
+    validate_primitive_child_attributes(
+        &tag,
+        &["closed", "capStart", "capEnd", "segments"],
+        asset_id,
+        start + 1,
+    )?;
+    if is_self_closing_tag(&tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("PrimitiveAsset \"{asset_id}\" Loft must contain Section children."),
+        });
+    }
+    let close = find_matching_close_tag(lines, open_end + 1, "Loft")?;
+    let segments = parse_primitive_segments(&tag, "segments", 16, asset_id, start + 1)?;
+    let closed =
+        parse_optional_primitive_bool(&tag, "closed", asset_id, start + 1)?.unwrap_or(true);
+    let cap_start =
+        parse_optional_primitive_bool(&tag, "capStart", asset_id, start + 1)?.unwrap_or(true);
+    let cap_end =
+        parse_optional_primitive_bool(&tag, "capEnd", asset_id, start + 1)?.unwrap_or(true);
+    let mut sections = Vec::new();
+    let mut index = open_end + 1;
+    while index < close {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "Section") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("PrimitiveAsset \"{asset_id}\" Loft accepts Section children."),
+            });
+        }
+        let (section_tag, end) = collect_self_closing_block(lines, index)?;
+        validate_primitive_child_attributes(
+            &section_tag,
+            &["at", "width", "depth", "profile", "offset", "rotation"],
+            asset_id,
+            index + 1,
+        )?;
+        let profile = primitive_string_attribute(&section_tag, "profile", "ellipse");
+        if !matches!(
+            profile.as_str(),
+            "ellipse" | "rounded_rect" | "diamond" | "capsule"
+        ) {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "PrimitiveAsset \"{asset_id}\" Loft Section profile must be ellipse, rounded_rect, diamond, or capsule."
+                ),
+            });
+        }
+        sections.push(PrimitiveLoftSectionNode {
+            at: parse_finite_primitive_number(&section_tag, "at", asset_id, index + 1)?,
+            width: parse_positive_primitive_number(&section_tag, "width", asset_id, index + 1)?,
+            depth: parse_positive_primitive_number(&section_tag, "depth", asset_id, index + 1)?,
+            profile,
+            offset: parse_optional_primitive_vec::<2>(
+                &section_tag,
+                "offset",
+                asset_id,
+                index + 1,
+                false,
+            )?
+            .unwrap_or([0.0; 2]),
+            rotation: attr_value(&section_tag, "rotation")
+                .map(|_| {
+                    parse_finite_primitive_number(&section_tag, "rotation", asset_id, index + 1)
+                })
+                .transpose()?
+                .unwrap_or(0.0),
+        });
+        index = end + 1;
+    }
+    if sections.len() < 2 {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("PrimitiveAsset \"{asset_id}\" Loft requires at least two Sections."),
+        });
+    }
+    if sections.windows(2).any(|pair| pair[0].at >= pair[1].at) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" Loft Sections must use strictly increasing at values."
+            ),
+        });
+    }
+    Ok((
+        PrimitiveGeometry::Loft {
+            segments,
+            closed,
+            cap_start,
+            cap_end,
+            sections,
+        },
+        close,
+    ))
+}
+
+fn parse_primitive_ribbon(
+    lines: &[&str],
+    start: usize,
+    asset_id: &str,
+) -> Result<(PrimitiveGeometry, usize), GraphParseError> {
+    let (tag, open_end) = collect_tag_block(lines, start, '>', false)?;
+    validate_primitive_child_attributes(
+        &tag,
+        &["width", "thickness", "facing", "capStart", "capEnd"],
+        asset_id,
+        start + 1,
+    )?;
+    if is_self_closing_tag(&tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" Ribbon must contain PathPoint children."
+            ),
+        });
+    }
+    let facing = primitive_string_attribute(&tag, "facing", "stable");
+    if !matches!(facing.as_str(), "stable" | "camera_safe") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" Ribbon facing must be stable or camera_safe."
+            ),
+        });
+    }
+    let close = find_matching_close_tag(lines, open_end + 1, "Ribbon")?;
+    let width = parse_positive_primitive_number(&tag, "width", asset_id, start + 1)?;
+    let thickness =
+        parse_optional_positive_primitive_number(&tag, "thickness", asset_id, start + 1)?
+            .unwrap_or(0.02);
+    let cap_start =
+        parse_optional_primitive_bool(&tag, "capStart", asset_id, start + 1)?.unwrap_or(true);
+    let cap_end =
+        parse_optional_primitive_bool(&tag, "capEnd", asset_id, start + 1)?.unwrap_or(true);
+    let mut points = Vec::new();
+    let mut index = open_end + 1;
+    while index < close {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "PathPoint") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!(
+                    "PrimitiveAsset \"{asset_id}\" Ribbon accepts PathPoint children."
+                ),
+            });
+        }
+        let (point_tag, end) = collect_self_closing_block(lines, index)?;
+        validate_primitive_child_attributes(
+            &point_tag,
+            &["position", "width", "thickness", "roll"],
+            asset_id,
+            index + 1,
+        )?;
+        points.push(PrimitiveRibbonPointNode {
+            position: parse_optional_primitive_vec::<3>(
+                &point_tag,
+                "position",
+                asset_id,
+                index + 1,
+                false,
+            )?
+            .ok_or_else(|| GraphParseError {
+                line: index + 1,
+                message: format!("PrimitiveAsset \"{asset_id}\" PathPoint requires position."),
+            })?,
+            width: parse_optional_positive_primitive_number(
+                &point_tag,
+                "width",
+                asset_id,
+                index + 1,
+            )?,
+            thickness: parse_optional_positive_primitive_number(
+                &point_tag,
+                "thickness",
+                asset_id,
+                index + 1,
+            )?,
+            roll: attr_value(&point_tag, "roll")
+                .map(|_| parse_finite_primitive_number(&point_tag, "roll", asset_id, index + 1))
+                .transpose()?
+                .unwrap_or(0.0),
+        });
+        index = end + 1;
+    }
+    if points.len() < 2 {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" Ribbon requires at least two PathPoints."
+            ),
+        });
+    }
+    if points
+        .windows(2)
+        .any(|pair| pair[0].position == pair[1].position)
+    {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "PrimitiveAsset \"{asset_id}\" Ribbon consecutive PathPoints must differ."
+            ),
+        });
+    }
+    Ok((
+        PrimitiveGeometry::Ribbon {
+            width,
+            thickness,
+            cap_start,
+            cap_end,
+            points,
+        },
+        close,
+    ))
+}
+
 fn parse_compound_asset(
     lines: &[&str],
     start: usize,
@@ -2959,6 +5019,7 @@ fn parse_compound_asset(
     let material_seed = parse_optional_primitive_u64(&open_tag, "materialSeed", &id, start + 1)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "CompoundAsset")?;
     let mut instances = Vec::new();
+    let mut skin_binding = None;
     let mut index = open_end_ix + 1;
     while index < close_ix {
         let line = lines[index].trim();
@@ -2966,40 +5027,247 @@ fn parse_compound_asset(
             index += 1;
             continue;
         }
+        if starts_open_tag(line, "SkinBinding") {
+            if skin_binding.is_some() {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "CompoundAsset \"{id}\" must not contain more than one SkinBinding."
+                    ),
+                });
+            }
+            let (tag, open_end_ix) = collect_tag_block(lines, index, '>', false)?;
+            validate_primitive_child_attributes(
+                &tag,
+                &["mode", "maxInfluences", "falloff", "normalize"],
+                &id,
+                index + 1,
+            )?;
+            let mode = attr_value(&tag, "mode")
+                .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+                .unwrap_or_else(|| "automatic".to_string());
+            if mode != "automatic" {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("CompoundAsset \"{id}\" SkinBinding mode must be automatic."),
+                });
+            }
+            let max_influences =
+                parse_optional_primitive_u64(&tag, "maxInfluences", &id, index + 1)?.unwrap_or(4);
+            if !(1..=4).contains(&max_influences) {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "CompoundAsset \"{id}\" SkinBinding maxInfluences must be from 1 through 4."
+                    ),
+                });
+            }
+            let falloff = attr_value(&tag, "falloff")
+                .map(|_| parse_finite_primitive_number(&tag, "falloff", &id, index + 1))
+                .transpose()?
+                .unwrap_or(2.5);
+            if falloff <= 0.0 {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "CompoundAsset \"{id}\" SkinBinding falloff must be greater than zero."
+                    ),
+                });
+            }
+            let normalize =
+                parse_optional_primitive_bool(&tag, "normalize", &id, index + 1)?.unwrap_or(true);
+            let mut weight_regions = Vec::new();
+            let end_ix = if is_self_closing_tag(&tag) {
+                open_end_ix
+            } else {
+                let close = find_matching_close_tag(lines, open_end_ix + 1, "SkinBinding")?;
+                let mut region_index = open_end_ix + 1;
+                while region_index < close {
+                    let line = lines[region_index].trim();
+                    if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+                        region_index += 1;
+                        continue;
+                    }
+                    if !starts_open_tag(line, "WeightRegion") {
+                        return Err(GraphParseError {
+                            line: region_index + 1,
+                            message: format!(
+                                "CompoundAsset \"{id}\" SkinBinding accepts WeightRegion children."
+                            ),
+                        });
+                    }
+                    let (region_tag, region_end) = collect_self_closing_block(lines, region_index)?;
+                    validate_primitive_child_attributes(
+                        &region_tag,
+                        &[
+                            "instance",
+                            "bone",
+                            "center",
+                            "radius",
+                            "strength",
+                            "operation",
+                        ],
+                        &id,
+                        region_index + 1,
+                    )?;
+                    let operation = primitive_string_attribute(&region_tag, "operation", "add");
+                    if !matches!(operation.as_str(), "add" | "replace") {
+                        return Err(GraphParseError {
+                            line: region_index + 1,
+                            message: format!(
+                                "CompoundAsset \"{id}\" WeightRegion operation must be add or replace."
+                            ),
+                        });
+                    }
+                    let strength = attr_value(&region_tag, "strength")
+                        .map(|_| {
+                            parse_finite_primitive_number(
+                                &region_tag,
+                                "strength",
+                                &id,
+                                region_index + 1,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(1.0);
+                    if !(0.0..=1.0).contains(&strength) {
+                        return Err(GraphParseError {
+                            line: region_index + 1,
+                            message: format!(
+                                "CompoundAsset \"{id}\" WeightRegion strength must be from zero through one."
+                            ),
+                        });
+                    }
+                    weight_regions.push(NativeWeightRegionNode {
+                        instance: strip_wrappers(&required_attr_value(
+                            &region_tag,
+                            "instance",
+                            region_index + 1,
+                        )?)
+                        .to_string(),
+                        bone: strip_wrappers(&required_attr_value(
+                            &region_tag,
+                            "bone",
+                            region_index + 1,
+                        )?)
+                        .to_string(),
+                        center: parse_optional_primitive_vec::<3>(
+                            &region_tag,
+                            "center",
+                            &id,
+                            region_index + 1,
+                            false,
+                        )?
+                        .ok_or_else(|| GraphParseError {
+                            line: region_index + 1,
+                            message: format!(
+                                "CompoundAsset \"{id}\" WeightRegion requires center."
+                            ),
+                        })?,
+                        radius: parse_positive_primitive_number(
+                            &region_tag,
+                            "radius",
+                            &id,
+                            region_index + 1,
+                        )?,
+                        strength,
+                        operation,
+                    });
+                    region_index = region_end + 1;
+                }
+                close
+            };
+            skin_binding = Some(NativeSkinBindingNode {
+                mode,
+                max_influences: max_influences as u32,
+                falloff,
+                normalize,
+                weight_regions,
+            });
+            index = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Mirror") {
+            let (mirror_tag, mirror_open_end) = collect_tag_block(lines, index, '>', false)?;
+            validate_primitive_child_attributes(&mirror_tag, &["axis", "suffix"], &id, index + 1)?;
+            let axis = primitive_string_attribute(&mirror_tag, "axis", "x");
+            if axis != "x" {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "CompoundAsset \"{id}\" Mirror currently supports axis=\"x\"."
+                    ),
+                });
+            }
+            let suffix = attr_value(&mirror_tag, "suffix")
+                .map(|value| parse_string_array(&value, index + 1, "Mirror suffix"))
+                .transpose()?
+                .unwrap_or_else(|| vec!["_l".to_string(), "_r".to_string()]);
+            if suffix.len() != 2 || suffix[0] == suffix[1] {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!(
+                        "CompoundAsset \"{id}\" Mirror suffix requires two distinct values."
+                    ),
+                });
+            }
+            let mirror_close = find_matching_close_tag(lines, mirror_open_end + 1, "Mirror")?;
+            let mut child_index = mirror_open_end + 1;
+            let mut child_count = 0;
+            while child_index < mirror_close {
+                let child_line = lines[child_index].trim();
+                if child_line.is_empty()
+                    || child_line.starts_with("//")
+                    || child_line.starts_with("<!--")
+                {
+                    child_index += 1;
+                    continue;
+                }
+                if !starts_open_tag(child_line, "Instance") {
+                    return Err(GraphParseError {
+                        line: child_index + 1,
+                        message: format!(
+                            "CompoundAsset \"{id}\" Mirror accepts Instance children."
+                        ),
+                    });
+                }
+                let (child_tag, child_end) = collect_self_closing_block(lines, child_index)?;
+                let original = parse_compound_instance_tag(
+                    &child_tag,
+                    &id,
+                    child_index + 1,
+                    instances.len() + 1,
+                )?;
+                let mirrored = mirror_compound_instance(&original, &suffix[0], &suffix[1]);
+                instances.push(original);
+                instances.push(mirrored);
+                child_count += 1;
+                child_index = child_end + 1;
+            }
+            if child_count == 0 {
+                return Err(GraphParseError {
+                    line: index + 1,
+                    message: format!("CompoundAsset \"{id}\" Mirror requires an Instance."),
+                });
+            }
+            index = mirror_close + 1;
+            continue;
+        }
         if !starts_open_tag(line, "Instance") {
             return Err(GraphParseError {
                 line: index + 1,
                 message: format!(
-                    "CompoundAsset \"{id}\" only accepts self-closing <Instance /> children."
+                    "CompoundAsset \"{id}\" accepts SkinBinding, Mirror, and self-closing Instance children."
                 ),
             });
         }
         let (tag, end_ix) = collect_self_closing_block(lines, index)?;
-        let instance_id = attr_value(&tag, "id")
-            .map(|value| strip_wrappers(&value).to_string())
-            .unwrap_or_else(|| format!("instance_{}", instances.len() + 1));
-        let asset = strip_wrappers(&required_attr_value(&tag, "asset", index + 1)?).to_string();
-        let bone = attr_value(&tag, "bone").map(|value| strip_wrappers(&value).to_string());
-        let position =
-            parse_optional_primitive_vec::<3>(&tag, "position", &instance_id, index + 1, false)?
-                .unwrap_or([0.0; 3]);
-        let rotation =
-            parse_optional_primitive_vec::<3>(&tag, "rotation", &instance_id, index + 1, false)?
-                .unwrap_or([0.0; 3]);
-        let scale =
-            parse_optional_positive_primitive_number(&tag, "scale", &instance_id, index + 1)?
-                .unwrap_or(1.0);
-        let material_seed =
-            parse_optional_primitive_u64(&tag, "materialSeed", &instance_id, index + 1)?;
-        instances.push(CompoundAssetInstanceNode {
-            id: instance_id,
-            asset,
-            bone,
-            position,
-            rotation,
-            scale,
-            material_seed,
-        });
+        instances.push(parse_compound_instance_tag(
+            &tag,
+            &id,
+            index + 1,
+            instances.len() + 1,
+        )?);
         index = end_ix + 1;
     }
     if instances.is_empty() {
@@ -3026,10 +5294,113 @@ fn parse_compound_asset(
             id,
             rig,
             material_seed,
+            skin_binding,
             instances,
         },
         close_ix,
     ))
+}
+
+fn parse_compound_instance_tag(
+    tag: &str,
+    compound_id: &str,
+    line: usize,
+    fallback_index: usize,
+) -> Result<CompoundAssetInstanceNode, GraphParseError> {
+    validate_primitive_child_attributes(
+        tag,
+        &[
+            "id",
+            "asset",
+            "bone",
+            "position",
+            "rotation",
+            "scale",
+            "materialSeed",
+            "skin",
+            "influences",
+        ],
+        compound_id,
+        line,
+    )?;
+    let id = attr_value(tag, "id")
+        .map(|value| strip_wrappers(&value).to_string())
+        .unwrap_or_else(|| format!("instance_{fallback_index}"));
+    let asset = strip_wrappers(&required_attr_value(tag, "asset", line)?).to_string();
+    let bone = attr_value(tag, "bone").map(|value| strip_wrappers(&value).to_string());
+    let position =
+        parse_optional_primitive_vec::<3>(tag, "position", &id, line, false)?.unwrap_or([0.0; 3]);
+    let rotation =
+        parse_optional_primitive_vec::<3>(tag, "rotation", &id, line, false)?.unwrap_or([0.0; 3]);
+    let scale = parse_optional_positive_primitive_number(tag, "scale", &id, line)?.unwrap_or(1.0);
+    let material_seed = parse_optional_primitive_u64(tag, "materialSeed", &id, line)?;
+    let skin = match attr_value(tag, "skin")
+        .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("rigid") => NativeSkinMode::Rigid,
+        Some("smooth") => NativeSkinMode::Smooth,
+        Some(other) => {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "CompoundAsset \"{compound_id}\" Instance \"{id}\" skin=\"{other}\" is invalid. Use rigid or smooth."
+                ),
+            });
+        }
+    };
+    let influences = attr_value(tag, "influences")
+        .map(|value| {
+            parse_string_array(
+                &value,
+                line,
+                &format!("CompoundAsset {compound_id} Instance {id} influences"),
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(CompoundAssetInstanceNode {
+        id,
+        asset,
+        bone,
+        position,
+        rotation,
+        scale,
+        material_seed,
+        skin,
+        influences,
+    })
+}
+
+fn mirror_compound_instance(
+    original: &CompoundAssetInstanceNode,
+    source_suffix: &str,
+    target_suffix: &str,
+) -> CompoundAssetInstanceNode {
+    let swap = |value: &str| {
+        value.strip_suffix(source_suffix).map_or_else(
+            || format!("{value}{target_suffix}"),
+            |stem| format!("{stem}{target_suffix}"),
+        )
+    };
+    let swap_if_suffixed = |value: &str| {
+        value.strip_suffix(source_suffix).map_or_else(
+            || value.to_string(),
+            |stem| format!("{stem}{target_suffix}"),
+        )
+    };
+    let mut mirrored = original.clone();
+    mirrored.id = swap(&original.id);
+    mirrored.bone = original.bone.as_deref().map(&swap_if_suffixed);
+    mirrored.position[0] = -mirrored.position[0];
+    mirrored.rotation[1] = -mirrored.rotation[1];
+    mirrored.rotation[2] = -mirrored.rotation[2];
+    mirrored.influences = original
+        .influences
+        .iter()
+        .map(|value| swap_if_suffixed(value))
+        .collect();
+    mirrored
 }
 
 fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, GraphParseError> {
@@ -3269,6 +5640,57 @@ fn resolve_primitive_material_assets(
         .filter(|asset| asset.kind == GraphAssetKind::Image)
         .map(|asset| (asset.id.clone(), asset.color_space.clone()))
         .collect::<HashMap<_, _>>();
+    for asset in assets.iter_mut() {
+        if let GraphAssetSource::Primitive(PrimitiveAssetNode {
+            geometry:
+                PrimitiveGeometry::HeadSurface {
+                    face_layout: Some(layout),
+                    ..
+                },
+            ..
+        }) = &mut asset.source
+        {
+            let resolve_face_texture =
+                |texture: &mut FaceTextureNode| -> Result<(), GraphParseError> {
+                    texture.source =
+                        Some(image_sources.get(&texture.asset).cloned().ok_or_else(|| {
+                            GraphParseError {
+                                line,
+                                message: format!(
+                                    "Texture references unknown ImageAsset \"{}\".",
+                                    texture.asset
+                                ),
+                            }
+                        })?);
+                    Ok(())
+                };
+            for eye in &mut layout.eyes {
+                if let Some(texture) = &mut eye.texture {
+                    resolve_face_texture(texture)?;
+                }
+                if let Some(iris) = &mut eye.iris {
+                    if let Some(texture) = &mut iris.texture {
+                        resolve_face_texture(texture)?;
+                    }
+                }
+                for liner in &mut eye.eyeliners {
+                    if let Some(texture) = &mut liner.texture {
+                        resolve_face_texture(texture)?;
+                    }
+                }
+            }
+            for texture in layout
+                .eyebrows
+                .iter_mut()
+                .filter_map(|e| e.texture.as_mut())
+                .chain(layout.noses.iter_mut().filter_map(|e| e.texture.as_mut()))
+                .chain(layout.mouths.iter_mut().filter_map(|e| e.texture.as_mut()))
+                .chain(layout.ears.iter_mut().filter_map(|e| e.texture.as_mut()))
+            {
+                resolve_face_texture(texture)?;
+            }
+        }
+    }
     let resolve_texture = |material: &MaterialAssetNode,
                            slot: &str,
                            reference: &Option<String>|
@@ -4268,11 +6690,13 @@ fn parse_primitive_asset(
         "cylinder" | "cone" => {
             vec!["id", "shape", "radius", "height", "segments", "color"]
         }
+        "loft" => vec!["id", "shape", "color"],
+        "ribbon" => vec!["id", "shape", "color"],
         _ => {
             return Err(GraphParseError {
                 line,
                 message: format!(
-                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, capsule, plane, cylinder, cone, wedge, ellipsoid, frustum, or roundedBox."
+                    "PrimitiveAsset \"{id}\" has unknown shape=\"{shape}\". Use box, sphere, capsule, plane, cylinder, cone, wedge, ellipsoid, frustum, roundedBox, loft, or ribbon."
                 ),
             });
         }
@@ -4307,6 +6731,8 @@ fn parse_primitive_asset(
                 "ellipsoid" => "Use radii={[x,y,z]} and optional segments/rings.",
                 "frustum" => "Use topSize={[x,z]}, bottomSize={[x,z]}, and height=\"...\".",
                 "cylinder" | "cone" => "Use radius=\"...\", height=\"...\", and optional segments.",
+                "loft" => "Use a nested <Loft> block with at least two <Section /> children.",
+                "ribbon" => "Use a nested <Ribbon> block with at least two <PathPoint /> children.",
                 _ => unreachable!(),
             };
             return Err(GraphParseError {
@@ -4372,6 +6798,20 @@ fn parse_primitive_asset(
             radius: parse_positive_primitive_number(tag, "radius", id, line)?,
             height: parse_positive_primitive_number(tag, "height", id, line)?,
             segments: parse_primitive_segments(tag, "segments", 32, id, line)?,
+        },
+        "loft" => PrimitiveGeometry::Loft {
+            segments: 16,
+            closed: true,
+            cap_start: true,
+            cap_end: true,
+            sections: Vec::new(),
+        },
+        "ribbon" => PrimitiveGeometry::Ribbon {
+            width: 0.1,
+            thickness: 0.02,
+            cap_start: true,
+            cap_end: true,
+            points: Vec::new(),
         },
         _ => unreachable!(),
     };
@@ -4545,6 +6985,11 @@ fn parse_primitive_collision(
             PrimitiveGeometry::Ellipsoid { .. } => PrimitiveColliderShape::Sphere,
             PrimitiveGeometry::Frustum { .. } => PrimitiveColliderShape::Convex,
             PrimitiveGeometry::RoundedBox { .. } => PrimitiveColliderShape::Box,
+            PrimitiveGeometry::Loft { .. }
+            | PrimitiveGeometry::Ribbon { .. }
+            | PrimitiveGeometry::HairCards { .. }
+            | PrimitiveGeometry::HeadSurface { .. }
+            | PrimitiveGeometry::Mesh { .. } => PrimitiveColliderShape::Convex,
         }
     } else {
         collider
@@ -10119,8 +12564,8 @@ Font note: this is not a structured XML comment.
   <Assets>
     <PrimitiveAsset id="x" shape="sphere" radius="1" collider="box" />
   </Assets>
-  <Background id="canvas" color="#000000" />
-  <Present from="canvas" />
+  <Background color="#000000" />
+  <Present from="scene" />
 </Graph>"##,
         )
         .expect_err("disabled collision cannot carry collider settings");
@@ -10131,8 +12576,8 @@ Font note: this is not a structured XML comment.
   <Assets>
     <PrimitiveAsset id="x" shape="sphere" radius="1" collision="solid" colliderRadius="1" colliderSize={[1,1,1]} />
   </Assets>
-  <Background id="canvas" color="#000000" />
-  <Present from="canvas" />
+  <Background color="#000000" />
+  <Present from="scene" />
 </Graph>"##,
         )
         .expect_err("sphere collider cannot use colliderSize");
@@ -10272,6 +12717,193 @@ Font note: this is not a structured XML comment.
         assert_eq!(axes.axes[0].side.as_deref(), Some("rotationZ:-1"));
         assert_eq!(graph.skeletons[0].bones[1].z, "0");
         assert_eq!(graph.skeletons[0].bones[1].rotation_z, "-5");
+    }
+
+    #[test]
+    fn native_smooth_skin_is_opt_in_and_rigid_instances_keep_their_default() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="limb" shape="capsule" radius="0.1" height="0.5" />
+    <CompoundAsset id="hero" rig="rig">
+      <SkinBinding mode="automatic" maxInfluences="3" falloff="2.25" normalize="true" />
+      <Instance id="soft_arm" asset="limb" bone="arm" skin="smooth"
+                influences={["root","arm"]} />
+      <Instance id="rigid_hand" asset="limb" bone="arm" />
+    </CompoundAsset>
+  </Assets>
+  <Skeleton id="rig" space="3d">
+    <Bone id="root" position={[0,0,0]} />
+    <Bone id="arm" parent="root" position={[0,1,0]} />
+  </Skeleton>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("opt-in native skin should parse");
+        let compound = graph.assets[1].compound().expect("compound");
+        let binding = compound.skin_binding.as_ref().expect("skin binding");
+        assert_eq!(binding.max_influences, 3);
+        assert_eq!(binding.falloff, 2.25);
+        assert_eq!(compound.instances[0].skin, crate::NativeSkinMode::Smooth);
+        assert_eq!(compound.instances[0].influences, ["root", "arm"]);
+        assert_eq!(compound.instances[1].skin, crate::NativeSkinMode::Rigid);
+
+        let invalid = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="limb" shape="capsule" radius="0.1" height="0.5" />
+    <CompoundAsset id="hero" rig="rig">
+      <SkinBinding />
+      <Instance id="missing_primary" asset="limb" skin="smooth" />
+    </CompoundAsset>
+  </Assets>
+  <Skeleton id="rig" space="3d">
+    <Bone id="root" position={[0,0,0]} />
+  </Skeleton>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect_err("smooth instances require a primary bone");
+        assert!(invalid.message.contains("no primary bone"));
+    }
+
+    #[test]
+    fn loft_ribbon_weight_regions_and_mirror_are_additive() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="coat" shape="loft">
+      <Loft segments="12">
+        <Section at="-0.5" width="0.7" depth="0.4" profile="rounded_rect" />
+        <Section at="0.5" width="0.9" depth="0.45" profile="ellipse" offset={[0.1,0]} />
+      </Loft>
+    </PrimitiveAsset>
+    <PrimitiveAsset id="hair" shape="ribbon">
+      <Ribbon width="0.2" thickness="0.03" facing="camera_safe">
+        <PathPoint position={[0,0,0]} />
+        <PathPoint position={[0,-0.5,0.1]} width="0.08" roll="12" />
+      </Ribbon>
+    </PrimitiveAsset>
+    <CompoundAsset id="hero" rig="rig">
+      <SkinBinding>
+        <WeightRegion instance="coat" bone="root" center={[0,0,0]} radius="0.4" operation="replace" />
+      </SkinBinding>
+      <Instance id="coat" asset="coat" bone="root" skin="smooth" />
+      <Mirror axis="x" suffix={["_l","_r"]}>
+        <Instance id="hair_l" asset="hair" bone="arm_l" position={[-0.2,0,0]} />
+      </Mirror>
+    </CompoundAsset>
+  </Assets>
+  <Skeleton id="rig" space="3d">
+    <Bone id="root" position={[0,0,0]} />
+    <Bone id="arm_l" parent="root" position={[-1,0,0]} />
+    <Bone id="arm_r" parent="root" position={[1,0,0]} />
+  </Skeleton>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("advanced native character geometry should parse");
+        let loft = graph.assets[0].primitive().expect("loft");
+        assert_eq!(loft.geometry.shape_name(), "loft");
+        let ribbon = graph.assets[1].primitive().expect("ribbon");
+        assert_eq!(ribbon.geometry.shape_name(), "ribbon");
+        let compound = graph.assets[2].compound().expect("compound");
+        assert_eq!(compound.instances.len(), 3);
+        assert_eq!(compound.instances[2].id, "hair_r");
+        assert_eq!(compound.instances[2].bone.as_deref(), Some("arm_r"));
+        assert_eq!(compound.instances[2].position[0], 0.2);
+        assert_eq!(
+            compound.skin_binding.as_ref().unwrap().weight_regions.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hair_asset_preserves_guides_while_selecting_cards() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <MaterialAsset id="hair" baseColor="#665C60" />
+    <HairAsset id="bangs" material="hair" bindBone="head"
+               defaultRepresentation="cards" seed="9">
+      <HairGroom>
+        <HairGroup id="front" role="bang">
+          <HairGuide id="center">
+            <HairPoint position={[0,0.3,0]} width="0.2" camber="0.1" />
+            <HairPoint position={[0,-0.1,0.1]} width="0.14" roll="4" />
+            <HairPoint position={[-0.04,-0.4,0.08]} width="0.02" />
+          </HairGuide>
+        </HairGroup>
+      </HairGroom>
+      <HairRepresentations>
+        <HairCards id="cards" lengthSegments="12" widthSegments="4"
+                   thickness="0.01" crossSection="arched" tipShape="point" />
+      </HairRepresentations>
+      <HairLOD representation="cards" />
+    </HairAsset>
+  </Assets>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("guide-authored cards should parse");
+        let hair = graph.assets[0].primitive().expect("compiled hair asset");
+        let PrimitiveGeometry::HairCards {
+            representation_id,
+            bind_bone,
+            guides,
+            ..
+        } = &hair.geometry
+        else {
+            panic!("expected retained hair card geometry");
+        };
+        assert_eq!(representation_id, "cards");
+        assert_eq!(bind_bone.as_deref(), Some("head"));
+        assert_eq!(guides[0].id, "center");
+        assert_eq!(guides[0].points.len(), 3);
+        assert_eq!(hair.material_definition.as_ref().unwrap().id, "hair");
+    }
+
+    #[test]
+    fn head_asset_keeps_face_layout_optional_for_creature_anatomy() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <MaterialAsset id="scales" baseColor="#355A42" />
+    <HeadAsset id="dragon_head" material="scales" archetype="dragon" symmetry="x">
+      <HeadShape size={[1.2,0.8,1.5]} forehead="0.82" cheekWidth="0.9"
+                 jawWidth="0.72" chinLength="0.04" />
+      <HeadFeature id="muzzle" kind="muzzle" center={[0,-0.12,0.78]}
+                   size={[0.52,0.34,0.42]} amount="0.32" offset={[0,0,0.02]} />
+      <HeadFeature id="horn_l" kind="horn" center={[-0.48,0.68,-0.12]}
+                   size={[0.18,0.30,0.22]} amount="0.18" mirror="x" falloff="sharp" />
+      <HeadMorph headWidth="1.08" muzzleLength="1.25" />
+    </HeadAsset>
+  </Assets>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect("creature heads should not require a human FaceLayout");
+        let head = graph.assets[0].primitive().expect("compiled head asset");
+        let PrimitiveGeometry::HeadSurface {
+            archetype,
+            face_layout,
+            features,
+            morph,
+            ..
+        } = &head.geometry
+        else {
+            panic!("expected procedural head surface");
+        };
+        assert_eq!(archetype, "dragon");
+        assert!(face_layout.is_none());
+        assert_eq!(features.len(), 2);
+        assert_eq!(features[0].offset, [0.0, 0.0, 0.02]);
+        assert_eq!(morph.muzzle_length, 1.25);
     }
 
     #[test]

@@ -1,9 +1,26 @@
 # MotionLoom LLM Authoring Guide
 
+FaceLayout is an attribute-free container for Eye, Eyebrow, Nose, Mouth, and Ear children.
+Use Eyebrow position/width/thickness/arch/tilt for ordinary brows; omit Texture
+to inspect the generated ribbon with the head material.
+Eye may contain one direct Texture for the sclera, one optional Iris, and multiple
+Eyeliner children. Use the same Eyeliner tag with edge="upper" or edge="lower".
+Do not author removed flat iris or eyelid attributes on Eye.
+Bind images with Texture asset="image_id" inside the owning component. Flat
+FaceLayout attributes have been removed. See [Face components](FACE_COMPONENTS.md).
+
 Use this guide when generating or editing MotionLoom DSL. Prefer valid,
 predictable, editable, and renderable output over the shortest possible script.
 
 ## MotionLoom Agent Authoring Protocol
+
+For guide-based hair, follow [Hair cards authoring](HAIR_CARDS.md). Use one
+HairDefaults before guides in each HairGroup, then override only changed values
+on HairGuide or HairPoint. HairMirror references an earlier guide in the same
+group. Specify a nonparallel outward root normal rather than compensating with
+large rolls. Radius/stiffness do not enable static-card dynamics. The complete
+`showcase/s-000086/hair-cards-review.motionloom` in motionloom-example demonstrates
+the syntax; it does not regenerate or modify S86 main.motionloom.
 
 An agent must treat MotionLoom authoring as a five-stage feedback loop:
 
@@ -283,6 +300,30 @@ resource and only enters the Scene through `Model`:
 <RigidBody id="ball_body" target="ball_model" dimension="3d"
            type="dynamic" shape="auto" mass="1" />
 ```
+
+For a native head without GLB geometry, use `HeadAsset`. `HeadShape` is the
+required species-neutral volume; `FaceLayout` is optional and must not be
+forced onto creature heads. Use `HeadFeature center/size/amount` for sockets,
+muzzles, ridges, ear roots, horns, and invented anatomy. Use `mirror="x"` for
+bilateral features and `HeadMorph` for non-destructive proportion changes.
+Author Nose.position and Eye.position independently within FaceLayout.
+Flat FaceLayout attributes are no longer supported.
+
+To match a native head to an existing skinned character, run the additive
+comparison diagnostic before changing `HeadShape` values:
+
+```bash
+cargo run -p motionloom --example compare_head_asset -- \
+  character1.glb candidate.motionloom s86_head
+```
+
+The JSON report measures vertices weighted to the GLB `Head` joint in head
+local space, then reports width/height/depth ratios, a uniform scale, and a
+translation that align the candidate bounds. Use the ratios to tune anatomy;
+use `uniformScale` and `translation` only when attaching the calibrated part.
+`axisScale` is diagnostic and is intentionally not applied automatically, so
+the comparison never silently stretches a character. The API is non-breaking
+and does not rewrite the source DSL.
 
 V1 shapes are `box`, `sphere`, `plane`, `cylinder`, `cone`, and `wedge`.
 Dimensions must be positive, tessellation attributes accept 3 through 256,
@@ -1199,3 +1240,18 @@ When guidance differs, use this order:
 3. `PUBLIC_API.md` and ACP documentation for host integration.
 4. Current `motionloom-example/core` examples.
 5. Showcase examples for composition ideas, not minimal grammar.
+# Procedural surface authoring
+
+For GPU-generated liquid-relief imagery use the additive `procedural_surface` Process effect. See [parameter contract](PROCEDURAL_SURFACE.md) and `examples/motionloom/scene/motion_graphics/procedural_surface.motionloom`. It is a 2D effect with virtual normals, not a 3D mesh. Preserve DSL as the source of truth; do not substitute prerecorded imagery. CPU-only rendering is unsupported and must report an error.
+# Procedural flow variant
+
+For `procedural_surface`, optional `flowStrength: "1"` enables directional flowing ribbons. Default `0` preserves the original relief. Animate `evolution` using absolute seconds for seekable motion; this is analytic transport, not a fluid simulation.
+
+## Audio editing
+
+Use top-level `AudioClip` for cut placement and source trims, and `AudioTarget`
+for `gainDb`, `pan`, or `playbackRate`. Preserve Key attributes: time or frame,
+value, optional ease. Do not put play/stop/sourceIn on Key or audio properties on
+AnimationTarget. All key times are global graph times. Crossfades use overlapping
+clips with gain curves. See [AUDIO.md](AUDIO.md) and the full audio_edit.motionloom
+example; detection/beat analysis is not implemented.

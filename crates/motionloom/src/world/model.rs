@@ -329,6 +329,8 @@ fn default_world_camera_up_z() -> String {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorldActor {
+    #[serde(default)]
+    pub cel_materials: Vec<crate::scene::model::SceneMaterialBindingNode>,
     pub id: String,
     pub model: String,
     /// Typed procedural geometry bypasses external asset resolution.
@@ -341,6 +343,10 @@ pub struct WorldActor {
     /// the actor while sharing the normal PBR mesh pipeline.
     #[serde(default)]
     pub vegetation: Option<crate::dsl::VegetationAssetNode>,
+    /// Frame-local matrices drive opt-in native smooth skinning while the
+    /// generated weighted mesh remains retained in the normal mesh cache.
+    #[serde(default)]
+    pub native_skin: Option<WorldNativeSkin>,
     pub path_style: WorldPathStyle,
     pub hide_meshes: Vec<String>,
     pub hide_materials: Vec<String>,
@@ -372,6 +378,39 @@ pub struct WorldActor {
     pub play: Option<WorldPlay>,
     #[serde(default)]
     pub plays: Vec<WorldPlay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldNativeSkin {
+    pub mesh_position: [f32; 3],
+    pub mesh_rotation: [f32; 4],
+    pub mesh_scale: f32,
+    pub candidates: Vec<WorldNativeSkinSegment>,
+    #[serde(default)]
+    pub weight_regions: Vec<WorldNativeWeightRegion>,
+    pub joint_matrices: Vec<[f32; 16]>,
+    /// Current compound-local joints let editor hosts reuse the normal 3D overlay.
+    pub joint_names: Vec<String>,
+    pub joint_positions: Vec<[f32; 3]>,
+    pub max_influences: u32,
+    pub falloff: f32,
+    pub normalize: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldNativeSkinSegment {
+    pub joint: u16,
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldNativeWeightRegion {
+    pub joint: u16,
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub strength: f32,
+    pub replace: bool,
 }
 
 fn default_world_actor_scale_mode() -> String {

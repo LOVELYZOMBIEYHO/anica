@@ -403,7 +403,7 @@ pub fn motionloom_analyze_script_json(script: &str) -> String {
     analyze_script_json(script)
 }
 
-/// Inspect the Scene style request and compiler fallbacks without a GPU.
+/// Inspect the resolved Scene style without a GPU.
 #[wasm_bindgen]
 pub fn motionloom_render_style_json(script: &str, scene_id: &str) -> Result<String, JsValue> {
     let graph = crate::dsl::parse_graph_script(script).map_err(|e| js_error(e.to_string()))?;
@@ -422,6 +422,24 @@ pub fn motionloom_analyze_script_for_target_json(script: &str, target: &str) -> 
 #[wasm_bindgen]
 pub fn motionloom_showcase_schema_json(script: &str) -> String {
     showcase_schema_json(script)
+}
+
+/// Inspect an explicit or generated control cage without rendering or filesystem access.
+#[wasm_bindgen]
+pub fn motionloom_inspect_control_cage_json(
+    script: &str,
+    asset_id: &str,
+) -> Result<String, JsValue> {
+    let graph = parse_graph_script(script).map_err(|error| js_error(error.to_string()))?;
+    let asset = graph
+        .assets
+        .iter()
+        .find(|asset| asset.id == asset_id)
+        .and_then(|asset| asset.primitive())
+        .ok_or_else(|| js_error(format!("missing primitive asset {asset_id:?}")))?;
+    let report = crate::inspect_control_cage(asset)
+        .ok_or_else(|| js_error(format!("asset {asset_id:?} has no control cage")))?;
+    serde_json::to_string_pretty(&report).map_err(|error| js_error(error.to_string()))
 }
 
 /// Analyze host/backend observations without parsing or changing MotionLoom DSL.
@@ -1271,4 +1289,80 @@ mod tests {
         assert_eq!(camera.position, "[1,2,3]");
         assert_eq!(camera.target, "[0,1,0]");
     }
+}
+
+// Head authoring transports reuse the native CPU implementation and never fetch images.
+#[wasm_bindgen(js_name = validateHeadReferenceSet)]
+pub fn wasm_validate_head_reference_set(request: &str) -> Result<String, JsValue> {
+    crate::head_fitting::validate_head_reference_set_json(request)
+        .map_err(|e| js_error(e.to_string()))
+}
+#[wasm_bindgen(js_name = evaluateHeadReferenceFit)]
+pub fn wasm_evaluate_head_reference_fit(source: &str, request: &str) -> Result<String, JsValue> {
+    crate::head_fitting::evaluate_head_reference_fit_json(source, request)
+        .map_err(|e| js_error(e.to_string()))
+}
+#[wasm_bindgen(js_name = fitHeadAssetToReferences)]
+pub fn wasm_fit_head_asset_to_references(source: &str, request: &str) -> Result<String, JsValue> {
+    crate::head_fitting::fit_head_asset_to_references_json(source, request)
+        .map_err(|e| js_error(e.to_string()))
+}
+#[wasm_bindgen(js_name = applyHeadFitProposal)]
+pub fn wasm_apply_head_fit_proposal(source: &str, proposal: &str) -> Result<String, JsValue> {
+    crate::head_fitting::apply_head_fit_proposal_json(source, proposal)
+        .map_err(|e| js_error(e.to_string()))
+}
+
+/// Shared PCM renderer; browser hosts own decoding, playback and container codecs.
+#[wasm_bindgen]
+pub struct WasmAudioMixer {
+    mixer: crate::audio::AudioMixer,
+    plan: crate::audio::AudioTimelinePlan,
+}
+#[wasm_bindgen]
+impl WasmAudioMixer {
+    #[wasm_bindgen(constructor)]
+    pub fn new(script: &str, sample_rate: u32) -> Result<WasmAudioMixer, JsValue> {
+        let graph = parse_graph_script(script).map_err(|e| js_error(e.to_string()))?;
+        let plan = crate::audio::compile_audio_plan(&graph).map_err(|e| js_error(e.to_string()))?;
+        let mixer = crate::audio::AudioMixer::new(plan.clone(), sample_rate)
+            .map_err(|e| js_error(e.to_string()))?;
+        Ok(Self { mixer, plan })
+    }
+    pub fn plan_json(&self) -> Result<String, JsValue> {
+        serde_json::to_string(&self.plan).map_err(|e| js_error(e.to_string()))
+    }
+    pub fn add_asset(&mut self, id: &str, stereo_pcm: &[f32]) -> Result<(), JsValue> {
+        self.mixer
+            .add_asset(id, stereo_pcm.to_vec())
+            .map_err(|e| js_error(e.to_string()))
+    }
+    pub fn render(&self, start_sample: f64, frames: u32) -> Result<Vec<f32>, JsValue> {
+        if !start_sample.is_finite()
+            || start_sample < 0.0
+            || start_sample.fract() != 0.0
+            || start_sample > 9_007_199_254_740_991.0
+        {
+            return Err(js_error(
+                "start_sample must be a non-negative safe integer".into(),
+            ));
+        }
+        self.mixer
+            .render(start_sample as u64, frames as usize)
+            .map_err(|e| js_error(e.to_string()))
+    }
+}
+
+/// Read a MeshAsset cage with preview-compatible projection; does not mutate the DSL.
+#[wasm_bindgen]
+pub async fn motionloom_mesh_edit_snapshot_json(
+    script: &str,
+    model_id: &str,
+    frame: u32,
+) -> Result<String, JsValue> {
+    let graph = parse_graph_script(script).map_err(|e| js_error(e.to_string()))?;
+    let snapshot = crate::scene::render::mesh_edit_snapshot(&graph, model_id, frame)
+        .await
+        .map_err(|e| js_error(e.to_string()))?;
+    serde_json::to_string(&snapshot).map_err(|e| js_error(e.to_string()))
 }

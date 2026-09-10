@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/root.rs
+
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -170,7 +174,8 @@ where
     let shell = inspect_root_graph(script)?;
 
     if shell.has_scene || (shell.has_world && shell.has_process) {
-        let graph = parse_graph_script(script)?;
+        let mut graph = parse_graph_script(script)?;
+        resolve_audio_sources(&mut graph, asset_root.as_ref());
         return render_scene_graph_to_video_with_progress_and_cancel(
             ffmpeg_bin,
             &graph,
@@ -185,7 +190,8 @@ where
     }
 
     if shell.has_process {
-        let graph = parse_process_graph_script(script)?;
+        let mut graph = parse_process_graph_script(script)?;
+        resolve_audio_sources(&mut graph, asset_root.as_ref());
         if process_graph_needs_external_input(&graph) {
             return Err(MotionLoomError::UnsupportedDocument {
                 message:
@@ -222,7 +228,8 @@ where
         .map_err(MotionLoomError::from);
     }
 
-    let graph = parse_graph_script(script)?;
+    let mut graph = parse_graph_script(script)?;
+    resolve_audio_sources(&mut graph, asset_root.as_ref());
     render_scene_graph_to_video_with_progress_and_cancel(
         ffmpeg_bin,
         &graph,
@@ -518,5 +525,18 @@ mod tests {
             panic!("expected scene document");
         };
         assert_eq!(graph.scenes[0].id, "commented_scene");
+    }
+}
+
+// Resolve only audio assets here; visual asset resolution retains its existing policy.
+fn resolve_audio_sources(graph: &mut crate::GraphScript, root: &Path) {
+    for asset in &mut graph.assets {
+        if asset.kind == crate::dsl::GraphAssetKind::Audio {
+            if let crate::GraphAssetSource::External { src } = &mut asset.source {
+                if !src.contains("://") && !Path::new(src).is_absolute() {
+                    *src = root.join(&*src).to_string_lossy().into_owned();
+                }
+            }
+        }
     }
 }

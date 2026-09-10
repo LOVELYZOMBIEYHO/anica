@@ -15,6 +15,8 @@ use crate::scene::drawable::parse_color;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessCpuRenderError {
+    #[error("procedural_surface requires GPU rendering; CPU fallback is not implemented")]
+    ProceduralSurfaceRequiresGpu,
     #[error(transparent)]
     Parse(#[from] GraphParseError),
     #[error(transparent)]
@@ -37,6 +39,15 @@ pub struct ProcessCpuRenderer {
 
 impl ProcessCpuRenderer {
     pub fn new(graph: GraphScript) -> Result<Self, ProcessCpuRenderError> {
+        // Reject at construction because the legacy render_image API is infallible.
+        if graph.passes.iter().any(|pass| {
+            matches!(
+                crate::process::effect_kind::resolve_process_effect(&pass.effect),
+                Some(crate::process::effect_kind::ProcessEffect::ProceduralSurface)
+            )
+        }) {
+            return Err(ProcessCpuRenderError::ProceduralSurfaceRequiresGpu);
+        }
         let runtime = compile_runtime_program(graph.clone())?;
         Ok(Self {
             graph,
@@ -200,6 +211,9 @@ fn apply_process_pass(
         | Some(ProcessEffect::SpectralEnergy) => {
             // CPU renderer does not implement these effects yet; pass through unchanged.
             image
+        }
+        Some(ProcessEffect::ProceduralSurface) => {
+            unreachable!("rejected by ProcessCpuRenderer::new")
         }
         None => image,
     }

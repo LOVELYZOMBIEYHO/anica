@@ -116,6 +116,9 @@ MotionLoom supports WASM, which enables it to run directly in modern web browser
 `crates/motionloom/examples/wgpu_live_preview.rs` is a native diagnostic viewer
 for testing MotionLoom's direct wgpu preview path without Anica, allowing you to
 evaluate the best preview-quality trade-offs.
+When a graph contains `AudioAsset`/`AudioClip`, this viewer also prepares the
+same mixed timeline for the host's default audio device; export is not required
+just to hear a soundtrack.
 
 Run the live preview:
 

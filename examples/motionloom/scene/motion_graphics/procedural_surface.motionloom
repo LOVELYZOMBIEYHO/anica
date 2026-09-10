@@ -1,0 +1,24 @@
+<!-- GPU-only procedural surface; no external assets or new Scene syntax. -->
+<Graph fps={30} duration="4s" size={[640,360]}>
+<Background color="#000000" />
+<Scene id="surface_demo">
+<Timeline>
+<Track>
+<Sequence from="0s" duration="4s">
+<Layer>
+<Rect x="0" y="0" width="640" height="360" fill="#000000" />
+</Layer>
+</Sequence>
+</Track>
+</Timeline>
+<Effects>
+<Effect process="liquid" />
+</Effects>
+</Scene>
+<Process id="liquid">
+<Tex id="src" fmt="rgba16f" from="scene" />
+<Tex id="out" fmt="rgba16f" />
+<Pass id="surface" kind="compute" effect="procedural_surface" in={["src"]} out={["out"]} params={{ evolution: "$time.sec*0.12", flowStrength: "1" }} />
+</Process>
+<Present from="surface_demo" />
+</Graph>

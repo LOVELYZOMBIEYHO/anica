@@ -4,6 +4,52 @@
 
 use motionloom::api::{parse_graph_script, resolve_scene_render_style};
 
+// Exercise the solid-color GLB path, not just generated primitive textures.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+#[ignore = "requires GPU and sibling Character1 CC0 asset"]
+fn character1_opaque_glb_has_visible_outline() {
+    use motionloom::api::{SceneRenderProfile, SceneRenderer};
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../../motionloom-example/assets/sample_assets/characters/character1/character1.glb",
+    );
+    assert!(asset.is_file());
+    let source = script(
+        "<RenderStyle id=\"c\">\n<SurfaceStyle shading=\"cel\" />\n<OutlineStyle width=\"3\" />\n</RenderStyle>",
+        "renderStyle=\"c\"",
+    ).replace("<PrimitiveAsset id=\"ball\" shape=\"sphere\" radius=\"1\" material=\"paint\" />",
+        &format!("<ModelAsset id=\"ball\" src=\"{}\" />", asset.display()))
+     .replace("<Model id=\"hero\" asset=\"ball\" />", "<Model id=\"hero\" asset=\"ball\" scaleMode=\"normalize_height\" scale=\"2\" />")
+     .replace("target={[0,0,0]}", "target={[0,1,0]}");
+    pollster::block_on(async {
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        let on = renderer
+            .render_frame(&parse_graph_script(&source).unwrap(), 0)
+            .await
+            .unwrap();
+        let off_source = source.replace("width=\"3\"", "enabled=\"false\"");
+        let off = renderer
+            .render_frame(&parse_graph_script(&off_source).unwrap(), 0)
+            .await
+            .unwrap();
+        let black_added = on
+            .pixels()
+            .zip(off.pixels())
+            .filter(|(a, b)| {
+                a[3] > 240
+                    && a[0] < 10
+                    && a[1] < 10
+                    && a[2] < 10
+                    && (b[3] < 10 || b[0] > 30 || b[1] > 30 || b[2] > 30)
+            })
+            .count();
+        assert!(
+            black_added > 50,
+            "expected visible GLB outline; added {black_added} black pixels"
+        );
+    });
+}
+
 // Keep camera, lights and assets identical across visual comparisons.
 fn script(resource: &str, reference: &str) -> String {
     format!(
@@ -46,6 +92,36 @@ fn style_reference_and_legacy_defaults() {
 }
 
 #[test]
+fn cel_defaults_and_outline_validation() {
+    let cel = "<RenderStyle id=\"c\">\n<SurfaceStyle shading=\"cel\" />\n</RenderStyle>";
+    let graph = parse_graph_script(&script(cel, "renderStyle=\"c\"")).unwrap();
+    let r = resolve_scene_render_style(&graph, "main").unwrap();
+    assert_eq!(r.cel.outline_width, 1.5);
+    assert_eq!(r.cel.outline_color, [0.0; 3]);
+    let disabled = cel.replace(
+        "</RenderStyle>",
+        "<OutlineStyle enabled=\"false\" />\n</RenderStyle>",
+    );
+    let graph = parse_graph_script(&script(&disabled, "renderStyle=\"c\"")).unwrap();
+    assert_eq!(
+        resolve_scene_render_style(&graph, "main")
+            .unwrap()
+            .cel
+            .outline_width,
+        0.0
+    );
+    for child in [
+        "<OutlineStyle width=\"-1\" />",
+        "<OutlineStyle method=\"screen\" />",
+        "<OutlineStyle distanceMode=\"world\" />",
+        "<SurfaceStyle shadowFeather=\"0\" />",
+    ] {
+        let bad = format!("<RenderStyle id=\"c\">\n{child}\n</RenderStyle>");
+        assert!(parse_graph_script(&script(&bad, "renderStyle=\"c\"")).is_err());
+    }
+}
+
+#[test]
 fn invalid_styles_are_rejected_before_render() {
     for resource in [
         "<RenderStyle id=\"t\">\n<SurfaceStyle shading=\"typo\" />\n</RenderStyle>",
@@ -73,14 +149,24 @@ fn invalid_styles_are_rejected_before_render() {
 }
 
 #[test]
-fn quality_is_separate_and_reports_real_fallbacks() {
-    let g = parse_graph_script(&script("<RenderQuality id=\"q\">\n<Resolution scale=\"0.5\" />\n<Shadows resolution=\"1024\" filtering=\"pcf\" />\n<AntiAliasing mode=\"fxaa\" />\n<AmbientOcclusion quality=\"high\" />\n</RenderQuality>","renderQuality=\"q\"")).unwrap();
-    let r = resolve_scene_render_style(&g, "main").unwrap();
-    assert_eq!(r.render_scale, 0.5);
-    assert_eq!(r.shadow_resolution, 1024);
-    assert_eq!(r.anti_aliasing, "fxaa");
-    assert_eq!(r.fallbacks.len(), 1);
-    assert!(r.fallbacks[0].contains("not SSAO"));
+fn removed_quality_syntax_is_rejected() {
+    assert!(parse_graph_script(&script("<RenderQuality id=\"q\">\n</RenderQuality>", "")).is_err());
+    assert!(parse_graph_script(&script("", "renderQuality=\"q\"")).is_err());
+
+    let graph = parse_graph_script(&script("", "")).unwrap();
+    let mut graph_json = serde_json::to_value(&graph).unwrap();
+    graph_json
+        .as_object_mut()
+        .unwrap()
+        .insert("renderQualities".into(), serde_json::json!([]));
+    assert!(serde_json::from_value::<motionloom::GraphScript>(graph_json).is_err());
+
+    let mut scene_json = serde_json::to_value(&graph).unwrap();
+    scene_json["scenes"][0]
+        .as_object_mut()
+        .unwrap()
+        .insert("renderQuality".into(), serde_json::json!("q"));
+    assert!(serde_json::from_value::<motionloom::GraphScript>(scene_json).is_err());
 }
 
 #[test]
@@ -110,13 +196,11 @@ fn style_never_rewrites_authored_materials() {
 }
 
 #[test]
-fn explicit_nodes_are_reported_and_quality_children_override_presets() {
-    let text = script("<RenderStyle id=\"t\">\n<LightingStyle preset=\"night\" />\n<PostStyle exposure=\"2\" />\n</RenderStyle>\n<RenderQuality id=\"q\" preset=\"cinematic\">\n<Resolution scale=\"0.75\" />\n</RenderQuality>", "renderStyle=\"t\" renderQuality=\"q\"")
+fn explicit_nodes_are_reported() {
+    let text = script("<RenderStyle id=\"t\">\n<LightingStyle preset=\"night\" />\n<PostStyle exposure=\"2\" />\n</RenderStyle>", "renderStyle=\"t\"")
         .replace("<Model id=\"hero\"", "<ColorManagement id=\"grade\" exposure=\"1.2\" />\n<Model id=\"hero\"");
     let g = parse_graph_script(&text).unwrap();
     let r = resolve_scene_render_style(&g, "main").unwrap();
-    assert_eq!(r.render_scale, 0.75);
-    assert_eq!(r.shadow_resolution, 4096);
     assert!(r.overrides.iter().any(|v| v.property == "lighting.preset"));
     let exposure = r
         .overrides
@@ -128,7 +212,7 @@ fn explicit_nodes_are_reported_and_quality_children_override_presets() {
 }
 
 #[test]
-fn styles_are_scene_local_and_old_serialized_graphs_load() {
+fn styles_are_scene_local_and_serialized_graphs_roundtrip() {
     let text = script(
         "<RenderStyle id=\"t\">\n<SurfaceStyle shading=\"toon\" />\n</RenderStyle>",
         "renderStyle=\"t\"",
@@ -143,16 +227,9 @@ fn styles_are_scene_local_and_old_serialized_graphs_load() {
         resolve_scene_render_style(&g, "main").unwrap().shading,
         "toon"
     );
-    let plain = parse_graph_script(&script("", "")).unwrap();
-    let mut old = serde_json::to_value(&plain).unwrap();
-    old.as_object_mut().unwrap().remove("renderStyles");
-    old.as_object_mut().unwrap().remove("renderQualities");
-    for s in old["scenes"].as_array_mut().unwrap() {
-        s.as_object_mut().unwrap().remove("renderStyle");
-        s.as_object_mut().unwrap().remove("renderQuality");
-    }
-    let loaded: motionloom::GraphScript = serde_json::from_value(old).unwrap();
-    assert!(loaded.render_styles.is_empty());
+    let encoded = serde_json::to_value(&g).unwrap();
+    let loaded: motionloom::GraphScript = serde_json::from_value(encoded).unwrap();
+    assert_eq!(loaded.render_styles, g.render_styles);
 }
 
 #[test]
@@ -170,13 +247,26 @@ fn existing_showcases_remain_parseable() {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[ignore = "requires the sibling motionloom-example checkout"]
+fn showcases_80_to_88_remain_parseable() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../motionloom-example/showcase");
+    for number in 80..=88 {
+        let file = root.join(format!("s-{number:06}/main.motionloom"));
+        let text = std::fs::read_to_string(&file).unwrap();
+        parse_graph_script(&text).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 #[ignore = "requires a GPU; run explicitly on native Metal/WebGPU host"]
-fn rendered_modes_differ_and_quality_preserves_output_size() {
+fn rendered_modes_differ_and_preserve_output_size() {
     use motionloom::api::{SceneRenderProfile, SceneRenderer};
     pollster::block_on(async {
         let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
         let mut images = Vec::new();
-        for mode in ["physical", "stylized", "toon", "clay"] {
+        for mode in ["physical", "stylized", "toon", "clay", "cel"] {
             let g = parse_graph_script(&script(
                 &format!(
                     "<RenderStyle id=\"t\">\n<SurfaceStyle shading=\"{mode}\" />\n</RenderStyle>"
@@ -194,10 +284,127 @@ fn rendered_modes_differ_and_quality_preserves_output_size() {
         }
         let plain = parse_graph_script(&script("", "")).unwrap();
         assert_eq!(renderer.render_frame(&plain, 0).await.unwrap(), images[0]);
-        let g = parse_graph_script(&script("<RenderQuality id=\"q\">\n<Resolution scale=\"0.5\" />\n<AntiAliasing mode=\"fxaa\" />\n<Shadows resolution=\"512\" />\n</RenderQuality>","renderQuality=\"q\"")).unwrap();
+    });
+}
+
+#[test]
+fn cel_material_settings_validate_and_roundtrip() {
+    let source = script("", "").replace(
+        "<Model id=\"hero\" asset=\"ball\" />",
+        "<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding material=\"*\" celRole=\"hair\" outlineWidth=\"0.5\" celShadowColor=\"#684C71\" hairHighlight=\"0.3\" />\n</Model>",
+    );
+    let graph = parse_graph_script(&source).unwrap();
+    let json = serde_json::to_value(&graph).unwrap();
+    let restored: motionloom::GraphScript = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    for (old, new) in [
+        ("outlineWidth=\"0.5\"", "outlineWidth=\"-1\""),
+        ("celRole=\"hair\"", "celRole=\"unknown\""),
+        ("hairHighlight=\"0.3\"", "hairHighlight=\"NaN\""),
+        ("#684C71", "bad-color"),
+    ] {
+        assert!(parse_graph_script(&source.replace(old, new)).is_err());
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+#[ignore = "requires a GPU"]
+fn cel_outline_material_override_and_missing_slot() {
+    use motionloom::api::{SceneRenderProfile, SceneRenderer};
+    pollster::block_on(async {
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        let source = script(
+            "<RenderStyle id=\"c\">\n<SurfaceStyle shading=\"cel\" />\n<OutlineStyle width=\"3\" />\n</RenderStyle>",
+            "renderStyle=\"c\"",
+        );
+        let normal = parse_graph_script(&source).unwrap();
+        let outlined = renderer.render_frame(&normal, 0).await.unwrap();
+        let disabled_source = source.replace(
+            "<OutlineStyle width=\"3\" />",
+            "<OutlineStyle enabled=\"false\" />",
+        );
+        let disabled = renderer
+            .render_frame(&parse_graph_script(&disabled_source).unwrap(), 0)
+            .await
+            .unwrap();
+        assert_ne!(outlined, disabled);
+        let override_source = source.replace("<Model id=\"hero\" asset=\"ball\" />",
+            "<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding material=\"*\" outlineWidth=\"0\" />\n</Model>");
+        let override_image = renderer
+            .render_frame(&parse_graph_script(&override_source).unwrap(), 0)
+            .await
+            .unwrap();
+        assert_eq!(override_image, disabled);
+        let bad = override_source.replace("material=\"*\"", "material=\"missing_slot\"");
+        let error = renderer
+            .render_frame(&parse_graph_script(&bad).unwrap(), 0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing_slot"), "{error}");
+    });
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+#[ignore = "requires a GPU"]
+fn cel_control_texture_changes_outline_and_face_shadow() {
+    use base64::Engine;
+    use motionloom::api::{SceneRenderProfile, SceneRenderer};
+    fn source(pixel: [u8; 4], role: &str) -> String {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba(pixel))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        script("<RenderStyle id=\"c\">\n<SurfaceStyle shading=\"cel\" />\n<OutlineStyle width=\"3\" />\n</RenderStyle>", "renderStyle=\"c\"")
+            .replace("<Assets>", &format!("<Assets>\n<ImageAsset id=\"control\" src=\"data:image/png;base64,{data}\" colorSpace=\"linear-srgb\" />"))
+            .replace("<Model id=\"hero\" asset=\"ball\" />", &format!("<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding material=\"*\" celRole=\"{role}\" celControlMap=\"control\" />\n</Model>"))
+    }
+    pollster::block_on(async {
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        let white = source([255; 4], "body");
+        let black = source([0, 255, 255, 255], "body");
+        let a = renderer
+            .render_frame(&parse_graph_script(&white).unwrap(), 0)
+            .await
+            .unwrap();
+        let b = renderer
+            .render_frame(&parse_graph_script(&black).unwrap(), 0)
+            .await
+            .unwrap();
+        assert_ne!(a, b);
+        let off = black.replace(
+            "<OutlineStyle width=\"3\" />",
+            "<OutlineStyle enabled=\"false\" />",
+        );
         assert_eq!(
-            renderer.render_frame(&g, 0).await.unwrap().dimensions(),
-            (256, 192)
+            b,
+            renderer
+                .render_frame(&parse_graph_script(&off).unwrap(), 0)
+                .await
+                .unwrap()
+        );
+        let face_lit = source([0, 255, 255, 255], "face");
+        let face_shadow = source([0, 0, 255, 255], "face");
+        let a = renderer
+            .render_frame(&parse_graph_script(&face_lit).unwrap(), 0)
+            .await
+            .unwrap();
+        let b = renderer
+            .render_frame(&parse_graph_script(&face_shadow).unwrap(), 0)
+            .await
+            .unwrap();
+        assert!(a != b, "face SDF channels should produce different pixels");
+        assert!(parse_graph_script(&face_lit.replace(" celControlMap=\"control\"", "")).is_err());
+        let bad = face_lit.replace("celControlMap=\"control\"", "celControlMap=\"missing\"");
+        assert!(
+            renderer
+                .render_frame(&parse_graph_script(&bad).unwrap(), 0)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
         );
     });
 }

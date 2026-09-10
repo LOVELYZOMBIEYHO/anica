@@ -29,6 +29,10 @@ impl VideoFrame {
 /// Errors that can occur while encoding a video.
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error(transparent)]
+    AudioPlan(#[from] crate::GraphParseError),
+    #[error(transparent)]
+    Audio(#[from] crate::audio::AudioError),
     #[error("failed to create output directory ({path}): {source}")]
     CreateOutputDir {
         path: std::path::PathBuf,

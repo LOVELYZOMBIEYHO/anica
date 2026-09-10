@@ -17,14 +17,11 @@ async fn style_modes_render_on_browser_webgpu() {
 <RenderStyle id="s">
 <SurfaceStyle shading="{shading}" />
 </RenderStyle>
-<RenderQuality id="q" preset="web_high">
-<Resolution scale="0.75" />
-</RenderQuality>
 <Assets>
 <MaterialAsset id="paint" baseColor="#38ACB8" roughness="0.32" />
 <PrimitiveAsset id="ball" shape="sphere" radius="1" material="paint" />
 </Assets>
-<Scene id="main" renderStyle="s" renderQuality="q">
+<Scene id="main" renderStyle="s">
 <Timeline>
 <Track space="3d">
 <Sequence duration="1s">

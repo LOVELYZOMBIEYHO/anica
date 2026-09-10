@@ -235,6 +235,9 @@ fn append_mesh(target: &mut GlbMeshData, mut source: GlbMeshData) {
             .metallic_roughness_texture
             .map(|value| value + texture_offset);
         material.normal_texture = material.normal_texture.map(|value| value + texture_offset);
+        material.occlusion_texture = material
+            .occlusion_texture
+            .map(|value| value + texture_offset);
         material.emissive_texture = material
             .emissive_texture
             .map(|value| value + texture_offset);

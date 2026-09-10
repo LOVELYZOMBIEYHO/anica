@@ -1,3 +1,7 @@
+// =========================================
+// =========================================
+// crates/motionloom/src/api.rs
+
 //! Recommended MotionLoom public API surface.
 //!
 //! This module intentionally re-exports the main integration APIs without
@@ -69,8 +73,16 @@
 //! assert!(bloom.is_some());
 //! ```
 
+// Audio adapters share one timeline and mixer across native and browser hosts.
+pub use crate::audio::{
+    AudioClipNode, AudioError, AudioKeyNode, AudioMixer, AudioTargetNode, AudioTimelinePlan,
+    compile_audio_plan,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::audio::{PreparedAudio, prepare_audio};
+
 pub use crate::render_style::{
-    RenderQualityNode, RenderStyleNode, ResolvedSceneRenderStyle, resolve_scene_render_style,
+    RenderStyleNode, ResolvedSceneRenderStyle, resolve_scene_render_style,
 };
 pub use crate::{
     ANIMATION_PROPERTY_DESCRIPTORS, ActionLibraryNode, ActorVisibilityObservation,
@@ -78,11 +90,14 @@ pub use crate::{
     AnimationInterpolation, AnimationPropertyDescriptor, AnimationValueType, AssetResolver,
     AssetSource, AuthoringDiagnostic, AuthoringDiagnosticSeverity, AuthoringStatus,
     AuthoringSuggestion, AuthoringSummary, CameraClearanceObservation, CompositionObservation,
-    ContactSurfaceNode, EffectiveGraphSummary, ExposureObservation, GpuCompatibilityIssue,
-    GpuCompatibilityReport, GpuCompatibilitySeverity, GpuCompatibilityTarget, GpuFrameTexture,
-    GraphAssetSource, GraphParseError, GraphScript, MemoryAssetResolver, MotionLoomAuthoringReport,
-    MotionLoomDocument, MotionLoomError, MotionLoomRenderProgress, MotionLoomSceneRenderError,
-    MotionLoomShowcaseSchema, PathAssetResolver, PenetrationObservation, PrimitiveAssetNode,
+    ContactSurfaceNode, ControlCageInspection, ControlCageNode, EarNode, EffectiveGraphSummary,
+    ExposureObservation, EyeNode, EyebrowNode, EyelinerNode, FaceLayoutNode, FaceTextureNode,
+    FacialCageNode, GpuCompatibilityIssue, GpuCompatibilityReport, GpuCompatibilitySeverity,
+    GpuCompatibilityTarget, GpuFrameTexture, GraphAssetSource, GraphParseError, GraphScript,
+    HeadBounds, HeadComparisonReport, HeadDomeNode, HeadFitProposal, HeadSectionNode, IrisNode,
+    MemoryAssetResolver, MotionLoomAuthoringReport, MotionLoomDocument, MotionLoomError,
+    MotionLoomRenderProgress, MotionLoomSceneRenderError, MotionLoomShowcaseSchema, MouthNode,
+    NoseNode, PathAssetResolver, PenetrationObservation, PrimitiveAssetNode,
     PrimitiveAuthoringSummary, PrimitiveAxis, PrimitiveGeometry, PrimitiveLodNode,
     PrimitiveMeshBuildNode, PrimitiveModifierNode, ProcessCategory, ProcessEffectDefinition,
     ProcessGraph, ProjectedJointObservation, RenderPassDag, RenderPassDagEdge, RenderPassDagKind,
@@ -99,17 +114,18 @@ pub use crate::{
     analyze_shot_observations, animation_properties_for_node_kind, animation_property_descriptor,
     animation_property_schema_json, auto_correct_skeleton, build_skeleton_overlay,
     builtin_proportion_profile, builtin_proportion_profiles, builtin_skeleton_pose_presets,
-    clear_scene_asset_roots, compile_render_pass_dag, compile_runtime_program,
+    clear_scene_asset_roots, compare_glb_head_to_head_asset_json,
+    compare_glb_head_to_head_asset_path, compile_render_pass_dag, compile_runtime_program,
     evaluate_world_actor_rig, inspect_animation_targets, inspect_glb_environment_bytes,
-    inspect_glb_environment_json, inspect_glb_environment_path, inspect_glb_humanoid_profile_bytes,
-    inspect_glb_humanoid_profile_json, inspect_glb_skeleton_bytes, inspect_glb_skeleton_json,
-    inspect_glb_skeleton_path, inspect_gpu_compatibility, inspect_root_graph, is_graph_script,
-    is_known_process_kernel, is_process_graph_script, kernel_source_by_name,
-    motionloom_analyze_script_for_target_json, motionloom_analyze_script_json,
-    motionloom_dsl_schema_json, motionloom_showcase_schema_json, next_scene_output_path,
-    next_scene_output_path_for_profile, parse_action_library_document, parse_graph_script,
-    parse_motionloom_document, parse_process_graph_script, parse_world_graph_script,
-    process_effect_for_id, process_effects, process_effects_for_category,
+    inspect_glb_environment_json, inspect_glb_environment_path, inspect_glb_head_path,
+    inspect_glb_humanoid_profile_bytes, inspect_glb_humanoid_profile_json,
+    inspect_glb_skeleton_bytes, inspect_glb_skeleton_json, inspect_glb_skeleton_path,
+    inspect_gpu_compatibility, inspect_root_graph, is_graph_script, is_known_process_kernel,
+    is_process_graph_script, kernel_source_by_name, motionloom_analyze_script_for_target_json,
+    motionloom_analyze_script_json, motionloom_dsl_schema_json, motionloom_showcase_schema_json,
+    next_scene_output_path, next_scene_output_path_for_profile, parse_action_library_document,
+    parse_graph_script, parse_motionloom_document, parse_process_graph_script,
+    parse_world_graph_script, process_effect_for_id, process_effects, process_effects_for_category,
     render_motionloom_document_to_png_sequence_with_progress,
     render_motionloom_document_to_png_sequence_with_progress_and_cancel,
     render_motionloom_document_to_video_with_progress,
@@ -121,6 +137,9 @@ pub use crate::{
     render_scene_graph_to_video_with_progress_and_cancel, set_scene_asset_roots,
     shot_validation_sample_frames,
 };
+
+// Geometry tools use the same generated cage on native and WASM hosts.
+pub use crate::world::primitive::{generated_control_cage, inspect_control_cage};
 
 pub use crate::{
     ActionDriver, ActionExecutionTrace, AppliedActionTrace, AxisEffectiveness, BoneDifference,
@@ -143,3 +162,10 @@ pub use crate::DmabufPlane;
 
 #[cfg(target_os = "windows")]
 pub use crate::{WindowsD3DSharedHandle, WindowsD3DSharedSurface};
+
+// Head fitting uses the same typed contract on native and WASM hosts.
+pub use crate::head_fitting;
+
+// Native hosts can attach prepared audio while retaining the VideoEncoder interface.
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::export::FfmpegVideoEncoder;

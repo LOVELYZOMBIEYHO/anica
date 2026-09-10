@@ -15,7 +15,9 @@ use super::gltf_loader::{
     GlbLoadError, GlbMeshData, GlbNodeData, load_glb_animation_data, load_glb_mesh_data,
     parse_glb_animation_data, parse_glb_mesh_data, parse_gltf_json_value,
 };
+use super::primitive::generate_primitive_mesh;
 use super::{WorldAction, WorldModelProfile};
+use crate::dsl::parse_graph_script;
 
 const REPORT_VERSION: u32 = 1;
 const EPSILON: f32 = 1.0e-5;
@@ -26,11 +28,176 @@ pub enum ModelInspectionError {
     Glb(#[from] GlbLoadError),
     #[error("GLB {asset} has no skin or skeleton joints")]
     MissingSkeleton { asset: String },
+    #[error("failed to read candidate graph {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid candidate graph {asset}: {message}")]
+    Candidate { asset: String, message: String },
+    #[error("head comparison failed for {asset}: {message}")]
+    HeadComparison { asset: String, message: String },
     #[error("failed to serialize skeleton inspection report: {source}")]
     Serialize {
         #[source]
         source: serde_json::Error,
     },
+}
+
+/// Axis-aligned bounds measured in a documented comparison coordinate space.
+/// For a skinned GLB this is the selected joint's local space; for a generated
+/// primitive it is the primitive's authored local space.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadBounds {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub center: [f32; 3],
+    pub size: [f32; 3],
+    pub vertex_count: usize,
+    pub triangle_count: usize,
+}
+
+/// A non-destructive sizing/alignment proposal for a HeadAsset candidate.
+/// `uniform_scale` preserves the candidate's anatomy while `axis_scale` is
+/// reported as an optional diagnostic when the proportions themselves differ.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadFitProposal {
+    pub uniform_scale: f32,
+    pub axis_scale: [f32; 3],
+    pub translation: [f32; 3],
+    pub width_ratio: f32,
+    pub height_ratio: f32,
+    pub depth_ratio: f32,
+    pub reference_width_over_height: f32,
+    pub reference_depth_over_height: f32,
+    pub candidate_width_over_height: f32,
+    pub candidate_depth_over_height: f32,
+}
+
+/// Machine-readable comparison between Character1's weighted head geometry
+/// and one generated HeadAsset. This is authoring/diagnostic data only; it
+/// does not alter the runtime DSL or any existing scene.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadComparisonReport {
+    pub version: u32,
+    pub reference_asset: String,
+    pub reference_joint: String,
+    pub reference: HeadBounds,
+    pub candidate_asset: String,
+    pub candidate: HeadBounds,
+    pub selection_threshold: f32,
+    pub selected_weight_mass: f32,
+    pub fit: HeadFitProposal,
+    pub diagnostics: Vec<String>,
+}
+
+/// Measure the geometry weighted to Character1's `Head` joint.
+pub fn inspect_glb_head_path(path: impl AsRef<Path>) -> Result<HeadBounds, ModelInspectionError> {
+    let path = path.as_ref();
+    let mesh = load_glb_mesh_data(path)?;
+    let (bounds, _, _, _) = extract_weighted_head_bounds(&mesh, &path.to_string_lossy())?;
+    Ok(bounds)
+}
+
+/// Compare a generated HeadAsset in a graph file with a skinned GLB head.
+/// The output gives both the measured values and a deterministic fit proposal
+/// suitable for subsequent HeadShape parameter tuning.
+pub fn compare_glb_head_to_head_asset_path(
+    reference_glb_path: impl AsRef<Path>,
+    candidate_graph_path: impl AsRef<Path>,
+    candidate_id: &str,
+) -> Result<HeadComparisonReport, ModelInspectionError> {
+    let reference_path = reference_glb_path.as_ref();
+    let candidate_path = candidate_graph_path.as_ref();
+    let reference_mesh = load_glb_mesh_data(reference_path)?;
+    let (reference, reference_joint, threshold, weight_mass) =
+        extract_weighted_head_bounds(&reference_mesh, &reference_path.to_string_lossy())?;
+
+    let source =
+        std::fs::read_to_string(candidate_path).map_err(|source| ModelInspectionError::Io {
+            path: candidate_path.to_path_buf(),
+            source,
+        })?;
+    let graph = parse_graph_script(&source).map_err(|error| ModelInspectionError::Candidate {
+        asset: candidate_path.to_string_lossy().into_owned(),
+        message: error.to_string(),
+    })?;
+    let asset = graph
+        .assets
+        .iter()
+        .find(|asset| asset.id == candidate_id)
+        .and_then(|asset| asset.primitive())
+        .ok_or_else(|| ModelInspectionError::Candidate {
+            asset: candidate_path.to_string_lossy().into_owned(),
+            message: format!("asset '{candidate_id}' is missing or is not a PrimitiveAsset"),
+        })?;
+    let candidate_mesh = generate_primitive_mesh(asset);
+    let candidate = bounds_from_points(
+        candidate_mesh.positions.iter().copied(),
+        candidate_mesh.triangles.len(),
+    )
+    .ok_or_else(|| ModelInspectionError::HeadComparison {
+        asset: candidate_id.to_string(),
+        message: "candidate HeadAsset generated no vertices".to_string(),
+    })?;
+    let fit = fit_head_bounds(reference, candidate);
+    let mut diagnostics = Vec::new();
+    if (fit.reference_width_over_height - fit.candidate_width_over_height).abs() > 0.08 {
+        diagnostics.push(
+            "width/height differs materially; tune HeadShape cheekWidth or headWidth before scaling"
+                .to_string(),
+        );
+    }
+    if (fit.reference_depth_over_height - fit.candidate_depth_over_height).abs() > 0.08 {
+        diagnostics.push(
+            "depth/height differs materially; tune HeadShape depth or headDepth before scaling"
+                .to_string(),
+        );
+    }
+    if fit
+        .axis_scale
+        .iter()
+        .any(|scale| (*scale - fit.uniform_scale).abs() > 0.08)
+    {
+        diagnostics.push(
+            "uniform fit preserves proportions; axisScale is diagnostic only and would stretch anatomy"
+                .to_string(),
+        );
+    }
+    diagnostics.push(format!(
+        "reference uses vertices with Head skin weight >= {threshold:.2}; inspect the weighting if the silhouette still differs"
+    ));
+    Ok(HeadComparisonReport {
+        version: REPORT_VERSION,
+        reference_asset: reference_path.to_string_lossy().into_owned(),
+        reference_joint,
+        reference,
+        candidate_asset: candidate_id.to_string(),
+        candidate,
+        selection_threshold: threshold,
+        selected_weight_mass: weight_mass,
+        fit,
+        diagnostics,
+    })
+}
+
+/// Serialize [`HeadComparisonReport`] for editor panels and LLM tooling.
+pub fn compare_glb_head_to_head_asset_json(
+    reference_glb_path: impl AsRef<Path>,
+    candidate_graph_path: impl AsRef<Path>,
+    candidate_id: &str,
+) -> Result<String, ModelInspectionError> {
+    let report = compare_glb_head_to_head_asset_path(
+        reference_glb_path,
+        candidate_graph_path,
+        candidate_id,
+    )?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|source| ModelInspectionError::Serialize { source })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2314,6 +2481,240 @@ fn escape_xml(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn extract_weighted_head_bounds(
+    mesh: &GlbMeshData,
+    asset: &str,
+) -> Result<(HeadBounds, String, f32, f32), ModelInspectionError> {
+    let skin = mesh
+        .skin
+        .as_ref()
+        .ok_or_else(|| ModelInspectionError::MissingSkeleton {
+            asset: asset.to_string(),
+        })?;
+    let Some((head_slot, head_joint)) = skin.joints.iter().enumerate().find(|(_, joint)| {
+        joint
+            .name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("head"))
+    }) else {
+        return Err(ModelInspectionError::HeadComparison {
+            asset: asset.to_string(),
+            message: "skin has no joint named Head".to_string(),
+        });
+    };
+    let matrices = world_matrices(&mesh.nodes);
+    let head_matrix = matrices
+        .get(head_joint.node_index)
+        .copied()
+        .unwrap_or_else(identity);
+    let Some(head_inverse) = inverse_affine(head_matrix) else {
+        return Err(ModelInspectionError::HeadComparison {
+            asset: asset.to_string(),
+            message: "Head node world matrix is not invertible".to_string(),
+        });
+    };
+
+    let fallback_mesh_node = mesh
+        .nodes
+        .iter()
+        .find(|node| node.mesh.is_some())
+        .map(|node| node.index);
+    let mut vertex_mesh_nodes = vec![None; mesh.positions.len()];
+    for triangle in &mesh.triangles {
+        for index in triangle.indices {
+            if let Some(slot) = vertex_mesh_nodes.get_mut(index as usize) {
+                if slot.is_none() {
+                    *slot = triangle.mesh_node.or(fallback_mesh_node);
+                }
+            }
+        }
+    }
+
+    // Prefer a strict head influence. The relaxed pass is useful for rigs
+    // whose face vertices are shared with a neck joint at small weights.
+    let mut selected = Vec::new();
+    let mut selected_mask = vec![false; mesh.positions.len()];
+    let mut threshold = 0.25;
+    for candidate_threshold in [0.25, 0.05] {
+        selected.clear();
+        selected_mask.fill(false);
+        for (index, position) in mesh.positions.iter().copied().enumerate() {
+            let head_weight = head_weight(mesh, index, head_slot);
+            if head_weight < candidate_threshold {
+                continue;
+            }
+            let mesh_matrix = vertex_mesh_nodes
+                .get(index)
+                .and_then(|node| node.and_then(|node| matrices.get(node)))
+                .copied()
+                .unwrap_or_else(identity);
+            let world_position = transform_point(mesh_matrix, position);
+            selected.push(transform_point(head_inverse, world_position));
+            if let Some(mask) = selected_mask.get_mut(index) {
+                *mask = true;
+            }
+        }
+        if selected.len() >= 3 {
+            threshold = candidate_threshold;
+            break;
+        }
+    }
+    let bounds = bounds_from_points(
+        selected.iter().copied(),
+        mesh.triangles
+            .iter()
+            .filter(|triangle| {
+                triangle
+                    .indices
+                    .iter()
+                    .all(|index| selected_mask.get(*index as usize).copied().unwrap_or(false))
+            })
+            .count(),
+    )
+    .ok_or_else(|| ModelInspectionError::HeadComparison {
+        asset: asset.to_string(),
+        message: "Head joint has fewer than three weighted vertices".to_string(),
+    })?;
+    let weight_mass = mesh
+        .positions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| selected_mask.get(*index).copied().unwrap_or(false))
+        .map(|(index, _)| head_weight(mesh, index, head_slot))
+        .sum();
+    Ok((
+        bounds,
+        head_joint
+            .name
+            .clone()
+            .unwrap_or_else(|| "Head".to_string()),
+        threshold,
+        weight_mass,
+    ))
+}
+
+fn head_weight(mesh: &GlbMeshData, vertex: usize, head_slot: usize) -> f32 {
+    let Some(Some(joints)) = mesh.joints.get(vertex) else {
+        return 0.0;
+    };
+    let Some(Some(weights)) = mesh.weights.get(vertex) else {
+        return 0.0;
+    };
+    joints
+        .iter()
+        .zip(weights.iter())
+        .filter(|(joint, _)| **joint as usize == head_slot)
+        .map(|(_, weight)| *weight)
+        .sum()
+}
+
+fn bounds_from_points(
+    points: impl IntoIterator<Item = [f32; 3]>,
+    triangle_count: usize,
+) -> Option<HeadBounds> {
+    let mut points = points.into_iter();
+    let first = points.next()?;
+    let mut min = first;
+    let mut max = first;
+    let mut vertex_count = 1;
+    for point in points {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(point[axis]);
+            max[axis] = max[axis].max(point[axis]);
+        }
+        vertex_count += 1;
+    }
+    let size = sub3(max, min);
+    Some(HeadBounds {
+        min,
+        max,
+        center: scale3(add3(min, max), 0.5),
+        size,
+        vertex_count,
+        triangle_count,
+    })
+}
+
+fn fit_head_bounds(reference: HeadBounds, candidate: HeadBounds) -> HeadFitProposal {
+    let uniform_scale = safe_ratio(reference.size[1], candidate.size[1]);
+    let axis_scale = [
+        safe_ratio(reference.size[0], candidate.size[0]),
+        safe_ratio(reference.size[1], candidate.size[1]),
+        safe_ratio(reference.size[2], candidate.size[2]),
+    ];
+    let translation = sub3(reference.center, scale3(candidate.center, uniform_scale));
+    HeadFitProposal {
+        uniform_scale,
+        axis_scale,
+        translation,
+        width_ratio: safe_ratio(reference.size[0], candidate.size[0]),
+        height_ratio: safe_ratio(reference.size[1], candidate.size[1]),
+        depth_ratio: safe_ratio(reference.size[2], candidate.size[2]),
+        reference_width_over_height: safe_ratio(reference.size[0], reference.size[1]),
+        reference_depth_over_height: safe_ratio(reference.size[2], reference.size[1]),
+        candidate_width_over_height: safe_ratio(candidate.size[0], candidate.size[1]),
+        candidate_depth_over_height: safe_ratio(candidate.size[2], candidate.size[1]),
+    }
+}
+
+fn safe_ratio(numerator: f32, denominator: f32) -> f32 {
+    if denominator.abs() <= EPSILON {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn inverse_affine(matrix: [f32; 16]) -> Option<[f32; 16]> {
+    let (a, b, c) = (matrix[0], matrix[4], matrix[8]);
+    let (d, e, f) = (matrix[1], matrix[5], matrix[9]);
+    let (g, h, i) = (matrix[2], matrix[6], matrix[10]);
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if det.abs() <= EPSILON {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let (ia, ib, ic) = (
+        (e * i - f * h) * inv_det,
+        (c * h - b * i) * inv_det,
+        (b * f - c * e) * inv_det,
+    );
+    let (id, ie, if_) = (
+        (f * g - d * i) * inv_det,
+        (a * i - c * g) * inv_det,
+        (c * d - a * f) * inv_det,
+    );
+    let (ig, ih, ii) = (
+        (d * h - e * g) * inv_det,
+        (b * g - a * h) * inv_det,
+        (a * e - b * d) * inv_det,
+    );
+    let translation = [matrix[12], matrix[13], matrix[14]];
+    let inverse_translation = [
+        -(ia * translation[0] + ib * translation[1] + ic * translation[2]),
+        -(id * translation[0] + ie * translation[1] + if_ * translation[2]),
+        -(ig * translation[0] + ih * translation[1] + ii * translation[2]),
+    ];
+    Some([
+        ia,
+        id,
+        ig,
+        0.0,
+        ib,
+        ie,
+        ih,
+        0.0,
+        ic,
+        if_,
+        ii,
+        0.0,
+        inverse_translation[0],
+        inverse_translation[1],
+        inverse_translation[2],
+        1.0,
+    ])
 }
 
 pub(crate) fn world_matrices(nodes: &[GlbNodeData]) -> Vec<[f32; 16]> {

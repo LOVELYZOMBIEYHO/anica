@@ -6,10 +6,20 @@ mod box_mesh;
 mod capsule_mesh;
 mod cone_mesh;
 mod cylinder_mesh;
+mod face_textures;
+mod facial_cage_mesh;
 mod frustum_mesh;
+mod hair_card_mesh;
+mod head_surface_mesh;
+mod loft_mesh;
 mod plane_mesh;
+mod profiled_surface;
+mod ribbon_mesh;
 mod sphere_mesh;
+mod subdivision_surface_mesh;
 mod wedge_mesh;
+
+pub(crate) use facial_cage_mesh::validate_layout as validate_facial_layout;
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -17,13 +27,45 @@ use crate::dsl::{PrimitiveAssetNode, PrimitiveAxis, PrimitiveGeometry, Primitive
 use crate::world::gltf_loader::{
     GlbAlphaMode, GlbDepthWriteMode, GlbMaterialData, GlbMeshData, GlbTextureData, GlbTriangle,
 };
+use crate::world::model::WorldNativeSkin;
+
+/// Machine-readable weight quality report for an opt-in native smooth mesh.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSkinDiagnostics {
+    pub vertex_count: usize,
+    pub weighted_vertex_count: usize,
+    pub unweighted_vertex_count: usize,
+    pub joint_count: usize,
+    pub maximum_influences: usize,
+    pub minimum_weight_sum: f32,
+    pub maximum_weight_sum: f32,
+    pub warnings: Vec<String>,
+}
+
+/// Serialize native skin diagnostics for editors, CI and LLM inspection.
+pub fn native_skin_diagnostics_json(diagnostics: &NativeSkinDiagnostics) -> String {
+    serde_json::to_string_pretty(diagnostics)
+        .expect("NativeSkinDiagnostics contains only JSON-compatible values")
+}
+
+/// Compile a disposable mesh and report the exact automatic weighting result.
+pub fn diagnose_native_skinned_primitive(
+    asset: &PrimitiveAssetNode,
+    skin: &WorldNativeSkin,
+) -> NativeSkinDiagnostics {
+    let mut mesh = generate_primitive_mesh(asset);
+    apply_native_skin_to_mesh(&mut mesh, skin)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct PrimitiveTextureSet {
+    pub face: HashMap<String, GlbTextureData>,
     pub base_color: Option<GlbTextureData>,
     pub metallic_roughness: Option<GlbTextureData>,
     pub normal: Option<GlbTextureData>,
     pub emissive: Option<GlbTextureData>,
+    pub occlusion: Option<GlbTextureData>,
 }
 
 /// Generate the canonical triangle mesh used by both native and WASM renderers.
@@ -38,6 +80,79 @@ pub fn generated_primitive_summary(asset: &PrimitiveAssetNode) -> (([f32; 3], [f
     ((mesh.bounds_min, mesh.bounds_max), mesh.indices.len() / 3)
 }
 
+/// Return the authored or generated control cage for inspection and deterministic export.
+pub fn generated_control_cage(asset: &PrimitiveAssetNode) -> Option<crate::ControlCageNode> {
+    match &asset.geometry {
+        PrimitiveGeometry::Mesh { cage } => Some(cage.clone()),
+        PrimitiveGeometry::HeadSurface {
+            topology,
+            facial_cage,
+            head_profile,
+            head_dome,
+            face_layout,
+            ..
+        } if topology == "facialcage" => Some(facial_cage_mesh::build(
+            facial_cage.as_ref()?,
+            head_profile,
+            head_dome.as_ref(),
+            face_layout.as_ref()?,
+        )),
+        PrimitiveGeometry::HeadSurface {
+            topology,
+            explicit_cage,
+            ..
+        } if topology == "explicit" => explicit_cage.clone(),
+        _ => None,
+    }
+}
+
+/// Compact topology report for editor, CI, native, and browser tooling.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlCageInspection {
+    pub asset_id: String,
+    pub control_vertices: usize,
+    pub control_faces: usize,
+    pub pinned_vertices: usize,
+    pub subdivision: u32,
+    pub open_edges: usize,
+    pub non_manifold_edges: usize,
+    pub uv_source: String,
+}
+
+/// Inspect the source cage without allocating the subdivided render mesh.
+pub fn inspect_control_cage(asset: &PrimitiveAssetNode) -> Option<ControlCageInspection> {
+    let cage = generated_control_cage(asset)?;
+    let mut edges = std::collections::BTreeMap::<(u32, u32), usize>::new();
+    for face in &cage.faces {
+        for index in 0..face.len() {
+            let a = face[index];
+            let b = face[(index + 1) % face.len()];
+            *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let fallback_uv = cage
+        .positions
+        .iter()
+        .zip(&cage.uvs)
+        .all(|(position, uv)| *uv == [position[0], position[1]]);
+    Some(ControlCageInspection {
+        asset_id: asset.id.clone(),
+        control_vertices: cage.positions.len(),
+        control_faces: cage.faces.len(),
+        pinned_vertices: cage.pinned.iter().filter(|&&pin| pin).count(),
+        subdivision: cage.subdivision,
+        open_edges: edges.values().filter(|&&count| count == 1).count(),
+        non_manifold_edges: edges.values().filter(|&&count| count > 2).count(),
+        uv_source: if fallback_uv {
+            "fallback_xy"
+        } else {
+            "authored"
+        }
+        .into(),
+    })
+}
+
 /// Generate a primitive and attach already-resolved PBR textures to its glTF-like mesh.
 pub fn generate_primitive_mesh_textured(
     asset: &PrimitiveAssetNode,
@@ -45,6 +160,7 @@ pub fn generate_primitive_mesh_textured(
 ) -> GlbMeshData {
     let mut builder = MeshBuilder::for_asset(asset);
     match &asset.geometry {
+        PrimitiveGeometry::Mesh { cage } => subdivision_surface_mesh::generate(&mut builder, cage),
         PrimitiveGeometry::Box { size } if asset.bevel_radius > 0.0 => box_mesh::generate_beveled(
             &mut builder,
             *size,
@@ -95,14 +211,112 @@ pub fn generate_primitive_mesh_textured(
             radius,
             segments,
         } => box_mesh::generate_beveled(&mut builder, *size, *radius, *segments),
+        PrimitiveGeometry::Loft {
+            segments,
+            closed,
+            cap_start,
+            cap_end,
+            sections,
+        } => loft_mesh::generate(
+            &mut builder,
+            *segments,
+            *closed,
+            *cap_start,
+            *cap_end,
+            sections,
+        ),
+        PrimitiveGeometry::Ribbon {
+            width,
+            thickness,
+            cap_start,
+            cap_end,
+            points,
+        } => ribbon_mesh::generate(
+            &mut builder,
+            *width,
+            *thickness,
+            *cap_start,
+            *cap_end,
+            points,
+        ),
+        PrimitiveGeometry::HairCards {
+            length_segments,
+            width_segments,
+            thickness,
+            cross_section,
+            tip_shape,
+            guides,
+            ..
+        } => hair_card_mesh::generate(
+            &mut builder,
+            *length_segments,
+            *width_segments,
+            *thickness,
+            cross_section,
+            tip_shape,
+            guides,
+        ),
+        PrimitiveGeometry::HeadSurface {
+            topology,
+            segments,
+            rings,
+            head_shape,
+            face_layout,
+            facial_cage,
+            head_profile,
+            head_dome,
+            explicit_cage,
+            features,
+            morph,
+            ..
+        } => match topology.as_str() {
+            "explicit" => subdivision_surface_mesh::generate(
+                &mut builder,
+                explicit_cage
+                    .as_ref()
+                    .expect("validated explicit HeadAsset"),
+            ),
+            "facialcage" => {
+                let cage = facial_cage_mesh::build(
+                    facial_cage.as_ref().expect("validated facial HeadAsset"),
+                    head_profile,
+                    head_dome.as_ref(),
+                    face_layout.as_ref().expect("validated facial FaceLayout"),
+                );
+                subdivision_surface_mesh::generate(&mut builder, &cage);
+            }
+            _ => head_surface_mesh::generate(
+                &mut builder,
+                *segments,
+                *rings,
+                head_shape,
+                face_layout.as_ref(),
+                features,
+                morph,
+            ),
+        },
     }
     builder.apply_modifiers(&asset.modifiers);
-    builder.finish(asset, texture_set)
+    let face_textures = texture_set.face.clone();
+    let mut mesh = builder.finish(asset, texture_set);
+    face_textures::append(&mut mesh, asset, &face_textures);
+    mesh
 }
 
 /// Return exact local-space bounds without loading or tessellating an asset.
 pub fn primitive_bounds(geometry: &PrimitiveGeometry) -> ([f32; 3], [f32; 3]) {
     match geometry {
+        PrimitiveGeometry::Mesh { cage } => {
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            for p in &cage.positions {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+            (lo, hi)
+        }
         PrimitiveGeometry::Box { size } | PrimitiveGeometry::Wedge { size } => {
             let half = size.map(|value| value * 0.5);
             (half.map(|value| -value), half)
@@ -138,6 +352,67 @@ pub fn primitive_bounds(geometry: &PrimitiveGeometry) -> ([f32; 3], [f32; 3]) {
         }
         PrimitiveGeometry::RoundedBox { size, .. } => {
             let half = size.map(|value| value * 0.5);
+            (half.map(|value| -value), half)
+        }
+        PrimitiveGeometry::Loft { sections, .. } => {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for section in sections {
+                let half = section.width.max(section.depth) * 0.5;
+                let center = [section.offset[0], section.at, section.offset[1]];
+                for axis in 0..3 {
+                    let radius = if axis == 1 { 0.0 } else { half };
+                    min[axis] = min[axis].min(center[axis] - radius);
+                    max[axis] = max[axis].max(center[axis] + radius);
+                }
+            }
+            (min, max)
+        }
+        PrimitiveGeometry::Ribbon {
+            width,
+            thickness,
+            points,
+            ..
+        } => {
+            let radius = width.max(*thickness) * 0.5;
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for point in points {
+                let local_radius = point
+                    .width
+                    .unwrap_or(*width)
+                    .max(point.thickness.unwrap_or(*thickness))
+                    * 0.5;
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(point.position[axis] - local_radius.max(radius));
+                    max[axis] = max[axis].max(point.position[axis] + local_radius.max(radius));
+                }
+            }
+            (min, max)
+        }
+        PrimitiveGeometry::HairCards {
+            thickness, guides, ..
+        } => {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for point in guides.iter().flat_map(|guide| &guide.points) {
+                let radius = point.width * 0.5 + point.camber * point.width + *thickness;
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(point.position[axis] - radius);
+                    max[axis] = max[axis].max(point.position[axis] + radius);
+                }
+            }
+            (min, max)
+        }
+        PrimitiveGeometry::HeadSurface {
+            head_shape, morph, ..
+        } => {
+            // Semantic fields may extend the cage, so keep conservative bounds.
+            let half = [
+                head_shape.size[0] * 0.65 * morph.head_width,
+                head_shape.size[1] * 0.65 * morph.head_height + head_shape.chin_length,
+                head_shape.size[2] * 0.8 * morph.head_depth,
+            ];
             (half.map(|value| -value), half)
         }
     }
@@ -237,6 +512,215 @@ pub fn primitive_cache_key(asset: &PrimitiveAssetNode) -> PathBuf {
     hash_bytes(&mut hash, &geometry.to_le_bytes());
     hash_bytes(&mut hash, &material.to_le_bytes());
     PathBuf::from(format!("motionloom-primitive-{hash:016x}"))
+}
+
+/// Build a retained key for geometry whose rest-space vertices carry native weights.
+pub fn native_skinned_primitive_cache_key(
+    asset: &PrimitiveAssetNode,
+    skin: &WorldNativeSkin,
+) -> PathBuf {
+    let base = primitive_cache_key(asset);
+    let mut hash = 0xcbf29ce484222325_u64;
+    hash_bytes(&mut hash, base.to_string_lossy().as_bytes());
+    for value in skin.mesh_position {
+        hash_bytes(&mut hash, &value.to_bits().to_le_bytes());
+    }
+    for value in skin.mesh_rotation {
+        hash_bytes(&mut hash, &value.to_bits().to_le_bytes());
+    }
+    hash_bytes(&mut hash, &skin.mesh_scale.to_bits().to_le_bytes());
+    hash_bytes(&mut hash, &skin.max_influences.to_le_bytes());
+    hash_bytes(&mut hash, &skin.falloff.to_bits().to_le_bytes());
+    hash_bytes(&mut hash, &[skin.normalize as u8]);
+    for candidate in &skin.candidates {
+        hash_bytes(&mut hash, &candidate.joint.to_le_bytes());
+        for value in candidate.start.into_iter().chain(candidate.end) {
+            hash_bytes(&mut hash, &value.to_bits().to_le_bytes());
+        }
+    }
+    for region in &skin.weight_regions {
+        hash_bytes(&mut hash, &region.joint.to_le_bytes());
+        hash_f32s(&mut hash, &region.center);
+        hash_f32s(&mut hash, &[region.radius, region.strength]);
+        hash_bytes(&mut hash, &[region.replace as u8]);
+    }
+    PathBuf::from(format!("motionloom-native-skin-{hash:016x}"))
+}
+
+/// Move a generated primitive into compound rest space and assign up to four joints.
+pub fn apply_native_skin_to_mesh(
+    mesh: &mut GlbMeshData,
+    skin: &WorldNativeSkin,
+) -> NativeSkinDiagnostics {
+    let rotation = normalize_quaternion(skin.mesh_rotation);
+    for position in &mut mesh.positions {
+        let scaled = position.map(|value| value * skin.mesh_scale);
+        *position = add_vec3(rotate_by_quaternion(scaled, rotation), skin.mesh_position);
+    }
+    for value in mesh.normals.iter_mut().flatten() {
+        *value = normalize_vec3(rotate_by_quaternion(*value, rotation));
+    }
+
+    mesh.joints.clear();
+    mesh.weights.clear();
+    mesh.joints.reserve(mesh.positions.len());
+    mesh.weights.reserve(mesh.positions.len());
+    let max_influences = skin.max_influences.clamp(1, 4) as usize;
+    let mut weighted_vertex_count = 0;
+    let mut minimum_weight_sum = f32::MAX;
+    let mut maximum_weight_sum = 0.0_f32;
+    for position in &mesh.positions {
+        let mut candidates = skin
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let distance = point_segment_distance(*position, candidate.start, candidate.end);
+                let weight = (distance + 1.0e-4).powf(-skin.falloff.max(0.01));
+                (candidate.joint, weight)
+            })
+            .collect::<Vec<_>>();
+        for region in &skin.weight_regions {
+            let distance = distance_vec3(*position, region.center);
+            if distance >= region.radius {
+                continue;
+            }
+            let influence = (1.0 - distance / region.radius).powi(2) * region.strength;
+            let baseline = candidates
+                .iter()
+                .map(|(_, weight)| *weight)
+                .fold(0.0_f32, f32::max)
+                .max(1.0);
+            if region.replace {
+                for (joint, weight) in &mut candidates {
+                    if *joint == region.joint {
+                        *weight += baseline * influence * 8.0;
+                    } else {
+                        *weight *= 1.0 - influence.clamp(0.0, 1.0);
+                    }
+                }
+            } else if let Some((_, weight)) = candidates
+                .iter_mut()
+                .find(|(joint, _)| *joint == region.joint)
+            {
+                *weight += baseline * influence * 2.0;
+            }
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        candidates.truncate(max_influences);
+        let sum = candidates.iter().map(|(_, weight)| *weight).sum::<f32>();
+        let mut joints = [0_u16; 4];
+        let mut weights = [0.0_f32; 4];
+        if sum.is_finite() && sum > f32::EPSILON {
+            weighted_vertex_count += 1;
+            for (slot, (joint, weight)) in candidates.into_iter().enumerate() {
+                joints[slot] = joint;
+                weights[slot] = if skin.normalize { weight / sum } else { weight };
+            }
+        }
+        let stored_sum = weights.iter().sum::<f32>();
+        minimum_weight_sum = minimum_weight_sum.min(stored_sum);
+        maximum_weight_sum = maximum_weight_sum.max(stored_sum);
+        mesh.joints.push(Some(joints));
+        mesh.weights.push(Some(weights));
+    }
+    if mesh.positions.is_empty() {
+        minimum_weight_sum = 0.0;
+    }
+    if let Some(first) = mesh.positions.first().copied() {
+        let mut minimum = first;
+        let mut maximum = first;
+        for position in mesh.positions.iter().copied().skip(1) {
+            for axis in 0..3 {
+                minimum[axis] = minimum[axis].min(position[axis]);
+                maximum[axis] = maximum[axis].max(position[axis]);
+            }
+        }
+        mesh.bounds_min = minimum;
+        mesh.bounds_max = maximum;
+    }
+    let unweighted_vertex_count = mesh.positions.len() - weighted_vertex_count;
+    let mut warnings = Vec::new();
+    if skin.candidates.is_empty() {
+        warnings.push("no candidate bones were available".to_string());
+    }
+    if unweighted_vertex_count > 0 {
+        warnings.push(format!(
+            "{unweighted_vertex_count} vertices have no usable weight"
+        ));
+    }
+    NativeSkinDiagnostics {
+        vertex_count: mesh.positions.len(),
+        weighted_vertex_count,
+        unweighted_vertex_count,
+        joint_count: skin.candidates.len(),
+        maximum_influences: max_influences,
+        minimum_weight_sum,
+        maximum_weight_sum,
+        warnings,
+    }
+}
+
+fn add_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn distance_vec3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn normalize_vec3(value: [f32; 3]) -> [f32; 3] {
+    let length = value.iter().map(|part| part * part).sum::<f32>().sqrt();
+    if length > 1.0e-8 {
+        value.map(|part| part / length)
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+fn normalize_quaternion(value: [f32; 4]) -> [f32; 4] {
+    let length = value.iter().map(|part| part * part).sum::<f32>().sqrt();
+    if length > 1.0e-8 {
+        value.map(|part| part / length)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn rotate_by_quaternion(value: [f32; 3], quaternion: [f32; 4]) -> [f32; 3] {
+    let [x, y, z, w] = quaternion;
+    let cross = [
+        y * value[2] - z * value[1],
+        z * value[0] - x * value[2],
+        x * value[1] - y * value[0],
+    ];
+    let second = [
+        y * cross[2] - z * cross[1],
+        z * cross[0] - x * cross[2],
+        x * cross[1] - y * cross[0],
+    ];
+    std::array::from_fn(|axis| value[axis] + 2.0 * (w * cross[axis] + second[axis]))
+}
+
+fn point_segment_distance(point: [f32; 3], start: [f32; 3], end: [f32; 3]) -> f32 {
+    let segment = std::array::from_fn::<_, 3, _>(|axis| end[axis] - start[axis]);
+    let relative = std::array::from_fn::<_, 3, _>(|axis| point[axis] - start[axis]);
+    let length_squared = segment.iter().map(|value| value * value).sum::<f32>();
+    let amount = if length_squared > 1.0e-8 {
+        relative
+            .iter()
+            .zip(segment)
+            .map(|(a, b)| a * b)
+            .sum::<f32>()
+            / length_squared
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+    std::array::from_fn::<_, 3, _>(|axis| point[axis] - (start[axis] + segment[axis] * amount))
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt()
 }
 
 /// Resolve deterministic UV translation for one primitive instance.
@@ -357,6 +841,140 @@ fn hash_geometry(geometry: &PrimitiveGeometry, hash: &mut u64) {
             hash_f32s(hash, size);
             hash_bytes(hash, &radius.to_bits().to_le_bytes());
             hash_bytes(hash, &segments.to_le_bytes());
+        }
+        PrimitiveGeometry::Mesh { cage } => {
+            hash_bytes(hash, &[14]);
+            hash_bytes(hash, &cage.subdivision.to_le_bytes());
+            for (index, (p, pin)) in cage.positions.iter().zip(&cage.pinned).enumerate() {
+                let uv = cage.uvs.get(index).copied().unwrap_or([p[0], p[1]]);
+                hash_f32s(hash, p);
+                hash_f32s(hash, &uv);
+                hash_bytes(hash, &[*pin as u8]);
+            }
+            for face in &cage.faces {
+                hash_bytes(hash, &[face.len() as u8]);
+                for i in face {
+                    hash_bytes(hash, &i.to_le_bytes());
+                }
+            }
+        }
+        PrimitiveGeometry::Loft {
+            segments,
+            closed,
+            cap_start,
+            cap_end,
+            sections,
+        } => {
+            hash_bytes(hash, &[10, *closed as u8, *cap_start as u8, *cap_end as u8]);
+            hash_bytes(hash, &segments.to_le_bytes());
+            for section in sections {
+                hash_f32s(hash, &[section.at, section.width, section.depth]);
+                hash_bytes(hash, section.profile.as_bytes());
+                hash_f32s(hash, &section.offset);
+                hash_bytes(hash, &section.rotation.to_bits().to_le_bytes());
+            }
+        }
+        PrimitiveGeometry::Ribbon {
+            width,
+            thickness,
+            cap_start,
+            cap_end,
+            points,
+        } => {
+            hash_bytes(hash, &[11, *cap_start as u8, *cap_end as u8]);
+            hash_f32s(hash, &[*width, *thickness]);
+            for point in points {
+                hash_f32s(hash, &point.position);
+                hash_f32s(
+                    hash,
+                    &[
+                        point.width.unwrap_or(-1.0),
+                        point.thickness.unwrap_or(-1.0),
+                        point.roll,
+                    ],
+                );
+            }
+        }
+        PrimitiveGeometry::HairCards {
+            representation_id,
+            bind_bone,
+            space,
+            length_segments,
+            width_segments,
+            thickness,
+            cross_section,
+            tip_shape,
+            guides,
+        } => {
+            hash_bytes(hash, &[12]);
+            hash_bytes(hash, representation_id.as_bytes());
+            hash_optional_string(hash, bind_bone);
+            hash_bytes(hash, space.as_bytes());
+            hash_bytes(hash, &length_segments.to_le_bytes());
+            hash_bytes(hash, &width_segments.to_le_bytes());
+            hash_bytes(hash, &thickness.to_bits().to_le_bytes());
+            hash_bytes(hash, cross_section.as_bytes());
+            hash_bytes(hash, tip_shape.as_bytes());
+            for guide in guides {
+                hash_bytes(hash, guide.id.as_bytes());
+                hash_bytes(hash, guide.group.as_bytes());
+                hash_bytes(hash, guide.role.as_bytes());
+                hash_bytes(hash, &[guide.normal.is_some() as u8]);
+                if let Some(normal) = guide.normal {
+                    hash_f32s(hash, &normal);
+                }
+                for point in &guide.points {
+                    hash_f32s(hash, &point.position);
+                    hash_f32s(
+                        hash,
+                        &[
+                            point.width,
+                            point.radius,
+                            point.camber,
+                            point.roll,
+                            point.stiffness,
+                        ],
+                    );
+                }
+            }
+        }
+        PrimitiveGeometry::HeadSurface {
+            archetype,
+            variant,
+            bind_bone,
+            symmetry,
+            topology,
+            segments,
+            rings,
+            head_shape,
+            face_layout,
+            facial_cage,
+            head_profile,
+            head_dome,
+            explicit_cage,
+            features,
+            morph,
+        } => {
+            hash_bytes(hash, &[13]);
+            hash_bytes(hash, archetype.as_bytes());
+            hash_optional_string(hash, variant);
+            hash_optional_string(hash, bind_bone);
+            hash_bytes(hash, symmetry.as_bytes());
+            hash_bytes(hash, topology.as_bytes());
+            hash_bytes(hash, &segments.to_le_bytes());
+            hash_bytes(hash, &rings.to_le_bytes());
+            if let Ok(serialized) = serde_json::to_vec(&(
+                head_shape,
+                face_layout,
+                facial_cage,
+                head_profile,
+                head_dome,
+                explicit_cage,
+                features,
+                morph,
+            )) {
+                hash_bytes(hash, &serialized);
+            }
         }
     }
 }
@@ -700,6 +1318,7 @@ impl MeshBuilder {
         let metallic_roughness_texture = push_texture(texture_set.metallic_roughness);
         let normal_texture = push_texture(texture_set.normal);
         let emissive_texture = push_texture(texture_set.emissive);
+        let occlusion_texture = push_texture(texture_set.occlusion);
         let material_color = material_definition
             .map(|material| {
                 std::array::from_fn(|index| material.base_color[index] * asset.color[index])
@@ -722,6 +1341,8 @@ impl MeshBuilder {
                 metallic_roughness_texture,
                 normal_texture,
                 normal_scale: material_definition.map_or(1.0, |material| material.normal_scale),
+                occlusion_texture,
+                occlusion_strength: material_definition.map_or(1.0, |m| m.occlusion_strength),
                 emissive_texture,
                 emissive_factor: material_definition.map_or([0.0; 3], |material| material.emissive),
                 emissive_strength: material_definition
@@ -905,6 +1526,106 @@ fn squared_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_smooth_skin_weights_are_normalized_and_diagnostic() {
+        let asset = PrimitiveAssetNode {
+            id: "native_limb".into(),
+            geometry: PrimitiveGeometry::Capsule {
+                radius: 0.2,
+                height: 1.0,
+                segments: 12,
+                rings: 8,
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
+        };
+        let skin = WorldNativeSkin {
+            mesh_position: [0.0, 1.0, 0.0],
+            mesh_rotation: [0.0, 0.0, 0.0, 1.0],
+            mesh_scale: 1.0,
+            candidates: vec![
+                crate::world::model::WorldNativeSkinSegment {
+                    joint: 0,
+                    start: [0.0, 0.0, 0.0],
+                    end: [0.0, 1.0, 0.0],
+                },
+                crate::world::model::WorldNativeSkinSegment {
+                    joint: 1,
+                    start: [0.0, 1.0, 0.0],
+                    end: [0.0, 2.0, 0.0],
+                },
+            ],
+            weight_regions: Vec::new(),
+            joint_matrices: vec![],
+            joint_names: vec!["root".into(), "tip".into()],
+            joint_positions: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            max_influences: 2,
+            falloff: 2.5,
+            normalize: true,
+        };
+        let mut mesh = generate_primitive_mesh(&asset);
+        let diagnostics = apply_native_skin_to_mesh(&mut mesh, &skin);
+        assert_eq!(diagnostics.unweighted_vertex_count, 0);
+        assert_eq!(diagnostics.weighted_vertex_count, mesh.positions.len());
+        assert!(mesh.weights.iter().flatten().all(|weights| {
+            (weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-5
+                && weights.iter().filter(|weight| **weight > 0.0).count() <= 2
+        }));
+        let json = native_skin_diagnostics_json(&diagnostics);
+        assert!(json.contains("\"weightedVertexCount\""));
+    }
+
+    #[test]
+    fn loft_and_ribbon_generate_finite_gpu_geometry() {
+        let graph = crate::parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <PrimitiveAsset id="coat" shape="loft">
+      <Loft segments="16">
+        <Section at="-0.6" width="0.7" depth="0.4" profile="rounded_rect" />
+        <Section at="0" width="0.9" depth="0.5" profile="capsule" />
+        <Section at="0.7" width="0.55" depth="0.35" profile="ellipse" />
+      </Loft>
+    </PrimitiveAsset>
+    <PrimitiveAsset id="hair" shape="ribbon">
+      <Ribbon width="0.2" thickness="0.03">
+        <PathPoint position={[0,0,0]} />
+        <PathPoint position={[0.2,-0.4,0.1]} roll="15" />
+        <PathPoint position={[0.1,-0.8,0]} width="0.04" />
+      </Ribbon>
+    </PrimitiveAsset>
+  </Assets>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .unwrap();
+        for asset in &graph.assets {
+            let mesh = generate_primitive_mesh(asset.primitive().unwrap());
+            assert!(!mesh.positions.is_empty());
+            assert!(!mesh.indices.is_empty());
+            assert!(
+                mesh.positions
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
+            );
+            assert!(
+                mesh.indices
+                    .iter()
+                    .all(|index| *index < mesh.positions.len() as u32)
+            );
+        }
+    }
 
     fn seeded_material() -> crate::dsl::MaterialAssetNode {
         crate::dsl::MaterialAssetNode {
@@ -1293,5 +2014,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hair_cards_generate_curved_finite_geometry() {
+        let point = |position, width, camber, roll| crate::dsl::HairPointNode {
+            position,
+            width,
+            radius: 0.003,
+            camber,
+            roll,
+            stiffness: 1.0,
+        };
+        let asset = PrimitiveAssetNode {
+            id: "hair".into(),
+            geometry: PrimitiveGeometry::HairCards {
+                representation_id: "cards".into(),
+                bind_bone: Some("head".into()),
+                space: "bone_local".into(),
+                length_segments: 12,
+                width_segments: 4,
+                thickness: 0.01,
+                cross_section: "arched".into(),
+                tip_shape: "point".into(),
+                guides: vec![crate::dsl::HairGuideNode {
+                    id: "bang".into(),
+                    group: "front".into(),
+                    role: "bang".into(),
+                    normal: None,
+                    points: vec![
+                        point([0.0, 0.3, 0.0], 0.2, 0.1, 0.0),
+                        point([0.02, 0.0, 0.1], 0.14, 0.12, 4.0),
+                        point([-0.04, -0.4, 0.08], 0.02, 0.02, 8.0),
+                    ],
+                }],
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
+        };
+        let mesh = generate_primitive_mesh(&asset);
+        assert!(!mesh.indices.is_empty());
+        assert!(
+            mesh.positions
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            mesh.normals
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            mesh.indices
+                .iter()
+                .all(|index| (*index as usize) < mesh.positions.len())
+        );
+        assert!(mesh.bounds_min[1] < 0.0 && mesh.bounds_max[1] > 0.0);
+    }
+
+    #[test]
+    fn head_surface_generates_closed_finite_feature_geometry() {
+        let asset = PrimitiveAssetNode {
+            id: "head".into(),
+            geometry: PrimitiveGeometry::HeadSurface {
+                archetype: "feline".into(),
+                variant: None,
+                bind_bone: Some("head".into()),
+                symmetry: "x".into(),
+                topology: "procedural".into(),
+                segments: 32,
+                rings: 20,
+                head_shape: crate::dsl::HeadShapeNode {
+                    size: [0.9, 0.8, 1.0],
+                    forehead: 1.05,
+                    cheek_width: 1.0,
+                    jaw_width: 0.68,
+                    chin_length: 0.03,
+                    chin_roundness: 0.8,
+                },
+                face_layout: None,
+                facial_cage: None,
+                head_profile: Vec::new(),
+                head_dome: None,
+                explicit_cage: None,
+                features: vec![crate::dsl::HeadFeatureNode {
+                    id: "muzzle".into(),
+                    kind: "muzzle".into(),
+                    center: [0.0, -0.15, 0.82],
+                    size: [0.5, 0.32, 0.4],
+                    amount: 0.22,
+                    offset: [0.0; 3],
+                    falloff: "smooth".into(),
+                    mirror_x: false,
+                }],
+                morph: crate::dsl::HeadMorphNode {
+                    head_width: 1.0,
+                    head_height: 1.0,
+                    head_depth: 1.0,
+                    face_width: 1.0,
+                    face_height: 1.0,
+                    jaw_width: 1.0,
+                    muzzle_length: 1.0,
+                    feature_scale: 1.0,
+                },
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
+        };
+        let mesh = generate_primitive_mesh(&asset);
+        assert_eq!(mesh.indices.len(), 32 * 20 * 6);
+        assert!(
+            mesh.positions
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            mesh.normals
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(mesh.bounds_max[2] > 0.5);
     }
 }

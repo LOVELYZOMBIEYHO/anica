@@ -16,6 +16,8 @@ use crate::scene::render::{SceneRenderProfile, render_scene_graph_frame};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessWebGpuRenderError {
+    #[error(transparent)]
+    SurfaceParameters(#[from] crate::process::procedural_surface::SurfaceParameterError),
     #[error("invalid RGBA buffer: expected {expected} bytes for {width}x{height}, got {actual}")]
     InvalidRgbaBuffer {
         width: u32,
@@ -354,7 +356,44 @@ impl ProcessWebGpuRenderer {
                 label: Some("anica-motionloom-process-webgpu-encoder"),
             });
 
+        let mut surface_pipeline = None;
         for pass in passes {
+            // Use the shared shader instead of duplicating its math in the dispatcher.
+            if matches!(
+                crate::process::effect_kind::resolve_process_effect(&pass.effect),
+                Some(crate::process::effect_kind::ProcessEffect::ProceduralSurface)
+            ) {
+                use wgpu::util::DeviceExt;
+                if pass.mask.is_some() {
+                    return Err(ProcessWebGpuRenderError::UnsupportedEffect("procedural_surface Process masks are not supported yet; use an alpha-masked input".into()));
+                }
+                let values = crate::process::procedural_surface::surface_values(
+                    pass,
+                    [self.width, self.height],
+                    time_norm,
+                    time_sec,
+                )?;
+                let bytes = crate::process::procedural_surface::surface_bytes(&values);
+                let uniform = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("procedural-surface-uniform"),
+                        contents: &bytes,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                let pipeline = surface_pipeline.get_or_insert_with(|| {
+                    crate::process::procedural_surface::SurfacePipeline::new(&self.device)
+                });
+                let (src, dst) = if current_is_a {
+                    (&tex_a, &tex_b)
+                } else {
+                    (&tex_b, &tex_a)
+                };
+                pipeline.encode(&self.device, &mut encoder, src, dst, &uniform);
+                uniform_buffers.push(uniform);
+                current_is_a = !current_is_a;
+                continue;
+            }
             let effect_ids = process_effect_ids(pass)?;
             for effect_id in effect_ids {
                 let uniform_buffer = self.make_uniform_buffer(pass, effect_id, time_norm, time_sec);
@@ -971,6 +1010,7 @@ fn process_effect_ids(pass: &PassNode) -> Result<Vec<u32>, ProcessWebGpuRenderEr
         Some(crate::process::effect_kind::ProcessEffect::Brightness) => Ok(vec![11]),
         Some(crate::process::effect_kind::ProcessEffect::Opacity) => Ok(vec![12]),
         Some(crate::process::effect_kind::ProcessEffect::SpectralEnergy) => Ok(vec![20]),
+        Some(crate::process::effect_kind::ProcessEffect::ProceduralSurface) => Ok(vec![]),
         None => Err(ProcessWebGpuRenderError::UnsupportedEffect(
             pass.effect.clone(),
         )),

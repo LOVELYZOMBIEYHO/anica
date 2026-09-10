@@ -168,6 +168,7 @@ pub(crate) fn terrain_surface_primitive(asset: &TerrainAssetNode) -> PrimitiveAs
         material.metallic = 1.0;
         material.roughness = 1.0;
         material.normal_scale = 1.0;
+        material.occlusion_strength = 1.0;
         material.emissive = [0.0; 3];
         material.emissive_strength = 1.0;
         material.texture_scale = [1.0; 2];

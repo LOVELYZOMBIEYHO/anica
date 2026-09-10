@@ -99,6 +99,12 @@ impl From<crate::export::EncodeError> for MotionLoomSceneRenderError {
     fn from(err: crate::export::EncodeError) -> Self {
         use crate::export::EncodeError;
         match err {
+            EncodeError::Audio(error) => Self::FfmpegFailed {
+                stderr: error.to_string(),
+            },
+            EncodeError::AudioPlan(error) => Self::FfmpegFailed {
+                stderr: error.to_string(),
+            },
             EncodeError::CreateOutputDir { path, source } => Self::CreateOutputDir { path, source },
             EncodeError::StartEncoder(message) => Self::StartFfmpeg {
                 source: std::io::Error::other(message),

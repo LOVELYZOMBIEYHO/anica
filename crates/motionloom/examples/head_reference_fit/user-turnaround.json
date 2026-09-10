@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "1.0",
+  "targetAssetId": "s86_head",
+  "references": [
+    {
+      "id": "front",
+      "imageId": "user-turnaround-1448x1086",
+      "view": "front",
+      "projection": "orthographic",
+      "imageSize": [
+        1448,
+        1086
+      ],
+      "alignment": {
+        "top": [
+          282,
+          36
+        ],
+        "bottom": [
+          282,
+          204
+        ],
+        "centerline": [
+          [
+            282,
+            36
+          ],
+          [
+            282,
+            204
+          ]
+        ]
+      },
+      "landmarks": [
+        {
+          "id": "nose_tip",
+          "pixel": [
+            282,
+            174
+          ],
+          "confidence": 0.35,
+          "weight": 1,
+          "enabled": true
+        }
+      ],
+      "contours": []
+    },
+    {
+      "id": "left",
+      "imageId": "user-turnaround-1448x1086",
+      "view": "left",
+      "projection": "orthographic",
+      "imageSize": [
+        1448,
+        1086
+      ],
+      "alignment": {
+        "top": [
+          735,
+          33
+        ],
+        "bottom": [
+          735,
+          201
+        ],
+        "centerline": [
+          [
+            735,
+            33
+          ],
+          [
+            735,
+            201
+          ]
+        ]
+      },
+      "landmarks": [
+        {
+          "id": "nose_tip",
+          "pixel": [
+            660,
+            169
+          ],
+          "confidence": 0.35,
+          "weight": 1,
+          "enabled": true
+        }
+      ],
+      "contours": []
+    },
+    {
+      "id": "back",
+      "imageId": "user-turnaround-1448x1086",
+      "view": "back",
+      "projection": "orthographic",
+      "imageSize": [
+        1448,
+        1086
+      ],
+      "alignment": {
+        "top": [
+          1166,
+          35
+        ],
+        "bottom": [
+          1166,
+          203
+        ],
+        "centerline": [
+          [
+            1166,
+            35
+          ],
+          [
+            1166,
+            203
+          ]
+        ]
+      },
+      "landmarks": [],
+      "contours": []
+    }
+  ],
+  "options": {
+    "maxIterations": 12,
+    "allowedParameters": [
+      "HeadShape.depth",
+      "FaceLayout.noseProjection"
+    ]
+  }
+}

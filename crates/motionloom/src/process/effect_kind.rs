@@ -26,6 +26,7 @@ pub enum ProcessEffect {
     TextureOverlay,
     MagnifyLens,
     SpectralEnergy,
+    ProceduralSurface,
 }
 
 /// Resolve a raw effect string (including aliases) to its canonical
@@ -79,6 +80,7 @@ pub fn resolve_process_effect(effect: &str) -> Option<ProcessEffect> {
         "spectral_energy" | "particle_energy" | "stylize_look_spectral_energy" => {
             Some(ProcessEffect::SpectralEnergy)
         }
+        "procedural_surface" => Some(ProcessEffect::ProceduralSurface),
         _ => None,
     }
 }
@@ -114,6 +116,7 @@ pub fn is_wasm_webgpu_compatible_effect(effect: &str) -> bool {
                 | ProcessEffect::TextureOverlay
                 | ProcessEffect::MagnifyLens
                 | ProcessEffect::SpectralEnergy
+                | ProcessEffect::ProceduralSurface
         )
     )
 }

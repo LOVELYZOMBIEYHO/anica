@@ -1,0 +1,25 @@
+<!-- Isolated baseline; S86 remains untouched. -->
+<Graph fps={30} duration="1s" size={[512,512]}>
+<Assets>
+<MaterialAsset id="clay" baseColor="#BBAAAA" />
+<HeadAsset material="clay" id="demo_head" archetype="humanoid" symmetry="x" segments="48" rings="32">
+<HeadShape size={[0.9994999766349792,1.399999976158142,1.0994999408721924]} forehead="1" cheekWidth="1" jawWidth="1" chinLength="0" chinRoundness="0.5" />
+<HeadMorph headWidth="1" headHeight="1" headDepth="1" />
+</HeadAsset>
+</Assets>
+<Background color="#17202D" />
+<Scene id="review">
+<Timeline>
+<Track id="world" space="3d">
+<Sequence duration="1s">
+<CompositeGroup id="stage" space="3d" depth="true">
+<Camera3D position={[0,0,3.5]} target={[0,0,0]} fov="34" />
+<DirectionalLight direction={[-0.4,-0.6,-1]} intensity="2" />
+<Model id="head_model" asset="demo_head" />
+</CompositeGroup>
+</Sequence>
+</Track>
+</Timeline>
+</Scene>
+<Present from="review" />
+</Graph>

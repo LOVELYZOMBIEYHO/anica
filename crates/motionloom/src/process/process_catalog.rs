@@ -67,7 +67,14 @@ pub const PROCESS_CATEGORIES: [ProcessCategory; 10] = [
     ProcessCategory::Testing,
 ];
 
-pub const PROCESS_EFFECTS: [ProcessEffectDefinition; 16] = [
+pub const PROCESS_EFFECTS: [ProcessEffectDefinition; 17] = [
+    ProcessEffectDefinition {
+        id: "procedural_surface",
+        display_name: "Procedural Surface",
+        category: ProcessCategory::StylizeLook,
+        kernel: "procedural_surface.wgsl",
+        summary: "GPU-only evolving relief with metallic veins and pools; preserves input alpha.",
+    },
     ProcessEffectDefinition {
         id: "transform_camera.affine_uv",
         display_name: "Affine UV Transform",
@@ -200,6 +207,9 @@ pub fn process_effects_for_category(
 
 pub fn kernel_source_by_name(kernel: &str) -> Option<&'static str> {
     match kernel {
+        "procedural_surface.wgsl" => {
+            Some(include_str!("kernels/stylize_look/procedural_surface.wgsl"))
+        }
         "transform_camera_affine.wgsl" => Some(include_str!(
             "kernels/transform_camera/transform_camera_affine.wgsl"
         )),

@@ -1,0 +1,55 @@
+<Graph fps={30} duration="1s" size={[512,512]}>
+<Assets>
+<MaterialAsset id="s86_skin_clay" baseColor="#C8B8AD" roughness="0.75" />
+<HeadAsset id="s86_head" material="s86_skin_clay" archetype="humanoid"
+               variant="feminine" symmetry="x" segments="72" rings="52" seed="8601">
+      <HeadShape size={[0.800000011920929,1.399999976158142,0.9912499785423279]} forehead="1.18" cheekWidth="1.025"
+                 jawWidth="0.94" chinLength="0.012" chinRoundness="0.60" />
+      <FaceLayout>
+  <Eye id="eye_a" position={[-0.44,0,0]} width="0.34" opening="0.14" tilt="0" socketWidth="0.44" socketHeight="0.28" socketDepth="0.13" />
+  <Eye id="eye_b" position={[0.44,0,0]} width="0.34" opening="0.14" tilt="0" socketWidth="0.44" socketHeight="0.28" socketDepth="0.13" />
+  <Nose id="nose" position={[0,-0.208,0]} length="0.40" width="0.20" projection="0.44999998807907104" />
+  <Mouth id="mouth" position={[0,-0.48,0]} width="0.48" opening="0.035" upperLip="0.025" lowerLip="0.03" muzzleLength="0" muzzleWidth="0.3" />
+  <Ear id="ear_a" position={[-0.6508,-0.02,0.38]} width="0.1" height="0.24" depth="0.045" />
+  <Ear id="ear_b" position={[0.6508,-0.02,0.38]} width="0.1" height="0.24" depth="0.045" />
+</FaceLayout>
+      <HeadFeature id="s86_cheek_l" kind="cheek" center={[-0.55,-0.19,0.81]}
+                   size={[0.30,0.24,0.25]} amount="0.055" falloff="smooth" mirror="x" />
+      <HeadFeature id="s86_brow" kind="brow_ridge" center={[0,0.14,0.985]}
+                   size={[0.70,0.12,0.22]} amount="0.045" falloff="smooth" />
+      <HeadFeature id="s86_upper_lid_l" kind="eyelid" center={[-0.44,0.06,0.896]}
+                   size={[0.22,0.060,0.15]} amount="0.025" falloff="smooth" mirror="x" />
+      <HeadFeature id="s86_nose_bridge" kind="nose_bridge" center={[0,-0.10,0.995]}
+                   size={[0.14,0.33,0.20]} amount="0.15" falloff="smooth" />
+      <HeadFeature id="s86_nose_tip" kind="nose_tip" center={[0,-0.32,0.948]}
+                   size={[0.20,0.14,0.18]} amount="0.28" falloff="smooth" />
+      <HeadFeature id="s86_temple_l" kind="temple" center={[-0.77,0.16,0.62]}
+                   size={[0.22,0.28,0.25]} amount="-0.035" falloff="smooth" mirror="x" />
+      <HeadFeature id="s86_mouth_groove" kind="mouth" center={[0,-0.48,0.877]}
+                   size={[0.48,0.055,0.17]} amount="-0.026" falloff="smooth" />
+      <HeadFeature id="s86_lower_lip" kind="lip" center={[0,-0.55,0.835]}
+                   size={[0.34,0.065,0.17]} amount="0.05" falloff="smooth" />
+      <HeadFeature id="s86_ear_l" kind="ear" center={[-0.98,-0.15,0.08]}
+                   size={[0.18,0.24,0.27]} amount="0.065" falloff="smooth" mirror="x" />
+      <HeadFeature id="s86_chin_plane" kind="chin" center={[0,-0.81,0.586]}
+                   size={[0.42,0.22,0.26]} amount="0.12" falloff="smooth" />
+      <HeadMorph headWidth="1.0" headHeight="1.0" headDepth="1.0"
+                 faceWidth="1.0" faceHeight="1.0" jawWidth="1.0" featureScale="1.0" />
+    </HeadAsset>
+</Assets>
+<Background color="#17202D" />
+<Scene id="head_fit_review">
+<Timeline>
+<Track id="head_fit_track" space="3d">
+<Sequence from="0s" duration="1s">
+<CompositeGroup id="head_fit_stage" space="3d" depth="true">
+<Camera3D position={[2.3758788,0,2.3758788]} target={[0,0,0]} fov="34" />
+<DirectionalLight direction={[-0.4,-0.6,-1]} intensity="2.2" />
+<Model id="head_fit_model" asset="s86_head" />
+</CompositeGroup>
+</Sequence>
+</Track>
+</Timeline>
+</Scene>
+<Present from="head_fit_review" />
+</Graph>

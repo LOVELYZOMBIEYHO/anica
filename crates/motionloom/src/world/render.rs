@@ -2,6 +2,10 @@
 // =========================================
 // crates/motionloom/src/world/render.rs
 
+#[path = "material_mips.rs"]
+mod material_mips;
+use material_mips::{TextureRole, build_mips};
+
 use std::collections::{HashMap, HashSet};
 pub mod pose_diagnostics;
 use std::fs;
@@ -172,6 +176,12 @@ impl From<crate::export::EncodeError> for WorldRenderError {
     fn from(err: crate::export::EncodeError) -> Self {
         use crate::export::EncodeError;
         match err {
+            EncodeError::Audio(error) => Self::FfmpegFailed {
+                stderr: error.to_string(),
+            },
+            EncodeError::AudioPlan(error) => Self::FfmpegFailed {
+                stderr: error.to_string(),
+            },
             EncodeError::CreateOutputDir { path, source } => Self::CreateOutputDir { path, source },
             EncodeError::StartEncoder(message) => Self::StartFfmpeg {
                 source: std::io::Error::other(message),
@@ -678,6 +688,7 @@ fn diagnose_gpu_shader_projection(
         &[],
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     )?;
 
     let mut min_x = f32::INFINITY;
@@ -905,6 +916,9 @@ struct PrimitiveResourceLoadStats {
 
 /// Internal Scene 3D backend name; the legacy World type remains for API compatibility.
 pub(crate) type Scene3DRenderer = WorldFrameRenderer;
+
+#[path = "geometry_snapshot.rs"]
+mod geometry_snapshot;
 
 /// Screen-space canonical joints from the exact pose and camera used by the
 /// most recent 3D render. Editor hosts use these for real model picking; they
@@ -1780,6 +1794,19 @@ impl CharacterDesignGpuViewport {
     }
 }
 
+fn inverse_display(value: f32, mode: f32) -> f32 {
+    let y = value.clamp(0.0, 1.0).powf(2.2);
+    if mode > 1.5 {
+        let a = 2.51 - y * 2.43;
+        let b = 0.03 - y * 0.59;
+        (-b + (b * b + 4.0 * a * y * 0.14).sqrt()) / (2.0 * a)
+    } else if mode > 0.5 {
+        y / (1.0 - y).max(0.0001)
+    } else {
+        y
+    }
+}
+
 struct GpuWorldRenderer {
     device: Arc<wgpu::Device>,
     queue: wgpu::Queue,
@@ -1789,6 +1816,7 @@ struct GpuWorldRenderer {
     background_empty_bind_group: wgpu::BindGroup,
     shadow_lighting_bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    outline_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     transparent_depth_write_pipeline: wgpu::RenderPipeline,
     transmissive_pipeline: wgpu::RenderPipeline,
@@ -1818,6 +1846,7 @@ struct GpuWorldRenderer {
     /// frame. Extra targets are only added when an external caller deliberately
     /// retains every pooled texture.
     targets: Vec<Arc<wgpu::Texture>>,
+    hdr_target: Arc<wgpu::Texture>,
     target_cursor: usize,
     depth_texture: wgpu::Texture,
     shadow_texture: wgpu::Texture,
@@ -1842,10 +1871,14 @@ fn create_world_surface_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(if fragment_entry == "fs_outline" {
+                "vs_outline"
+            } else {
+                "vs_main"
+            }),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[wgpu::VertexBufferLayout {
-                array_stride: 104,
+                array_stride: 116,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
                     wgpu::VertexAttribute {
@@ -1888,6 +1921,11 @@ fn create_world_surface_pipeline(
                         offset: 92,
                         shader_location: 7,
                     },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 104,
+                        shader_location: 8,
+                    },
                 ],
             }],
         },
@@ -1896,14 +1934,18 @@ fn create_world_surface_pipeline(
             entry_point: Some(fragment_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: wgpu::TextureFormat::Rgba16Float,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
+            cull_mode: if fragment_entry == "fs_outline" {
+                Some(wgpu::Face::Front)
+            } else {
+                None
+            },
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -2067,6 +2109,26 @@ impl GpuWorldRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
             ],
         });
         let lighting_bind_group_layout =
@@ -2213,7 +2275,7 @@ impl GpuWorldRenderer {
             });
         let lighting_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("anica-motionloom-world-lighting-params"),
-            size: 624,
+            size: 672,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2287,7 +2349,7 @@ impl GpuWorldRenderer {
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 104,
+                    array_stride: 116,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute {
@@ -2330,6 +2392,11 @@ impl GpuWorldRenderer {
                             offset: 92,
                             shader_location: 7,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 104,
+                            shader_location: 8,
+                        },
                     ],
                 }],
             },
@@ -2338,7 +2405,7 @@ impl GpuWorldRenderer {
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2405,7 +2472,7 @@ impl GpuWorldRenderer {
                 entry_point: Some("fs_background"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2430,7 +2497,7 @@ impl GpuWorldRenderer {
                 entry_point: Some("vs_shadow"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 104,
+                    array_stride: 116,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute {
@@ -2472,6 +2539,11 @@ impl GpuWorldRenderer {
                             format: wgpu::VertexFormat::Float32x3,
                             offset: 92,
                             shader_location: 7,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 104,
+                            shader_location: 8,
                         },
                     ],
                 }],
@@ -2519,7 +2591,7 @@ impl GpuWorldRenderer {
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2569,7 +2641,8 @@ impl GpuWorldRenderer {
         let targets = (0..3)
             .map(|_| Arc::new(Self::make_target_texture(&device, width, height)))
             .collect();
-        let transmission_scene_texture = Self::make_target_texture(&device, width, height);
+        let hdr_target = Arc::new(Self::make_hdr_texture(&device, width, height));
+        let transmission_scene_texture = Self::make_hdr_texture(&device, width, height);
         let transmission_scene_view =
             transmission_scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let transmission_scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2606,6 +2679,7 @@ impl GpuWorldRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
+            anisotropy_clamp: 8,
             ..Default::default()
         });
         let environment_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2697,6 +2771,14 @@ impl GpuWorldRenderer {
             view_formats: &[],
         });
 
+        let outline_pipeline = create_world_surface_pipeline(
+            &device,
+            &shader,
+            &pipeline_layout,
+            "cel-outline",
+            "fs_outline",
+            false,
+        );
         Ok(Self {
             device,
             queue,
@@ -2705,6 +2787,7 @@ impl GpuWorldRenderer {
             lighting_bind_group_layout,
             background_empty_bind_group,
             shadow_lighting_bind_group,
+            outline_pipeline,
             pipeline,
             transparent_pipeline,
             transparent_depth_write_pipeline,
@@ -2731,6 +2814,7 @@ impl GpuWorldRenderer {
             lighting_params_buffer,
             environment_resource: None,
             targets,
+            hdr_target,
             target_cursor: 0,
             depth_texture,
             shadow_texture,
@@ -2823,18 +2907,43 @@ impl GpuWorldRenderer {
             });
             self.environment_resource = None;
         }
-        let target = self.acquire_target();
+        let target = Arc::clone(&self.hdr_target);
         if clear_color.is_none() {
             let background = background.ok_or_else(|| WorldRenderError::GpuRender {
                 message: "world GPU render requires a background when no clear color is supplied"
                     .to_string(),
             })?;
-            self.write_texture_rgba(&target, background.as_raw());
+            self.write_texture_hdr_background(
+                &target,
+                background.as_raw(),
+                lighting.params.color0[3],
+            );
         }
+        // Fit small rigid scenes without increasing shadow texture resolution.
+        let mut shadow_bounds = Vec::with_capacity(draw_calls.len());
+        for draw in draw_calls {
+            if draw.params.vegetation[0] != 0.0
+                || draw
+                    .bone_matrices
+                    .iter()
+                    .any(|matrix| *matrix != mat4_identity())
+            {
+                shadow_bounds.clear();
+                break;
+            }
+            let geometry =
+                self.shared_actor_geometry(draw.vertex_signature, &draw.vertices, &draw.indices);
+            let Some(bounds) = geometry.rigid_bounds else {
+                shadow_bounds.clear();
+                break;
+            };
+            shadow_bounds.push((bounds, draw.params));
+        }
+        let fitted_lighting = fit_rigid_shadow_volume(lighting.params, &shadow_bounds);
         self.queue.write_buffer(
             &self.lighting_params_buffer,
             0,
-            &pack_gpu_world_lighting(lighting.params),
+            &pack_gpu_world_lighting(fitted_lighting),
         );
         self.ensure_environment_resource(lighting);
         let lighting_bind_group = self
@@ -2853,7 +2962,8 @@ impl GpuWorldRenderer {
             / std::mem::size_of::<GpuWorldParams>())
         .max(1);
         for draw in draw_calls {
-            let geometry = self.shared_actor_geometry(draw.vertex_signature, &draw.vertices);
+            let geometry =
+                self.shared_actor_geometry(draw.vertex_signature, &draw.vertices, &draw.indices);
             // Procedural meshes use an identity joint, not necessarily zero weights.
             // Only identity palettes can safely use the cached undeformed bounds.
             let rigid = draw
@@ -2880,6 +2990,8 @@ impl GpuWorldRenderer {
                     && previous.metallic_roughness_texture.signature
                         == draw.metallic_roughness_texture.signature
                     && previous.emissive_texture.signature == draw.emissive_texture.signature
+                    && previous.occlusion_texture.signature == draw.occlusion_texture.signature
+                    && previous.cel_texture.signature == draw.cel_texture.signature
                     && previous.bone_matrices == draw.bone_matrices
                     && rigid
                     && geometry.rigid_bounds.is_some()
@@ -2892,16 +3004,30 @@ impl GpuWorldRenderer {
         }
         for (batch, camera_visible) in batches {
             let draw = batch[0];
-            if draw.vertices.is_empty() {
+            if draw.indices.is_empty() {
                 continue;
             }
-            let geometry =
-                self.shared_actor_geometry(draw.vertex_signature, draw.vertices.as_ref());
+            let geometry = self.shared_actor_geometry(
+                draw.vertex_signature,
+                draw.vertices.as_ref(),
+                draw.indices.as_ref(),
+            );
             let texture_keys = [
-                GpuWorldTextureKey::from(draw.texture.as_ref()),
-                GpuWorldTextureKey::from(draw.normal_texture.as_ref()),
+                GpuWorldTextureKey {
+                    role: TextureRole::Color,
+                    ..GpuWorldTextureKey::from(draw.texture.as_ref())
+                },
+                GpuWorldTextureKey {
+                    role: TextureRole::Normal,
+                    ..GpuWorldTextureKey::from(draw.normal_texture.as_ref())
+                },
                 GpuWorldTextureKey::from(draw.metallic_roughness_texture.as_ref()),
-                GpuWorldTextureKey::from(draw.emissive_texture.as_ref()),
+                GpuWorldTextureKey {
+                    role: TextureRole::Color,
+                    ..GpuWorldTextureKey::from(draw.emissive_texture.as_ref())
+                },
+                GpuWorldTextureKey::from(draw.cel_texture.as_ref()),
+                GpuWorldTextureKey::from(draw.occlusion_texture.as_ref()),
             ];
             active_texture_keys.extend(texture_keys);
             let texture = self.shared_actor_texture(
@@ -2924,6 +3050,16 @@ impl GpuWorldRenderer {
                 draw.emissive_texture.as_ref(),
                 "anica-motionloom-world-gpu-emissive-texture",
             );
+            let cel_texture = self.shared_actor_texture(
+                texture_keys[4],
+                draw.cel_texture.as_ref(),
+                "cel-control-map",
+            );
+            let occlusion_texture = self.shared_actor_texture(
+                texture_keys[5],
+                draw.occlusion_texture.as_ref(),
+                "material-occlusion",
+            );
             let texture_binding_changed = self
                 .actor_resource_cache
                 .get(&draw.resource_key)
@@ -2938,6 +3074,8 @@ impl GpuWorldRenderer {
                 resource.normal_texture = Arc::clone(&normal_texture);
                 resource.metallic_roughness_texture = Arc::clone(&metallic_roughness_texture);
                 resource.emissive_texture = Arc::clone(&emissive_texture);
+                resource.occlusion_texture = Arc::clone(&occlusion_texture);
+                resource.cel_texture = Arc::clone(&cel_texture);
                 self.instance_resource_cache
                     .retain(|key, _| key.resource_key != draw.resource_key);
             }
@@ -2951,29 +3089,33 @@ impl GpuWorldRenderer {
                         normal_texture,
                         metallic_roughness_texture,
                         emissive_texture,
+                        occlusion_texture,
+                        cel_texture,
                     },
                 );
             }
 
             let (
-                vertex_buffer,
+                geometry,
                 texture_view,
                 normal_texture_view,
                 metallic_roughness_texture_view,
                 emissive_texture_view,
-                vertex_count,
+                occlusion_texture_view,
+                cel_texture_view,
             ) = {
                 let resource = self
                     .actor_resource_cache
                     .get(&draw.resource_key)
                     .expect("GPU actor resource inserted before draw");
                 (
-                    resource.geometry.vertex_buffer.clone(),
+                    Arc::clone(&resource.geometry),
                     resource.texture.view.clone(),
                     resource.normal_texture.view.clone(),
                     resource.metallic_roughness_texture.view.clone(),
                     resource.emissive_texture.view.clone(),
-                    resource.geometry.vertex_count,
+                    resource.occlusion_texture.view.clone(),
+                    resource.cel_texture.view.clone(),
                 )
             };
             let params_bytes: Vec<u8> = batch
@@ -3036,6 +3178,14 @@ impl GpuWorldRenderer {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(&emissive_texture_view),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&cel_texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(&occlusion_texture_view),
+                        },
                     ],
                 });
                 self.instance_resource_cache.insert(
@@ -3068,17 +3218,21 @@ impl GpuWorldRenderer {
                     .write_buffer(&instance_resource.bone_buffer, 0, &bone_bytes);
                 instance_resource.last_bones = bone_bytes;
             }
-            gpu_draws.push(GpuWorldDrawResources {
-                vertex_buffer,
-                bind_group: instance_resource.bind_group.clone(),
-                vertex_count,
-                instance_count: batch.len() as u32,
-                camera_visible,
-                phase: draw.phase,
-                depth_write: draw.depth_write,
-                sort_priority: draw.sort_priority,
-                camera_depth: draw.camera_depth,
-            });
+            let bind_group = instance_resource.bind_group.clone();
+            for chunk in &geometry.chunks {
+                gpu_draws.push(GpuWorldDrawResources {
+                    vertex_buffer: chunk.vertex_buffer.clone(),
+                    index_buffer: chunk.index_buffer.clone(),
+                    bind_group: bind_group.clone(),
+                    index_count: chunk.index_count,
+                    instance_count: batch.len() as u32,
+                    camera_visible,
+                    phase: draw.phase,
+                    depth_write: draw.depth_write,
+                    sort_priority: draw.sort_priority,
+                    camera_depth: draw.camera_depth,
+                });
+            }
         }
         // Optional native diagnostics do not change the public profile/DSL contract.
         #[cfg(not(target_arch = "wasm32"))]
@@ -3147,7 +3301,9 @@ impl GpuWorldRenderer {
             {
                 shadow_pass.set_bind_group(0, &draw.bind_group, &[]);
                 shadow_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                shadow_pass.draw(0..draw.vertex_count, 0..draw.instance_count);
+                shadow_pass
+                    .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                shadow_pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
             }
         }
         {
@@ -3206,7 +3362,45 @@ impl GpuWorldRenderer {
                 }
                 pass.set_bind_group(0, &draw.bind_group, &[]);
                 pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                pass.draw(0..draw.vertex_count, 0..draw.instance_count);
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
+            }
+        }
+        // Completed opaque depth hides occluded backface outlines.
+        if lighting.params.cel0[2] > 0.0 {
+            let view = target.create_view(&Default::default());
+            let depth = self.depth_texture.create_view(&Default::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("cel-outline"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.outline_pipeline);
+            pass.set_bind_group(1, &lighting_bind_group, &[]);
+            for draw in gpu_draws
+                .iter()
+                .filter(|d| d.camera_visible && d.phase == GpuWorldDrawPhase::Opaque)
+            {
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
             }
         }
         // Transmissive shaders sample a stable opaque snapshot. Reading the
@@ -3276,13 +3470,12 @@ impl GpuWorldRenderer {
                 }
                 pass.set_bind_group(0, &draw.bind_group, &[]);
                 pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                pass.draw(0..draw.vertex_count, 0..draw.instance_count);
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
             }
         }
-        let output_target = if (lighting.params.optics0[0] > 0.0
-            && lighting.params.optics0[3] > 0.0)
-            || lighting.params.surface3[3] > 0.5
-        {
+        // Resolve HDR after transparency and depth-aware optics, even with DoF disabled.
+        let output_target = {
             let dof_target = self.acquire_target();
             let dof_view = dof_target.create_view(&wgpu::TextureViewDescriptor::default());
             let dof_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3327,8 +3520,6 @@ impl GpuWorldRenderer {
                 pass.draw(0..3, 0..1);
             }
             dof_target
-        } else {
-            target
         };
         self.queue.submit([encoder.finish()]);
         Ok(crate::scene::preview_surface::GpuFrameTexture {
@@ -3378,6 +3569,26 @@ impl GpuWorldRenderer {
         })
     }
 
+    fn make_hdr_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("anica-motionloom-world-gpu-hdr-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
     fn make_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("anica-motionloom-world-gpu-depth"),
@@ -3395,7 +3606,23 @@ impl GpuWorldRenderer {
         })
     }
 
-    fn write_texture_rgba(&self, texture: &wgpu::Texture, rgba: &[u8]) {
+    // Background pixels are display-referred; invert only the final curve so
+    // the shared resolve preserves them without grading the host's 2D canvas.
+    fn write_texture_hdr_background(&self, texture: &wgpu::Texture, rgba: &[u8], mode: f32) {
+        let bytes: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|p| {
+                let alpha = p[3] as f32 / 255.0;
+                [
+                    inverse_display(p[0] as f32 / 255.0, mode) * alpha,
+                    inverse_display(p[1] as f32 / 255.0, mode) * alpha,
+                    inverse_display(p[2] as f32 / 255.0, mode) * alpha,
+                    alpha,
+                ]
+                .into_iter()
+                .flat_map(|v| half::f16::from_f32(v).to_bits().to_ne_bytes())
+            })
+            .collect();
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -3403,10 +3630,10 @@ impl GpuWorldRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            rgba,
+            &bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(self.width.saturating_mul(4)),
+                bytes_per_row: Some(self.width * 8),
                 rows_per_image: Some(self.height),
             },
             wgpu::Extent3d {
@@ -3508,25 +3735,50 @@ impl GpuWorldRenderer {
         &mut self,
         signature: u64,
         vertices: &[GpuWorldVertex],
+        indices: &[u32],
     ) -> Arc<GpuWorldVertexResource> {
         if let Some(resource) = self.vertex_resource_cache.get(&signature) {
             return Arc::clone(resource);
         }
-        let vertex_bytes = pack_gpu_world_vertices(vertices);
-        let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("anica-motionloom-world-gpu-vertices"),
-            size: vertex_bytes.len().max(4) as u64,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        vertex_buffer
-            .slice(..vertex_bytes.len() as u64)
-            .get_mapped_range_mut()
-            .copy_from_slice(&vertex_bytes);
-        vertex_buffer.unmap();
+        // Indexed chunks keep imported GLB vertices shared and ensure no single
+        // allocation approaches the backend's advertised buffer limit.
+        let chunk_bytes = gpu_world_vertex_chunk_bytes(&self.device);
+        let chunks = split_gpu_world_indexed_chunks(vertices, indices, chunk_bytes)
+            .into_iter()
+            .map(|chunk| {
+                let vertex_bytes = pack_gpu_world_vertices(&chunk.vertices);
+                let index_bytes = pack_gpu_world_indices(&chunk.indices);
+                let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("anica-motionloom-world-gpu-vertices"),
+                    size: vertex_bytes.len().max(4) as u64,
+                    usage: wgpu::BufferUsages::VERTEX,
+                    mapped_at_creation: true,
+                });
+                vertex_buffer
+                    .slice(..vertex_bytes.len() as u64)
+                    .get_mapped_range_mut()
+                    .copy_from_slice(&vertex_bytes);
+                vertex_buffer.unmap();
+                let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("anica-motionloom-world-gpu-indices"),
+                    size: index_bytes.len().max(4) as u64,
+                    usage: wgpu::BufferUsages::INDEX,
+                    mapped_at_creation: true,
+                });
+                index_buffer
+                    .slice(..index_bytes.len() as u64)
+                    .get_mapped_range_mut()
+                    .copy_from_slice(&index_bytes);
+                index_buffer.unmap();
+                GpuWorldGeometryChunk {
+                    vertex_buffer,
+                    index_buffer,
+                    index_count: chunk.indices.len() as u32,
+                }
+            })
+            .collect();
         let resource = Arc::new(GpuWorldVertexResource {
-            vertex_buffer,
-            vertex_count: vertices.len() as u32,
+            chunks,
             rigid_bounds: rigid_vertex_bounds(vertices),
         });
         self.vertex_resource_cache
@@ -3543,7 +3795,7 @@ impl GpuWorldRenderer {
         if let Some(resource) = self.texture_resource_cache.get(&key) {
             return Arc::clone(resource);
         }
-        let gpu_texture = self.make_actor_texture(texture, label);
+        let gpu_texture = self.make_actor_texture(texture, label, key.role);
         let view = gpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let resource = Arc::new(GpuWorldTextureResource {
             _texture: gpu_texture,
@@ -3554,17 +3806,25 @@ impl GpuWorldRenderer {
         resource
     }
 
-    fn make_actor_texture(&self, texture: &GpuWorldTexture, label: &'static str) -> wgpu::Texture {
-        let width = texture.width.max(1);
-        let height = texture.height.max(1);
+    fn make_actor_texture(
+        &self,
+        texture: &GpuWorldTexture,
+        label: &'static str,
+        role: TextureRole,
+    ) -> wgpu::Texture {
+        let mut width = texture.width.max(1);
+        let mut height = texture.height.max(1);
         let expected_len = width as usize * height as usize * 4;
         let fallback;
         let rgba = if texture.rgba.len() == expected_len {
             texture.rgba.as_slice()
         } else {
+            width = 1;
+            height = 1;
             fallback = vec![255, 255, 255, 255];
             fallback.as_slice()
         };
+        let levels = build_mips(width, height, rgba, role);
         let gpu_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -3572,32 +3832,38 @@ impl GpuWorldRenderer {
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: levels.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: if role == TextureRole::Color {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &gpu_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width.saturating_mul(4)),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        for (level, (width, height, rgba)) in levels.iter().enumerate() {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu_texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width.saturating_mul(4)),
+                    rows_per_image: Some(*height),
+                },
+                wgpu::Extent3d {
+                    width: *width,
+                    height: *height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         gpu_texture
     }
 
@@ -3631,8 +3897,9 @@ impl GpuWorldRenderer {
 
 struct GpuWorldDrawResources {
     vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    vertex_count: u32,
+    index_count: u32,
     instance_count: u32,
     camera_visible: bool,
     phase: GpuWorldDrawPhase,
@@ -3675,11 +3942,13 @@ fn gpu_world_material_depth_write(
 
 struct GpuWorldActorResource {
     geometry: Arc<GpuWorldVertexResource>,
-    texture_keys: [GpuWorldTextureKey; 4],
+    texture_keys: [GpuWorldTextureKey; 6],
     texture: Arc<GpuWorldTextureResource>,
     normal_texture: Arc<GpuWorldTextureResource>,
     metallic_roughness_texture: Arc<GpuWorldTextureResource>,
     emissive_texture: Arc<GpuWorldTextureResource>,
+    occlusion_texture: Arc<GpuWorldTextureResource>,
+    cel_texture: Arc<GpuWorldTextureResource>,
 }
 
 // Cache undeformed bounds once; the current bone palette gates their use.
@@ -3746,9 +4015,14 @@ fn rigid_draw_visible(bounds: Option<([f32; 3], [f32; 3])>, p: GpuWorldParams) -
 }
 
 struct GpuWorldVertexResource {
-    vertex_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    chunks: Vec<GpuWorldGeometryChunk>,
     rigid_bounds: Option<([f32; 3], [f32; 3])>,
+}
+
+struct GpuWorldGeometryChunk {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
 }
 
 struct GpuWorldTextureResource {
@@ -3758,6 +4032,7 @@ struct GpuWorldTextureResource {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GpuWorldTextureKey {
+    role: TextureRole,
     width: u32,
     height: u32,
     signature: u64,
@@ -3769,6 +4044,7 @@ impl From<&GpuWorldTexture> for GpuWorldTextureKey {
             width: texture.width.max(1),
             height: texture.height.max(1),
             signature: texture.signature,
+            role: TextureRole::Data,
         }
     }
 }
@@ -3783,8 +4059,131 @@ struct GpuWorldInstanceResource {
     bind_group: wgpu::BindGroup,
 }
 
+const GPU_WORLD_VERTEX_STRIDE_BYTES: usize = 116;
+const GPU_WORLD_DEFAULT_CHUNK_MIB: u64 = 128;
+
+struct CpuGpuWorldGeometryChunk {
+    vertices: Vec<GpuWorldVertex>,
+    indices: Vec<u32>,
+}
+
+// Keep allocations modest even when a native adapter advertises multi-GiB
+// buffers. The environment override is an expert tuning knob, not a DSL rule.
+fn gpu_world_vertex_chunk_bytes(device: &wgpu::Device) -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    let requested_mib = std::env::var("MOTIONLOOM_VERTEX_CHUNK_MIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GPU_WORLD_DEFAULT_CHUNK_MIB);
+    #[cfg(target_arch = "wasm32")]
+    let requested_mib = GPU_WORLD_DEFAULT_CHUNK_MIB;
+
+    let requested = requested_mib.saturating_mul(1024 * 1024);
+    let device_limit = device.limits().max_buffer_size;
+    requested
+        .min(device_limit)
+        .max((GPU_WORLD_VERTEX_STRIDE_BYTES * 3) as u64) as usize
+}
+
+fn gpu_world_vertex_key(vertex: GpuWorldVertex) -> [u32; 29] {
+    let mut words = [0u32; 29];
+    let mut cursor = 0;
+    for value in vertex
+        .position
+        .into_iter()
+        .chain(vertex.normal)
+        .chain(vertex.joints)
+        .chain(vertex.weights)
+        .chain(vertex.uv)
+        .chain(vertex.color)
+        .chain(vertex.tangent)
+        .chain(vertex.bitangent)
+        .chain(vertex.outline_normal)
+    {
+        words[cursor] = value.to_bits();
+        cursor += 1;
+    }
+    words
+}
+
+// Collapse the renderer's material-expanded triangles before they enter the
+// retained cache, so repeated GLB vertices do not remain duplicated on CPU.
+fn index_gpu_world_vertices(
+    expanded_vertices: &[GpuWorldVertex],
+) -> (Vec<GpuWorldVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::with_capacity(expanded_vertices.len());
+    let mut index_by_vertex = HashMap::<[u32; 29], u32>::new();
+    for vertex in expanded_vertices.iter().copied() {
+        let key = gpu_world_vertex_key(vertex);
+        let index = *index_by_vertex.entry(key).or_insert_with(|| {
+            let index = vertices.len() as u32;
+            vertices.push(vertex);
+            index
+        });
+        indices.push(index);
+    }
+    (vertices, indices)
+}
+
+// Remap indexed triangles into local chunks before either GPU allocation
+// exceeds the configured upload target.
+fn split_gpu_world_indexed_chunks(
+    source_vertices: &[GpuWorldVertex],
+    source_indices: &[u32],
+    chunk_bytes: usize,
+) -> Vec<CpuGpuWorldGeometryChunk> {
+    let mut chunks = Vec::new();
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut local_by_source = HashMap::<u32, u32>::new();
+
+    for triangle in source_indices.chunks(3) {
+        let new_vertices = triangle
+            .iter()
+            .enumerate()
+            .filter(|(index, source_index)| {
+                !local_by_source.contains_key(*source_index)
+                    && !triangle[..*index].contains(source_index)
+            })
+            .count();
+        let vertex_bytes = vertices
+            .len()
+            .saturating_add(new_vertices)
+            .saturating_mul(GPU_WORLD_VERTEX_STRIDE_BYTES);
+        let index_bytes = indices
+            .len()
+            .saturating_add(triangle.len())
+            .saturating_mul(std::mem::size_of::<u32>());
+        if !indices.is_empty() && (vertex_bytes > chunk_bytes || index_bytes > chunk_bytes) {
+            chunks.push(CpuGpuWorldGeometryChunk {
+                vertices: std::mem::take(&mut vertices),
+                indices: std::mem::take(&mut indices),
+            });
+            local_by_source.clear();
+        }
+
+        for source_index in triangle.iter().copied() {
+            let Some(vertex) = source_vertices.get(source_index as usize).copied() else {
+                continue;
+            };
+            let local_index = *local_by_source.entry(source_index).or_insert_with(|| {
+                let local_index = vertices.len() as u32;
+                vertices.push(vertex);
+                local_index
+            });
+            indices.push(local_index);
+        }
+    }
+    if !indices.is_empty() {
+        chunks.push(CpuGpuWorldGeometryChunk { vertices, indices });
+    }
+    chunks
+}
+
 fn pack_gpu_world_vertices(vertices: &[GpuWorldVertex]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vertices.len().saturating_mul(104));
+    let mut out = Vec::with_capacity(vertices.len().saturating_mul(GPU_WORLD_VERTEX_STRIDE_BYTES));
     for vertex in vertices {
         for value in vertex.position {
             out.extend_from_slice(&value.to_ne_bytes());
@@ -3810,13 +4209,27 @@ fn pack_gpu_world_vertices(vertices: &[GpuWorldVertex]) -> Vec<u8> {
         for value in vertex.bitangent {
             out.extend_from_slice(&value.to_ne_bytes());
         }
+        for value in vertex.outline_normal {
+            out.extend_from_slice(&value.to_ne_bytes());
+        }
     }
     out
 }
 
-fn gpu_world_vertex_signature(vertices: &[GpuWorldVertex]) -> u64 {
+fn pack_gpu_world_indices(indices: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(indices.len().saturating_mul(std::mem::size_of::<u32>()));
+    for index in indices {
+        out.extend_from_slice(&index.to_ne_bytes());
+    }
+    out
+}
+
+fn gpu_world_geometry_signature(vertices: &[GpuWorldVertex], indices: &[u32]) -> u64 {
     let mut hasher = DefaultHasher::new();
-    pack_gpu_world_vertices(vertices).hash(&mut hasher);
+    for vertex in vertices.iter().copied() {
+        gpu_world_vertex_key(vertex).hash(&mut hasher);
+    }
+    indices.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3840,6 +4253,8 @@ fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
         params.material5,
         params.material6,
         params.material7,
+        params.cel_material0,
+        params.cel_material1,
         params.vegetation,
         params.hidden0,
         params.hidden1,
@@ -3858,7 +4273,7 @@ fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
 }
 
 fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(624);
+    let mut out = Vec::with_capacity(672);
     for vector in [
         params.environment0,
         params.environment1,
@@ -3883,6 +4298,9 @@ fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8> {
         params.surface1,
         params.surface2,
         params.surface3,
+        params.cel0,
+        params.cel1,
+        params.cel2,
     ] {
         for value in vector {
             out.extend_from_slice(&value.to_ne_bytes());
@@ -3966,6 +4384,8 @@ struct Params {
     material5: vec4<f32>,
     material6: vec4<f32>,
     material7: vec4<f32>,
+    cel_material0: vec4<f32>,
+    cel_material1: vec4<f32>,
     vegetation: vec4<f32>,
     hidden0: vec4<f32>,
     hidden1: vec4<f32>,
@@ -4008,6 +4428,9 @@ struct Lighting {
     surface1: vec4<f32>,
     surface2: vec4<f32>,
     surface3: vec4<f32>,
+    cel0: vec4<f32>,
+    cel1: vec4<f32>,
+    cel2: vec4<f32>,
     lights: array<Light, 4>,
 };
 
@@ -4024,6 +4447,7 @@ struct VertexIn {
     @location(5) color: vec4<f32>,
     @location(6) tangent: vec3<f32>,
     @location(7) bitangent: vec3<f32>,
+    @location(8) outline_normal: vec3<f32>,
 };
 
 struct VertexOut {
@@ -4036,6 +4460,8 @@ struct VertexOut {
     @location(5) bitangent: vec3<f32>,
     @location(6) hidden_weight: f32,
     @location(7) @interpolate(flat) instance_id: u32,
+    @location(8) face_forward: vec3<f32>,
+    @location(9) face_right: vec3<f32>,
 };
 
 // Each invocation selects its own packed instance; fragment selection is flat.
@@ -4047,6 +4473,8 @@ var<private> params: Params;
 @group(0) @binding(4) var normal_texture: texture_2d<f32>;
 @group(0) @binding(5) var metallic_roughness_texture: texture_2d<f32>;
 @group(0) @binding(6) var emissive_texture: texture_2d<f32>;
+@group(0) @binding(7) var cel_texture: texture_2d<f32>;
+@group(0) @binding(8) var occlusion_texture: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> lighting: Lighting;
 @group(1) @binding(1) var environment_texture: texture_2d<f32>;
 @group(1) @binding(2) var environment_sampler: sampler;
@@ -4122,6 +4550,16 @@ fn bone_transform_vector(joint: f32, vector: vec3<f32>) -> vec3<f32> {
     return (bones.matrices[joint_index] * vec4<f32>(vector, 0.0)).xyz;
 }
 
+fn cel_basis(input: VertexIn, axis: vec3<f32>) -> vec3<f32> {
+    let sum = dot(input.weights, vec4<f32>(1.0));
+    if (sum < 0.000001) { return normalize(actor_rotate(axis)); }
+    let v = bone_transform_vector(input.joints.x, axis) * input.weights.x
+        + bone_transform_vector(input.joints.y, axis) * input.weights.y
+        + bone_transform_vector(input.joints.z, axis) * input.weights.z
+        + bone_transform_vector(input.joints.w, axis) * input.weights.w;
+    return normalize(actor_rotate(v / sum));
+}
+
 fn actor_rotate(vector: vec3<f32>) -> vec3<f32> {
     let quaternion = normalize(params.actor_rotation);
     let doubled_cross = 2.0 * cross(quaternion.xyz, vector);
@@ -4156,8 +4594,7 @@ fn vegetation_deform(position: vec3<f32>) -> vec3<f32> {
     return position + sway;
 }
 
-@vertex
-fn vs_main(input: VertexIn, @builtin(instance_index) instance_id: u32) -> VertexOut {
+fn cel_shared_vertex(input: VertexIn, instance_id: u32) -> VertexOut {
     params = instance_params[instance_id];
     let weight_sum = input.weights.x + input.weights.y + input.weights.z + input.weights.w;
     var skinned = vegetation_deform(input.position);
@@ -4205,20 +4642,17 @@ fn vs_main(input: VertexIn, @builtin(instance_index) instance_id: u32) -> Vertex
     let view_x = dot(rel, right);
     let view_y = dot(rel, up);
     let view_z = dot(rel, forward);
-    let safe_z = max(view_z, params.camera1.w);
-    let screen_x = params.canvas.z + (view_x * params.camera0.w) / safe_z;
-    let screen_y = params.canvas.w - (view_y * params.camera0.w) / safe_z;
-    let ndc_x = (screen_x / params.canvas.x) * 2.0 - 1.0;
-    let ndc_y = 1.0 - (screen_y / params.canvas.y) * 2.0;
+    let near = params.camera1.w;
     let far = max(params.camera2.w, params.camera1.w + 0.001);
-    let ndc_z = clamp(1.0 - ((safe_z - params.camera1.w) / (far - params.camera1.w)), 0.0, 1.0);
+    let clip_x = (2.0 * params.canvas.z / params.canvas.x - 1.0) * view_z + 2.0 * view_x * params.camera0.w / params.canvas.x;
+    let clip_y = (1.0 - 2.0 * params.canvas.w / params.canvas.y) * view_z + 2.0 * view_y * params.camera0.w / params.canvas.y;
+    let clip_z = near * (far - view_z) / (far - near);
 
     var out: VertexOut;
     out.instance_id = instance_id;
-    // Preserve camera-space depth in clip-space w. The previous shader wrote
-    // already-divided NDC coordinates with w=1, which forced affine varying
-    // interpolation and visibly warped material UVs on oblique surfaces.
-    out.pos = vec4<f32>(ndc_x * safe_z, ndc_y * safe_z, ndc_z * safe_z, safe_z);
+    // Signed camera depth allows homogeneous near-plane clipping, including
+    // triangles crossing behind the camera, and perspective-correct varyings.
+    out.pos = vec4<f32>(clip_x, clip_y, clip_z, view_z);
     out.color = input.color;
     // Seeded variation is per instance. Keeping it out of authored vertices
     // lets every CompoundAsset child reuse the same retained geometry.
@@ -4232,6 +4666,12 @@ fn vs_main(input: VertexIn, @builtin(instance_index) instance_id: u32) -> Vertex
     out.normal = normal_world;
     out.tangent = tangent_world;
     out.bitangent = bitangent_world;
+    out.face_forward = vec3<f32>(0.0,0.0,1.0);
+    out.face_right = vec3<f32>(1.0,0.0,0.0);
+    if (params.cel_material0.y > 2.5) {
+        out.face_forward = cel_basis(input, vec3<f32>(0.0,0.0,1.0));
+        out.face_right = cel_basis(input, vec3<f32>(1.0,0.0,0.0));
+    }
     var hidden_weight = params.style.w;
     if (hidden_weight <= 0.01 && weight_sum > 0.000001) {
         hidden_weight = (camera_hidden_joint(input.joints.x) * input.weights.x +
@@ -4241,6 +4681,40 @@ fn vs_main(input: VertexIn, @builtin(instance_index) instance_id: u32) -> Vertex
     }
     out.hidden_weight = hidden_weight;
     return out;
+}
+
+@vertex
+fn vs_main(input: VertexIn, @builtin(instance_index) instance_id: u32) -> VertexOut {
+    return cel_shared_vertex(input, instance_id);
+}
+
+// Reuse the exact skinned vertex path, expanding only in projected screen space.
+@vertex
+fn vs_outline(input: VertexIn, @builtin(instance_index) instance_id: u32) -> VertexOut {
+    var smooth_input = input;
+    smooth_input.normal = input.outline_normal;
+    var out = cel_shared_vertex(smooth_input, instance_id);
+    let projected = vec2<f32>(dot(out.normal, params.camera1.xyz), dot(out.normal, params.camera2.xyz));
+    let magnitude = max(length(projected), 0.0001);
+    let dims = textureDimensions(cel_texture);
+    let coord = clamp(vec2<i32>(out.uv * vec2<f32>(dims)), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+    let mask = textureLoad(cel_texture, coord, 0).r;
+    let width = select(lighting.cel0.z, params.cel_material0.x, params.cel_material0.x >= 0.0) * lighting.cel0.w * mask;
+    out.pos.x += projected.x / magnitude * width * 2.0 / params.canvas.x * out.pos.w;
+    out.pos.y += projected.y / magnitude * width * 2.0 / params.canvas.y * out.pos.w;
+    return out;
+}
+
+@fragment
+fn fs_outline(input: VertexOut) -> @location(0) vec4<f32> {
+    params = instance_params[input.instance_id];
+    let alpha = textureSample(actor_texture, actor_sampler, input.uv).a * input.color.a * params.material4.a * params.style.x;
+    // Opaque materials ignore texture alpha, including legacy solid-color fallbacks.
+    // Masked materials retain cutouts; actor fades still suppress solid outlines.
+    let masked_out = params.material7.w > 0.0 && alpha < max(params.material7.w, 0.99);
+    if (input.hidden_weight > 0.5 || masked_out || params.style.x < 0.99
+        || dot(input.world_position - params.camera0.xyz, params.camera3.xyz) <= params.camera1.w) { discard; }
+    return vec4<f32>(inverse_display_curve(lighting.cel2.rgb), 1.0);
 }
 
 @vertex
@@ -4296,6 +4770,7 @@ fn direct_pbr(
     metallic: f32,
     roughness: f32,
     f0: vec3<f32>,
+    face_band: f32,
 ) -> vec3<f32> {
     let halfway = normalize(view + light);
     let n_dot_l = max(dot(normal, light), 0.0);
@@ -4307,6 +4782,20 @@ fn direct_pbr(
     let diffuse_weight = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic);
     let diffuse = diffuse_weight * base_color / 3.14159265;
     // Art-directed diffuse is calculated per light, not by posterizing pixels.
+    if (lighting.surface0.x > 3.5) {
+        let n = dot(normal, light) * 0.5 + 0.5;
+        let feather = lighting.cel0.y;
+        let steps = max(lighting.surface0.y, 2.0);
+        var band = 0.0;
+        for (var i = 1.0; i < steps; i += 1.0) {
+            let threshold = clamp(lighting.cel0.x + (i / (steps - 1.0) - 0.5) * 0.5, 0.0, 1.0);
+            band += smoothstep(threshold - feather, threshold + feather, n) / (steps - 1.0);
+        }
+        if (face_band >= 0.0) { band = face_band; }
+        let shadow_color = select(lighting.cel1.rgb, params.cel_material1.rgb, params.cel_material1.w > 0.5);
+        let shade = mix(pow(shadow_color, vec3<f32>(2.2)), vec3<f32>(1.0), band);
+        return (base_color * shade / 3.14159265 + specular * lighting.surface1.y * n_dot_l) * radiance;
+    }
     if (lighting.surface0.x > 0.5) {
         var intensity = clamp((dot(normal, light) + lighting.surface0.z) / (1.0 + lighting.surface0.z), 0.0, 1.0);
         if (lighting.surface0.x > 1.5 && lighting.surface0.x < 2.5) {
@@ -4322,18 +4811,21 @@ fn direct_pbr(
     return (diffuse + specular) * radiance * n_dot_l;
 }
 
-fn aces_fitted(color: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
 fn white_balance(color: vec3<f32>, kelvin: f32) -> vec3<f32> {
     let temperature = clamp((kelvin - 6500.0) / 6500.0, -0.75, 0.75);
     return color * vec3<f32>(1.0 + temperature * 0.16, 1.0, 1.0 - temperature * 0.16);
+}
+
+// Display-locked colors enter HDR through the inverse final curve.
+fn inverse_display_curve(color: vec3<f32>) -> vec3<f32> {
+    let y = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+    if (lighting.color0.w > 1.5) {
+        let a = vec3<f32>(2.51) - y * 2.43;
+        let b = vec3<f32>(0.03) - y * 0.59;
+        return (-b + sqrt(b * b + 4.0 * a * y * 0.14)) / (2.0 * a);
+    }
+    if (lighting.color0.w > 0.5) { return y / max(vec3<f32>(1.0) - y, vec3<f32>(0.0001)); }
+    return y;
 }
 
 fn display_transform(color: vec3<f32>) -> vec3<f32> {
@@ -4342,13 +4834,7 @@ fn display_transform(color: vec3<f32>) -> vec3<f32> {
     if (lighting.surface1.w != 1.0) {
         adjusted = mix(vec3<f32>(dot(adjusted, vec3<f32>(0.2126,0.7152,0.0722))), adjusted, lighting.surface1.w);
     }
-    var mapped = adjusted;
-    if (lighting.color0.w > 1.5) {
-        mapped = aces_fitted(adjusted);
-    } else if (lighting.color0.w > 0.5) {
-        mapped = adjusted / (vec3<f32>(1.0) + adjusted);
-    }
-    return pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    return max(adjusted, vec3<f32>(0.0));
 }
 
 // Return fog-path length, edge weight, and representative height for either
@@ -4444,18 +4930,23 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     if (alpha <= 0.001 || (params.material7.w > 0.0 && alpha < params.material7.w)) {
         discard;
     }
+    // The sRGB texture format decodes before filtering. Undo it only for
+    // display-locked materials; PBR uses the sampled linear radiance directly.
+    let encoded_sample = select(1.055 * pow(max(sampled.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055,
+        sampled.rgb * 12.92, sampled.rgb <= vec3<f32>(0.0031308));
     let base_srgb = clamp(
-        sampled.rgb * input.color.rgb * params.material4.rgb,
+        encoded_sample * input.color.rgb * params.material4.rgb,
         vec3<f32>(0.0), vec3<f32>(1.0)
     );
-    var base_color = pow(base_srgb, vec3<f32>(2.2));
+    var base_color = sampled.rgb * pow(clamp(input.color.rgb * params.material4.rgb,
+        vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
     if (lighting.surface3.x != 1.0) {
         base_color = max(mix(vec3<f32>(dot(base_color, vec3<f32>(0.2126,0.7152,0.0722))), base_color, lighting.surface3.x), vec3<f32>(0.0));
     }
     let mr_sample = textureSample(metallic_roughness_texture, actor_sampler, uv);
     var metallic = clamp(params.material0.x * mr_sample.b, 0.0, 1.0);
     var roughness = clamp(params.material0.y * mr_sample.g + lighting.surface1.z, 0.045, 1.0);
-    if (lighting.surface0.x > 2.5) {
+    if (lighting.surface0.x > 2.5 && lighting.surface0.x < 3.5) {
         base_color = vec3<f32>(0.55,0.48,0.40);
         metallic = 0.0;
         roughness = 0.85;
@@ -4483,26 +4974,46 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let f0 = mix(dielectric_f0, base_color, metallic);
     var lit = vec3<f32>(0.0);
     let light_count = u32(lighting.environment2.y + 0.5);
+    var face_band = -1.0;
+    if (lighting.surface0.x > 3.5 && params.cel_material0.y > 2.5) {
+        var key = normalize(vec3<f32>(-0.42, 0.78, 0.47));
+        if (light_count > 0u) { key = authored_light_radiance(lighting.lights[0], input.world_position).xyz; }
+        let forward = normalize(input.face_forward);
+        let right = normalize(input.face_right);
+        let lateral = dot(key, right);
+        let frontal = dot(key, forward);
+        let planar = max(length(vec2<f32>(lateral, frontal)), 0.0001);
+        let threshold = 1.0 - clamp(frontal / planar, 0.0, 1.0);
+        let face_uv = vec2<f32>(select(uv.x, 1.0 - uv.x, lateral < 0.0), uv.y);
+        let sdf = textureSampleLevel(cel_texture, actor_sampler, face_uv, 0.0).g;
+        face_band = smoothstep(threshold - lighting.cel0.y, threshold + lighting.cel0.y, sdf);
+        if (frontal <= 0.0) { face_band = 0.0; }
+    }
     for (var light_index = 0u; light_index < 4u; light_index = light_index + 1u) {
         if (light_index < light_count) {
             let authored = lighting.lights[light_index];
             let direction_attenuation = authored_light_radiance(authored, input.world_position);
             let radiance = authored.color_intensity.rgb * authored.color_intensity.w * direction_attenuation.w;
-            lit += direct_pbr(
-                normal, view, direction_attenuation.xyz, radiance,
-                base_color, metallic, roughness, f0
-            );
+            if (lighting.surface0.x > 3.5 && light_index > 0u) {
+                // Only the first authored light shapes cel bands; others provide soft fill.
+                lit += base_color * radiance * max(dot(normal, direction_attenuation.xyz), 0.0) * 0.15 / 3.14159265;
+            } else {
+                lit += direct_pbr(
+                    normal, view, direction_attenuation.xyz, radiance,
+                    base_color, metallic, roughness, f0, face_band
+                );
+            }
         }
     }
     // Scenes without authored lighting retain the earlier studio setup.
     if (light_count == 0u && lighting.environment0.w < 0.5) {
         lit += direct_pbr(
             normal, view, normalize(vec3<f32>(-0.42, 0.78, 0.47)), vec3<f32>(4.2, 4.0, 3.75),
-            base_color, metallic, roughness, f0
+            base_color, metallic, roughness, f0, face_band
         );
         lit += direct_pbr(
             normal, view, normalize(vec3<f32>(0.68, 0.28, 0.51)), vec3<f32>(1.25, 1.45, 1.75),
-            base_color, metallic, roughness, f0
+            base_color, metallic, roughness, f0, face_band
         );
     }
     lit *= sample_shadow(input.world_position, normal);
@@ -4519,20 +5030,27 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         (0.45 + 0.55 * (1.0 - lighting.color1.z));
     let diffuse_ambient = base_color * (1.0 - metallic) * diffuse_environment * lighting.surface2.rgb * lighting.surface2.w;
     let specular_ambient = environment_fresnel * specular_environment * lighting.surface1.y;
-    lit += (diffuse_ambient + specular_ambient) * ao * contact;
+    let material_ao = textureSample(occlusion_texture, actor_sampler, uv).r;
+    lit += (diffuse_ambient + specular_ambient) * ao * contact * material_ao;
     lit += base_color * lighting.surface0.w * pow(1.0 - n_dot_v, lighting.surface1.x);
+    // Tangent-aligned hair highlights are optional and do not change PBR materials.
+    if (lighting.surface0.x > 3.5 && params.cel_material0.y > 1.5 && params.cel_material0.y < 2.5) {
+        let key = select(normalize(vec3<f32>(-0.42,0.78,0.47)), authored_light_radiance(lighting.lights[0], input.world_position).xyz, light_count > 0u);
+        let half_vector = normalize(view + key);
+        let strand = sqrt(max(0.0, 1.0 - pow(dot(tangent, half_vector), 2.0)));
+        lit += base_color * smoothstep(0.96, 0.99, strand) * params.cel_material0.z
+            * textureSampleLevel(cel_texture, actor_sampler, uv, 0.0).b;
+    }
 
-    let emissive_sample = pow(
-        clamp(textureSample(emissive_texture, actor_sampler, uv).rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
-        vec3<f32>(2.2)
-    );
+    let emissive_sample = textureSample(emissive_texture, actor_sampler, uv).rgb;
     lit += emissive_sample * params.material1.rgb;
     let force_unlit = max(params.material1.w, params.material2.w);
     let lighting_mix = params.style.y * (1.0 - force_unlit);
     let shaded = mix(base_color, lit, lighting_mix);
     let surface_exposure = mix(params.style.z, 1.0, params.material2.w);
     let exposed = shaded * surface_exposure;
-    var display = mix(display_transform(exposed), base_srgb, params.material2.w);
+    var display = display_transform(exposed);
+    if (params.material2.w > 0.5) { display = inverse_display_curve(base_srgb); }
     let fog_amount = atmosphere_fog_amount(input.world_position);
     let fog_radiance = lighting.fog1.rgb * (1.0 + lighting.fog2.y * 0.35);
     display = mix(display, display_transform(fog_radiance), fog_amount);
@@ -4697,6 +5215,9 @@ struct Lighting {
     surface1: vec4<f32>,
     surface2: vec4<f32>,
     surface3: vec4<f32>,
+    cel0: vec4<f32>,
+    cel1: vec4<f32>,
+    cel2: vec4<f32>,
     lights: array<Light, 4>,
 };
 
@@ -4720,8 +5241,24 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
     return out;
 }
 
+// Color arrives premultiplied from hardware blending. Map straight radiance
+// and restore coverage so transparent silhouettes do not gain a dark fringe.
+fn resolve_display(color: vec4<f32>) -> vec4<f32> {
+    let alpha = clamp(color.a, 0.0, 1.0);
+    if (alpha < 0.00001) { return vec4<f32>(0.0); }
+    let linear = max(color.rgb / alpha, vec3<f32>(0.0));
+    var mapped = linear;
+    if (lighting.color0.w > 1.5) {
+        mapped = clamp((linear * (2.51 * linear + 0.03)) /
+            (linear * (2.43 * linear + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
+    } else if (lighting.color0.w > 0.5) { mapped = linear / (vec3<f32>(1.0) + linear); }
+    return vec4<f32>(pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)) * alpha, alpha);
+}
+
 fn view_distance(depth: f32) -> f32 {
-    return lighting.camera1.w + (1.0 - depth) * (lighting.camera2.w - lighting.camera1.w);
+    let near = lighting.camera1.w;
+    let far = max(lighting.camera2.w, near + 0.001);
+    return near * far / max(near + depth * (far - near), 0.000001);
 }
 
 fn circle_of_confusion(distance: f32, image_height: f32) -> f32 {
@@ -4769,7 +5306,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     // even though the preceding 3D render completed successfully.
     let center = antialiased_color(input.uv);
     if (radius_px < 0.35) {
-        return center;
+        return resolve_display(center);
     }
 
     let offsets = array<vec2<f32>, 12>(
@@ -4780,7 +5317,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         vec2<f32>(0.383, 0.924), vec2<f32>(-0.924, 0.383),
         vec2<f32>(0.924, -0.383), vec2<f32>(-0.383, -0.924)
     );
-    var accumulated = center.rgb;
+    var accumulated = center;
     var total_weight = 1.0;
     for (var i = 0u; i < 12u; i = i + 1u) {
         let sample_uv = clamp(
@@ -4797,10 +5334,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let depth_weight = exp(-separation * 6.0);
         let coc_weight = smoothstep(0.0, 1.0, sample_coc + radius_px);
         let weight = max(depth_weight * coc_weight, 0.001);
-        accumulated += textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0).rgb * weight;
+        accumulated += textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0) * weight;
         total_weight += weight;
     }
-    return vec4<f32>(accumulated / total_weight, center.a);
+    return resolve_display(accumulated / total_weight);
 }
 "#;
 
@@ -4843,18 +5380,10 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
     var out: VertexOut;
     out.world_pos = world;
-    if (view_z <= near) {
-        out.pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-        return out;
-    }
-
-    let safe_z = max(view_z, near + 0.0001);
-    let screen_x = params.canvas.z + (view_x * params.camera0.w) / safe_z;
-    let screen_y = params.canvas.w - (view_y * params.camera0.w) / safe_z;
-    let ndc_x = (screen_x / params.canvas.x) * 2.0 - 1.0;
-    let ndc_y = 1.0 - (screen_y / params.canvas.y) * 2.0;
-    let ndc_z = clamp(1.0 - ((safe_z - near) / (far - near)), 0.0, 1.0);
-    out.pos = vec4<f32>(ndc_x * safe_z, ndc_y * safe_z, ndc_z * safe_z, safe_z);
+    let clip_x = (2.0 * params.canvas.z / params.canvas.x - 1.0) * view_z + 2.0 * view_x * params.camera0.w / params.canvas.x;
+    let clip_y = (1.0 - 2.0 * params.canvas.w / params.canvas.y) * view_z + 2.0 * view_y * params.camera0.w / params.canvas.y;
+    let clip_z = near * (far - view_z) / (far - near);
+    out.pos = vec4<f32>(clip_x, clip_y, clip_z, view_z);
     return out;
 }
 
@@ -5920,6 +6449,23 @@ fn build_actor_gpu_draws(
         let static_draws = gpu_static_draw_cache
             .get(&static_plan_key)
             .expect("GPU static draw cache entry inserted before render");
+        let mut cel_textures = HashMap::new();
+        for binding in &actor.cel_materials {
+            if let Some(source) = &binding.cel.control_map {
+                let data = load_cached_primitive_texture(
+                    asset_root,
+                    WorldPathStyle::Relative,
+                    source,
+                    resolver,
+                    primitive_texture_cache,
+                    &mut resource_stats,
+                )?;
+                cel_textures.insert(
+                    binding.material.clone(),
+                    Arc::new(GpuWorldTexture::new(data.width, data.height, data.rgba)),
+                );
+            }
+        }
         let actor_draws = build_actor_mesh_gpu_draws(
             graph,
             actor,
@@ -5941,6 +6487,7 @@ fn build_actor_gpu_draws(
             model_key,
             skinning_strategy_cache,
             material_overrides,
+            &cel_textures,
             external_sampled,
             &actor_constraint_overrides,
         )?;
@@ -6085,6 +6632,49 @@ fn project_actor_editor_joints(
     ),
     WorldRenderError,
 > {
+    if let Some(native) = actor.native_skin.as_ref() {
+        let rotation = actor
+            .rotation_quaternion
+            .map(mat4_from_quat)
+            .unwrap_or_else(|| {
+                mat4_from_quat(actor_yxz_quaternion(
+                    pose.rotation_deg[0],
+                    pose.rotation_deg[1],
+                    pose.rotation_deg[2],
+                ))
+            });
+        let mut joints = Vec::with_capacity(native.joint_positions.len());
+        for (bone, point) in native.joint_names.iter().zip(&native.joint_positions) {
+            let local = point.map(|value| value * pose.scale);
+            let rotated = mat4_transform_point(rotation, local);
+            let world = [
+                pose.position[0] + rotated[0],
+                pose.position[1] + rotated[1],
+                pose.position[2] + rotated[2],
+            ];
+            let relative = [
+                world[0] - camera.eye[0],
+                world[1] - camera.eye[1],
+                world[2] - camera.eye[2],
+            ];
+            let depth = dot3(relative, camera.forward);
+            if depth <= camera.near || !depth.is_finite() {
+                continue;
+            }
+            let x = width as f32 * 0.5 + dot3(relative, camera.right) * camera.focal_px / depth;
+            let y = height as f32 * 0.5 - dot3(relative, camera.up) * camera.focal_px / depth;
+            if x.is_finite() && y.is_finite() {
+                joints.push(Scene3DEditorJointProjection {
+                    actor: actor.id.clone(),
+                    bone: bone.clone(),
+                    x,
+                    y,
+                    depth,
+                });
+            }
+        }
+        return Ok((joints, None));
+    }
     let frame = prepare_actor_joint_frame(
         graph,
         actor,
@@ -6613,6 +7203,15 @@ fn skinned_actor_positions(
     mesh: &GlbMeshData,
     time: WorldTime,
 ) -> Result<Option<Vec<[f32; 3]>>, WorldRenderError> {
+    if let Some(native) = actor.native_skin.as_ref() {
+        if mesh.joints.len() != mesh.positions.len() || mesh.weights.len() != mesh.positions.len() {
+            return Ok(None);
+        }
+        return Ok(Some(apply_joint_matrices_to_positions(
+            mesh,
+            &native.joint_matrices,
+        )));
+    }
     let Some(skin) = mesh.skin.as_ref() else {
         return Ok(None);
     };
@@ -6645,6 +7244,16 @@ fn skinned_actor_positions(
         })
         .collect::<Vec<_>>();
 
+    Ok(Some(apply_joint_matrices_to_positions(
+        mesh,
+        &joint_matrices,
+    )))
+}
+
+fn apply_joint_matrices_to_positions(
+    mesh: &GlbMeshData,
+    joint_matrices: &[[f32; 16]],
+) -> Vec<[f32; 3]> {
     let mut out = Vec::with_capacity(mesh.positions.len());
     for (idx, position) in mesh.positions.iter().copied().enumerate() {
         let Some(joints) = mesh.joints.get(idx).copied().flatten() else {
@@ -6678,11 +7287,12 @@ fn skinned_actor_positions(
         }
         out.push(skinned);
     }
-    Ok(Some(out))
+    out
 }
 
 struct ActorJointFrame {
     global_matrices: Option<Vec<[f32; 16]>>,
+    native_matrices: Option<Vec<[f32; 16]>>,
 }
 
 fn prepare_actor_joint_frame(
@@ -6693,9 +7303,16 @@ fn prepare_actor_joint_frame(
     external_sampled: &HashMap<usize, SampledNodeTrs>,
     constraint_overrides: &HashMap<String, BoneOverride>,
 ) -> Result<ActorJointFrame, WorldRenderError> {
+    if let Some(native) = actor.native_skin.as_ref() {
+        return Ok(ActorJointFrame {
+            global_matrices: None,
+            native_matrices: Some(native.joint_matrices.clone()),
+        });
+    }
     let Some(skin) = mesh.skin.as_ref() else {
         return Ok(ActorJointFrame {
             global_matrices: None,
+            native_matrices: None,
         });
     };
     if mesh.nodes.is_empty()
@@ -6704,6 +7321,7 @@ fn prepare_actor_joint_frame(
     {
         return Ok(ActorJointFrame {
             global_matrices: None,
+            native_matrices: None,
         });
     }
 
@@ -6717,12 +7335,14 @@ fn prepare_actor_joint_frame(
         let _ = skin;
         return Ok(ActorJointFrame {
             global_matrices: None,
+            native_matrices: None,
         });
     }
     let global_matrices =
         actor_global_node_matrices(graph, actor, mesh, time, &overrides, Some(external_sampled))?;
     Ok(ActorJointFrame {
         global_matrices: Some(global_matrices),
+        native_matrices: None,
     })
 }
 
@@ -6733,6 +7353,13 @@ fn actor_joint_matrices(
     frame: &ActorJointFrame,
     skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
 ) -> Vec<[f32; 16]> {
+    if let Some(matrices) = frame.native_matrices.as_ref() {
+        return if matrices.is_empty() {
+            vec![mat4_identity()]
+        } else {
+            matrices.clone()
+        };
+    }
     let Some(skin) = mesh.skin.as_ref() else {
         return vec![mat4_identity()];
     };
@@ -9759,6 +10386,7 @@ struct ProjectedTriangle {
 
 #[derive(Debug, Clone, Copy)]
 struct GpuWorldVertex {
+    outline_normal: [f32; 3],
     position: [f32; 3],
     normal: [f32; 3],
     tangent: [f32; 3],
@@ -9774,11 +10402,14 @@ struct GpuWorldDraw {
     resource_key: GpuWorldResourceKey,
     instance_key: GpuWorldInstanceKey,
     vertices: Arc<Vec<GpuWorldVertex>>,
+    indices: Arc<Vec<u32>>,
     vertex_signature: u64,
     texture: Arc<GpuWorldTexture>,
     normal_texture: Arc<GpuWorldTexture>,
     metallic_roughness_texture: Arc<GpuWorldTexture>,
     emissive_texture: Arc<GpuWorldTexture>,
+    occlusion_texture: Arc<GpuWorldTexture>,
+    cel_texture: Arc<GpuWorldTexture>,
     bone_matrices: Vec<[f32; 16]>,
     params: GpuWorldParams,
     phase: GpuWorldDrawPhase,
@@ -9814,6 +10445,9 @@ struct GpuWorldLighting {
 
 #[derive(Debug, Clone, Copy)]
 struct GpuWorldLightingParams {
+    cel0: [f32; 4],
+    cel1: [f32; 4],
+    cel2: [f32; 4],
     surface0: [f32; 4],
     surface1: [f32; 4],
     surface2: [f32; 4],
@@ -9838,6 +10472,48 @@ struct GpuWorldLightingParams {
     shadow2: [f32; 4],
     shadow3: [f32; 4],
     lights: [[f32; 16]; 4],
+}
+
+// Bounding spheres remain stable as rigid actors rotate and include off-camera casters.
+// Deformed scenes retain the existing projection until deformed bounds are available.
+fn fit_rigid_shadow_volume(
+    mut lighting: GpuWorldLightingParams,
+    bounds: &[(([f32; 3], [f32; 3]), GpuWorldParams)],
+) -> GpuWorldLightingParams {
+    if bounds.is_empty() || lighting.color1[3] <= 0.0 {
+        return lighting;
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for &((lo, hi), p) in bounds {
+        let local = std::array::from_fn(|i| ((lo[i] + hi[i]) * 0.5 - p.model[i]) * p.model[3]);
+        let center = quat_rotate_vec3(quat_normalize_xyzw(p.actor_rotation), local);
+        let radius = (0..3)
+            .map(|i| ((hi[i] - lo[i]) * 0.5).powi(2))
+            .sum::<f32>()
+            .sqrt()
+            * p.model[3].abs();
+        for i in 0..3 {
+            min[i] = min[i].min(center[i] + p.actor[i] - radius);
+            max[i] = max[i].max(center[i] + p.actor[i] + radius);
+        }
+    }
+    let center: [f32; 3] = std::array::from_fn(|i| (min[i] + max[i]) * 0.5);
+    let radius = (0..3)
+        .map(|i| ((max[i] - min[i]) * 0.5).powi(2))
+        .sum::<f32>()
+        .sqrt()
+        * 1.05;
+    if !radius.is_finite() || radius <= 0.0 || radius >= 14.0 {
+        return lighting;
+    }
+    let radius = radius.max(0.01);
+    lighting.shadow0[3] = radius;
+    lighting.shadow1[3] = radius;
+    lighting.shadow2[3] = radius * 2.0;
+    // The old normalized bias detached small-scale hair shadows from the forehead.
+    lighting.shadow3 = [center[0], center[1], center[2], 0.00015];
+    lighting
 }
 
 impl GpuWorldLighting {
@@ -9940,6 +10616,36 @@ impl GpuWorldLightingParams {
             };
         Self {
             // Disabled styles use exact legacy-neutral multipliers.
+            cel0: lighting
+                .render_style
+                .as_ref()
+                .map_or([0.5, 0.025, 0.0, 0.0], |s| {
+                    [
+                        s.cel.shadow_threshold,
+                        s.cel.shadow_feather,
+                        s.cel.outline_width,
+                        1.0,
+                    ]
+                }),
+            cel1: lighting
+                .render_style
+                .as_ref()
+                .map_or([0.4, 0.37, 0.5, 0.0], |s| {
+                    [
+                        s.cel.shadow_color[0],
+                        s.cel.shadow_color[1],
+                        s.cel.shadow_color[2],
+                        0.0,
+                    ]
+                }),
+            cel2: lighting.render_style.as_ref().map_or([0.0; 4], |s| {
+                [
+                    s.cel.outline_color[0],
+                    s.cel.outline_color[1],
+                    s.cel.outline_color[2],
+                    0.0,
+                ]
+            }),
             surface0: lighting
                 .render_style
                 .as_ref()
@@ -9949,6 +10655,7 @@ impl GpuWorldLightingParams {
                             "stylized" => 1.0,
                             "toon" => 2.0,
                             "clay" => 3.0,
+                            "cel" => 4.0,
                             _ => 0.0,
                         },
                         s.shading_steps as f32,
@@ -9982,8 +10689,8 @@ impl GpuWorldLightingParams {
                     [
                         s.surface_saturation,
                         s.hard_shadows as u8 as f32,
-                        s.shadow_resolution as f32,
-                        (s.anti_aliasing == "fxaa") as u8 as f32,
+                        1536.0,
+                        0.0,
                     ]
                 }),
             // x intensity, y rotation, z mip count, w environment present.
@@ -10138,11 +10845,13 @@ struct GpuWorldStaticPlanKey {
 struct GpuWorldStaticDraw {
     resource_key: GpuWorldResourceKey,
     vertices: Arc<Vec<GpuWorldVertex>>,
+    indices: Arc<Vec<u32>>,
     vertex_signature: u64,
     texture: Arc<GpuWorldTexture>,
     normal_texture: Arc<GpuWorldTexture>,
     metallic_roughness_texture: Arc<GpuWorldTexture>,
     emissive_texture: Arc<GpuWorldTexture>,
+    occlusion_texture: Arc<GpuWorldTexture>,
     mesh_node: Option<usize>,
     bounds: ([f32; 3], [f32; 3]),
 }
@@ -10166,6 +10875,8 @@ struct GpuWorldParams {
     material5: [f32; 4],
     material6: [f32; 4],
     material7: [f32; 4],
+    cel_material0: [f32; 4],
+    cel_material1: [f32; 4],
     vegetation: [f32; 4],
     hidden0: [f32; 4],
     hidden1: [f32; 4],
@@ -10296,9 +11007,38 @@ fn build_actor_mesh_gpu_draws(
     model_path: &Path,
     skinning_strategy_cache: &mut HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
     material_overrides: &[WorldMaterialTextureOverride],
+    cel_textures: &HashMap<String, Arc<GpuWorldTexture>>,
     external_sampled: &HashMap<usize, SampledNodeTrs>,
     constraint_overrides: &HashMap<String, BoneOverride>,
 ) -> Result<Vec<GpuWorldDraw>, WorldRenderError> {
+    let mut cel_slots = std::collections::HashSet::new();
+    for binding in actor
+        .cel_materials
+        .iter()
+        .filter(|b| b.cel != crate::render_style::CelMaterialSettings::default())
+    {
+        if !cel_slots.insert(&binding.material) {
+            return Err(WorldRenderError::GpuRender {
+                message: format!(
+                    "Duplicate MaterialBinding on actor '{}' for '{}'",
+                    actor.id, binding.material
+                ),
+            });
+        }
+        if binding.material != "*"
+            && !mesh
+                .materials
+                .iter()
+                .any(|m| m.name.as_deref() == Some(binding.material.as_str()))
+        {
+            return Err(WorldRenderError::GpuRender {
+                message: format!(
+                    "MaterialBinding on actor '{}' references missing material '{}'",
+                    actor.id, binding.material
+                ),
+            });
+        }
+    }
     for binding in material_overrides
         .iter()
         .filter(|binding| binding.actor_id == actor.id)
@@ -10393,6 +11133,8 @@ fn build_actor_mesh_gpu_draws(
         material6: [0.0, 1.5, 0.0, 1_000_000.0],
         // material7: attenuation RGB; w carries a positive alpha-mask cutoff.
         material7: [1.0, 1.0, 1.0, 0.0],
+        cel_material0: [-1.0, 0.0, 0.0, 0.0],
+        cel_material1: [0.0; 4],
         // Vegetation wind is gated per actor; all existing asset paths retain zero deformation.
         vegetation: actor.vegetation.as_ref().map_or([0.0; 4], |vegetation| {
             [
@@ -10463,6 +11205,30 @@ fn build_actor_mesh_gpu_draws(
             .material
             .and_then(|index| mesh.materials.get(index));
         let mut draw_params = params;
+        // Exact material slots take precedence over an explicit wildcard.
+        let cel_binding = actor
+            .cel_materials
+            .iter()
+            .find(|b| material.and_then(|m| m.name.as_deref()) == Some(b.material.as_str()))
+            .or_else(|| actor.cel_materials.iter().find(|b| b.material == "*"));
+        if let Some(binding) = cel_binding {
+            let c = &binding.cel;
+            draw_params.cel_material0 = [
+                c.outline_width.unwrap_or(-1.0),
+                match c.role.as_deref() {
+                    Some("skin") => 1.0,
+                    Some("hair") => 2.0,
+                    Some("face") => 3.0,
+                    _ => 0.0,
+                },
+                c.hair_highlight.unwrap_or(0.25),
+                if c.control_map.is_some() { 1.0 } else { 0.0 },
+            ];
+            if let Some(color) = &c.shadow_color {
+                let rgb = crate::render_style::cel_color(color);
+                draw_params.cel_material1 = [rgb[0], rgb[1], rgb[2], 1.0];
+            }
+        }
         if let Some(primitive) = actor.primitive.as_ref() {
             let offset = crate::world::primitive::primitive_material_seed_offset(primitive);
             let material = primitive.material_definition.as_ref();
@@ -10540,7 +11306,7 @@ fn build_actor_mesh_gpu_draws(
             draw_params.material2[3] = 1.0;
         }
         let mut resource_key = static_draw.resource_key.clone();
-        if texture_override.is_some() {
+        if texture_override.is_some() || cel_binding.is_some_and(|b| b.cel.control_map.is_some()) {
             resource_key.binding_actor = Some(actor.id.clone());
         }
         let phase = gpu_world_material_phase(material);
@@ -10557,11 +11323,17 @@ fn build_actor_mesh_gpu_draws(
             },
             resource_key,
             vertices: Arc::clone(&static_draw.vertices),
+            indices: Arc::clone(&static_draw.indices),
             vertex_signature: static_draw.vertex_signature,
             texture,
             normal_texture: Arc::clone(&static_draw.normal_texture),
             metallic_roughness_texture: Arc::clone(&static_draw.metallic_roughness_texture),
             emissive_texture: Arc::clone(&static_draw.emissive_texture),
+            occlusion_texture: Arc::clone(&static_draw.occlusion_texture),
+            cel_texture: cel_binding
+                .and_then(|b| cel_textures.get(&b.material))
+                .cloned()
+                .unwrap_or_else(|| Arc::new(GpuWorldTexture::new(1, 1, vec![255u8; 4]))),
             bone_matrices: bone_matrices.clone(),
             params: draw_params,
             phase,
@@ -10712,6 +11484,18 @@ fn build_actor_mesh_gpu_static_draws(
                 .copied()
                 .flatten()
                 .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            // glTF COLOR_0 is linear; the shader decodes the combined legacy
+            // color factor, so encode imported vertex RGB before that decode.
+            let vertex_color = if primitive_material_uniform {
+                vertex_color
+            } else {
+                [
+                    vertex_color[0].max(0.0).powf(1.0 / 2.2),
+                    vertex_color[1].max(0.0).powf(1.0 / 2.2),
+                    vertex_color[2].max(0.0).powf(1.0 / 2.2),
+                    vertex_color[3],
+                ]
+            };
             let color = [
                 color_factor[0] * vertex_color[0],
                 color_factor[1] * vertex_color[1],
@@ -10719,6 +11503,7 @@ fn build_actor_mesh_gpu_static_draws(
                 color_factor[3] * vertex_color[3],
             ];
             chunk.vertices.push(GpuWorldVertex {
+                outline_normal: normal,
                 position,
                 normal,
                 tangent,
@@ -10731,21 +11516,47 @@ fn build_actor_mesh_gpu_static_draws(
         }
     }
     let mut draws = Vec::<GpuWorldStaticDraw>::with_capacity(chunks.len());
-    for chunk in chunks {
+    for mut chunk in chunks {
         if chunk.vertices.is_empty() {
             continue;
+        }
+        // Only weld outline normals within the same mesh/material and skin weights.
+        // Lighting normals are untouched; this cache is built once per static mesh.
+        let key = |v: &GpuWorldVertex| {
+            (
+                v.position.map(f32::to_bits),
+                v.joints.map(f32::to_bits),
+                v.weights.map(f32::to_bits),
+            )
+        };
+        let mut normals = HashMap::<_, [f32; 3]>::new();
+        for v in &chunk.vertices {
+            let n = normals.entry(key(v)).or_default();
+            for (axis, value) in n.iter_mut().enumerate() {
+                *value += v.normal[axis];
+            }
+        }
+        for v in &mut chunk.vertices {
+            if let Some(n) = normals.get(&key(v)) {
+                if dot3(*n, *n) > 0.000001 {
+                    v.outline_normal = normalize3(*n);
+                }
+            }
         }
         let resource_key = GpuWorldResourceKey {
             model_path: model_path.to_path_buf(),
             draw_key: chunk.key,
             binding_actor: None,
         };
-        let vertices = Arc::new(chunk.vertices);
+        let (indexed_vertices, indexed_indices) = index_gpu_world_vertices(&chunk.vertices);
+        let vertices = Arc::new(indexed_vertices);
+        let indices = Arc::new(indexed_indices);
         let bounds = gpu_world_vertices_bounds(vertices.as_ref());
-        let vertex_signature = gpu_world_vertex_signature(vertices.as_ref());
+        let vertex_signature = gpu_world_geometry_signature(vertices.as_ref(), indices.as_ref());
         draws.push(GpuWorldStaticDraw {
             resource_key,
             vertices,
+            indices,
             vertex_signature,
             texture: Arc::new(chunk.texture),
             normal_texture: Arc::new(gpu_texture_for_index(
@@ -10775,11 +11586,41 @@ fn build_actor_mesh_gpu_static_draws(
                     .and_then(|material| material.emissive_texture),
                 [255, 255, 255, 255],
             )),
+            occlusion_texture: Arc::new(gpu_occlusion_texture(
+                mesh,
+                chunk
+                    .key
+                    .material
+                    .and_then(|index| mesh.materials.get(index))
+                    .and_then(|material| material.occlusion_texture),
+                chunk
+                    .key
+                    .material
+                    .and_then(|i| mesh.materials.get(i))
+                    .map_or(1.0, |m| m.occlusion_strength),
+            )),
             mesh_node: chunk.mesh_node,
             bounds,
         });
     }
     draws
+}
+
+// Resolve AO strength once while retaining a neutral white fallback.
+fn gpu_occlusion_texture(
+    mesh: &GlbMeshData,
+    index: Option<usize>,
+    strength: f32,
+) -> GpuWorldTexture {
+    let mut texture = gpu_texture_for_index(mesh, index, [255; 4]);
+    let mut pixels = texture.rgba.as_ref().clone();
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[0] = ((1.0 - strength.clamp(0.0, 1.0) * (1.0 - pixel[0] as f32 / 255.0)) * 255.0)
+            .round() as u8;
+    }
+    texture.signature = texture.signature ^ u64::from(strength.to_bits()).rotate_left(17);
+    texture.rgba = Arc::new(pixels);
+    texture
 }
 
 fn gpu_world_vertices_bounds(vertices: &[GpuWorldVertex]) -> ([f32; 3], [f32; 3]) {
@@ -12079,7 +12920,10 @@ fn load_cached_actor_mesh<'a>(
         return Ok((source_key, mesh));
     }
     if let Some(primitive) = &actor.primitive {
-        let source_key = crate::world::primitive::primitive_cache_key(primitive);
+        let source_key = actor.native_skin.as_ref().map_or_else(
+            || crate::world::primitive::primitive_cache_key(primitive),
+            |skin| crate::world::primitive::native_skinned_primitive_cache_key(primitive, skin),
+        );
         if !mesh_cache.contains_key(&source_key) {
             let texture_set = load_primitive_texture_set(
                 asset_root,
@@ -12089,10 +12933,12 @@ fn load_cached_actor_mesh<'a>(
                 primitive_texture_cache,
                 resource_stats,
             )?;
-            mesh_cache.insert(
-                source_key.clone(),
-                crate::world::primitive::generate_primitive_mesh_textured(primitive, texture_set),
-            );
+            let mut mesh =
+                crate::world::primitive::generate_primitive_mesh_textured(primitive, texture_set);
+            if let Some(skin) = actor.native_skin.as_ref() {
+                crate::world::primitive::apply_native_skin_to_mesh(&mut mesh, skin);
+            }
+            mesh_cache.insert(source_key.clone(), mesh);
         }
         let mesh = mesh_cache
             .get(&source_key)
@@ -12173,6 +13019,7 @@ fn blend_terrain_layers(
     let mut metallic_roughness = vec![0_u8; base.len()];
     let mut normal = vec![0_u8; base.len()];
     let mut emissive = vec![0_u8; base.len()];
+    let mut occlusion = vec![255_u8; base.len()];
     for y in 0..height {
         for x in 0..width {
             let index = ((y * width + x) * 4) as usize;
@@ -12181,8 +13028,20 @@ fn blend_terrain_layers(
             let mut mr_pixel = [0.0_f32; 4];
             let mut normal_vector = [0.0_f32; 3];
             let mut emissive_pixel = [0.0_f32; 4];
+            let mut occlusion_value = 0.0_f32;
             for (layer_index, (material, textures)) in layers.iter().enumerate() {
                 let weight = weights[layer_index];
+                let layer_ao = terrain_texture_pixel(
+                    textures.occlusion.as_ref(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    material.texture_scale,
+                    material.texture_offset,
+                    [255.0; 4],
+                )[0] / 255.0;
+                occlusion_value += (1.0 - material.occlusion_strength * (1.0 - layer_ao)) * weight;
                 let color = terrain_texture_pixel(
                     textures.base_color.as_ref(),
                     x,
@@ -12248,6 +13107,7 @@ fn blend_terrain_layers(
                     normal_vector[channel] += layer_normal[channel] * weight;
                 }
             }
+            occlusion[index] = (occlusion_value * 255.0).round().clamp(0.0, 255.0) as u8;
             let normal_length = normal_vector
                 .iter()
                 .map(|value| value * value)
@@ -12275,10 +13135,12 @@ fn blend_terrain_layers(
         rgba: Arc::new(rgba),
     };
     crate::world::primitive::PrimitiveTextureSet {
+        face: HashMap::new(),
         base_color: Some(texture(base)),
         metallic_roughness: Some(texture(metallic_roughness)),
         normal: Some(texture(normal)),
         emissive: Some(texture(emissive)),
+        occlusion: Some(texture(occlusion)),
     }
 }
 
@@ -12355,46 +13217,44 @@ fn load_primitive_texture_set(
             })
             .transpose()
     };
-    let mut base_color = load(&material.base_color_texture_src)?;
-    if let Some(occlusion) = load(&material.occlusion_texture_src)? {
-        let mut base = base_color.take().unwrap_or_else(|| GlbTextureData {
-            width: occlusion.width,
-            height: occlusion.height,
-            rgba: Arc::new(vec![
-                255;
-                occlusion.width as usize * occlusion.height as usize * 4
-            ]),
-        });
-        let occlusion_image = RgbaImage::from_raw(
-            occlusion.width,
-            occlusion.height,
-            occlusion.rgba.as_ref().clone(),
-        )
-        .expect("decoded primitive occlusion texture has complete RGBA pixels");
-        let occlusion_image =
-            if base.width == occlusion_image.width() && base.height == occlusion_image.height() {
-                occlusion_image
-            } else {
-                imageops::resize(
-                    &occlusion_image,
-                    base.width,
-                    base.height,
-                    imageops::FilterType::Triangle,
-                )
-            };
-        for (base_pixel, ao_pixel) in Arc::make_mut(&mut base.rgba)
-            .chunks_exact_mut(4)
-            .zip(occlusion_image.pixels())
+    let mut face = HashMap::new();
+    if let crate::dsl::PrimitiveGeometry::HeadSurface {
+        face_layout: Some(layout),
+        ..
+    } = &primitive.geometry
+    {
+        for (id, texture) in layout
+            .eyes
+            .iter()
+            .map(|e| (&e.id, &e.texture))
+            .chain(
+                layout
+                    .eyes
+                    .iter()
+                    .filter_map(|e| e.iris.as_ref().map(|i| (&i.id, &i.texture))),
+            )
+            .chain(
+                layout
+                    .eyes
+                    .iter()
+                    .flat_map(|e| e.eyeliners.iter().map(|l| (&l.id, &l.texture))),
+            )
+            .chain(layout.noses.iter().map(|e| (&e.id, &e.texture)))
+            .chain(layout.mouths.iter().map(|e| (&e.id, &e.texture)))
+            .chain(layout.ears.iter().map(|e| (&e.id, &e.texture)))
+            .chain(layout.eyebrows.iter().map(|e| (&e.id, &e.texture)))
         {
-            let ao = 1.0 - material.occlusion_strength * (1.0 - f32::from(ao_pixel[0]) / 255.0);
-            for channel in &mut base_pixel[..3] {
-                *channel = (f32::from(*channel) * ao).round().clamp(0.0, 255.0) as u8;
+            if let Some(texture) = texture {
+                if let Some(image) = load(&texture.source)? {
+                    face.insert(id.clone(), image);
+                }
             }
         }
-        base_color = Some(base);
     }
     Ok(crate::world::primitive::PrimitiveTextureSet {
-        base_color,
+        face,
+        base_color: load(&material.base_color_texture_src)?,
+        occlusion: load(&material.occlusion_texture_src)?,
         metallic_roughness: load(&material.metallic_roughness_texture_src)?,
         normal: load(&material.normal_texture_src)?,
         emissive: load(&material.emissive_texture_src)?,
@@ -12494,6 +13354,51 @@ fn load_cached_glb_animation_resolved<'a>(
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    fn test_gpu_vertex(x: f32) -> super::GpuWorldVertex {
+        super::GpuWorldVertex {
+            outline_normal: [0.0, 0.0, 1.0],
+            position: [x, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+            bitangent: [0.0, 1.0, 0.0],
+            joints: [0.0; 4],
+            weights: [1.0, 0.0, 0.0, 0.0],
+            uv: [0.0; 2],
+            color: [1.0; 4],
+        }
+    }
+
+    #[test]
+    fn indexed_geometry_reuses_matching_vertices() {
+        let triangle = [
+            test_gpu_vertex(0.0),
+            test_gpu_vertex(1.0),
+            test_gpu_vertex(2.0),
+        ];
+        let expanded = triangle.into_iter().chain(triangle).collect::<Vec<_>>();
+        let (vertices, indices) = super::index_gpu_world_vertices(&expanded);
+        let chunks = super::split_gpu_world_indexed_chunks(&vertices, &indices, 1024 * 1024);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].vertices.len(), 3);
+        assert_eq!(chunks[0].indices, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn indexed_geometry_splits_only_between_triangles() {
+        let expanded = (0..6)
+            .map(|index| test_gpu_vertex(index as f32))
+            .collect::<Vec<_>>();
+        let (vertices, indices) = super::index_gpu_world_vertices(&expanded);
+        let chunks = super::split_gpu_world_indexed_chunks(
+            &vertices,
+            &indices,
+            super::GPU_WORLD_VERTEX_STRIDE_BYTES * 3,
+        );
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.vertices.len() == 3));
+        assert!(chunks.iter().all(|chunk| chunk.indices == [0, 1, 2]));
+    }
+
     #[test]
     fn rigid_visibility_is_conservative_at_camera_edges() {
         let mut p = super::GpuWorldParams {
@@ -12539,6 +13444,48 @@ mod tests {
     use crate::asset::{AssetResolver, AssetSource, MemoryAssetResolver, PathAssetResolver};
     use crate::world::{parse_world_graph_script, render_world_frame};
 
+    // Check projection containment separately from uniform packing assertions.
+    fn assert_fitted_shadow_volume(params: super::GpuWorldLightingParams) {
+        // Small translated actors must stay inside the fitted volume at every rotation.
+        let mut shadow = params;
+        shadow.color1[3] = 0.8;
+        shadow.shadow0 = [1.0, 0.0, 0.0, 14.0];
+        shadow.shadow1 = [0.0, 1.0, 0.0, 14.0];
+        shadow.shadow2 = [0.0, 0.0, 1.0, 28.0];
+        let mut actor = super::GpuWorldParams::default();
+        actor.model[3] = 1.0;
+        actor.actor = [3.0, -2.0, 1.0, 0.0];
+        actor.actor_rotation[3] = 1.0;
+        let bounds = ([-0.5; 3], [0.5; 3]);
+        let fitted = super::fit_rigid_shadow_volume(shadow, &[(bounds, actor)]);
+        assert!(fitted.shadow0[3] < 2.0);
+        assert_eq!(&fitted.shadow3[..3], &[3.0, -2.0, 1.0]);
+        actor.actor_rotation = [0.0, 0.70710677, 0.0, 0.70710677];
+        let rotated = super::fit_rigid_shadow_volume(shadow, &[(bounds, actor)]);
+        assert_eq!(rotated.shadow0, fitted.shadow0);
+        assert_eq!(rotated.shadow3, fitted.shadow3);
+        for corner in 0..8 {
+            let local =
+                std::array::from_fn(|axis| if corner & (1 << axis) == 0 { -0.5 } else { 0.5 });
+            let world = super::quat_rotate_vec3(actor.actor_rotation, local);
+            for axis in 0..3 {
+                assert!(
+                    (world[axis] + actor.actor[axis] - fitted.shadow3[axis]).abs()
+                        < fitted.shadow0[3]
+                );
+            }
+        }
+        assert_eq!(
+            super::fit_rigid_shadow_volume(shadow, &[]).shadow0,
+            shadow.shadow0
+        );
+        let large = (([-20.0; 3], [20.0; 3]), actor);
+        assert_eq!(
+            super::fit_rigid_shadow_volume(shadow, &[large]).shadow0,
+            shadow.shadow0
+        );
+    }
+
     #[test]
     fn fog_and_optics_pack_into_distinct_gpu_uniform_slots() {
         let lighting = crate::world::WorldLighting {
@@ -12571,12 +13518,13 @@ mod tests {
         };
 
         let params = super::GpuWorldLightingParams::from_world(&lighting, camera, false, 1);
+        assert_fitted_shadow_volume(params);
         assert_eq!(params.fog0, [3.0, 0.02, 3.0, 40.0]);
         assert_eq!(params.fog2, [0.2, 0.1, 1.0, 1.0]);
         assert_eq!(params.fog3, [-4.0, 0.0, -8.0, 1.0]);
         assert_eq!(params.fog4, [4.0, 6.0, -1.0, 0.75]);
         assert_eq!(params.optics0, [5.0, 50.0, 2.8, 8.0]);
-        assert_eq!(super::pack_gpu_world_lighting(params).len(), 624);
+        assert_eq!(super::pack_gpu_world_lighting(params).len(), 672);
     }
 
     #[test]
@@ -12867,9 +13815,10 @@ mod tests {
 
     #[test]
     fn world_pbr_shader_preserves_clip_w_for_perspective_correct_uvs() {
-        assert!(super::WGPU_WORLD_SHADER.contains(
-            "out.pos = vec4<f32>(ndc_x * safe_z, ndc_y * safe_z, ndc_z * safe_z, safe_z);"
-        ));
+        assert!(
+            super::WGPU_WORLD_SHADER
+                .contains("out.pos = vec4<f32>(clip_x, clip_y, clip_z, view_z);")
+        );
         assert!(
             !super::WGPU_WORLD_SHADER.contains("out.pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);")
         );
@@ -12975,11 +13924,13 @@ mod tests {
             mask: Vec::new(),
         };
         let actor = crate::world::WorldActor {
+            cel_materials: Vec::new(),
             id: "girl".to_string(),
             model: "clips.glb".to_string(),
             primitive: None,
             terrain: None,
             vegetation: None,
+            native_skin: None,
             path_style: crate::world::WorldPathStyle::Relative,
             hide_meshes: Vec::new(),
             hide_materials: Vec::new(),
@@ -13283,10 +14234,12 @@ mod tests {
         let target = empty_mesh("target.glb", node("upper_arm_r"));
         let actor = crate::world::WorldActor {
             id: "character_a".to_string(),
+            cel_materials: Vec::new(),
             model: "target.glb".to_string(),
             primitive: None,
             terrain: None,
             vegetation: None,
+            native_skin: None,
             path_style: crate::world::WorldPathStyle::Relative,
             hide_meshes: Vec::new(),
             hide_materials: Vec::new(),

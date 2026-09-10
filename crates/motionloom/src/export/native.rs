@@ -13,6 +13,7 @@ pub struct FfmpegVideoEncoder {
     ffmpeg_bin: String,
     output_path: std::path::PathBuf,
     encoder_args: Vec<String>,
+    audio_path: Option<std::path::PathBuf>,
     size_arg: Option<String>,
     fps_arg: Option<String>,
     child: Option<Child>,
@@ -25,6 +26,7 @@ impl FfmpegVideoEncoder {
             ffmpeg_bin: ffmpeg_bin.to_string(),
             output_path: output_path.to_path_buf(),
             encoder_args: default_encoder_args(),
+            audio_path: None,
             size_arg: None,
             fps_arg: None,
             child: None,
@@ -36,6 +38,12 @@ impl FfmpegVideoEncoder {
     /// ProRes or platform-specific H.264).
     pub fn with_encoder_args(mut self, args: Vec<String>) -> Self {
         self.encoder_args = args;
+        self
+    }
+
+    /// Add a prepared soundtrack without changing the video-only encoder trait.
+    pub fn with_audio_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.audio_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -108,24 +116,38 @@ impl VideoEncoder for FfmpegVideoEncoder {
         self.fps_arg = Some(format!("{fps:.6}"));
         let output_arg = self.output_path.to_string_lossy().to_string();
 
-        let mut child = Command::new(&self.ffmpeg_bin)
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "-s",
-                self.size_arg.as_ref().expect("size_arg set above"),
-                "-r",
-                self.fps_arg.as_ref().expect("fps_arg set above"),
-                "-i",
-                "pipe:0",
-                "-an",
-            ])
+        let mut command = Command::new(&self.ffmpeg_bin);
+        command.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            self.size_arg.as_ref().expect("size_arg set above"),
+            "-r",
+            self.fps_arg.as_ref().expect("fps_arg set above"),
+            "-i",
+            "pipe:0",
+        ]);
+        // Encode the optional soundtrack in the existing FFmpeg invocation.
+        if let Some(audio) = &self.audio_path {
+            command
+                .arg("-i")
+                .arg(audio)
+                .args(["-map", "0:v:0", "-map", "1:a:0", "-c:a"]);
+            let codec = match self.output_path.extension().and_then(|x| x.to_str()) {
+                Some("webm") => "libopus",
+                _ => "aac",
+            };
+            command.args([codec, "-b:a", "192k"]);
+        } else {
+            command.arg("-an");
+        }
+        let mut child = command
             .args(&self.encoder_args)
             .arg(output_arg.as_str())
             .stdin(Stdio::piped())

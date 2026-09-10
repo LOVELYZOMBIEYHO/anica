@@ -61,13 +61,11 @@ fn default_scene_out_hold() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SceneRootNode {
     /// References Graph-level visual resources, not scene children.
     #[serde(default)]
     pub render_style: Option<String>,
-    #[serde(default)]
-    pub render_quality: Option<String>,
     pub id: String,
     pub size: Option<(u32, u32)>,
     /// Process-backed effects applied after every Track in this Scene has been
@@ -1522,6 +1520,8 @@ fn default_scene_bool_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SceneMaterialBindingNode {
+    #[serde(default)]
+    pub cel: crate::render_style::CelMaterialSettings,
     pub material: String,
     #[serde(default)]
     pub definition: Option<String>,

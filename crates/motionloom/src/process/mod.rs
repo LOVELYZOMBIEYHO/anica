@@ -9,6 +9,7 @@ pub mod graph;
 pub mod model;
 pub mod parser;
 pub mod pass;
+pub(crate) mod procedural_surface;
 pub mod process_catalog;
 pub mod runtime;
 #[cfg(target_arch = "wasm32")]
