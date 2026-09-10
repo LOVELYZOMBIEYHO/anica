@@ -7057,11 +7057,13 @@ impl MotionLoomPage {
                                 .cloned()
                                 .unwrap_or_else(|| model.asset.clone());
                             actors.push(WorldActor {
+                                cel_materials: Vec::new(),
                                 id: actor_id,
                                 model: source,
                                 primitive: None,
                                 terrain: None,
                                 vegetation: None,
+                                native_skin: None,
                                 path_style: WorldPathStyle::Relative,
                                 hide_meshes: Vec::new(),
                                 hide_materials: Vec::new(),

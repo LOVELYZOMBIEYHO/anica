@@ -4088,8 +4088,7 @@ fn gpu_world_vertex_chunk_bytes(device: &wgpu::Device) -> usize {
 
 fn gpu_world_vertex_key(vertex: GpuWorldVertex) -> [u32; 29] {
     let mut words = [0u32; 29];
-    let mut cursor = 0;
-    for value in vertex
+    for (cursor, value) in vertex
         .position
         .into_iter()
         .chain(vertex.normal)
@@ -4100,9 +4099,9 @@ fn gpu_world_vertex_key(vertex: GpuWorldVertex) -> [u32; 29] {
         .chain(vertex.tangent)
         .chain(vertex.bitangent)
         .chain(vertex.outline_normal)
+        .enumerate()
     {
         words[cursor] = value.to_bits();
-        cursor += 1;
     }
     words
 }
@@ -10474,11 +10473,13 @@ struct GpuWorldLightingParams {
     lights: [[f32; 16]; 4],
 }
 
+type GpuWorldActorBounds = (([f32; 3], [f32; 3]), GpuWorldParams);
+
 // Bounding spheres remain stable as rigid actors rotate and include off-camera casters.
 // Deformed scenes retain the existing projection until deformed bounds are available.
 fn fit_rigid_shadow_volume(
     mut lighting: GpuWorldLightingParams,
-    bounds: &[(([f32; 3], [f32; 3]), GpuWorldParams)],
+    bounds: &[GpuWorldActorBounds],
 ) -> GpuWorldLightingParams {
     if bounds.is_empty() || lighting.color1[3] <= 0.0 {
         return lighting;
@@ -11618,7 +11619,7 @@ fn gpu_occlusion_texture(
         pixel[0] = ((1.0 - strength.clamp(0.0, 1.0) * (1.0 - pixel[0] as f32 / 255.0)) * 255.0)
             .round() as u8;
     }
-    texture.signature = texture.signature ^ u64::from(strength.to_bits()).rotate_left(17);
+    texture.signature ^= u64::from(strength.to_bits()).rotate_left(17);
     texture.rgba = Arc::new(pixels);
     texture
 }
@@ -13468,10 +13469,9 @@ mod tests {
             let local =
                 std::array::from_fn(|axis| if corner & (1 << axis) == 0 { -0.5 } else { 0.5 });
             let world = super::quat_rotate_vec3(actor.actor_rotation, local);
-            for axis in 0..3 {
+            for (axis, value) in world.iter().enumerate() {
                 assert!(
-                    (world[axis] + actor.actor[axis] - fitted.shadow3[axis]).abs()
-                        < fitted.shadow0[3]
+                    (*value + actor.actor[axis] - fitted.shadow3[axis]).abs() < fitted.shadow0[3]
                 );
             }
         }

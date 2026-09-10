@@ -80,11 +80,12 @@ fn preview_required_limits(adapter_limits: wgpu::Limits) -> wgpu::Limits {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .and_then(|value| value.checked_mul(1024 * 1024));
-    let mut required = wgpu::Limits::default();
-    required.max_buffer_size = configured_max
-        .unwrap_or(adapter_limits.max_buffer_size)
-        .min(adapter_limits.max_buffer_size);
-    required
+    wgpu::Limits {
+        max_buffer_size: configured_max
+            .unwrap_or(adapter_limits.max_buffer_size)
+            .min(adapter_limits.max_buffer_size),
+        ..wgpu::Limits::default()
+    }
 }
 
 fn aspect_fit_viewport(

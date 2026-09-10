@@ -655,6 +655,8 @@ pub struct FacialCageNode {
 #[path = "dsl_control_cage.rs"]
 mod control_cage_parser;
 
+// Keep the public serialized geometry model direct and stable across all variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "shape")]
 pub enum PrimitiveGeometry {

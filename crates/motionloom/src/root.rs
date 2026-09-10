@@ -368,6 +368,19 @@ fn contains_open_tag(script: &str, tag: &str) -> bool {
     false
 }
 
+// Resolve only audio assets here; visual asset resolution retains its existing policy.
+fn resolve_audio_sources(graph: &mut crate::GraphScript, root: &Path) {
+    for asset in &mut graph.assets {
+        if asset.kind == crate::dsl::GraphAssetKind::Audio {
+            if let crate::GraphAssetSource::External { src } = &mut asset.source {
+                if !src.contains("://") && !Path::new(src).is_absolute() {
+                    *src = root.join(&*src).to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MotionLoomDocument, parse_motionloom_document};
@@ -525,18 +538,5 @@ mod tests {
             panic!("expected scene document");
         };
         assert_eq!(graph.scenes[0].id, "commented_scene");
-    }
-}
-
-// Resolve only audio assets here; visual asset resolution retains its existing policy.
-fn resolve_audio_sources(graph: &mut crate::GraphScript, root: &Path) {
-    for asset in &mut graph.assets {
-        if asset.kind == crate::dsl::GraphAssetKind::Audio {
-            if let crate::GraphAssetSource::External { src } = &mut asset.source {
-                if !src.contains("://") && !Path::new(src).is_absolute() {
-                    *src = root.join(&*src).to_string_lossy().into_owned();
-                }
-            }
-        }
     }
 }

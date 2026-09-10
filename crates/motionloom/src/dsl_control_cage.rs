@@ -145,8 +145,8 @@ fn parse_cage_children(
         if starts_open_tag(line, vertex_tag) {
             validate_head_attributes(&child, &["position", "uv", "pinned"], vertex_tag, i + 1)?;
             let raw = required_attr_value(&child, "position", i + 1)?;
-            let position = parse_primitive_vec_value::<3>(&raw, "position", &id, i + 1, false)?;
-            let uv = parse_optional_primitive_vec::<2>(&child, "uv", &id, i + 1, false)?
+            let position = parse_primitive_vec_value::<3>(&raw, "position", id, i + 1, false)?;
+            let uv = parse_optional_primitive_vec::<2>(&child, "uv", id, i + 1, false)?
                 .unwrap_or([position[0], position[1]]);
             cage.positions.push(position);
             cage.uvs.push(uv);

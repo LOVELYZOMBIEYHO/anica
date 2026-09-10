@@ -53,7 +53,7 @@ fn cross(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 }
 fn polygon(points: &[[f64; 2]]) -> bool {
     let n = points.len();
-    if n < 3 || n > 2048 {
+    if !(3..=2048).contains(&n) {
         return false;
     }
     let area: f64 = (0..n)

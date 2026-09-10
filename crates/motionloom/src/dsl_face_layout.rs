@@ -265,6 +265,8 @@ fn nested_id(
     Ok(id)
 }
 
+type EyeChildren = (Option<FaceTextureNode>, Option<IrisNode>, Vec<EyelinerNode>);
+
 /// Eye owns one optional Iris, any number of Eyeliner ribbons, and one sclera Texture.
 fn parse_eye_children(
     lines: &[&str],
@@ -273,7 +275,7 @@ fn parse_eye_children(
     asset: &str,
     eye_id: &str,
     ids: &mut HashSet<String>,
-) -> Result<(Option<FaceTextureNode>, Option<IrisNode>, Vec<EyelinerNode>), GraphParseError> {
+) -> Result<EyeChildren, GraphParseError> {
     let mut texture = None;
     let mut iris = None;
     let mut eyeliners = vec![];

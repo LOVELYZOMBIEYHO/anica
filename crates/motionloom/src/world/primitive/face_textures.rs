@@ -507,9 +507,9 @@ fn push_vertex(mesh: &mut GlbMeshData, position: [f32; 3], uv: [f32; 2], normal:
     mesh.colors.push(Some([1.0; 4]));
     mesh.joints.push(None);
     mesh.weights.push(None);
-    for axis in 0..3 {
-        mesh.bounds_min[axis] = mesh.bounds_min[axis].min(position[axis]);
-        mesh.bounds_max[axis] = mesh.bounds_max[axis].max(position[axis]);
+    for (axis, value) in position.iter().enumerate() {
+        mesh.bounds_min[axis] = mesh.bounds_min[axis].min(*value);
+        mesh.bounds_max[axis] = mesh.bounds_max[axis].max(*value);
     }
 }
 

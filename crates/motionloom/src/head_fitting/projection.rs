@@ -149,6 +149,8 @@ fn chamfer(a: &[[f64; 2]], b: &[[f64; 2]]) -> f64 {
     (directed(a, b) + directed(b, a)) * 0.5
 }
 
+// Projection fitting passes independent semantic and camera inputs explicitly.
+#[allow(clippy::too_many_arguments)]
 fn semantic_curve(
     id: &str,
     view: View,

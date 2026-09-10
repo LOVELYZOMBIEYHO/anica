@@ -97,7 +97,7 @@ fn fit_improves_and_preserves_source_and_locks() {
     assert_eq!(apply_head_fit_proposal(&s, &p).unwrap(), p.candidate_dsl);
     assert!(apply_head_fit_proposal(&(s.clone() + " "), &p).is_err());
     let mut forged = p.clone();
-    forged.candidate_dsl.push_str(" ");
+    forged.candidate_dsl.push(' ');
     assert!(apply_head_fit_proposal(&s, &forged).is_err());
     let mut forged = p;
     forged.changes[0].before = serde_json::json!([1, 2, 3]);

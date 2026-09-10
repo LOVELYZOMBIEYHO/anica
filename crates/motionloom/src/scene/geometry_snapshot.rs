@@ -46,6 +46,8 @@ pub(crate) async fn extract_geometry_snapshot(
     Ok(snapshot)
 }
 
+// Recursive traversal keeps timing, visibility, and output state explicit at each branch.
+#[allow(clippy::too_many_arguments)]
 fn visit(
     renderer: &mut SceneFrameRenderer,
     nodes: &[SceneNode],

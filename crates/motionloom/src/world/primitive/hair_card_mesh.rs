@@ -91,8 +91,8 @@ fn generate_guide(
             mesh.positions[tri[2] as usize],
         );
         for &i in tri {
-            for k in 0..3 {
-                normals[i as usize][k] += n[k];
+            for (component, value) in n.iter().enumerate() {
+                normals[i as usize][component] += *value;
             }
         }
     }
