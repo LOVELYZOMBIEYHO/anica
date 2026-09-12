@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 mod preview_host_platform;
 
 use motionloom::{
-    PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,
-    PreviewInteractionNode, Scene3DFrameProfile, SceneCpuFrameProfile,
-    WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewPreloadSession,
-    WgpuPreviewQuality,
+    ImmediatePreviewProfile, ImmediatePreviewSettings, PREVIEW_PROTOCOL_VERSION, PreviewCommand,
+    PreviewEvent, PreviewInteractionMode, PreviewInteractionNode, Scene3DFrameProfile,
+    SceneCpuFrameProfile, WgpuPreviewAdaptiveController, WgpuPreviewEngine,
+    WgpuPreviewPreloadSession, WgpuPreviewQuality,
     api::{PreparedAudio, compile_audio_plan, prepare_audio},
     parse_graph_script,
 };
@@ -369,6 +369,7 @@ struct LivePreviewApp {
     overlay_pipeline: Option<wgpu::RenderPipeline>,
     picking_pipeline: Option<wgpu::RenderPipeline>,
     quality: WgpuPreviewQuality,
+    preview_settings: ImmediatePreviewSettings,
     adaptive_quality: WgpuPreviewAdaptiveController,
     pending_preload: bool,
     preload_session: Option<WgpuPreviewPreloadSession>,
@@ -465,6 +466,7 @@ impl LivePreviewApp {
         auto_advance: bool,
         host_mode: bool,
         host_events: Option<PreviewEventBroadcaster>,
+        preview_settings: ImmediatePreviewSettings,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (script_source, script) = if let Some(script_source) = script_source {
             configure_scene_asset_root_for_source(&script_source);
@@ -512,6 +514,7 @@ impl LivePreviewApp {
             overlay_pipeline: None,
             picking_pipeline: None,
             quality: WgpuPreviewQuality::Full,
+            preview_settings,
             adaptive_quality: {
                 let mut adaptive = WgpuPreviewAdaptiveController::for_fps(fps);
                 adaptive.set_enabled(
@@ -1445,10 +1448,11 @@ impl LivePreviewApp {
         };
         surface.configure(&device, &surface_config);
 
-        let preview_engine = pollster::block_on(WgpuPreviewEngine::new_with_device(
+        let mut preview_engine = pollster::block_on(WgpuPreviewEngine::new_with_device(
             device.clone(),
             queue.clone(),
         ))?;
+        preview_engine.set_settings(self.preview_settings);
         let graph = WgpuPreviewEngine::graph_for_quality(&self.base_graph, self.quality);
         let (target_width, target_height) = graph.render_size.unwrap_or(graph.size);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2488,6 +2492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut script_source = None;
     let mut print_stats = false;
     let mut listen_addr = None::<String>;
+    let mut preview_settings = ImmediatePreviewSettings::default();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         if arg == "--stats" || arg == "--print-stats" {
@@ -2498,6 +2503,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             };
             listen_addr = Some(addr);
+        } else if arg == "--profile" {
+            let Some(profile) = args.next() else {
+                eprintln!("--profile requires portable, balanced, or cinematic");
+                std::process::exit(2);
+            };
+            preview_settings.profile = match profile.as_str() {
+                "portable" => ImmediatePreviewProfile::Portable,
+                "balanced" => ImmediatePreviewProfile::Balanced,
+                "cinematic" => ImmediatePreviewProfile::Cinematic,
+                _ => {
+                    eprintln!(
+                        "unknown preview profile: {profile}; expected portable, balanced, or cinematic"
+                    );
+                    std::process::exit(2);
+                }
+            };
         } else if script_source.is_none() {
             script_source = Some(arg);
         } else {
@@ -2507,7 +2528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if listen_addr.is_none() && script_source.is_none() {
         eprintln!(
-            "usage: cargo run -p motionloom --example wgpu_live_preview -- [--stats] path-or-url/to/main.motionloom\n       cargo run -p motionloom --example wgpu_live_preview -- --listen 127.0.0.1:49377 [optional/path.motionloom]"
+            "usage: cargo run -p motionloom --example wgpu_live_preview -- [--stats] [--profile portable|balanced|cinematic] path-or-url/to/main.motionloom\n       cargo run -p motionloom --example wgpu_live_preview -- --listen 127.0.0.1:49377 [optional/path.motionloom]"
         );
         std::process::exit(2);
     }
@@ -2526,6 +2547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         auto_advance,
         host_mode,
         host_events,
+        preview_settings,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())

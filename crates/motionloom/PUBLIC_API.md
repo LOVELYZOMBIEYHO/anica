@@ -1,5 +1,21 @@
 # MotionLoom Main Public API
 
+With the native-only `weaver` feature, `motionloom::api::weaver` exposes the initial
+offline renderer API (`RenderJob`, `QualityPreset`, `render`, `RenderProgress`,
+`RenderReport`, `CancellationToken`, `WeaverError`). This new API is provisional;
+its detailed contract and limitations live in [Weaver](src/weaver/README.md).
+
+`DepthOfFieldStyleNode` (via `motionloom::api`) supports the opt-in
+`filmic_bokeh_v1` preset with optional `aperture` and `max_blur` values in
+normalized UV units. `ResolvedSceneRenderStyle.depth_of_field` preserves these
+values. Existing serialized styles without this child retain legacy behavior.
+See RENDER_STYLE.md for the independent material and tone-mapping presets.
+
+Render presets use the existing `resolve_scene_render_style` API. The resolved
+report includes neutral-default `universal` controls; `ColorStyleNode`,
+`ToneStyleNode` and `ResolvedUniversalStyle` are exported through `motionloom::api`.
+See [RenderStyle](RENDER_STYLE.md) for the additive ink preset and DSL contract.
+
 Experimental geometry authoring APIs (`extract_scene_geometry`,
 `extract_scene_geometry_with_resolver`, `check_scene_uvs`, `export_scene_glb`)
 are documented in [GEOMETRY_TOOLING.md](GEOMETRY_TOOLING.md).

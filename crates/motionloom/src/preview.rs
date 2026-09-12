@@ -68,6 +68,171 @@ pub enum WgpuPreviewQuality {
     UltraSpeed,
 }
 
+/// Rendering budget for MotionLoom's immediate preview path.
+///
+/// This is deliberately separate from authored `RenderStyle` and offline
+/// rendering. A style describes the picture; this profile describes how much
+/// work the interactive renderer may spend reproducing it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmediatePreviewProfile {
+    /// Conservative WebGPU settings for integrated and mobile GPUs.
+    Portable,
+    /// Stable editor default with HDR, filtered shadows and depth-aware post.
+    #[default]
+    Balanced,
+    /// Highest-quality interactive path for discrete desktop GPUs.
+    Cinematic,
+}
+
+/// Host-controlled settings that never mutate the authored graph.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ImmediatePreviewSettings {
+    pub profile: ImmediatePreviewProfile,
+    pub target_fps: f32,
+    pub dynamic_resolution: bool,
+    pub min_resolution_scale: f32,
+}
+
+impl Default for ImmediatePreviewSettings {
+    fn default() -> Self {
+        Self {
+            profile: ImmediatePreviewProfile::Balanced,
+            target_fps: 30.0,
+            dynamic_resolution: true,
+            min_resolution_scale: 0.5,
+        }
+    }
+}
+
+impl ImmediatePreviewSettings {
+    pub fn normalized(self) -> Self {
+        Self {
+            target_fps: if self.target_fps.is_finite() {
+                self.target_fps.clamp(1.0, 60.0)
+            } else {
+                30.0
+            },
+            min_resolution_scale: if self.min_resolution_scale.is_finite() {
+                self.min_resolution_scale.clamp(0.05, 1.0)
+            } else {
+                0.5
+            },
+            ..self
+        }
+    }
+
+    /// Concrete GPU limits selected by this host-side profile.
+    pub const fn budget(self) -> ImmediatePreviewBudget {
+        match self.profile {
+            ImmediatePreviewProfile::Portable => ImmediatePreviewBudget {
+                shadow_map_size: 1024,
+                texture_anisotropy: 2,
+                max_lights: 4,
+                dof_sample_limit: 32,
+                hdr: true,
+                antialiasing: ImmediatePreviewAntialiasing::Fxaa,
+                screen_space_ao: false,
+                temporal_antialiasing: false,
+                temporal_jitter: false,
+                screen_space_reflections: false,
+                motion_blur: false,
+            },
+            ImmediatePreviewProfile::Balanced => ImmediatePreviewBudget {
+                shadow_map_size: 1536,
+                texture_anisotropy: 8,
+                max_lights: 8,
+                dof_sample_limit: 96,
+                hdr: true,
+                antialiasing: ImmediatePreviewAntialiasing::Fxaa,
+                screen_space_ao: true,
+                temporal_antialiasing: true,
+                temporal_jitter: false,
+                screen_space_reflections: false,
+                motion_blur: true,
+            },
+            ImmediatePreviewProfile::Cinematic => ImmediatePreviewBudget {
+                shadow_map_size: 2048,
+                texture_anisotropy: 16,
+                max_lights: 8,
+                dof_sample_limit: 192,
+                hdr: true,
+                antialiasing: ImmediatePreviewAntialiasing::Fxaa,
+                screen_space_ao: true,
+                temporal_antialiasing: true,
+                temporal_jitter: false,
+                screen_space_reflections: true,
+                motion_blur: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmediatePreviewAntialiasing {
+    Off,
+    Fxaa,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImmediatePreviewBudget {
+    pub shadow_map_size: u32,
+    pub texture_anisotropy: u16,
+    pub max_lights: u8,
+    pub dof_sample_limit: u16,
+    pub hdr: bool,
+    pub antialiasing: ImmediatePreviewAntialiasing,
+    pub screen_space_ao: bool,
+    pub temporal_antialiasing: bool,
+    /// Move the projection sample for sub-pixel accumulation. Current immediate
+    /// profiles keep this disabled until thin-geometry coverage is stable.
+    pub temporal_jitter: bool,
+    pub screen_space_reflections: bool,
+    pub motion_blur: bool,
+}
+
+/// Honest feature report for host UIs. Features not yet in the immediate path
+/// are reported as false instead of being exposed as no-op switches.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImmediatePreviewCapabilities {
+    pub retained_scene: bool,
+    pub gpu_timestamps: bool,
+    pub hdr_working_buffer: bool,
+    pub image_based_lighting: bool,
+    pub filtered_shadows: bool,
+    pub temporal_antialiasing: bool,
+    pub ambient_occlusion: bool,
+    pub screen_space_reflections: bool,
+    pub depth_of_field: bool,
+    pub motion_blur: bool,
+    pub volumetrics: bool,
+    pub bloom: bool,
+    pub tone_mapping: bool,
+}
+
+/// Compact telemetry intended for editor HUDs and automated preview budgets.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct ImmediatePreviewFrameMetrics {
+    pub target_frame_ms: f64,
+    pub gpu_ms: Option<f64>,
+    pub cpu_ms: f64,
+    pub scene_3d: crate::Scene3DFrameProfile,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ImmediatePreviewFrameMetrics {
+    pub fn estimated_frame_ms(self) -> f64 {
+        self.gpu_ms.unwrap_or(0.0).max(self.cpu_ms)
+    }
+
+    pub fn meets_target(self) -> bool {
+        self.estimated_frame_ms() <= self.target_frame_ms
+    }
+}
+
 impl WgpuPreviewQuality {
     pub const fn label(self) -> &'static str {
         match self {
@@ -117,6 +282,27 @@ impl WgpuPreviewQuality {
             Self::HighSpeed => Self::Speed,
             Self::UltraSpeed => Self::HighSpeed,
         }
+    }
+
+    pub fn respecting_min_scale(self, min_scale: f32) -> Self {
+        let min_scale = if min_scale.is_finite() {
+            min_scale.clamp(0.05, 1.0)
+        } else {
+            0.5
+        };
+        if self.scale() >= min_scale {
+            return self;
+        }
+        [
+            Self::UltraSpeed,
+            Self::HighSpeed,
+            Self::Speed,
+            Self::Balanced,
+            Self::Full,
+        ]
+        .into_iter()
+        .find(|quality| quality.scale() >= min_scale)
+        .unwrap_or(Self::Full)
     }
 }
 
@@ -364,6 +550,7 @@ impl WgpuPreviewGraphCache {
 pub struct WgpuPreviewEngine {
     gpu_renderer: Option<SceneRenderer>,
     cpu_renderer: Option<SceneRenderer>,
+    settings: ImmediatePreviewSettings,
 }
 
 impl WgpuPreviewEngine {
@@ -371,18 +558,25 @@ impl WgpuPreviewEngine {
     pub async fn new_with_cpu_fallback() -> Self {
         let gpu_renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.ok();
         let cpu_renderer = SceneRenderer::new(SceneRenderProfile::Cpu).await.ok();
-        Self {
+        let settings = ImmediatePreviewSettings::default();
+        let mut engine = Self {
             gpu_renderer,
             cpu_renderer,
-        }
+            settings,
+        };
+        engine.apply_settings();
+        engine
     }
 
     /// Build a CPU-only preview engine for panic recovery and headless paths.
     pub async fn new_cpu_only() -> Self {
-        Self {
+        let mut engine = Self {
             gpu_renderer: None,
             cpu_renderer: SceneRenderer::new(SceneRenderProfile::Cpu).await.ok(),
-        }
+            settings: ImmediatePreviewSettings::default(),
+        };
+        engine.apply_settings();
+        engine
     }
 
     /// Build a GPU preview engine around a host-owned wgpu device and queue.
@@ -393,10 +587,63 @@ impl WgpuPreviewEngine {
     ) -> Result<Self, MotionLoomSceneRenderError> {
         let gpu_renderer =
             SceneRenderer::new_with_device(device, queue, SceneRenderProfile::Gpu).await?;
-        Ok(Self {
+        let mut engine = Self {
             gpu_renderer: Some(gpu_renderer),
             cpu_renderer: None,
-        })
+            settings: ImmediatePreviewSettings::default(),
+        };
+        engine.apply_settings();
+        Ok(engine)
+    }
+
+    pub fn settings(&self) -> ImmediatePreviewSettings {
+        self.settings
+    }
+
+    pub fn allowed_quality(&self, requested: WgpuPreviewQuality) -> WgpuPreviewQuality {
+        if !self.settings.dynamic_resolution {
+            return WgpuPreviewQuality::Full;
+        }
+        requested.respecting_min_scale(self.settings.min_resolution_scale)
+    }
+
+    /// Change interactive rendering cost without rewriting or reparsing DSL.
+    pub fn set_settings(&mut self, settings: ImmediatePreviewSettings) {
+        self.settings = settings.normalized();
+        self.apply_settings();
+    }
+
+    pub fn capabilities(&self) -> ImmediatePreviewCapabilities {
+        let gpu = self.gpu_renderer.is_some();
+        let any_renderer = gpu || self.cpu_renderer.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_timestamps = self.gpu_timestamp_supported();
+        #[cfg(target_arch = "wasm32")]
+        let gpu_timestamps = false;
+        ImmediatePreviewCapabilities {
+            retained_scene: any_renderer,
+            gpu_timestamps,
+            hdr_working_buffer: gpu,
+            image_based_lighting: gpu,
+            filtered_shadows: gpu,
+            temporal_antialiasing: gpu,
+            ambient_occlusion: gpu,
+            screen_space_reflections: gpu,
+            depth_of_field: gpu,
+            motion_blur: gpu,
+            volumetrics: gpu,
+            bloom: any_renderer,
+            tone_mapping: any_renderer,
+        }
+    }
+
+    fn apply_settings(&mut self) {
+        if let Some(renderer) = self.gpu_renderer.as_mut() {
+            renderer.set_immediate_preview_settings(self.settings);
+        }
+        if let Some(renderer) = self.cpu_renderer.as_mut() {
+            renderer.set_immediate_preview_settings(self.settings);
+        }
     }
 
     pub fn has_gpu_renderer(&self) -> bool {
@@ -627,6 +874,24 @@ impl WgpuPreviewEngine {
             .map(SceneRenderer::last_3d_frame_profile)
     }
 
+    /// One host-facing metrics record combining compositor GPU time, Scene CPU
+    /// work and retained 3D workload counters.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn last_frame_metrics(&self) -> Option<ImmediatePreviewFrameMetrics> {
+        let renderer = self.gpu_renderer.as_ref()?;
+        let cpu = renderer.last_cpu_frame_profile();
+        Some(ImmediatePreviewFrameMetrics {
+            target_frame_ms: 1000.0 / self.settings.target_fps as f64,
+            gpu_ms: renderer.last_gpu_frame_ms(),
+            cpu_ms: cpu.expression_ms
+                + cpu.traversal_ms
+                + cpu.upload_ms
+                + cpu.encode_ms
+                + cpu.wait_ms,
+            scene_3d: renderer.last_3d_frame_profile(),
+        })
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn gpu_timestamp_supported(&self) -> bool {
         self.gpu_renderer
@@ -786,9 +1051,59 @@ impl WgpuPreviewEngine {
 #[cfg(test)]
 mod tests {
     use super::{
+        ImmediatePreviewAntialiasing, ImmediatePreviewProfile, ImmediatePreviewSettings,
         WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewGraphCache,
         WgpuPreviewQuality, collect_sequence_activation_frames,
     };
+
+    #[test]
+    fn immediate_preview_profiles_have_bounded_real_gpu_budgets() {
+        let portable = ImmediatePreviewSettings {
+            profile: ImmediatePreviewProfile::Portable,
+            ..Default::default()
+        }
+        .budget();
+        let cinematic = ImmediatePreviewSettings {
+            profile: ImmediatePreviewProfile::Cinematic,
+            ..Default::default()
+        }
+        .budget();
+        let balanced = ImmediatePreviewSettings::default().budget();
+        assert!(portable.shadow_map_size < cinematic.shadow_map_size);
+        assert!(portable.dof_sample_limit < cinematic.dof_sample_limit);
+        assert!(balanced.temporal_antialiasing);
+        assert!(!balanced.temporal_jitter);
+        assert!(balanced.motion_blur);
+        assert!(!balanced.screen_space_reflections);
+        assert!(cinematic.screen_space_reflections);
+        assert!(!cinematic.temporal_jitter);
+        assert_eq!(cinematic.texture_anisotropy, 16);
+        assert_eq!(cinematic.antialiasing, ImmediatePreviewAntialiasing::Fxaa);
+    }
+
+    #[test]
+    fn immediate_preview_settings_normalize_untrusted_host_values() {
+        let settings = ImmediatePreviewSettings {
+            target_fps: f32::NAN,
+            min_resolution_scale: -4.0,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(settings.target_fps, 30.0);
+        assert_eq!(settings.min_resolution_scale, 0.05);
+    }
+
+    #[test]
+    fn preview_quality_respects_dynamic_resolution_floor() {
+        assert_eq!(
+            WgpuPreviewQuality::UltraSpeed.respecting_min_scale(0.5),
+            WgpuPreviewQuality::Balanced
+        );
+        assert_eq!(
+            WgpuPreviewQuality::Speed.respecting_min_scale(0.2),
+            WgpuPreviewQuality::Speed
+        );
+    }
 
     #[test]
     fn preview_preload_includes_delayed_scene_sequence_activation() {

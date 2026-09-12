@@ -116,6 +116,10 @@ mod shot_validation;
 pub mod simulation;
 mod world;
 
+// Offline rendering is opt-in and does not enter the browser preview build.
+#[cfg(all(feature = "weaver", not(target_arch = "wasm32")))]
+pub mod weaver;
+
 pub mod api;
 pub mod experimental;
 pub mod prelude;
@@ -176,10 +180,14 @@ pub use dsl::{
     parse_action_library_document, parse_graph_script,
 };
 pub use error::{GraphParseError, MotionLoomError, RootGraphError, RuntimeCompileError};
+#[cfg(not(target_arch = "wasm32"))]
+pub use preview::ImmediatePreviewFrameMetrics;
 pub use preview::{
-    WgpuPreviewAdaptiveController, WgpuPreviewEngine, WgpuPreviewEngineError, WgpuPreviewFrame,
-    WgpuPreviewGraphCache, WgpuPreviewPreloadProgress, WgpuPreviewPreloadReport,
-    WgpuPreviewPreloadSession, WgpuPreviewQuality,
+    ImmediatePreviewAntialiasing, ImmediatePreviewBudget, ImmediatePreviewCapabilities,
+    ImmediatePreviewProfile, ImmediatePreviewSettings, WgpuPreviewAdaptiveController,
+    WgpuPreviewEngine, WgpuPreviewEngineError, WgpuPreviewFrame, WgpuPreviewGraphCache,
+    WgpuPreviewPreloadProgress, WgpuPreviewPreloadReport, WgpuPreviewPreloadSession,
+    WgpuPreviewQuality,
 };
 pub use preview_protocol::{
     PREVIEW_PROTOCOL_VERSION, PreviewCommand, PreviewEvent, PreviewInteractionMode,

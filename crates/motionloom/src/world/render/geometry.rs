@@ -1,6 +1,6 @@
 // =========================================
 // =========================================
-// crates/motionloom/src/world/geometry_snapshot.rs
+// crates/motionloom/src/world/render/geometry.rs
 
 use super::*;
 use crate::experimental::geometry::{GeometryError, ResolvedMesh};

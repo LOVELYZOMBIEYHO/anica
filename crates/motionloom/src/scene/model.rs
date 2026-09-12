@@ -1123,6 +1123,8 @@ pub struct SceneCamera3DNode {
 #[serde(rename_all = "camelCase")]
 pub struct SceneDepthOfFieldNode {
     #[serde(default)]
+    pub max_blur_unit: Option<String>,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub focus_target: Option<String>,

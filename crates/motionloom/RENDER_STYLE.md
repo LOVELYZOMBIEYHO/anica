@@ -1,5 +1,110 @@
 # Scene RenderStyle (V1)
 
+## Filmic physical and lens presets
+
+```xml
+<RenderStyle id="filmic_scene">
+  <SurfaceStyle shading="filmic_physical_v1" />
+  <DepthOfFieldStyle preset="filmic_bokeh_v1" aperture="0.00032" maxBlur="0.0025" />
+  <LightingStyle ambientIntensity="0" />
+  <PostStyle toneMapping="filmic_aces_v1" exposure="0.97" whiteBalance="6500" bloomIntensity="0" />
+</RenderStyle>
+```
+
+Enable the camera with `depthOfField="true" focusDistance="16.2"`.
+The bokeh preset uses signed `(focus - viewDepth) * aperture` CoC and a fixed
+41-sample golden-angle disk. Style `aperture` and `maxBlur`
+are static normalized-UV controls in [0, 0.1], defaulting to 0.00032 / 0.0025.
+They are not f-numbers or pixels. Camera focalLength/fStop/maxBlur do not control
+this preset; camera focusDistance/focusTarget/focusOffset still do. `quality` is
+accepted but does not alter its fixed 41 taps. Set aperture to zero or disable
+camera DoF to remove blur. At 4K, maxBlur 0.0025 and the outer tap scale of 0.4
+produce a maximum radius of approximately 3.84 pixels, versus the earlier
+cinematic preset's 43.2-pixel cap with camera maxBlur=2 percentHeight.
+
+`filmic_physical_v1` keeps glTF factors linear, converts authored light colors
+using RGB and exact sRGB, uses correlated Smith visibility and Lambert diffuse,
+and shadows only the selected shadow owner. Environment irradiance remains active
+at zero ambient fill. `filmic_aces_v1` uses filmic ACES input/output matrices,
+an RRT/ODT fit, a 1/0.6 scale and exact sRGB output.
+These opt-in modes preserve existing physical/aces/cinematic_bokeh_v1 behavior.
+
+The material/light preset provides a standards-oriented glTF physical path; environment
+prefiltering, shadows, fog and rasterization remain MotionLoom implementations.
+The bokeh kernel retains premultiplied alpha for compositor compatibility. Depth
+comes from the reversed depth buffer. The filmic ACES curve is intended for
+physically shaded scenes; legacy
+display-locked materials still use their old inverse display curve.
+
+
+## Ink preset and universal controls
+
+`SurfaceStyle shading="ink_wash_soft_v1"` selects a complete, versioned GPU
+preset. Its dedicated `world/render/shaders/presets/ink_wash_soft_v1.wgsl`
+uses a physically lit scene as input, depth-aware wash filtering, five soft ink
+densities, one-sided contour deposition, world-anchored pigment variation and
+stationary paper grain. This is stylized ink rendering, not fluid simulation.
+The preset preserves material chroma and applies ink density primarily to
+luminance. For reference-like pastel colour, prefer a light universal tone blend
+(A light toneStrength and modest saturation preserve the authored palette); strong duotone blends deliberately
+replace more of the original palette. Far contours are faint and highlights
+receive less contour ink.
+It needs no temporal history, external textures, new render targets or quality
+DSL. Native and WASM GPU paths embed the same WGSL.
+
+```xml
+<RenderStyle id="courtyard_ink">
+  <SurfaceStyle shading="ink_wash_soft_v1" />
+  <ColorStyle tint="#DDE5D7" tintStrength="0.15" saturation="0.75" />
+  <ToneStyle exposure="1.0" contrast="0.95" shadowColor="#293B38"
+             highlightColor="#F1EBDD" toneStrength="0.65" />
+</RenderStyle>
+```
+
+`ColorStyle` and `ToneStyle` are optional, static, strict children available to
+**every** shading mode. They are applied by the shared resolve shader, not by
+individual presets. Future presets must return display RGB through that same
+finish function. Unsupported shading names are errors, never silent fallbacks.
+
+| Parameter | Range / format | Neutral default |
+| --- | --- | --- |
+| ColorStyle.tint | #RRGGBB | #FFFFFF |
+| ColorStyle.tintStrength | 0–1 | 0 |
+| ColorStyle.saturation | 0–3 | 1 |
+| ToneStyle.exposure | 0–32, linear-light multiplier, not EV | 1 |
+| ToneStyle.contrast | 0–3, display-space pivot 0.5 | 1 |
+| ToneStyle.shadowColor | #RRGGBB | #000000 |
+| ToneStyle.highlightColor | #RRGGBB | #FFFFFF |
+| ToneStyle.toneStrength | 0–1 | 0 |
+
+Order: existing scene lighting/fog/grading → DoF/resolve tone mapping → preset
+→ universal exposure → contrast → luminance-based shadow/highlight gradient
+blend → multiplicative tint blend → saturation → clamp. Exposure uses the
+renderer's gamma-2.2 working conversion. Tone colours interpolate by display
+luminance; tint multiplies RGB and blends by tintStrength, preserving black.
+Saturation is last, so zero guarantees monochrome even with coloured tone/tint.
+Controls operate on straight RGB and preserve premultiplied alpha.
+
+These controls affect the entire rendered 3D island, including its environment
+background, but not separate SVG/screen UI. Explicit `ColorManagement` and legacy
+`PostStyle` keep their previous precedence; universal controls run afterwards
+and compose with them, not replace them. Later Process effects, including style
+bloom, run after this island resolve. They can intentionally alter the result.
+
+### Additive migration
+
+Before: `<SurfaceStyle shading="physical" />` with optional legacy children.
+After: the same source remains valid and unchanged; optionally add ColorStyle
+and ToneStyle or choose ink_wash_soft_v1. Omitted/new empty controls are neutral.
+Old serialized graphs and resolved reports default to disabled neutral universal
+controls. Older engine versions do not understand the new tags/preset and must
+be rebuilt before loading such a document. CPU-only previews are not a reference
+implementation of the GPU styles.
+
+See [the self-contained template](examples/ink_wash.motionloom). Preset-specific
+shader constants stay internal;
+there is no new RenderStyle `preset` attribute.
+
 RenderStyle is an opt-in Graph resource referenced by `Scene`. It does not
 reintroduce the removed `World` DSL tag. The original DSL remains the source of
 truth; resolver JSON is read-only evidence, not a second authoring format.
@@ -36,14 +141,15 @@ changes. All identifiers are case-sensitive.
 
 | Child | Supported attributes |
 | --- | --- |
-| SurfaceStyle | shading: physical/stylized/toon/clay/cel; shadingSteps: integer 2–16; diffuseWrap: 0–1; rimLight: 0–4; rimPower: 0.1–32; specular: 0–4; roughnessBias: −1–1; saturation: 0–3; outline: none; shadowThreshold: 0–1; shadowFeather: 0.001–0.5; shadowColor: #RRGGBB |
+| SurfaceStyle | shading: physical/stylized/toon/clay/cel/ink_wash_soft_v1; shadingSteps: integer 2–16; diffuseWrap: 0–1; rimLight: 0–4; rimPower: 0.1–32; specular: 0–4; roughnessBias: −1–1; saturation: 0–3; outline: none; shadowThreshold: 0–1; shadowFeather: 0.001–0.5; shadowColor: #RRGGBB |
 | OutlineStyle | enabled: true/false; method: geometry; width: 0–12 output pixels; color: #RRGGBB; distanceMode: screen |
 | LightingStyle | preset: neutral/soft_sunlight/cinematic/overcast/night; ambientIntensity: 0–10; ambientColor: #RRGGBB; shadowStyle: hard/soft |
 | PostStyle | toneMapping: none/reinhard/aces; exposure: 0–32 (existing linear multiplier, **not EV**); saturation: 0–3; contrast: 0–3; whiteBalance: 1000–40000 K; bloomThreshold: 0–32; bloomIntensity: 0–4 |
 
+ColorStyle and ToneStyle are documented above and share all shading modes.
 Unknown children, unknown attributes, invalid references, duplicate declarations,
 non-finite values and unsupported modes fail before GPU submission. Illustration,
-screen-space edge-detection outlines, LUT assets, style inheritance and local style volumes
+custom screen-space OutlineStyle methods, LUT assets, style inheritance and local style volumes
 are **not V1 features** and are not accepted as no-op settings.
 
 ## Ownership and precedence
@@ -136,7 +242,7 @@ Use `renderSize` only when the output itself needs more pixels. It does not
 promise better lighting, shadows, materials or sampling. Existing
 Effect/ApplyEffect and Camera3D syntax is unchanged.
 
-## Showcase and validation
+## Validation and compatibility
 
 S80 `main.motionloom` switches physical/stylized/toon/clay/bright-anime at
 three-second cuts over one 15-second Scene. It shares the same procedural
@@ -144,7 +250,7 @@ forest, owl, bench, lights and camera throughout. The standalone
 `physical.motionloom`, `stylized.motionloom`, `toon.motionloom` and
 `clay.motionloom` are controlled comparisons. Separate files avoid the existing
 cross-Scene transition/composition limitations of the WASM preview; the main
-showcase changes one Scene's style reference instead.
+an example changes one Scene's style reference instead.
 Scene labels remain ordinary 2D overlays.
 No external or non-CC0 asset is needed; S1–S79 are not edited.
 
@@ -256,7 +362,7 @@ outline.
 
 S84 is a new 20-second comparison: Physical, Toon, Cel with outlines, Cel without
 outlines, then camera distance/occlusion with an animated CC0 Character1.
-No existing showcase is modified for this extension.
+No existing scene document is modified for this extension.
 
 Verification is recorded in S84's README. Browser timing is render/readback wall
 time, not GPU utilization or sustained FPS. The report's overrides list includes

@@ -1632,6 +1632,25 @@ fn scene_world_lighting(
         render_style: composite.render_style.clone(),
         ..WorldLighting::default()
     };
+    let filmic = composite
+        .render_style
+        .as_ref()
+        .is_some_and(|s| s.shading == "filmic_physical_v1");
+    let light_color = |value: &str| -> Result<[f32; 3], MotionLoomSceneRenderError> {
+        if !filmic {
+            return scene_light_color(value);
+        }
+        // Filmic authored colors use RGB and the exact sRGB transfer.
+        let rgba = parse_color(value)?;
+        Ok([rgba[0], rgba[1], rgba[2]].map(|byte| {
+            let c = byte as f32 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }))
+    };
     if let Some(style) = &composite.render_style {
         let p = &style.post;
         if let Some(v) = &p.tone_mapping {
@@ -1747,7 +1766,7 @@ fn scene_world_lighting(
                     time_sec,
                     [-0.4, -1.0, -0.35],
                 )?,
-                color: scene_light_color(&node.color)?,
+                color: light_color(&node.color)?,
                 intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
                 range: 0.0,
                 inner_cone_degrees: 0.0,
@@ -1763,7 +1782,7 @@ fn scene_world_lighting(
                 kind: WorldLightKind::Point,
                 position: eval_scene_vec3(&node.position, time_norm, time_sec, [0.0; 3])?,
                 direction: [0.0, -1.0, 0.0],
-                color: scene_light_color(&node.color)?,
+                color: light_color(&node.color)?,
                 intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
                 range: eval_scene_number(&node.range, time_norm, time_sec)?.max(0.001),
                 inner_cone_degrees: 0.0,
@@ -1778,7 +1797,7 @@ fn scene_world_lighting(
                 kind: WorldLightKind::Spot,
                 position: eval_scene_vec3(&node.position, time_norm, time_sec, [0.0; 3])?,
                 direction: eval_scene_vec3(&node.direction, time_norm, time_sec, [0.0, -1.0, 0.0])?,
-                color: scene_light_color(&node.color)?,
+                color: light_color(&node.color)?,
                 intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
                 range: eval_scene_number(&node.range, time_norm, time_sec)?.max(0.001),
                 inner_cone_degrees: eval_scene_number(&node.inner_cone, time_norm, time_sec)?
@@ -1795,7 +1814,7 @@ fn scene_world_lighting(
                 kind: WorldLightKind::RectArea,
                 position: eval_scene_vec3(&node.position, time_norm, time_sec, [0.0; 3])?,
                 direction: eval_scene_vec3(&node.direction, time_norm, time_sec, [0.0, -1.0, 0.0])?,
-                color: scene_light_color(&node.color)?,
+                color: light_color(&node.color)?,
                 intensity: eval_scene_number(&node.intensity, time_norm, time_sec)?.max(0.0),
                 range: 10.0,
                 inner_cone_degrees: 0.0,
@@ -2201,6 +2220,13 @@ pub struct SceneRenderer {
 
 #[path = "geometry_snapshot.rs"]
 mod geometry_snapshot;
+
+// Weaver reuses frame lowering without invoking the immediate renderer.
+#[cfg(all(feature = "weaver", not(target_arch = "wasm32")))]
+#[path = "../weaver/scene/bridge.rs"]
+mod weaver_bridge;
+#[cfg(all(feature = "weaver", not(target_arch = "wasm32")))]
+pub(crate) use weaver_bridge::weaver_snapshot;
 #[path = "mesh_edit.rs"]
 mod mesh_edit;
 pub(crate) use geometry_snapshot::extract_geometry_snapshot;
@@ -2399,6 +2425,18 @@ impl SceneRenderer {
     ) -> Result<RgbaImage, SceneRenderError> {
         validate_scene_graph(graph)?;
         self.inner.render_frame(graph, frame).await
+    }
+
+    /// Configure the interactive renderer independently from authored styles
+    /// and offline output settings.
+    pub fn set_immediate_preview_settings(
+        &mut self,
+        settings: crate::preview::ImmediatePreviewSettings,
+    ) {
+        self.inner.immediate_preview_settings = settings.normalized();
+        self.inner
+            .scene_3d_renderer
+            .set_immediate_preview_settings(settings);
     }
 
     /// Evaluate one actor using the exact Scene 3D render path without changing
@@ -3077,6 +3115,7 @@ type EnvironmentBounds = ([f32; 3], [f32; 3]);
 
 struct SceneFrameRenderer {
     profile: SceneRenderProfile,
+    immediate_preview_settings: crate::preview::ImmediatePreviewSettings,
     asset_resolver: Arc<dyn AssetResolver>,
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -6724,6 +6763,7 @@ fn scene_camera_to_world_camera(
                 .transpose()?
                 .unwrap_or(target_distance);
             Ok::<WorldDepthOfField, MotionLoomSceneRenderError>(WorldDepthOfField {
+                max_blur_percent_height: optics.max_blur_unit.as_deref() == Some("percentHeight"),
                 focus_distance: (focus_distance
                     + eval_scene_number(&optics.focus_offset, time_norm, time_sec)?)
                 .max(0.05)
@@ -6958,6 +6998,7 @@ impl SceneFrameRenderer {
         let world_asset_resolver = asset_resolver.clone();
         Self {
             profile,
+            immediate_preview_settings: crate::preview::ImmediatePreviewSettings::default(),
             asset_resolver,
             font_system,
             swash_cache: SwashCache::new(),
@@ -7143,6 +7184,7 @@ impl SceneFrameRenderer {
         let world_asset_resolver = asset_resolver.clone();
         Self {
             profile,
+            immediate_preview_settings: crate::preview::ImmediatePreviewSettings::default(),
             asset_resolver,
             font_system,
             swash_cache: SwashCache::new(),
@@ -15500,12 +15542,18 @@ impl SceneFrameRenderer {
                         message: "GPU compositor was not initialized".to_string(),
                     }
                 })?;
-                let bloom_scale =
-                    if original.width >= 1280 && original.height >= 720 && params.sigma >= 10.0 {
-                        0.25
-                    } else {
-                        0.5
-                    };
+                let bloom_scale = match self.immediate_preview_settings.profile {
+                    crate::preview::ImmediatePreviewProfile::Portable => 0.25,
+                    crate::preview::ImmediatePreviewProfile::Balanced => {
+                        if original.width >= 1280 && original.height >= 720 && params.sigma >= 10.0
+                        {
+                            0.25
+                        } else {
+                            0.5
+                        }
+                    }
+                    crate::preview::ImmediatePreviewProfile::Cinematic => 0.5,
+                };
                 let result = compositor.apply_gpu_bloom_texture_low_res(
                     original,
                     params.threshold,

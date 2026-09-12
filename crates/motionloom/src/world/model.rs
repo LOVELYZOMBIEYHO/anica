@@ -281,6 +281,8 @@ pub struct WorldCamera {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorldDepthOfField {
+    #[serde(default)]
+    pub max_blur_percent_height: bool,
     pub focus_distance: String,
     pub focal_length_mm: String,
     pub f_stop: String,

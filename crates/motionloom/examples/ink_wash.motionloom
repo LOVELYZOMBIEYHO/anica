@@ -1,0 +1,32 @@
+<!-- ========================================= -->
+<!-- ========================================= -->
+<!-- crates/motionloom/examples/ink_wash.motionloom -->
+<Graph fps="30" duration="3s" size={[960,540]}>
+  <RenderStyle id="courtyard_ink">
+    <SurfaceStyle shading="ink_wash_soft_v1" />
+    <ColorStyle tint="#DDE5D7" tintStrength="0.15" saturation="0.75" />
+    <ToneStyle exposure="1.0" contrast="0.95" shadowColor="#293B38" highlightColor="#F1EBDD" toneStrength="0.65" />
+  </RenderStyle>
+  <Assets>
+    <MaterialAsset id="stone" baseColor="#B7C5BC" roughness="0.8" />
+    <PrimitiveAsset id="rock" shape="sphere" radius="1" material="stone" />
+    <PrimitiveAsset id="floor" shape="box" size={[10,0.2,8]} material="stone" />
+  </Assets>
+  <Background color="#F1EBDD" />
+  <Scene id="ink_study" renderStyle="courtyard_ink">
+    <Timeline>
+      <Track id="world" space="3d">
+        <Sequence duration="3s">
+      <CompositeGroup id="stage" space="3d" depth="true" format="rgba16f">
+        <Camera3D position={[4,2.8,6]} target={[0,0.7,0]} fov="45" />
+        <DirectionalLight direction={[-0.6,-1,-0.3]} intensity="3" castShadow="true" />
+        <Model asset="floor" position={[0,-0.15,0]} receiveShadow="true" />
+        <Model asset="rock" position={[-1,1,0]} castShadow="true" />
+        <Model asset="rock" position={[1,0.6,-1]} scale="0.6" castShadow="true" />
+      </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="ink_study" />
+</Graph>

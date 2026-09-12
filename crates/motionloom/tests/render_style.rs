@@ -4,6 +4,248 @@
 
 use motionloom::api::{parse_graph_script, resolve_scene_render_style};
 
+#[test]
+fn filmic_style_controls_roundtrip_and_reject_invalid_values() {
+    let resource = "<RenderStyle id=\"t\">\n<SurfaceStyle shading=\"filmic_physical_v1\" />\n<DepthOfFieldStyle preset=\"filmic_bokeh_v1\" aperture=\"0.00032\" maxBlur=\"0.0025\" />\n<PostStyle toneMapping=\"filmic_aces_v1\" />\n</RenderStyle>";
+    let source = script(resource, "renderStyle=\"t\"");
+    let graph = parse_graph_script(&source).unwrap();
+    let style = resolve_scene_render_style(&graph, "main").unwrap();
+    assert_eq!(
+        style.depth_of_field.as_ref().unwrap().aperture,
+        Some(0.00032)
+    );
+    assert_eq!(
+        style.depth_of_field.as_ref().unwrap().max_blur,
+        Some(0.0025)
+    );
+    let restored = serde_json::from_str(&serde_json::to_string(&graph).unwrap()).unwrap();
+    assert_eq!(
+        style,
+        resolve_scene_render_style(&restored, "main").unwrap()
+    );
+    for bad in [
+        source.replace("0.00032", "-1"),
+        source.replace("0.0025", "0.5"),
+        source.replace("filmic_bokeh_v1", "cinematic_bokeh_v1"),
+    ] {
+        assert!(parse_graph_script(&bad).is_err());
+    }
+    let report: serde_json::Value = serde_json::from_str(
+        &motionloom::api::motionloom_analyze_script_for_target_json(&source, "native-webgpu"),
+    )
+    .unwrap();
+    assert_eq!(report["summary"]["errors"], 0);
+    assert_eq!(report["summary"]["ignoredAttributes"], 0);
+}
+
+// Zero aperture must preserve pixels; a defocused subject must actually change.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+#[ignore = "requires a native GPU adapter"]
+fn filmic_bokeh_gpu_zero_aperture_and_disabled_camera_are_neutral() {
+    use motionloom::api::{SceneRenderProfile, SceneRenderer};
+    pollster::block_on(async {
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        let make = |aperture: f32, enabled: bool| {
+            parse_graph_script(&script(
+            &format!("<RenderStyle id=\"t\">\n<DepthOfFieldStyle preset=\"filmic_bokeh_v1\" aperture=\"{aperture}\" maxBlur=\"0.04\" />\n</RenderStyle>"),
+            "renderStyle=\"t\"").replace("fov=\"45\"", &format!("fov=\"45\" depthOfField=\"{enabled}\" focusDistance=\"1\""))).unwrap()
+        };
+        let off = renderer
+            .render_frame_gpu_readback(&make(0.01, false), 0)
+            .await
+            .unwrap();
+        let zero = renderer
+            .render_frame_gpu_readback(&make(0.0, true), 0)
+            .await
+            .unwrap();
+        let blurred = renderer
+            .render_frame_gpu_readback(&make(0.01, true), 0)
+            .await
+            .unwrap();
+        let changed = |a: &image::RgbaImage, b: &image::RgbaImage| {
+            a.pixels()
+                .zip(b.pixels())
+                .filter(|(a, b)| a.0.iter().zip(b.0).any(|(x, y)| x.abs_diff(y) > 2))
+                .count()
+        };
+        assert_eq!(changed(&off, &zero), 0, "zero aperture changed the source");
+        assert!(
+            changed(&off, &blurred) > 100,
+            "defocus had no meaningful effect"
+        );
+    });
+}
+
+// Universal controls must remain accepted and effective regardless of the preset.
+#[test]
+fn universal_style_roundtrip_and_legacy_defaults() {
+    for mode in [
+        "physical",
+        "stylized",
+        "toon",
+        "clay",
+        "cel",
+        "ink_wash_soft_v1",
+    ] {
+        let resource = format!(
+            "<RenderStyle id=\"u\">\n<SurfaceStyle shading=\"{mode}\" />\n<ColorStyle tint=\"#DDE5D7\" tintStrength=\"0.15\" saturation=\"0.75\" />\n<ToneStyle exposure=\"1\" contrast=\"0.95\" shadowColor=\"#293B38\" highlightColor=\"#F1EBDD\" toneStrength=\"0.65\" />\n</RenderStyle>"
+        );
+        let graph = parse_graph_script(&script(&resource, "renderStyle=\"u\"")).unwrap();
+        let style = resolve_scene_render_style(&graph, "main").unwrap();
+        assert!(style.universal.enabled);
+        assert_eq!(style.universal.tint_strength, 0.15);
+        assert_eq!(style.universal.tone_strength, 0.65);
+        let restored = serde_json::from_str(&serde_json::to_string(&graph).unwrap()).unwrap();
+        assert_eq!(
+            style,
+            resolve_scene_render_style(&restored, "main").unwrap()
+        );
+        let mut old = serde_json::to_value(&style).unwrap();
+        old.as_object_mut().unwrap().remove("universal");
+        let old: motionloom::render_style::ResolvedSceneRenderStyle =
+            serde_json::from_value(old).unwrap();
+        assert!(!old.universal.enabled);
+        assert_eq!(old.universal.exposure, 1.0);
+    }
+}
+
+#[test]
+fn universal_style_rejects_invalid_controls() {
+    for child in [
+        "<ColorStyle tint=\"red\" />",
+        "<ColorStyle tintStrength=\"1.1\" />",
+        "<ColorStyle saturation=\"-1\" />",
+        "<ColorStyle unknown=\"1\" />",
+        "<ToneStyle exposure=\"NaN\" />",
+        "<ToneStyle contrast=\"4\" />",
+        "<ToneStyle toneStrength=\"-0.1\" />",
+        "<ToneStyle highlightColor=\"#GGGGGG\" />",
+        "<ColorStyle />\n<ColorStyle />",
+        "<ToneStyle />\n<ToneStyle />",
+        "<SurfaceStyle shading=\"ink_typo\" />",
+    ] {
+        let resource = format!("<RenderStyle id=\"u\">\n{child}\n</RenderStyle>");
+        assert!(
+            parse_graph_script(&script(&resource, "renderStyle=\"u\"")).is_err(),
+            "accepted {child}"
+        );
+    }
+}
+
+#[test]
+fn ink_template_has_strict_authoring_coverage() {
+    let source = include_str!("../examples/ink_wash.motionloom");
+    let graph = parse_graph_script(source).unwrap();
+    assert_eq!(
+        resolve_scene_render_style(&graph, "ink_study")
+            .unwrap()
+            .shading,
+        "ink_wash_soft_v1"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &motionloom::api::motionloom_analyze_script_for_target_json(source, "native-webgpu"),
+    )
+    .unwrap();
+    assert_eq!(report["summary"]["errors"], 0);
+    assert_eq!(report["summary"]["unknownTags"], 0);
+    assert_eq!(report["summary"]["ignoredAttributes"], 0);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+#[ignore = "requires a native GPU adapter"]
+fn universal_controls_affect_every_preset_on_gpu() {
+    use motionloom::api::{SceneRenderProfile, SceneRenderer};
+    pollster::block_on(async {
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        let mut physical = None;
+        for mode in [
+            "physical",
+            "stylized",
+            "toon",
+            "clay",
+            "cel",
+            "ink_wash_soft_v1",
+        ] {
+            let source = |controls: &str| {
+                parse_graph_script(&script(
+                &format!("<RenderStyle id=\"u\">\n<SurfaceStyle shading=\"{mode}\" />\n{controls}\n</RenderStyle>"),
+                "renderStyle=\"u\"")).unwrap()
+            };
+            let base = renderer
+                .render_frame_gpu_readback(&source(""), 0)
+                .await
+                .unwrap();
+            let neutral = renderer
+                .render_frame_gpu_readback(&source("<ColorStyle />\n<ToneStyle />"), 0)
+                .await
+                .unwrap();
+            assert!(base == neutral, "neutral controls changed {mode}");
+            let red = renderer
+                .render_frame_gpu_readback(
+                    &source("<ColorStyle tint=\"#FF0000\" tintStrength=\"1\" />"),
+                    0,
+                )
+                .await
+                .unwrap();
+            let gray = renderer
+                .render_frame_gpu_readback(&source("<ColorStyle saturation=\"0\" />"), 0)
+                .await
+                .unwrap();
+            let black = renderer
+                .render_frame_gpu_readback(&source("<ToneStyle exposure=\"0\" />"), 0)
+                .await
+                .unwrap();
+            let blue = renderer.render_frame_gpu_readback(&source("<ToneStyle shadowColor=\"#0000FF\" highlightColor=\"#0000FF\" toneStrength=\"1\" />"), 0).await.unwrap();
+            let p = red.get_pixel(128, 96);
+            assert!(
+                p[0] > 10 && p[1] < 3 && p[2] < 3,
+                "tint failed for {mode}: {p:?}"
+            );
+            let p = gray.get_pixel(128, 96);
+            assert!(
+                p[0].abs_diff(p[1]) <= 1 && p[1].abs_diff(p[2]) <= 1,
+                "saturation failed for {mode}"
+            );
+            let p = black.get_pixel(128, 96);
+            assert!(
+                p[0] < 2 && p[1] < 2 && p[2] < 2,
+                "exposure failed for {mode}"
+            );
+            let p = blue.get_pixel(128, 96);
+            assert!(
+                p[0] < 3 && p[1] < 3 && p[2] > 240,
+                "tone map failed for {mode}"
+            );
+            if mode == "physical" {
+                physical = Some(base.clone());
+            }
+            if mode == "ink_wash_soft_v1" {
+                // A coloured material must not collapse into the old grey-green wash.
+                let original = physical.as_ref().unwrap().get_pixel(128, 96);
+                let painted = base.get_pixel(128, 96);
+                let chroma = |p: &image::Rgba<u8>| {
+                    *p.0[..3].iter().max().unwrap() - *p.0[..3].iter().min().unwrap()
+                };
+                assert!(
+                    chroma(painted) as f32 >= chroma(original) as f32 * 0.65,
+                    "ink must retain material colour: {original:?} -> {painted:?}"
+                );
+                let difference: usize = base
+                    .pixels()
+                    .zip(physical.as_ref().unwrap().pixels())
+                    .map(|(a, b)| (0..3).map(|i| a[i].abs_diff(b[i]) as usize).sum::<usize>())
+                    .sum();
+                assert!(
+                    difference > 100_000,
+                    "ink preset must differ visibly from physical"
+                );
+            }
+        }
+    });
+}
+
 // Exercise the solid-color GLB path, not just generated primitive textures.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]

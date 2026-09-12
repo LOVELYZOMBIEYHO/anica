@@ -3018,9 +3018,20 @@ fn parse_composite_group_block(
         }
         if starts_open_tag(line, "Camera3D") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let max_blur_unit = scene_optional_attr(&tag, &["maxBlurUnit"]);
+            if max_blur_unit
+                .as_deref()
+                .is_some_and(|v| !matches!(v, "pixels" | "percentHeight"))
+            {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "maxBlurUnit must be pixels or percentHeight".into(),
+                });
+            }
             let hidden_bones = parse_scene_camera_hidden_bones(&tag, i + 1)?;
             let depth_of_field = scene_bool_attr(&tag, &["depthOfField", "depth_of_field"], false)
                 .then(|| SceneDepthOfFieldNode {
+                    max_blur_unit,
                     enabled: true,
                     focus_target: scene_optional_attr(&tag, &["focusTarget", "focus_target"]),
                     focus_distance: scene_optional_attr(&tag, &["focusDistance", "focus_distance"]),
@@ -3215,11 +3226,14 @@ fn parse_composite_group_block(
             let tone_mapping =
                 scene_attr_or_default(&tag, &["toneMapping", "tone_mapping"], "aces")
                     .to_ascii_lowercase();
-            if !matches!(tone_mapping.as_str(), "aces" | "reinhard" | "none") {
+            if !matches!(
+                tone_mapping.as_str(),
+                "aces" | "filmic_aces_v1" | "reinhard" | "none"
+            ) {
                 return Err(GraphParseError {
                     line: i + 1,
                     message: format!(
-                        "Invalid <ColorManagement toneMapping=\"{tone_mapping}\">. Expected aces, reinhard, or none."
+                        "Invalid <ColorManagement toneMapping=\"{tone_mapping}\">. Expected aces, filmic_aces_v1, reinhard, or none."
                     ),
                 });
             }

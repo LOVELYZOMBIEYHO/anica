@@ -1,9 +1,20 @@
 # MotionLoom
 
+Native high-quality rendering is available through the opt-in `weaver` feature
+and `motionloom::api::weaver`; see [Weaver](src/weaver/README.md) for its current
+capabilities and validation notes. Immediate preview remains a separate path.
+
+The opt-in [filmic physical and lens presets](RENDER_STYLE.md#filmic-physical-and-lens-presets)
+provide `filmic_physical_v1`, `filmic_bokeh_v1` and `filmic_aces_v1` with a
+41-sample golden-angle bokeh kernel.
+
 Experimental [geometry tooling](GEOMETRY_TOOLING.md) provides UV inspection and
 camera-free static GLB export directly from existing Scene DSL.
 
 Scene-owned visual style resources are documented in [RENDER_STYLE.md](RENDER_STYLE.md).
+The `ink_wash_soft_v1` WGSL preset provides soft 3D-to-2D ink rendering.
+Optional `ColorStyle` and `ToneStyle` controls work across all GPU shading modes;
+start with the [ink template](examples/ink_wash.motionloom).
 Cel Shading adds controllable geometry outlines and per-model material-slot
 controls; see the Cel extension and its documented limitations in that guide.
 Use `<Scene renderStyle="id">`; Scenes without a style keep the renderer defaults.
@@ -505,8 +516,8 @@ Example retrieval → Syntax discovery → DSL authoring
 
 `motionloom_analyze_script_json()` returns parse and compile status,
 source-addressed diagnostics, effective behavior, and recommended repairs.
-Per-showcase `schema.json` files describe the syntax demonstrated by individual
-examples. The complete protocol is documented in
+Per-example `schema.json` files describe the syntax demonstrated by individual
+documents. The complete protocol is documented in
 [LLM_AUTHORING.md](LLM_AUTHORING.md).
 
 ## Visual Action Authoring
@@ -562,6 +573,8 @@ fallback or renderer-capability report.
 
 ## Documentation
 
+- [Immediate Preview](IMMEDIATE_PREVIEW.md) — retained rendering, host quality
+  profiles, capability reporting, and frame metrics
 - [Hair cards authoring](HAIR_CARDS.md): shared defaults, root normals, mirrored
   guides, absolute roll, curved normals, and closed tapered tips.
 
@@ -569,7 +582,7 @@ fallback or renderer-capability report.
 - [Public API](PUBLIC_API.md) — supported Rust integration surface
 - [Changelog](CHANGELOG.md) — release history
 - [Path DSL benchmark](benchmarks/path-dsl/README.md) — benchmark methodology
-- [MotionLoom examples](https://github.com/LOVELYZOMBIEYHO/motionloom-example) — portable core and showcase documents
+- [MotionLoom examples](https://github.com/LOVELYZOMBIEYHO/motionloom-example) — portable core example documents
 
 ## Contributing
 

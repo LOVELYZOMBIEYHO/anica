@@ -1,5 +1,21 @@
 # MotionLoom LLM Authoring Guide
 
+For S89 filmic physical rendering use `SurfaceStyle shading="filmic_physical_v1"`,
+`PostStyle toneMapping="filmic_aces_v1"`, and `DepthOfFieldStyle preset="filmic_bokeh_v1"
+aperture="0.00032" maxBlur="0.0025"`. Enable camera depthOfField and set
+focusDistance. These bokeh controls use normalized UV units; fStop and camera
+maxBlur do not drive this preset. See RENDER_STYLE.md for compatibility details.
+
+For preset ink rendering, author `<SurfaceStyle shading="ink_wash_soft_v1" />`
+inside a scene-referenced RenderStyle. Use optional ColorStyle (tint,
+tintStrength, saturation) and ToneStyle (exposure, contrast, shadowColor,
+highlightColor, toneStrength) for universal adjustments. These children work
+with every GPU shading mode, use literal values, and do not animate individually.
+Never invent a RenderStyle preset attribute. Legacy PostStyle and LightingStyle
+remain valid; universal controls compose afterwards. See [the exact contract and
+neutral defaults](RENDER_STYLE.md#ink-preset-and-universal-controls) and the
+[copyable template](examples/ink_wash.motionloom).
+
 FaceLayout is an attribute-free container for Eye, Eyebrow, Nose, Mouth, and Ear children.
 Use Eyebrow position/width/thickness/arch/tilt for ordinary brows; omit Texture
 to inspect the generated ribbon with the head material.

@@ -1920,7 +1920,14 @@ fn tag_variants(tag: &str) -> BTreeMap<String, ShowcaseTagVariantSchema> {
 fn is_style_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "RenderStyle" | "SurfaceStyle" | "OutlineStyle" | "LightingStyle" | "PostStyle"
+        "RenderStyle"
+            | "SurfaceStyle"
+            | "OutlineStyle"
+            | "LightingStyle"
+            | "PostStyle"
+            | "ColorStyle"
+            | "ToneStyle"
+            | "DepthOfFieldStyle"
     )
 }
 
@@ -2582,6 +2589,15 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Background" => strict(&["id", "color"]),
         "Scene" => strict(&["id", "size", "renderStyle"]),
         "RenderStyle" => strict(&["id"]),
+        "DepthOfFieldStyle" => strict(&["preset", "quality", "aperture", "maxBlur"]),
+        "ColorStyle" => strict(&["tint", "tintStrength", "saturation"]),
+        "ToneStyle" => strict(&[
+            "exposure",
+            "contrast",
+            "shadowColor",
+            "highlightColor",
+            "toneStrength",
+        ]),
         "SurfaceStyle" => strict(&[
             "shadowThreshold",
             "shadowFeather",
@@ -2652,6 +2668,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "fStop",
             "f_stop",
             "maxBlur",
+            "maxBlurUnit",
             "max_blur",
         ]),
         "Anchor" => strict(&[
@@ -3755,8 +3772,11 @@ const LAYOUT_ATTRIBUTES: &[&str] = &[
 ];
 
 const KNOWN_TAGS: &[&str] = &[
+    "DepthOfFieldStyle",
     "RenderStyle",
     "SurfaceStyle",
+    "ColorStyle",
+    "ToneStyle",
     "OutlineStyle",
     "LightingStyle",
     "PostStyle",

@@ -1,302 +1,13 @@
 // =========================================
 // =========================================
-// crates/motionloom/src/render_style.rs
+// crates/motionloom/src/render_style/resolve.rs
 
-//! Scene-owned visual styles. Authored values stay separate from resolved GPU
-//! defaults; no style is an exact opt-out, including for legacy SVG scenes.
+//! Resolve authored styles and lower them into scene-owned runtime payloads.
 
-use crate::dsl::{GraphParseError, GraphScript, attr_value, strip_wrappers};
+use super::model::*;
+use super::validation::{color, error, validate};
+use crate::dsl::{GraphParseError, GraphScript};
 use crate::scene::model::{Scene3DNode, SceneNode};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RenderStyleNode {
-    pub outline: Option<OutlineStyleNode>,
-    pub id: String,
-    pub surface: Option<SurfaceStyleNode>,
-    pub lighting: Option<LightingStyleNode>,
-    pub post: Option<PostStyleNode>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SurfaceStyleNode {
-    pub shadow_threshold: Option<f32>,
-    pub shadow_feather: Option<f32>,
-    pub shadow_color: Option<String>,
-    pub shading: Option<String>,
-    pub shading_steps: Option<u32>,
-    pub diffuse_wrap: Option<f32>,
-    pub rim_light: Option<f32>,
-    pub rim_power: Option<f32>,
-    pub specular: Option<f32>,
-    pub roughness_bias: Option<f32>,
-    pub saturation: Option<f32>,
-    pub outline: Option<String>,
-}
-
-/// Screen-width geometry outlines are independent of the base material.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct OutlineStyleNode {
-    pub enabled: Option<bool>,
-    pub method: Option<String>,
-    pub color: Option<String>,
-    pub width: Option<f32>,
-    pub distance_mode: Option<String>,
-}
-
-/// Optional material-slot controls travel with the actor, never rewrite a GLB.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CelMaterialSettings {
-    pub control_map: Option<String>,
-    pub role: Option<String>,
-    pub outline_width: Option<f32>,
-    pub shadow_color: Option<String>,
-    pub hair_highlight: Option<f32>,
-}
-
-pub(crate) fn parse_cel_material(
-    tag: &str,
-    line: usize,
-) -> Result<CelMaterialSettings, GraphParseError> {
-    let scalar = |key: &str| -> Result<Option<f32>, GraphParseError> {
-        attr_value(tag, key)
-            .map(|v| {
-                strip_wrappers(&v)
-                    .parse::<f32>()
-                    .map_err(|_| GraphParseError {
-                        line,
-                        message: format!("{key} must be a number"),
-                    })
-            })
-            .transpose()
-    };
-    let settings = CelMaterialSettings {
-        control_map: attr_value(tag, "celControlMap").map(|v| strip_wrappers(&v).to_owned()),
-        role: attr_value(tag, "celRole").map(|v| strip_wrappers(&v).to_owned()),
-        shadow_color: attr_value(tag, "celShadowColor").map(|v| strip_wrappers(&v).to_owned()),
-        outline_width: scalar("outlineWidth")?,
-        hair_highlight: scalar("hairHighlight")?,
-    };
-    one_of(
-        settings.role.as_deref(),
-        &["body", "skin", "hair", "face"],
-        "celRole",
-    )?;
-    range(settings.outline_width, 0.0, 12.0, "outlineWidth")?;
-    range(settings.hair_highlight, 0.0, 2.0, "hairHighlight")?;
-    if let Some(c) = &settings.shadow_color {
-        color(c)?;
-    }
-    if settings.role.as_deref() == Some("face") && settings.control_map.is_none() {
-        return Err(GraphParseError {
-            line,
-            message: "celRole=face requires celControlMap (ImageAsset id)".into(),
-        });
-    }
-    Ok(settings)
-}
-
-pub(crate) fn cel_color(value: &str) -> [f32; 3] {
-    // Authored colors have already passed validation.
-    color(value).unwrap_or([0.4, 0.37, 0.5])
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LightingStyleNode {
-    pub preset: Option<String>,
-    pub ambient_intensity: Option<f32>,
-    pub ambient_color: Option<String>,
-    pub shadow_style: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PostStyleNode {
-    pub tone_mapping: Option<String>,
-    pub exposure: Option<f32>,
-    pub saturation: Option<f32>,
-    pub contrast: Option<f32>,
-    pub white_balance: Option<f32>,
-    pub bloom_threshold: Option<f32>,
-    pub bloom_intensity: Option<f32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResolvedCelStyle {
-    pub shadow_threshold: f32,
-    pub shadow_feather: f32,
-    pub shadow_color: [f32; 3],
-    pub outline_width: f32,
-    pub outline_color: [f32; 3],
-}
-impl Default for ResolvedCelStyle {
-    fn default() -> Self {
-        Self {
-            shadow_threshold: 0.5,
-            shadow_feather: 0.025,
-            shadow_color: [0.4, 0.37, 0.5],
-            outline_width: 0.0,
-            outline_color: [0.0; 3],
-        }
-    }
-}
-
-/// A serializable report, not an alternative authoring source of truth.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResolvedSceneRenderStyle {
-    #[serde(default)]
-    pub cel: ResolvedCelStyle,
-    pub scene_id: String,
-    pub style_id: Option<String>,
-    pub shading: String,
-    pub shading_steps: u32,
-    pub diffuse_wrap: f32,
-    pub rim_light: f32,
-    pub rim_power: f32,
-    pub specular: f32,
-    pub roughness_bias: f32,
-    pub surface_saturation: f32,
-    pub ambient_intensity: f32,
-    pub ambient_color: [f32; 3],
-    pub hard_shadows: bool,
-    pub lighting_preset: Option<String>,
-    pub post: PostStyleNode,
-    /// Explicit nodes own their complete setting group, including defaults.
-    pub overrides: Vec<RenderStyleOverride>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RenderStyleOverride {
-    pub island_id: Option<String>,
-    pub property: String,
-    pub style_value: serde_json::Value,
-    /// Retains expressions; this is compile-time evidence, not a sampled frame.
-    pub final_expression: String,
-    pub source: String,
-}
-
-fn error(message: impl Into<String>) -> GraphParseError {
-    GraphParseError {
-        line: 1,
-        message: message.into(),
-    }
-}
-
-// Reuse the DSL attribute lexer, then deserialize into strict typed children.
-fn attributes<T: serde::de::DeserializeOwned>(
-    tag: &str,
-    line: usize,
-) -> Result<T, GraphParseError> {
-    let mut values = serde_json::Map::new();
-    for key in crate::dsl::tag_attribute_names(tag) {
-        if values.contains_key(&key) {
-            return Err(error(format!("Duplicate style attribute {key}")));
-        }
-        let raw = attr_value(tag, &key).unwrap_or_default();
-        let raw = strip_wrappers(&raw);
-        let value = raw
-            .parse::<serde_json::Number>()
-            .map(serde_json::Value::Number)
-            .unwrap_or_else(|_| match raw {
-                "true" if key == "enabled" => serde_json::Value::Bool(true),
-                "false" if key == "enabled" => serde_json::Value::Bool(false),
-                _ => serde_json::Value::String(raw.to_string()),
-            });
-        values.insert(key, value);
-    }
-    serde_json::from_value(serde_json::Value::Object(values)).map_err(|e| GraphParseError {
-        line,
-        message: format!("Render style: {e}"),
-    })
-}
-
-pub(crate) fn parse_resource(
-    lines: &[&str],
-    start: usize,
-) -> Result<(serde_json::Value, usize), GraphParseError> {
-    let name = "RenderStyle";
-    let (open, end) = crate::dsl::collect_tag_block(lines, start, '>', false)?;
-    let mut root: serde_json::Value = attributes(&open, start + 1)?;
-    let id = root.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if id.is_empty() || id.starts_with("__ml_style_") {
-        return Err(error(
-            "Style id must be nonempty and not use reserved __ml_style_ prefix",
-        ));
-    }
-    let mut i = end + 1;
-    while i < lines.len() {
-        let text = lines[i].trim();
-        if text == format!("</{name}>") {
-            return Ok((root, i));
-        }
-        if text.is_empty() || text.starts_with("//") || text.starts_with("<!--") {
-            i += 1;
-            continue;
-        }
-        let (tag, last) = crate::dsl::collect_tag_block(lines, i, '>', false)?;
-        if !tag.trim_end().ends_with("/>") {
-            return Err(error("Style children must be self-closing"));
-        }
-        let child = tag
-            .trim_start_matches('<')
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
-        let field = match child {
-            "SurfaceStyle" => "surface",
-            "OutlineStyle" => "outline",
-            "LightingStyle" => "lighting",
-            "PostStyle" => "post",
-            _ => return Err(error(format!("Unsupported {name} child {child}"))),
-        };
-        if root.get(field).is_some() {
-            return Err(error(format!("Duplicate {child}")));
-        }
-        root[field] = attributes(&tag, i + 1)?;
-        i = last + 1;
-    }
-    Err(error(format!("Missing </{name}>")))
-}
-
-fn one_of(value: Option<&str>, allowed: &[&str], property: &str) -> Result<(), GraphParseError> {
-    if let Some(value) = value {
-        if !allowed.contains(&value) {
-            return Err(error(format!(
-                "Invalid {property}={value}; expected {}",
-                allowed.join(" | ")
-            )));
-        }
-    }
-    Ok(())
-}
-fn range(value: Option<f32>, min: f32, max: f32, property: &str) -> Result<(), GraphParseError> {
-    if value.is_some_and(|v| !v.is_finite() || v < min || v > max) {
-        return Err(error(format!(
-            "{property} must be finite in [{min}, {max}]"
-        )));
-    }
-    Ok(())
-}
-fn color(value: &str) -> Result<[f32; 3], GraphParseError> {
-    let hex = value
-        .strip_prefix('#')
-        .filter(|v| v.len() == 6)
-        .ok_or_else(|| error("Style color must be #RRGGBB"))?;
-    let n = u32::from_str_radix(hex, 16).map_err(|_| error("Invalid style color"))?;
-    Ok([
-        ((n >> 16) & 255) as f32 / 255.0,
-        ((n >> 8) & 255) as f32 / 255.0,
-        (n & 255) as f32 / 255.0,
-    ])
-}
 
 /// Resolve one Scene without changing the authored graph.
 pub fn resolve_scene_render_style(
@@ -353,7 +64,39 @@ pub fn resolve_scene_render_style(
             .transpose()?
             .unwrap_or([0.0; 3]),
     };
+    let mut universal = ResolvedUniversalStyle::default();
+    if let Some(c) = style.and_then(|s| s.color.as_ref()) {
+        universal.enabled = true;
+        universal.tint = c
+            .tint
+            .as_deref()
+            .map(color)
+            .transpose()?
+            .unwrap_or([1.0; 3]);
+        universal.tint_strength = c.tint_strength.unwrap_or(0.0);
+        universal.saturation = c.saturation.unwrap_or(1.0);
+    }
+    if let Some(t) = style.and_then(|s| s.tone.as_ref()) {
+        universal.enabled = true;
+        universal.exposure = t.exposure.unwrap_or(1.0);
+        universal.contrast = t.contrast.unwrap_or(1.0);
+        universal.shadow_color = t
+            .shadow_color
+            .as_deref()
+            .map(color)
+            .transpose()?
+            .unwrap_or([0.0; 3]);
+        universal.highlight_color = t
+            .highlight_color
+            .as_deref()
+            .map(color)
+            .transpose()?
+            .unwrap_or([1.0; 3]);
+        universal.tone_strength = t.tone_strength.unwrap_or(0.0);
+    }
     let mut r = ResolvedSceneRenderStyle {
+        depth_of_field: style.and_then(|s| s.depth_of_field.clone()),
+        universal,
         cel,
         scene_id: scene_id.into(),
         style_id: scene.render_style.clone(),
@@ -491,120 +234,6 @@ fn collect_overrides(nodes: &[SceneNode], r: &mut ResolvedSceneRenderStyle) {
         collect_overrides(children, r);
     }
 }
-
-/// Validate every declaration, including unused styles, before GPU work starts.
-pub(crate) fn validate(graph: &GraphScript) -> Result<(), GraphParseError> {
-    let mut ids = std::collections::HashSet::new();
-    for s in &graph.render_styles {
-        if !ids.insert(&s.id) {
-            return Err(error(format!("Duplicate RenderStyle id {}", s.id)));
-        }
-        if let Some(s) = &s.surface {
-            one_of(
-                s.shading.as_deref(),
-                &["physical", "stylized", "toon", "clay", "cel"],
-                "shading",
-            )?;
-            one_of(s.outline.as_deref(), &["none"], "outline (V1)")?;
-            range(s.shading_steps.map(|v| v as f32), 2.0, 16.0, "shadingSteps")?;
-            for (v, min, max, name) in [
-                (s.diffuse_wrap, 0.0, 1.0, "diffuseWrap"),
-                (s.rim_light, 0.0, 4.0, "rimLight"),
-                (s.rim_power, 0.1, 32.0, "rimPower"),
-                (s.specular, 0.0, 4.0, "specular"),
-                (s.roughness_bias, -1.0, 1.0, "roughnessBias"),
-                (s.saturation, 0.0, 3.0, "saturation"),
-            ] {
-                range(v, min, max, name)?;
-            }
-        }
-        if let Some(surface) = &s.surface {
-            range(surface.shadow_threshold, 0.0, 1.0, "shadowThreshold")?;
-            range(surface.shadow_feather, 0.001, 0.5, "shadowFeather")?;
-            if let Some(c) = &surface.shadow_color {
-                color(c)?;
-            }
-        }
-        if let Some(o) = &s.outline {
-            one_of(o.method.as_deref(), &["geometry"], "outline method")?;
-            one_of(
-                o.distance_mode.as_deref(),
-                &["screen"],
-                "outline distanceMode",
-            )?;
-            range(o.width, 0.0, 12.0, "outline width")?;
-            if let Some(c) = &o.color {
-                color(c)?;
-            }
-            if o.enabled == Some(true)
-                && s.surface.as_ref().and_then(|v| v.outline.as_deref()) == Some("none")
-            {
-                return Err(error(
-                    "OutlineStyle enabled conflicts with SurfaceStyle outline=none",
-                ));
-            }
-        }
-        if let Some(l) = &s.lighting {
-            one_of(
-                l.preset.as_deref(),
-                &["neutral", "soft_sunlight", "cinematic", "overcast", "night"],
-                "lighting preset",
-            )?;
-            one_of(l.shadow_style.as_deref(), &["hard", "soft"], "shadowStyle")?;
-            range(l.ambient_intensity, 0.0, 10.0, "ambientIntensity")?;
-            if let Some(v) = &l.ambient_color {
-                color(v)?;
-            }
-        }
-        if let Some(p) = &s.post {
-            one_of(
-                p.tone_mapping.as_deref(),
-                &["none", "aces", "reinhard"],
-                "toneMapping",
-            )?;
-            for (v, min, max, name) in [
-                (p.exposure, 0.0, 32.0, "exposure"),
-                (p.saturation, 0.0, 3.0, "saturation"),
-                (p.contrast, 0.0, 3.0, "contrast"),
-                (p.white_balance, 1000.0, 40000.0, "whiteBalance"),
-                (p.bloom_threshold, 0.0, 32.0, "bloomThreshold"),
-                (p.bloom_intensity, 0.0, 4.0, "bloomIntensity"),
-            ] {
-                range(v, min, max, name)?;
-            }
-        }
-    }
-    for s in &graph.scenes {
-        resolve_scene_render_style(graph, &s.id)?;
-    }
-    // Discrete Scene style keys must resolve before playback starts.
-    for target in graph
-        .animation_targets
-        .iter()
-        .filter(|target| target.property == "renderStyle")
-    {
-        if !graph.scenes.iter().any(|scene| scene.id == target.node) {
-            return Err(error(format!(
-                "AnimationTarget renderStyle references unknown Scene {}",
-                target.node
-            )));
-        }
-        for key in &target.keys {
-            if !graph
-                .render_styles
-                .iter()
-                .any(|style| style.id == key.value)
-            {
-                return Err(error(format!(
-                    "AnimationTarget renderStyle references unknown RenderStyle {}",
-                    key.value
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 // Lower once into per-island compiler payloads, never into shared materials.
 // Explicit ColorManagement owns its complete group; it is evaluated later so
 // animated keys always remain authoritative.
