@@ -75,7 +75,7 @@
 
 // Audio adapters share one timeline and mixer across native and browser hosts.
 #[cfg(all(feature = "weaver", not(target_arch = "wasm32")))]
-pub use crate::weaver as weaver;
+pub use crate::weaver;
 
 pub use crate::audio::{
     AudioClipNode, AudioError, AudioKeyNode, AudioMixer, AudioTargetNode, AudioTimelinePlan,
