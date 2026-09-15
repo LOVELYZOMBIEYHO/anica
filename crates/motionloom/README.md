@@ -18,8 +18,10 @@ start with the [ink template](examples/ink_wash.motionloom).
 Cel Shading adds controllable geometry outlines and per-model material-slot
 controls; see the Cel extension and its documented limitations in that guide.
 Use `<Scene renderStyle="id">`; Scenes without a style keep the renderer defaults.
+An authored RenderStyle opts out of anti-aliasing unless it contains an explicit
+`AntiAliasingStyle`; this keeps AA cost visible in LLM-authored scenes.
 Immediate GPU preview uses semantic material mipmaps, independent material AO,
-and HDR intermediates without additional DSL settings; see
+and HDR intermediates; anti-aliasing is explicitly authored per RenderStyle; see
 [scope and validation](IMMEDIATE_PREVIEW.md).
 
 MotionLoom is an agent-native motion graphics and compositing engine for Rust
@@ -430,6 +432,54 @@ directly under `<Graph>` and referenced `action="formal_bow"`. After moving
 that unchanged block under an external `<ActionLibrary>` root, declare the
 selection in the Graph and reference `action="performance.formal_bow"`.
 
+Props follow animated bones through a Graph-level inline attachment pair:
+
+```xml
+<Attachment id="hero_sword_left_grip" object="sword">
+  <Socket id="grip"
+          position={[0,-0.12,0]}
+          rotation={[0,0,90]} />
+  <Attach target="character.hand_l"
+          mode="snap"
+          positionWeight="1"
+          rotationWeight="1" />
+</Attachment>
+```
+
+For a two-handed prop, one primary grip drives the object and a secondary grip
+drives the other hand through the existing humanoid IK solver:
+
+```xml
+<Attachment id="hero_sword" object="sword">
+  <Socket id="main_grip" position={[0,-0.12,0]} />
+  <Socket id="support_grip" position={[0,0.18,0]} />
+  <Attach socket="main_grip" target="hero.hand_r"
+          mode="snap" drive="object" />
+  <Attach socket="support_grip" target="hero.hand_l"
+          mode="ik" drive="target"
+          positionWeight="1" rotationWeight="0.8" maxStretch="1.05" />
+</Attachment>
+```
+
+`Socket` is local to the attached Model and identifies the point that must
+meet the target bone. `Attach.target` uses `model-id.canonical-bone`, so
+`hand_l` and `hand_r` work through the target ModelProfile rather than raw GLB
+node names. Evaluation happens after Action sampling and contact constraints,
+then before render transforms and motion vectors. Both ordinary Models and a
+Model whose asset is a rigid CompoundAsset are supported. Each Attachment has
+exactly one `drive="object" mode="snap"` primary grip. Additional
+`drive="target" mode="ik"` grips move their target arms without moving or
+stretching the weapon. `maxStretch` bounds unreachable IK requests and defaults
+to `1.05`; the weights default to `1`. Set
+`MOTIONLOOM_ATTACHMENT_DIAGNOSTICS=1` on native diagnostic runs to report a
+clamped target with its measured and allowed reach; normal preview stays quiet.
+
+Migration from the old prop workaround is mechanical: remove the prop's copied
+Skeleton and duplicate `ApplyAction`, keep the prop as one Model, and replace
+them with one `Attachment`. Socket data belongs to the relationship, so the
+asset remains reusable and no standalone Socket or Action metadata tag is
+introduced.
+
 `humanoid_v1` full body conformance requires the 22 canonical body bones,
 including separate `chest` and `upper_chest` joints. Its 30 named finger bones
 are canonical but optional: an Action that does not key fingers remains fully
@@ -624,7 +674,8 @@ position-derived coordinates used before this addition.
 `HeadDome`, `FaceLayout`, and `FacialCage` declarations; Rust expands them to the
 same control-cage IR on native and WASM. This is not automatic retopology or a
 facial rig. See [Facial and subdivision cages](FACIAL_CAGES.md),
-[PUBLIC_API.md](PUBLIC_API.md), and S86 for both authoring levels.
+[PUBLIC_API.md](PUBLIC_API.md), [Mesh authoring API](MESH_AUTHORING.md), and S86
+for both authoring levels.
 `FaceLayout` contains explicit `Eye`, `Eyebrow`, `Nose`, `Mouth`, and `Ear` components.
 `Eyebrow` generates a curved ribbon from position, width, thickness, arch, and
 tilt; optional nested `Texture` follows it, otherwise it inherits head material.

@@ -1,5 +1,55 @@
 # Scene RenderStyle (V1)
 
+## Anti-aliasing
+
+```xml
+<RenderStyle id="clean_motion">
+  <SurfaceStyle shading="filmic_physical_v1" />
+  <AntiAliasingStyle method="taa" quality="high" fallback="smaa" sharpness="0.15" />
+</RenderStyle>
+```
+
+`method` accepts `auto`, `off`, `fxaa`, `smaa`, `msaa`, `taa`, or `ssaa`.
+`quality` accepts `low`, `medium`, `high`, or `ultra`; `sharpness` is in `[0,1]`.
+Safe fallbacks are `auto`, `off`, `fxaa`, and `smaa`. Preview profiles may
+downgrade an expensive request. Native and Web immediate preview currently run
+true FXAA, spatial morphology AA, and depth/normal/velocity-rejected TAA.
+
+| Method | Low | Medium | High | Ultra |
+| --- | --- | --- | --- | --- |
+| FXAA | fast | balanced | precise | precise |
+| SMAA | basic | edge + blend | wider edge search | wider edge search |
+| MSAA intent | 2x | 2x | 4x | 8x |
+| TAA | no jitter | 2 phases | 4 phases | 8 phases |
+| SSAA intent | 1.25x | 1.5x | 2x | 4x |
+
+FXAA and spatial morphology AA use discrete shader thresholds and search cost,
+so Low, Medium and High produce measurably different pixels; their documented
+High and Ultra modes intentionally match. TAA uses a bounded sub-pixel pattern,
+stable-grid history, and de-jittered physical velocity so its phase count does
+not become whole-frame camera shake.
+`msaa` and `ssaa` are accepted portable intents but currently report and use
+their fallback in immediate preview. Fallback quality is retained, so spatial
+fallbacks still follow the Low/Medium/High shader tiers, but they are not
+presented as native 2x/4x/8x or supersampled rendering. Weaver resolves edge sampling through its
+per-pixel sample job. A RenderStyle without `AntiAliasingStyle` resolves to `off`.
+Only a Scene without any RenderStyle retains the host preview AA policy.
+
+Migration example:
+
+```xml
+<!-- Before: AA is now intentionally off. -->
+<RenderStyle id="old_style">
+  <SurfaceStyle shading="physical" />
+</RenderStyle>
+
+<!-- After: opt into an explicit, portable AA policy. -->
+<RenderStyle id="old_style_with_aa">
+  <SurfaceStyle shading="physical" />
+  <AntiAliasingStyle method="taa" quality="high" fallback="smaa" sharpness="0.1" />
+</RenderStyle>
+```
+
 ## Filmic physical and lens presets
 
 ```xml
@@ -96,6 +146,12 @@ bloom, run after this island resolve. They can intentionally alter the result.
 Before: `<SurfaceStyle shading="physical" />` with optional legacy children.
 After: the same source remains valid and unchanged; optionally add ColorStyle
 and ToneStyle or choose ink_wash_soft_v1. Omitted/new empty controls are neutral.
+
+`SurfaceStyle shading="pbr_npr_soft_v1"` keeps the filmic PBR material and
+lighting path, then applies restrained painterly tone simplification, bilateral
+colour softening and soft normal/depth accents. It preserves metallic and
+specular highlights and deliberately does not draw a hard outline. Universal
+`ColorStyle` and `ToneStyle` controls run after the preset.
 Old serialized graphs and resolved reports default to disabled neutral universal
 controls. Older engine versions do not understand the new tags/preset and must
 be rebuilt before loading such a document. CPU-only previews are not a reference
@@ -141,7 +197,7 @@ changes. All identifiers are case-sensitive.
 
 | Child | Supported attributes |
 | --- | --- |
-| SurfaceStyle | shading: physical/stylized/toon/clay/cel/ink_wash_soft_v1; shadingSteps: integer 2–16; diffuseWrap: 0–1; rimLight: 0–4; rimPower: 0.1–32; specular: 0–4; roughnessBias: −1–1; saturation: 0–3; outline: none; shadowThreshold: 0–1; shadowFeather: 0.001–0.5; shadowColor: #RRGGBB |
+| SurfaceStyle | shading: physical/stylized/toon/clay/cel/ink_wash_soft_v1/pbr_npr_soft_v1; shadingSteps: integer 2–16; diffuseWrap: 0–1; rimLight: 0–4; rimPower: 0.1–32; specular: 0–4; roughnessBias: −1–1; saturation: 0–3; outline: none; shadowThreshold: 0–1; shadowFeather: 0.001–0.5; shadowColor: #RRGGBB |
 | OutlineStyle | enabled: true/false; method: geometry; width: 0–12 output pixels; color: #RRGGBB; distanceMode: screen |
 | LightingStyle | preset: neutral/soft_sunlight/cinematic/overcast/night; ambientIntensity: 0–10; ambientColor: #RRGGBB; shadowStyle: hard/soft |
 | PostStyle | toneMapping: none/reinhard/aces; exposure: 0–32 (existing linear multiplier, **not EV**); saturation: 0–3; contrast: 0–3; whiteBalance: 1000–40000 K; bloomThreshold: 0–32; bloomIntensity: 0–4 |

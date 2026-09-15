@@ -95,6 +95,18 @@ pub fn resolve_scene_render_style(
         universal.tone_strength = t.tone_strength.unwrap_or(0.0);
     }
     let mut r = ResolvedSceneRenderStyle {
+        anti_aliasing: style.map(|style| {
+            style
+                .anti_aliasing
+                .as_ref()
+                .map(|aa| ResolvedAntiAliasingStyle {
+                    method: aa.method.clone().unwrap_or_else(|| "auto".into()),
+                    quality: aa.quality.clone().unwrap_or_else(|| "medium".into()),
+                    fallback: aa.fallback.clone().unwrap_or_else(|| "auto".into()),
+                    sharpness: aa.sharpness.unwrap_or(0.0),
+                })
+                .unwrap_or_default()
+        }),
         depth_of_field: style.and_then(|s| s.depth_of_field.clone()),
         universal,
         cel,

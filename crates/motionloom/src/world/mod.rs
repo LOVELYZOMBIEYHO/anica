@@ -15,8 +15,9 @@ pub use gltf_loader::{
 };
 pub use model::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldApplyAction,
-    WorldAtmosphereFog, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
-    WorldCamera, WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldColorManagement,
+    WorldAtmosphereFog, WorldAttachment, WorldAttachmentSocket, WorldAttachmentTarget,
+    WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera,
+    WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldColorManagement,
     WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind,
     WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
     WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetarget, WorldRetargetMap,

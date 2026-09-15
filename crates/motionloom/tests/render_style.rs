@@ -87,6 +87,7 @@ fn universal_style_roundtrip_and_legacy_defaults() {
         "clay",
         "cel",
         "ink_wash_soft_v1",
+        "pbr_npr_soft_v1",
     ] {
         let resource = format!(
             "<RenderStyle id=\"u\">\n<SurfaceStyle shading=\"{mode}\" />\n<ColorStyle tint=\"#DDE5D7\" tintStrength=\"0.15\" saturation=\"0.75\" />\n<ToneStyle exposure=\"1\" contrast=\"0.95\" shadowColor=\"#293B38\" highlightColor=\"#F1EBDD\" toneStrength=\"0.65\" />\n</RenderStyle>"
@@ -167,6 +168,7 @@ fn universal_controls_affect_every_preset_on_gpu() {
             "clay",
             "cel",
             "ink_wash_soft_v1",
+            "pbr_npr_soft_v1",
         ] {
             let source = |controls: &str| {
                 parse_graph_script(&script(

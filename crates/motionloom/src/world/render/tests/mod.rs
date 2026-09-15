@@ -499,13 +499,93 @@ fn temporal_velocity_separates_projection_jitter_from_physical_motion() {
     assert!(super::WGPU_WORLD_SHADER.contains("@location(11) current_clip"));
     assert!(super::WGPU_WORLD_SHADER.contains("input.current_clip.xy / input.current_clip.w"));
     assert!(!super::WGPU_WORLD_SHADER.contains("let current_uv = input.pos.xy / params.canvas.xy"));
+    assert!(super::WGPU_WORLD_SHADER.contains(
+        "velocity = current_uv - previous_uv\n                - (lighting.preview1.xy - lighting.preview1.zw) / params.canvas.xy"
+    ));
     assert!(
         super::WGPU_WORLD_DOF_SHADER
-            .contains("let speed_pixels = length(preview_physical_velocity(uv) * dimensions)")
+            .contains("let physical_velocity = preview_physical_velocity(sample_uv)")
     );
-    assert!(super::WGPU_WORLD_DOF_SHADER.contains(
-        "preview_velocity(uv) - (lighting.preview1.xy - lighting.preview1.zw) / dimensions"
-    ));
+    assert!(super::WGPU_WORLD_DOF_SHADER.contains("return preview_velocity(uv)"));
+}
+
+#[test]
+fn authored_anti_aliasing_overrides_host_policy_and_portable_falls_back() {
+    let source = r#"<Graph fps={30} duration="1s" size={[320,180]}>
+  <RenderStyle id="styled_off"><SurfaceStyle shading="physical" /></RenderStyle>
+  <RenderStyle id="styled_taa">
+    <AntiAliasingStyle method="taa" quality="high" fallback="smaa" sharpness="0.2" />
+  </RenderStyle>
+  <Scene id="off_scene" renderStyle="styled_off"></Scene>
+  <Scene id="taa_scene" renderStyle="styled_taa"></Scene>
+  <Present from="off_scene" />
+</Graph>"#
+        .replace("><", ">\n<");
+    let graph = crate::dsl::parse_graph_script(&source).unwrap();
+    let balanced = crate::preview::ImmediatePreviewSettings::default();
+    let host = super::resolve_effective_anti_aliasing(None, balanced);
+    assert_eq!(host.requested, "host");
+    assert!(host.temporal);
+
+    let off_style = crate::render_style::resolve_scene_render_style(&graph, "off_scene").unwrap();
+    let off = super::resolve_effective_anti_aliasing(Some(&off_style), balanced);
+    assert_eq!(off.spatial_selector, 0.0);
+    assert!(!off.temporal);
+
+    let taa_style = crate::render_style::resolve_scene_render_style(&graph, "taa_scene").unwrap();
+    let taa = super::resolve_effective_anti_aliasing(Some(&taa_style), balanced);
+    assert!(taa.temporal);
+    assert_eq!(taa.jitter_phases, 4);
+    assert_eq!(taa.sharpness, 0.2);
+
+    let portable = crate::preview::ImmediatePreviewSettings {
+        profile: crate::preview::ImmediatePreviewProfile::Portable,
+        ..Default::default()
+    };
+    let fallback = super::resolve_effective_anti_aliasing(Some(&taa_style), portable);
+    assert!(!fallback.temporal);
+    assert_eq!(fallback.spatial_selector, 2.0);
+}
+
+#[test]
+fn unavailable_multisample_methods_report_a_spatial_fallback() {
+    let style = crate::render_style::ResolvedSceneRenderStyle {
+        anti_aliasing: Some(crate::render_style::ResolvedAntiAliasingStyle {
+            method: "msaa".into(),
+            quality: "ultra".into(),
+            fallback: "auto".into(),
+            sharpness: 0.1,
+        }),
+        depth_of_field: None,
+        universal: Default::default(),
+        cel: Default::default(),
+        scene_id: "test".into(),
+        style_id: Some("test".into()),
+        shading: "physical".into(),
+        shading_steps: 3,
+        diffuse_wrap: 0.0,
+        rim_light: 0.0,
+        rim_power: 3.0,
+        specular: 1.0,
+        roughness_bias: 0.0,
+        surface_saturation: 1.0,
+        ambient_intensity: 1.0,
+        ambient_color: [1.0; 3],
+        hard_shadows: false,
+        lighting_preset: None,
+        post: Default::default(),
+        overrides: Vec::new(),
+    };
+    let effective = super::resolve_effective_anti_aliasing(
+        Some(&style),
+        crate::preview::ImmediatePreviewSettings {
+            profile: crate::preview::ImmediatePreviewProfile::Cinematic,
+            ..Default::default()
+        },
+    );
+    assert_eq!(effective.requested, "msaa");
+    assert_eq!(effective.effective, "smaa");
+    assert!(effective.fallback_used);
 }
 
 #[test]
@@ -685,6 +765,7 @@ fn multiple_glb_clip_layers_crossfade_in_source_order() {
         apply_actions: Vec::new(),
         animation_assets: Vec::new(),
         constraints: Vec::new(),
+        attachments: Vec::new(),
         lighting: crate::world::WorldLighting::default(),
         present: crate::world::WorldPresent {
             from: String::new(),
@@ -1042,6 +1123,7 @@ fn external_humanoid_clip_maps_rotation_to_canonical_target_bone() {
             clip: Some("Walk".to_string()),
         }],
         constraints: Vec::new(),
+        attachments: Vec::new(),
         lighting: crate::world::WorldLighting::default(),
         present: crate::world::WorldPresent {
             from: String::new(),
@@ -1664,4 +1746,22 @@ fn terrain_rgba_blend_weights_cover_all_four_layers() {
     assert_eq!(leaf_litter, vec![0.0, 0.0, 0.0, 1.0]);
     let empty = super::terrain_blend_weights(&[0, 0, 0, 0], 4);
     assert_eq!(empty, vec![1.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn attachment_rotation_weight_uses_shortest_quaternion_path() {
+    let identity = [0.0, 0.0, 0.0, 1.0];
+    let same_rotation_with_opposite_sign = [0.0, 0.0, 0.0, -1.0];
+    let halfway = super::quat_slerp_shortest(identity, same_rotation_with_opposite_sign, 0.5);
+    assert!((halfway[3].abs() - 1.0).abs() < 1.0e-6);
+    assert!(halfway[..3].iter().all(|value| value.abs() < 1.0e-6));
+}
+
+#[test]
+fn attachment_parent_delta_keeps_compound_children_rigid() {
+    let quarter_turn = super::actor_yxz_quaternion(0.0, 90.0, 0.0);
+    let rotated = super::mat4_transform_point(super::mat4_from_quat(quarter_turn), [1.0, 0.0, 0.0]);
+    assert!(rotated[0].abs() < 1.0e-5);
+    assert!(rotated[1].abs() < 1.0e-5);
+    assert!((rotated[2] + 1.0).abs() < 1.0e-5);
 }

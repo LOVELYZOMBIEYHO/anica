@@ -195,6 +195,9 @@ pub struct Scene3DFrameProfile {
     pub temporal_antialiasing: bool,
     pub screen_space_reflections: bool,
     pub motion_blur: bool,
+    pub anti_aliasing_requested: &'static str,
+    pub anti_aliasing_effective: &'static str,
+    pub anti_aliasing_fallback_used: bool,
     /// Approximate bytes held by frame-sized color/depth targets and the
     /// active shadow target. Retained mesh/texture caches are reported
     /// separately because their allocations are asset-dependent.
@@ -935,6 +938,9 @@ struct ActorBuildStages {
 struct PreparedDrawStats {
     visible_triangles: u64,
     light_count: usize,
+    anti_aliasing_requested: &'static str,
+    anti_aliasing_effective: &'static str,
+    anti_aliasing_fallback_used: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -1390,7 +1396,8 @@ impl WorldFrameRenderer {
             return Ok(canvas.expect("readback frame requested a CPU background"));
         }
         let init_started = ProfileClock::now();
-        self.ensure_gpu_renderer(width, height).await?;
+        self.ensure_gpu_renderer(width, height, lighting.params.preview0[0] > 0.5)
+            .await?;
         let renderer_init_ms = init_started.elapsed().as_secs_f64() * 1000.0;
         let render_started = ProfileClock::now();
         let rendered = self
@@ -1438,7 +1445,8 @@ impl WorldFrameRenderer {
         )?;
         let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         let init_started = ProfileClock::now();
-        self.ensure_gpu_renderer(width, height).await?;
+        self.ensure_gpu_renderer(width, height, lighting.params.preview0[0] > 0.5)
+            .await?;
         let renderer_init_ms = init_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = ProfileClock::now();
         let texture = self
@@ -1497,11 +1505,20 @@ impl WorldFrameRenderer {
             .map(|renderer| (renderer.width as u64, renderer.height as u64))
             .unwrap_or_default();
         let frame_pixels = target_width.saturating_mul(target_height);
+        let temporal_bytes_per_pixel = if self
+            .gpu_renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.temporal_history_enabled)
+        {
+            16
+        } else {
+            0
+        };
         let render_target_bytes = frame_pixels
-            // HDR scene, depth, temporal history, transmission, RGBA16F
-            // normal/velocity and RGBA8 material MRT attachments, plus the
-            // pooled display targets.
-            .saturating_mul(36 + target_pool_size as u64 * 4)
+            // HDR scene, current/history depth, colour/geometry history,
+            // transmission, normal/velocity and material MRT attachments,
+            // plus the pooled display targets.
+            .saturating_mul(32 + temporal_bytes_per_pixel + target_pool_size as u64 * 4)
             .saturating_add(
                 (shadow_map_size as u64)
                     .saturating_mul(shadow_map_size as u64)
@@ -1534,9 +1551,19 @@ impl WorldFrameRenderer {
             light_count,
             shadow_map_size,
             temporal_history_valid,
-            temporal_antialiasing: preview_budget.temporal_antialiasing,
+            temporal_antialiasing: self
+                .gpu_renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.temporal_history_enabled),
             screen_space_reflections: preview_budget.screen_space_reflections,
-            motion_blur: preview_budget.motion_blur,
+            motion_blur: preview_budget.motion_blur
+                && self
+                    .gpu_renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.temporal_history_enabled),
+            anti_aliasing_requested: self.last_prepared_draw_stats.anti_aliasing_requested,
+            anti_aliasing_effective: self.last_prepared_draw_stats.anti_aliasing_effective,
+            anti_aliasing_fallback_used: self.last_prepared_draw_stats.anti_aliasing_fallback_used,
             render_target_bytes,
         };
     }
@@ -1638,20 +1665,25 @@ impl WorldFrameRenderer {
         };
         let mut lighting = self.prepare_gpu_lighting(&graph.lighting, asset_root, camera_view)?;
         let budget = self.immediate_preview_settings.budget();
+        let anti_aliasing = resolve_effective_anti_aliasing(
+            graph.lighting.render_style.as_ref(),
+            self.immediate_preview_settings,
+        );
         lighting.params.surface3[2] = budget.shadow_map_size as f32;
-        lighting.params.surface3[3] =
-            (budget.antialiasing != crate::preview::ImmediatePreviewAntialiasing::Off) as u8 as f32;
+        lighting.params.surface3[3] = anti_aliasing.spatial_selector;
+        lighting.params.render_compat[2] = anti_aliasing.quality_selector;
+        lighting.params.render_compat[3] = anti_aliasing.sharpness;
         lighting.params.environment2[1] =
             lighting.params.environment2[1].min(budget.max_lights as f32);
         lighting.params.render_compat[1] = budget.screen_space_ao as u8 as f32;
         lighting.params.preview0 = [
-            budget.temporal_antialiasing as u8 as f32,
+            anti_aliasing.temporal as u8 as f32,
             budget.screen_space_reflections as u8 as f32,
             budget.motion_blur as u8 as f32,
             0.0,
         ];
         lighting.frame_index = frame;
-        lighting.temporal_jitter = budget.temporal_jitter;
+        lighting.temporal_jitter = anti_aliasing.jitter_phases > 1;
         if lighting.params.dof_style[0] > 0.5 {
             lighting.params.dof_style[1] =
                 lighting.params.dof_style[1].min(budget.dof_sample_limit as f32);
@@ -1662,6 +1694,9 @@ impl WorldFrameRenderer {
                 .map(|draw| draw.indices.len() as u64 / 3)
                 .sum(),
             light_count: lighting.params.environment2[1].max(0.0) as usize,
+            anti_aliasing_requested: anti_aliasing.requested,
+            anti_aliasing_effective: anti_aliasing.effective,
+            anti_aliasing_fallback_used: anti_aliasing.fallback_used,
         };
         Ok((canvas, width, height, draw_calls, grid_params, lighting))
     }
@@ -1732,12 +1767,15 @@ impl WorldFrameRenderer {
         &mut self,
         width: u32,
         height: u32,
+        temporal_history_enabled: bool,
     ) -> Result<(), WorldRenderError> {
-        let texture_anisotropy = self.immediate_preview_settings.budget().texture_anisotropy;
+        let preview_budget = self.immediate_preview_settings.budget();
+        let texture_anisotropy = preview_budget.texture_anisotropy;
         let needs_renderer = self.gpu_renderer.as_ref().is_none_or(|renderer| {
             renderer.width != width
                 || renderer.height != height
                 || renderer.texture_anisotropy != texture_anisotropy
+                || renderer.temporal_history_enabled != temporal_history_enabled
         });
         if needs_renderer {
             self.gpu_renderer = Some(
@@ -1748,10 +1786,17 @@ impl WorldFrameRenderer {
                         width,
                         height,
                         texture_anisotropy,
+                        temporal_history_enabled,
                     )
                     .await?
                 } else {
-                    GpuWorldRenderer::new(width, height, texture_anisotropy).await?
+                    GpuWorldRenderer::new(
+                        width,
+                        height,
+                        texture_anisotropy,
+                        temporal_history_enabled,
+                    )
+                    .await?
                 },
             );
         }
@@ -1949,6 +1994,7 @@ struct GpuWorldRenderer {
     shadow_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
     dof_pipeline: wgpu::RenderPipeline,
+    motion_blur_pipeline: wgpu::RenderPipeline,
     dof_bind_group_layout: wgpu::BindGroupLayout,
     grid_bind_group: wgpu::BindGroup,
     grid_params_buffer: wgpu::Buffer,
@@ -1970,6 +2016,9 @@ struct GpuWorldRenderer {
     targets: Vec<Arc<wgpu::Texture>>,
     hdr_target: Arc<wgpu::Texture>,
     history_texture: wgpu::Texture,
+    history_depth_texture: wgpu::Texture,
+    history_gbuffer_texture: wgpu::Texture,
+    temporal_history_enabled: bool,
     preview_gbuffer_texture: wgpu::Texture,
     preview_material_texture: wgpu::Texture,
     history_valid: bool,
@@ -2016,10 +2065,138 @@ fn preview_halton(mut index: u32, base: u32) -> f32 {
 
 fn preview_frame_jitter(frame: u32) -> [f32; 2] {
     let sample = frame % 8 + 1;
+    // A sub-eighth-pixel radius retains phase coverage without making an editor
+    // preview appear to move when history is rejected on a thin silhouette.
+    const PREVIEW_JITTER_SCALE: f32 = 0.125;
     [
-        preview_halton(sample, 2) - 0.5,
-        preview_halton(sample, 3) - 0.5,
+        (preview_halton(sample, 2) - 0.5) * PREVIEW_JITTER_SCALE,
+        (preview_halton(sample, 3) - 0.5) * PREVIEW_JITTER_SCALE,
     ]
+}
+
+#[derive(Clone, Copy)]
+struct EffectiveAntiAliasing {
+    requested: &'static str,
+    effective: &'static str,
+    fallback_used: bool,
+    spatial_selector: f32,
+    temporal: bool,
+    jitter_phases: u32,
+    quality_selector: f32,
+    sharpness: f32,
+}
+
+fn canonical_anti_aliasing_method(value: &str) -> &'static str {
+    match value {
+        "auto" => "auto",
+        "off" => "off",
+        "fxaa" => "fxaa",
+        "smaa" => "smaa",
+        "msaa" => "msaa",
+        "taa" => "taa",
+        "ssaa" => "ssaa",
+        _ => "off",
+    }
+}
+
+fn resolve_effective_anti_aliasing(
+    style: Option<&crate::render_style::ResolvedSceneRenderStyle>,
+    settings: crate::preview::ImmediatePreviewSettings,
+) -> EffectiveAntiAliasing {
+    let budget = settings.budget();
+    let Some(style) = style.filter(|style| style.style_id.is_some()) else {
+        return EffectiveAntiAliasing {
+            requested: "host",
+            effective: if budget.temporal_antialiasing {
+                "taa"
+            } else if budget.antialiasing != crate::preview::ImmediatePreviewAntialiasing::Off {
+                "fxaa"
+            } else {
+                "off"
+            },
+            fallback_used: false,
+            spatial_selector: (budget.antialiasing
+                != crate::preview::ImmediatePreviewAntialiasing::Off)
+                as u8 as f32,
+            temporal: budget.temporal_antialiasing,
+            jitter_phases: if budget.temporal_jitter { 8 } else { 1 },
+            quality_selector: 1.0,
+            sharpness: 0.0,
+        };
+    };
+    let Some(authored) = style.anti_aliasing.as_ref() else {
+        return EffectiveAntiAliasing {
+            requested: "off",
+            effective: "off",
+            fallback_used: false,
+            spatial_selector: 0.0,
+            temporal: false,
+            jitter_phases: 1,
+            quality_selector: 0.0,
+            sharpness: 0.0,
+        };
+    };
+    let quality = match authored.quality.as_str() {
+        "low" => 0,
+        "high" => 2,
+        "ultra" => 3,
+        _ => 1,
+    };
+    let automatic = match settings.profile {
+        crate::preview::ImmediatePreviewProfile::Portable => "fxaa",
+        crate::preview::ImmediatePreviewProfile::Balanced
+        | crate::preview::ImmediatePreviewProfile::Cinematic => "taa",
+    };
+    let requested = if authored.method == "auto" {
+        automatic
+    } else {
+        canonical_anti_aliasing_method(&authored.method)
+    };
+    let supported = match settings.profile {
+        crate::preview::ImmediatePreviewProfile::Portable => {
+            matches!(requested, "off" | "fxaa" | "smaa")
+        }
+        crate::preview::ImmediatePreviewProfile::Balanced
+        | crate::preview::ImmediatePreviewProfile::Cinematic => {
+            matches!(requested, "off" | "fxaa" | "smaa" | "taa")
+        }
+    };
+    let method = if supported {
+        requested
+    } else if authored.fallback == "auto" {
+        if settings.profile == crate::preview::ImmediatePreviewProfile::Portable {
+            "fxaa"
+        } else {
+            "smaa"
+        }
+    } else {
+        canonical_anti_aliasing_method(&authored.fallback)
+    };
+    let (spatial_selector, temporal) = match method {
+        "off" => (0.0, false),
+        "smaa" => (2.0, false),
+        "taa" => (1.0, true),
+        _ => (1.0, false),
+    };
+    EffectiveAntiAliasing {
+        requested: canonical_anti_aliasing_method(&authored.method),
+        effective: method,
+        fallback_used: method != requested,
+        spatial_selector,
+        temporal,
+        jitter_phases: if temporal {
+            match quality {
+                0 => 1,
+                1 => 2,
+                2 => 4,
+                _ => 8,
+            }
+        } else {
+            1
+        },
+        quality_selector: quality as f32,
+        sharpness: authored.sharpness,
+    }
 }
 
 fn preview_camera_cut(previous: PreviewCameraHistory, current: PreviewCameraHistory) -> bool {
@@ -2080,6 +2257,7 @@ impl GpuWorldRenderer {
         width: u32,
         height: u32,
         texture_anisotropy: u16,
+        temporal_history_enabled: bool,
     ) -> Result<Self, WorldRenderError> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = request_adapter_async(
@@ -2119,7 +2297,15 @@ impl GpuWorldRenderer {
         .map_err(|err| WorldRenderError::GpuRender {
             message: format!("device request failed: {err}"),
         })?;
-        Self::new_with_device(Arc::new(device), queue, width, height, texture_anisotropy).await
+        Self::new_with_device(
+            Arc::new(device),
+            queue,
+            width,
+            height,
+            texture_anisotropy,
+            temporal_history_enabled,
+        )
+        .await
     }
 
     /// Build the legacy 3D backend on the Scene compositor's GPU context.
@@ -2129,6 +2315,7 @@ impl GpuWorldRenderer {
         width: u32,
         height: u32,
         texture_anisotropy: u16,
+        temporal_history_enabled: bool,
     ) -> Result<Self, WorldRenderError> {
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
         if width > max_texture_dimension_2d || height > max_texture_dimension_2d {
@@ -2356,6 +2543,26 @@ impl GpuWorldRenderer {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Depth,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
@@ -2794,11 +3001,42 @@ impl GpuWorldRenderer {
             multiview: None,
             cache: None,
         });
+        let motion_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("anica-motionloom-world-motion-blur-pipeline"),
+            layout: Some(&dof_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &dof_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &dof_shader,
+                entry_point: Some("fs_motion_blur"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
         let targets = (0..3)
             .map(|_| Arc::new(Self::make_target_texture(&device, width, height)))
             .collect();
         let hdr_target = Arc::new(Self::make_hdr_texture(&device, width, height));
-        let history_texture = Self::make_target_texture(&device, width, height);
+        let history_width = if temporal_history_enabled { width } else { 1 };
+        let history_height = if temporal_history_enabled { height } else { 1 };
+        let history_texture = Self::make_target_texture(&device, history_width, history_height);
+        let history_depth_texture =
+            Self::make_depth_texture(&device, history_width, history_height);
+        let history_gbuffer_texture =
+            Self::make_hdr_texture(&device, history_width, history_height);
         let preview_gbuffer_texture = Self::make_hdr_texture(&device, width, height);
         let preview_material_texture = Self::make_target_texture(&device, width, height);
         let transmission_scene_texture = Self::make_hdr_texture(&device, width, height);
@@ -2958,6 +3196,7 @@ impl GpuWorldRenderer {
             shadow_pipeline,
             grid_pipeline,
             dof_pipeline,
+            motion_blur_pipeline,
             dof_bind_group_layout,
             grid_bind_group,
             grid_params_buffer,
@@ -2975,6 +3214,9 @@ impl GpuWorldRenderer {
             targets,
             hdr_target,
             history_texture,
+            history_depth_texture,
+            history_gbuffer_texture,
+            temporal_history_enabled,
             preview_gbuffer_texture,
             preview_material_texture,
             history_valid: false,
@@ -3110,7 +3352,12 @@ impl GpuWorldRenderer {
         let mut fitted_lighting = fit_rigid_shadow_volume(lighting.params, &shadow_bounds);
         let taa_enabled = fitted_lighting.preview0[0] > 0.5;
         let current_jitter = if taa_enabled && lighting.temporal_jitter {
-            preview_frame_jitter(lighting.frame_index)
+            let phases = match fitted_lighting.render_compat[2] as u32 {
+                1 => 2,
+                2 => 4,
+                _ => 8,
+            };
+            preview_frame_jitter(lighting.frame_index % phases)
         } else {
             [0.0; 2]
         };
@@ -3771,6 +4018,12 @@ impl GpuWorldRenderer {
             let history_view = self
                 .history_texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
+            let history_depth_view = self
+                .history_depth_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let history_gbuffer_view = self
+                .history_gbuffer_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
             let dof_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("anica-motionloom-world-dof-bind-group"),
                 layout: &self.dof_bind_group_layout,
@@ -3803,6 +4056,14 @@ impl GpuWorldRenderer {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(&preview_material_view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&history_depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(&history_gbuffer_view),
+                    },
                 ],
             });
             {
@@ -3827,6 +4088,8 @@ impl GpuWorldRenderer {
             dof_target
         };
         if taa_enabled {
+            // Preserve the surface identity alongside colour so the next frame
+            // can reject history across disocclusions and moving silhouettes.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: output_target.as_ref(),
@@ -3846,7 +4109,127 @@ impl GpuWorldRenderer {
                     depth_or_array_layers: 1,
                 },
             );
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.depth_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.history_depth_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.preview_gbuffer_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.history_gbuffer_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
+        let final_target = if (fitted_lighting.preview0[2] > 0.5 && history_valid)
+            || fitted_lighting.surface3[3] > 0.5
+            || fitted_lighting.render_compat[3] > 0.0001
+        {
+            let target = self.acquire_target();
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let temporal_view = output_target.create_view(&wgpu::TextureViewDescriptor::default());
+            let history_view = self
+                .history_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let history_depth_view = self
+                .history_depth_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let history_gbuffer_view = self
+                .history_gbuffer_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let motion_blur_bind_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("anica-motionloom-world-motion-blur-bind-group"),
+                    layout: &self.dof_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.lighting_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&temporal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.dof_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&history_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&preview_gbuffer_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&preview_material_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&history_depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(&history_gbuffer_view),
+                        },
+                    ],
+                });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("anica-motionloom-world-motion-blur-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.motion_blur_pipeline);
+                pass.set_bind_group(0, &motion_blur_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            target
+        } else {
+            output_target
+        };
         self.queue.submit([encoder.finish()]);
         self.last_camera = Some(current_camera);
         self.last_temporal_style_signature = Some(current_style_signature);
@@ -3865,7 +4248,7 @@ impl GpuWorldRenderer {
                 )
             }));
         Ok(crate::scene::preview_surface::GpuFrameTexture {
-            texture: output_target,
+            texture: final_target,
             width: self.width,
             height: self.height,
             format: wgpu::TextureFormat::Rgba8Unorm,
@@ -3943,7 +4326,10 @@ impl GpuWorldRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         })
     }
@@ -5520,7 +5906,7 @@ fn build_actor_gpu_draws(
     }
     let animation_sample_ms = animation_started.elapsed().as_secs_f64() * 1000.0;
     let constraints_started = ProfileClock::now();
-    let constraint_overrides = scene_constraint_overrides(
+    let mut constraint_overrides = scene_constraint_overrides(
         graph,
         world,
         &model_keys,
@@ -5529,10 +5915,21 @@ fn build_actor_gpu_draws(
         &poses,
         time,
     )?;
+    let mut render_actors = world.actors.clone();
+    apply_world_attachments(
+        graph,
+        &mut render_actors,
+        &model_keys,
+        mesh_cache,
+        &sampled_by_actor,
+        &mut constraint_overrides,
+        &mut poses,
+        time,
+    )?;
     let constraints_ms = constraints_started.elapsed().as_secs_f64() * 1000.0;
 
     let draw_started = ProfileClock::now();
-    for actor in &world.actors {
+    for actor in &render_actors {
         let model_key = model_keys
             .get(&actor.id)
             .expect("actor model key prepared before rendering");
@@ -5974,6 +6371,556 @@ fn actor_frame_pose(
         scale: eval_number(&actor.scale, 1.0, time)?.max(0.01),
         opacity: eval_number(&actor.opacity, 1.0, time)?.clamp(0.0, 1.0),
     })
+}
+
+/// Resolve every socket binding after animation and IK, before draw transforms are built.
+#[allow(clippy::too_many_arguments)]
+fn apply_world_attachments(
+    graph: &WorldGraph,
+    actors: &mut [WorldActor],
+    model_keys: &HashMap<String, PathBuf>,
+    mesh_cache: &HashMap<PathBuf, GlbMeshData>,
+    sampled_by_actor: &HashMap<String, HashMap<usize, SampledNodeTrs>>,
+    constraint_overrides: &mut HashMap<String, HashMap<String, BoneOverride>>,
+    poses: &mut HashMap<String, ActorFramePose>,
+    time: WorldTime,
+) -> Result<(), WorldRenderError> {
+    let owners = graph
+        .attachments
+        .iter()
+        .map(|attachment| attachment.object.as_str())
+        .collect::<HashSet<_>>();
+    let mut resolved = HashSet::<String>::new();
+    let mut solved = HashMap::<String, AttachmentObjectTransform>::new();
+    let mut remaining = graph.attachments.len();
+    while remaining > 0 {
+        let before = remaining;
+        for attachment in &graph.attachments {
+            if resolved.contains(&attachment.id)
+                || (owners.contains(attachment_primary(attachment).target_model.as_str())
+                    && !graph.attachments.iter().any(|candidate| {
+                        candidate.object == attachment_primary(attachment).target_model
+                            && resolved.contains(&candidate.id)
+                    }))
+            {
+                continue;
+            }
+            let transform = resolve_world_attachment(
+                graph,
+                actors,
+                attachment,
+                model_keys,
+                mesh_cache,
+                sampled_by_actor,
+                constraint_overrides,
+                poses,
+                time,
+            )?;
+            solved.insert(attachment.id.clone(), transform);
+            resolved.insert(attachment.id.clone());
+            remaining -= 1;
+        }
+        if remaining == before {
+            return Err(WorldRenderError::GpuRender {
+                message: "Attachment dependency cycle reached the renderer.".to_string(),
+            });
+        }
+    }
+    for attachment in &graph.attachments {
+        apply_secondary_attachment_ik(
+            graph,
+            actors,
+            attachment,
+            solved
+                .get(&attachment.id)
+                .expect("primary attachment transform was solved"),
+            model_keys,
+            mesh_cache,
+            sampled_by_actor,
+            constraint_overrides,
+            poses,
+            time,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct AttachmentObjectTransform {
+    position: [f32; 3],
+    rotation: [f32; 4],
+    scale: f32,
+}
+
+fn attachment_primary(
+    attachment: &crate::world::WorldAttachment,
+) -> &crate::world::WorldAttachmentTarget {
+    attachment
+        .attaches
+        .iter()
+        .find(|attach| attach.drive == "object")
+        .expect("validated Attachment has one object driver")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_world_attachment(
+    graph: &WorldGraph,
+    actors: &mut [WorldActor],
+    attachment: &crate::world::WorldAttachment,
+    model_keys: &HashMap<String, PathBuf>,
+    mesh_cache: &HashMap<PathBuf, GlbMeshData>,
+    sampled_by_actor: &HashMap<String, HashMap<usize, SampledNodeTrs>>,
+    constraint_overrides: &HashMap<String, HashMap<String, BoneOverride>>,
+    poses: &mut HashMap<String, ActorFramePose>,
+    time: WorldTime,
+) -> Result<AttachmentObjectTransform, WorldRenderError> {
+    let primary = attachment_primary(attachment);
+    let socket = attachment
+        .sockets
+        .iter()
+        .find(|socket| socket.socket_id == primary.socket_id)
+        .expect("validated primary Attachment Socket exists");
+    let target_actor = actors
+        .iter()
+        .find(|actor| actor.id == primary.target_model)
+        .ok_or_else(|| WorldRenderError::GpuRender {
+            message: format!(
+                "Attachment '{}' target Model not found: {}",
+                attachment.id, primary.target_model
+            ),
+        })?;
+    let target_mesh = model_keys
+        .get(&primary.target_model)
+        .and_then(|key| mesh_cache.get(key))
+        .ok_or_else(|| WorldRenderError::GpuRender {
+            message: format!("Attachment '{}' target mesh is unavailable.", attachment.id),
+        })?;
+    let target_profile = actor_model_profile(graph, target_actor);
+    let target_node =
+        target_node_for_canonical_bone(target_mesh, target_profile, &primary.target_bone)
+            .ok_or_else(|| WorldRenderError::GpuRender {
+                message: format!(
+                    "Attachment '{}' target bone not found: {}.{}",
+                    attachment.id, primary.target_model, primary.target_bone
+                ),
+            })?;
+    let mut overrides =
+        actor_bone_overrides_for_mesh(graph, target_actor, Some(target_mesh), time)?;
+    if let Some(values) = constraint_overrides.get(&primary.target_model) {
+        overrides.extend(values.iter().map(|(bone, value)| (bone.clone(), *value)));
+    }
+    let sampled = sampled_by_actor
+        .get(&primary.target_model)
+        .cloned()
+        .unwrap_or_default();
+    let matrices = actor_global_node_matrices(
+        graph,
+        target_actor,
+        target_mesh,
+        time,
+        &overrides,
+        Some(&sampled),
+    )?;
+    let bone_matrix =
+        matrices
+            .get(target_node)
+            .copied()
+            .ok_or_else(|| WorldRenderError::GpuRender {
+                message: format!(
+                    "Attachment '{}' target bone matrix is unavailable.",
+                    attachment.id
+                ),
+            })?;
+    let target_pose =
+        poses
+            .get(&primary.target_model)
+            .copied()
+            .ok_or_else(|| WorldRenderError::GpuRender {
+                message: format!("Attachment '{}' target pose is unavailable.", attachment.id),
+            })?;
+    let target_root_rotation = target_actor.rotation_quaternion.unwrap_or_else(|| {
+        actor_yxz_quaternion(
+            target_pose.rotation_deg[0],
+            target_pose.rotation_deg[1],
+            target_pose.rotation_deg[2],
+        )
+    });
+    let target_bone_rotation = quat_normalize_xyzw(quat_mul_xyzw(
+        target_root_rotation,
+        quat_from_mat4_rotation(bone_matrix),
+    ));
+    let target_bone_position = actor_model_point_to_world_for_attachment(
+        matrix_translation(bone_matrix),
+        target_actor,
+        target_mesh,
+        target_pose,
+        target_root_rotation,
+    );
+
+    let socket_position = eval_attachment_vec3(&socket.socket_position, time)?;
+    let socket_rotation = eval_attachment_vec3(&socket.socket_rotation, time)?;
+    let socket_quaternion =
+        actor_yxz_quaternion(socket_rotation[0], socket_rotation[1], socket_rotation[2]);
+    let desired_rotation = quat_normalize_xyzw(quat_mul_xyzw(
+        target_bone_rotation,
+        quat_conjugate_xyzw(socket_quaternion),
+    ));
+    let compound_prefix = format!("{}::", attachment.object);
+    let object_actor_index = actors
+        .iter()
+        .position(|actor| actor.id == attachment.object);
+    let compound_actor_indices = actors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, actor)| actor.id.starts_with(&compound_prefix).then_some(index))
+        .collect::<Vec<_>>();
+    if object_actor_index.is_none() && compound_actor_indices.is_empty() {
+        return Err(WorldRenderError::GpuRender {
+            message: format!(
+                "Attachment '{}' object Model not found: {}",
+                attachment.id, attachment.object
+            ),
+        });
+    }
+    let object_pose = object_actor_index
+        .and_then(|index| poses.get(&actors[index].id).copied())
+        .unwrap_or(ActorFramePose {
+            position: attachment.object_position,
+            rotation_deg: attachment.object_rotation,
+            scale: attachment.object_scale,
+            opacity: 1.0,
+        });
+    let socket_local = if let Some(index) = object_actor_index {
+        let object_actor = &actors[index];
+        let object_mesh = model_keys
+            .get(&object_actor.id)
+            .and_then(|key| mesh_cache.get(key))
+            .ok_or_else(|| WorldRenderError::GpuRender {
+                message: format!("Attachment '{}' object mesh is unavailable.", attachment.id),
+            })?;
+        actor_model_local_point_for_attachment(
+            socket_position,
+            object_actor,
+            object_mesh,
+            object_pose.scale,
+        )
+    } else {
+        socket_position.map(|value| value * object_pose.scale)
+    };
+    let socket_offset = mat4_transform_point(mat4_from_quat(desired_rotation), socket_local);
+    let desired_position: [f32; 3] =
+        std::array::from_fn(|axis| target_bone_position[axis] - socket_offset[axis]);
+    let position_weight = eval_number(&primary.position_weight, 1.0, time)?.clamp(0.0, 1.0);
+    let rotation_weight = eval_number(&primary.rotation_weight, 1.0, time)?.clamp(0.0, 1.0);
+    let authored_rotation = object_actor_index
+        .and_then(|index| actors[index].rotation_quaternion)
+        .unwrap_or_else(|| {
+            actor_yxz_quaternion(
+                object_pose.rotation_deg[0],
+                object_pose.rotation_deg[1],
+                object_pose.rotation_deg[2],
+            )
+        });
+    let final_rotation = quat_slerp_shortest(authored_rotation, desired_rotation, rotation_weight);
+    let final_position = std::array::from_fn(|axis| {
+        object_pose.position[axis] * (1.0 - position_weight)
+            + desired_position[axis] * position_weight
+    });
+    if let Some(index) = object_actor_index {
+        actors[index].rotation_quaternion = Some(final_rotation);
+        if let Some(pose) = poses.get_mut(&attachment.object) {
+            pose.position = final_position;
+        }
+    } else {
+        // CompoundAsset instances are flattened by the Scene bridge. Apply the
+        // solved parent delta to every child so the assembled prop stays rigid.
+        let parent_delta_rotation = quat_normalize_xyzw(quat_mul_xyzw(
+            final_rotation,
+            quat_conjugate_xyzw(authored_rotation),
+        ));
+        for index in compound_actor_indices {
+            let child_id = actors[index].id.clone();
+            let Some(child_pose) = poses.get(&child_id).copied() else {
+                continue;
+            };
+            let relative_position =
+                std::array::from_fn(|axis| child_pose.position[axis] - object_pose.position[axis]);
+            let rotated_relative =
+                mat4_transform_point(mat4_from_quat(parent_delta_rotation), relative_position);
+            let child_rotation = actors[index].rotation_quaternion.unwrap_or_else(|| {
+                actor_yxz_quaternion(
+                    child_pose.rotation_deg[0],
+                    child_pose.rotation_deg[1],
+                    child_pose.rotation_deg[2],
+                )
+            });
+            actors[index].rotation_quaternion = Some(quat_normalize_xyzw(quat_mul_xyzw(
+                parent_delta_rotation,
+                child_rotation,
+            )));
+            if let Some(pose) = poses.get_mut(&child_id) {
+                pose.position =
+                    std::array::from_fn(|axis| final_position[axis] + rotated_relative[axis]);
+            }
+        }
+    }
+    Ok(AttachmentObjectTransform {
+        position: final_position,
+        rotation: final_rotation,
+        scale: object_pose.scale,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_secondary_attachment_ik(
+    graph: &WorldGraph,
+    actors: &[WorldActor],
+    attachment: &crate::world::WorldAttachment,
+    object_transform: &AttachmentObjectTransform,
+    model_keys: &HashMap<String, PathBuf>,
+    mesh_cache: &HashMap<PathBuf, GlbMeshData>,
+    sampled_by_actor: &HashMap<String, HashMap<usize, SampledNodeTrs>>,
+    constraint_overrides: &mut HashMap<String, HashMap<String, BoneOverride>>,
+    poses: &HashMap<String, ActorFramePose>,
+    time: WorldTime,
+) -> Result<(), WorldRenderError> {
+    for attach in attachment
+        .attaches
+        .iter()
+        .filter(|attach| attach.drive == "target" && attach.mode == "ik")
+    {
+        let socket = attachment
+            .sockets
+            .iter()
+            .find(|socket| socket.socket_id == attach.socket_id)
+            .expect("validated secondary Attachment Socket exists");
+        let socket_position = eval_attachment_vec3(&socket.socket_position, time)?;
+        let socket_rotation = eval_attachment_vec3(&socket.socket_rotation, time)?;
+        let socket_local = socket_position.map(|value| value * object_transform.scale);
+        let socket_world_offset =
+            mat4_transform_point(mat4_from_quat(object_transform.rotation), socket_local);
+        let socket_world: [f32; 3] =
+            std::array::from_fn(|axis| object_transform.position[axis] + socket_world_offset[axis]);
+        let desired_hand_world_rotation = quat_normalize_xyzw(quat_mul_xyzw(
+            object_transform.rotation,
+            actor_yxz_quaternion(socket_rotation[0], socket_rotation[1], socket_rotation[2]),
+        ));
+        let actor = actors
+            .iter()
+            .find(|actor| actor.id == attach.target_model)
+            .ok_or_else(|| WorldRenderError::GpuRender {
+                message: format!(
+                    "Attachment '{}' secondary target is unavailable.",
+                    attachment.id
+                ),
+            })?;
+        let mesh = model_keys
+            .get(&actor.id)
+            .and_then(|key| mesh_cache.get(key))
+            .ok_or_else(|| WorldRenderError::GpuRender {
+                message: format!(
+                    "Attachment '{}' secondary target mesh is unavailable.",
+                    attachment.id
+                ),
+            })?;
+        let pose = poses[&actor.id];
+        let sampled = sampled_by_actor.get(&actor.id).cloned().unwrap_or_default();
+        let profile = actor_model_profile(graph, actor);
+        let Some((root_bone, mid_bone, end_bone)) = humanoid_two_bone_chain(&attach.target_bone)
+        else {
+            continue;
+        };
+        let indices = [root_bone, mid_bone, end_bone]
+            .map(|bone| target_node_for_canonical_bone(mesh, profile, bone));
+        let [Some(root_index), Some(mid_index), Some(end_index)] = indices else {
+            continue;
+        };
+        let names = [
+            (root_index, root_bone),
+            (mid_index, mid_bone),
+            (end_index, end_bone),
+        ]
+        .map(|(index, fallback)| mesh.nodes[index].name.as_deref().unwrap_or(fallback));
+        let root_rotation = actor.rotation_quaternion.unwrap_or_else(|| {
+            actor_yxz_quaternion(
+                pose.rotation_deg[0],
+                pose.rotation_deg[1],
+                pose.rotation_deg[2],
+            )
+        });
+        let world_delta = std::array::from_fn(|axis| socket_world[axis] - pose.position[axis]);
+        let local_scaled = mat4_transform_point(
+            mat4_from_quat(quat_conjugate_xyzw(root_rotation)),
+            world_delta,
+        );
+        let height = (mesh.bounds_max[1] - mesh.bounds_min[1]).abs().max(0.001);
+        let mut target_local = if actor.scale_mode.eq_ignore_ascii_case("normalize_height") {
+            let center_x = (mesh.bounds_min[0] + mesh.bounds_max[0]) * 0.5;
+            let center_z = (mesh.bounds_min[2] + mesh.bounds_max[2]) * 0.5;
+            [
+                local_scaled[0] * height / pose.scale + center_x,
+                local_scaled[1] * height / pose.scale + mesh.bounds_min[1],
+                local_scaled[2] * height / pose.scale + center_z,
+            ]
+        } else {
+            local_scaled.map(|value| value / pose.scale.max(0.0001))
+        };
+        let overrides =
+            constraint_overrides
+                .entry(actor.id.clone())
+                .or_insert(actor_bone_overrides_for_mesh(
+                    graph,
+                    actor,
+                    Some(mesh),
+                    time,
+                )?);
+        let before = global_node_matrices_with_sampled(mesh, overrides, &sampled);
+        let root = matrix_translation(before[root_index]);
+        let mid = matrix_translation(before[mid_index]);
+        let end = matrix_translation(before[end_index]);
+        let reach = (attachment_length3(attachment_sub3(root, mid))
+            + attachment_length3(attachment_sub3(mid, end)))
+        .max(0.0001);
+        let max_stretch = eval_number(&attach.max_stretch, 1.05, time)?.max(1.0);
+        let delta = attachment_sub3(target_local, root);
+        let distance = attachment_length3(delta);
+        if distance > reach * max_stretch {
+            if std::env::var_os("MOTIONLOOM_ATTACHMENT_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "motionloom attachment '{}': {}.{} cannot reach socket '{}' ({distance:.4} > {:.4}); clamping IK target without moving the prop",
+                    attachment.id,
+                    attach.target_model,
+                    attach.target_bone,
+                    attach.socket_id,
+                    reach * max_stretch
+                );
+            }
+            let direction = normalize3(delta);
+            target_local =
+                std::array::from_fn(|axis| root[axis] + direction[axis] * reach * max_stretch);
+        }
+        let position_weight = eval_number(&attach.position_weight, 1.0, time)?.clamp(0.0, 1.0);
+        let iteration_weight = 1.0 - (1.0 - position_weight).powf(1.0 / 3.0);
+        for _ in 0..3 {
+            solve_two_bone_constraint(
+                mesh,
+                names[0],
+                names[1],
+                names[2],
+                root_index,
+                mid_index,
+                end_index,
+                target_local,
+                iteration_weight,
+                &sampled,
+                overrides,
+            );
+        }
+        let rotation_weight = eval_number(&attach.rotation_weight, 1.0, time)?.clamp(0.0, 1.0);
+        if rotation_weight > f32::EPSILON {
+            let matrices = global_node_matrices_with_sampled(mesh, overrides, &sampled);
+            let current_global = quat_from_mat4_rotation(matrices[end_index]);
+            let desired_model = quat_normalize_xyzw(quat_mul_xyzw(
+                quat_conjugate_xyzw(root_rotation),
+                desired_hand_world_rotation,
+            ));
+            let parent_global = mesh.nodes[end_index]
+                .parent
+                .and_then(|index| matrices.get(index).copied())
+                .map(quat_from_mat4_rotation)
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let current_local = quat_mul_xyzw(quat_conjugate_xyzw(parent_global), current_global);
+            let desired_local = quat_mul_xyzw(quat_conjugate_xyzw(parent_global), desired_model);
+            let delta_local = quat_mul_xyzw(quat_conjugate_xyzw(current_local), desired_local);
+            let rotation_delta = quat_to_zyx_euler_degrees(delta_local);
+            let end_override = overrides
+                .entry(names[2].to_string())
+                .or_insert_with(BoneOverride::identity);
+            for (axis, delta) in rotation_delta.iter().enumerate() {
+                end_override.rotation_deg[axis] += delta * rotation_weight;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn eval_attachment_vec3(
+    values: &[String; 3],
+    time: WorldTime,
+) -> Result<[f32; 3], WorldRenderError> {
+    Ok([
+        eval_number(&values[0], 0.0, time)?,
+        eval_number(&values[1], 0.0, time)?,
+        eval_number(&values[2], 0.0, time)?,
+    ])
+}
+
+fn attachment_sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|axis| a[axis] - b[axis])
+}
+
+fn attachment_length3(value: [f32; 3]) -> f32 {
+    value
+        .iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt()
+}
+
+fn actor_model_point_to_world_for_attachment(
+    point: [f32; 3],
+    actor: &WorldActor,
+    mesh: &GlbMeshData,
+    pose: ActorFramePose,
+    rotation: [f32; 4],
+) -> [f32; 3] {
+    let local = actor_model_local_point_for_attachment(point, actor, mesh, pose.scale);
+    let rotated = mat4_transform_point(mat4_from_quat(rotation), local);
+    std::array::from_fn(|axis| pose.position[axis] + rotated[axis])
+}
+
+fn actor_model_local_point_for_attachment(
+    point: [f32; 3],
+    actor: &WorldActor,
+    mesh: &GlbMeshData,
+    scale: f32,
+) -> [f32; 3] {
+    if actor.scale_mode.eq_ignore_ascii_case("normalize_height") {
+        let height = (mesh.bounds_max[1] - mesh.bounds_min[1]).abs().max(0.001);
+        let center_x = (mesh.bounds_min[0] + mesh.bounds_max[0]) * 0.5;
+        let center_z = (mesh.bounds_min[2] + mesh.bounds_max[2]) * 0.5;
+        [
+            (point[0] - center_x) * scale / height,
+            (point[1] - mesh.bounds_min[1]) * scale / height,
+            (point[2] - center_z) * scale / height,
+        ]
+    } else {
+        point.map(|value| value * scale)
+    }
+}
+
+fn quat_slerp_shortest(a: [f32; 4], mut b: [f32; 4], weight: f32) -> [f32; 4] {
+    let a = quat_normalize_xyzw(a);
+    b = quat_normalize_xyzw(b);
+    let mut dot = a
+        .iter()
+        .zip(b)
+        .map(|(left, right)| left * right)
+        .sum::<f32>();
+    if dot < 0.0 {
+        b = b.map(|value| -value);
+        dot = -dot;
+    }
+    if dot > 0.9995 {
+        return quat_normalize_xyzw(std::array::from_fn(|axis| {
+            a[axis] + (b[axis] - a[axis]) * weight
+        }));
+    }
+    let angle = dot.clamp(-1.0, 1.0).acos();
+    let sine = angle.sin().max(1.0e-6);
+    let left = ((1.0 - weight) * angle).sin() / sine;
+    let right = (weight * angle).sin() / sine;
+    quat_normalize_xyzw(std::array::from_fn(|axis| a[axis] * left + b[axis] * right))
 }
 
 #[allow(clippy::too_many_arguments)]

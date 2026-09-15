@@ -841,3 +841,28 @@ or new mesh syntax is introduced. Only MeshAsset models are accepted.
 The initial editor supports rigid Model transforms in CompositeGroup and X-ray
 control-cage selection. Nonidentity 2D Group transforms/deformations are rejected.
 The API does not expose final subdivided vertices as editable source vertices.
+
+### MeshAsset image-reference fitting
+
+`api::mesh_reference` exposes three filesystem-free authoring stages for LLM
+and editor hosts. `analyze_image_reference` turns caller-provided image bytes
+and segmentation hints into a versioned mask/contour/region/landmark report.
+`evaluate_mesh_asset_reference` projects a named MeshAsset model through the
+evaluated runtime camera and reports mask IoU, boundary and landmark residuals.
+`apply_mesh_asset_proposal` verifies exact source and topology fingerprints,
+checks the complete candidate cage, and atomically patches existing authored
+vertex positions. V1 never edits topology or UVs. WASM uses
+`analyzeImageReference`, `evaluateMeshAssetReference` and
+`applyMeshAssetProposal`; see [MeshAsset image-reference fitting](MESH_REFERENCE_FITTING.md).
+
+### MeshAsset construction and topology authoring
+
+`api::mesh_authoring` adds a versioned `GeometryRecipe`, semantic regions,
+revision-scoped handles, topology proposals, immutable candidate revisions, and
+explicit accept/reject decisions around the three image-reference stages.
+Position proposals retain the existing bounded `apply_mesh_asset_proposal`
+contract. Topology proposals run the same complete topology validator, require
+the current six fingerprints, return old-to-new correspondence, and identify
+feature bindings that must be rebound. WASM exposes `meshAuthoringSchema`,
+`executeGeometryRecipe`, and `applyMeshTopologyProposal`. See
+[Mesh authoring API](MESH_AUTHORING.md).

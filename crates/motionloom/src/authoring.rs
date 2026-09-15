@@ -105,6 +105,8 @@ pub struct EffectiveGraphSummary {
     pub environment_lights: usize,
     pub active_environment_lights: usize,
     pub animation_targets: usize,
+    #[serde(default)]
+    pub attachments: usize,
     pub process_passes: usize,
     pub present_from: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1536,6 +1538,7 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
             .filter(|tag| tag.name == "EnvironmentLight")
             .count(),
         animation_targets: graph.animation_targets.len(),
+        attachments: graph.attachments.len(),
         process_passes: graph.passes.len(),
         present_from: graph.present.from.clone(),
         primitives: graph
@@ -1775,6 +1778,17 @@ fn required_attributes(tag: &str) -> Vec<String> {
         "SkinBinding" => &[],
         "MaterialAsset" => &["id"],
         "ActionLibrary" => &["id", "src", "actions"],
+        "Attachment" => &["id", "object"],
+        "Socket" => &["id", "position", "rotation"],
+        "Attach" => &[
+            "socket",
+            "target",
+            "mode",
+            "drive",
+            "positionWeight",
+            "rotationWeight",
+            "maxStretch",
+        ],
         "Instance" => &["asset"],
         _ => &[],
     };
@@ -1928,6 +1942,7 @@ fn is_style_tag(tag: &str) -> bool {
             | "ColorStyle"
             | "ToneStyle"
             | "DepthOfFieldStyle"
+            | "AntiAliasingStyle"
     )
 }
 
@@ -2590,6 +2605,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Scene" => strict(&["id", "size", "renderStyle"]),
         "RenderStyle" => strict(&["id"]),
         "DepthOfFieldStyle" => strict(&["preset", "quality", "aperture", "maxBlur"]),
+        "AntiAliasingStyle" => strict(&["method", "quality", "fallback", "sharpness"]),
         "ColorStyle" => strict(&["tint", "tintStrength", "saturation"]),
         "ToneStyle" => strict(&[
             "exposure",
@@ -3073,6 +3089,17 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Use" => open(&["id", "ref"]),
         "Vary" => open(&["property", "values", "range", "choose"]),
         "ActionLibrary" => strict(&["id", "src", "actions"]),
+        "Attachment" => strict(&["id", "object"]),
+        "Socket" => strict(&["id", "position", "rotation"]),
+        "Attach" => strict(&[
+            "socket",
+            "target",
+            "mode",
+            "drive",
+            "positionWeight",
+            "rotationWeight",
+            "maxStretch",
+        ]),
         "ContactSurface" => strict(&[
             "id", "source", "kind", "plane", "position", "normal", "forward", "bounds", "margin",
         ]),
@@ -3772,6 +3799,7 @@ const LAYOUT_ATTRIBUTES: &[&str] = &[
 ];
 
 const KNOWN_TAGS: &[&str] = &[
+    "AntiAliasingStyle",
     "DepthOfFieldStyle",
     "RenderStyle",
     "SurfaceStyle",
@@ -3934,6 +3962,9 @@ const KNOWN_TAGS: &[&str] = &[
     "Variants",
     "Vary",
     "ActionLibrary",
+    "Attachment",
+    "Socket",
+    "Attach",
     "Action",
     "Pose",
     "Marker",
@@ -4305,6 +4336,26 @@ mod tests {
     }
 
     #[test]
+    fn complete_schema_exposes_anti_aliasing_style_contract() {
+        let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
+        let style = value["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["tag"] == "AntiAliasingStyle")
+            .expect("AntiAliasingStyle schema");
+        let attributes = style["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        for expected in ["method", "quality", "fallback", "sharpness"] {
+            assert!(attributes.contains(&expected), "missing {expected}");
+        }
+    }
+
+    #[test]
     fn complete_schema_exposes_unified_rigid_body_contract() {
         let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
         let rigid_body = value["tags"]
@@ -4355,6 +4406,38 @@ mod tests {
         for required in ["colliders", "contacts", "sweep", "corrections"] {
             assert!(debug_attributes.contains(&required));
         }
+    }
+
+    #[test]
+    fn complete_schema_exposes_inline_attachment_pair() {
+        let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
+        let attributes_for = |tag: &str| {
+            value["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["tag"] == tag)
+                .unwrap_or_else(|| panic!("missing {tag} schema"))["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(attributes_for("Attachment"), ["id", "object"]);
+        assert_eq!(attributes_for("Socket"), ["id", "position", "rotation"]);
+        assert_eq!(
+            attributes_for("Attach"),
+            [
+                "socket",
+                "target",
+                "mode",
+                "drive",
+                "positionWeight",
+                "rotationWeight",
+                "maxStretch"
+            ]
+        );
     }
 
     #[test]

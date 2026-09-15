@@ -1632,10 +1632,12 @@ fn scene_world_lighting(
         render_style: composite.render_style.clone(),
         ..WorldLighting::default()
     };
-    let filmic = composite
-        .render_style
-        .as_ref()
-        .is_some_and(|s| s.shading == "filmic_physical_v1");
+    let filmic = composite.render_style.as_ref().is_some_and(|style| {
+        matches!(
+            style.shading.as_str(),
+            "filmic_physical_v1" | "pbr_npr_soft_v1"
+        )
+    });
     let light_color = |value: &str| -> Result<[f32; 3], MotionLoomSceneRenderError> {
         if !filmic {
             return scene_light_color(value);
@@ -3149,6 +3151,7 @@ struct SceneFrameRenderer {
     prepared_scene_contact_surfaces: Vec<crate::dsl::ContactSurfaceNode>,
     prepared_scene_animation_assets: Vec<crate::dsl::GraphAssetNode>,
     prepared_scene_constraints: Vec<crate::dsl::SceneConstraintNode>,
+    prepared_scene_attachments: Vec<crate::dsl::AttachmentNode>,
     gpu_path_cache_hits: usize,
     gpu_path_cache_misses: usize,
     gradient_defs: HashMap<String, GradientDef>,
@@ -7030,6 +7033,7 @@ impl SceneFrameRenderer {
             prepared_scene_contact_surfaces: Vec::new(),
             prepared_scene_animation_assets: Vec::new(),
             prepared_scene_constraints: Vec::new(),
+            prepared_scene_attachments: Vec::new(),
             gpu_path_cache_hits: 0,
             gpu_path_cache_misses: 0,
             gradient_defs: HashMap::new(),
@@ -7216,6 +7220,7 @@ impl SceneFrameRenderer {
             prepared_scene_contact_surfaces: Vec::new(),
             prepared_scene_animation_assets: Vec::new(),
             prepared_scene_constraints: Vec::new(),
+            prepared_scene_attachments: Vec::new(),
             gpu_path_cache_hits: 0,
             gpu_path_cache_misses: 0,
             gradient_defs: HashMap::new(),
@@ -7950,6 +7955,7 @@ impl SceneFrameRenderer {
                 .cloned()
                 .collect();
             self.prepared_scene_constraints = graph.scene_constraints.clone();
+            self.prepared_scene_attachments = graph.attachments.clone();
             self.retained_gpu_shape_scenes.clear();
             self.retained_gpu_transform_scenes.clear();
             self.gpu_text_raster_cache.clear();
@@ -12332,6 +12338,53 @@ impl SceneFrameRenderer {
                     duration_ms: constraint.duration_ms,
                     solver: constraint.solver.clone(),
                     weight: constraint.weight.clone(),
+                })
+                .collect(),
+            attachments: self
+                .prepared_scene_attachments
+                .iter()
+                .filter(|attachment| {
+                    model_positions.contains_key(&attachment.object)
+                        && attachment
+                            .attaches
+                            .iter()
+                            .all(|attach| model_positions.contains_key(&attach.target_model))
+                })
+                .map(|attachment| crate::world::WorldAttachment {
+                    id: attachment.id.clone(),
+                    object: attachment.object.clone(),
+                    sockets: attachment
+                        .sockets
+                        .iter()
+                        .map(|socket| crate::world::WorldAttachmentSocket {
+                            socket_id: socket.id.clone(),
+                            socket_position: socket.position.clone(),
+                            socket_rotation: socket.rotation.clone(),
+                        })
+                        .collect(),
+                    attaches: attachment
+                        .attaches
+                        .iter()
+                        .map(|attach| crate::world::WorldAttachmentTarget {
+                            socket_id: attach.socket.clone(),
+                            target_model: attach.target_model.clone(),
+                            target_bone: attach.target_bone.clone(),
+                            mode: attach.mode.clone(),
+                            drive: attach.drive.clone(),
+                            position_weight: attach.position_weight.clone(),
+                            rotation_weight: attach.rotation_weight.clone(),
+                            max_stretch: attach.max_stretch.clone(),
+                        })
+                        .collect(),
+                    object_position: model_positions
+                        .get(&attachment.object)
+                        .copied()
+                        .unwrap_or([0.0; 3]),
+                    object_rotation: model_rotations
+                        .get(&attachment.object)
+                        .copied()
+                        .unwrap_or([0.0; 3]),
+                    object_scale: model_scales.get(&attachment.object).copied().unwrap_or(1.0),
                 })
                 .collect(),
             lighting: world_lighting,

@@ -63,6 +63,8 @@ struct VertexOut {
 @group(0) @binding(4) var history_color: texture_2d<f32>;
 @group(0) @binding(5) var preview_gbuffer: texture_2d<f32>;
 @group(0) @binding(6) var preview_material: texture_2d<f32>;
+@group(0) @binding(7) var history_depth: texture_depth_2d;
+@group(0) @binding(8) var history_gbuffer: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
@@ -117,10 +119,10 @@ fn circle_of_confusion(distance: f32, image_height: f32) -> f32 {
 }
 
 // FXAA resolves high-contrast edges without temporal history or extra buffers.
-fn antialiased_color(uv: vec2<f32>) -> vec4<f32> {
+fn fxaa_color(uv: vec2<f32>) -> vec4<f32> {
     let center = textureSampleLevel(scene_color, scene_sampler, uv, 0.0);
-    if (lighting.surface3.w < 0.5) { return center; }
     let texel = 1.0 / vec2<f32>(textureDimensions(scene_color));
+    let quality = clamp(lighting.render_compat.z, 0.0, 3.0);
     let nw = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(-1.0,-1.0) * texel, 0.0).rgb;
     let ne = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(1.0,-1.0) * texel, 0.0).rgb;
     let sw = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(-1.0,1.0) * texel, 0.0).rgb;
@@ -128,20 +130,112 @@ fn antialiased_color(uv: vec2<f32>) -> vec4<f32> {
     let luma = vec3<f32>(0.299,0.587,0.114);
     let a = dot(nw,luma); let b = dot(ne,luma); let c = dot(sw,luma); let d = dot(se,luma); let m = dot(center.rgb,luma);
     let lo = min(m,min(min(a,b),min(c,d))); let hi = max(m,max(max(a,b),max(c,d)));
-    if (hi - lo < max(0.0312, hi * 0.125)) { return center; }
+    var edge_floor = 0.055;
+    var relative_threshold = 0.18;
+    var span = 4.0;
+    if (quality > 0.5) {
+        edge_floor = 0.035;
+        relative_threshold = 0.125;
+        span = 8.0;
+    }
+    if (quality > 1.5) {
+        edge_floor = 0.022;
+        relative_threshold = 0.08;
+        span = 12.0;
+    }
+    if (hi - lo < max(edge_floor, hi * relative_threshold)) { return center; }
     var direction = vec2<f32>(-((a+b)-(c+d)), (a+c)-(b+d));
     let reduce = max((a+b+c+d)*0.03125,0.0078125);
-    direction = clamp(direction / (min(abs(direction.x),abs(direction.y))+reduce),vec2<f32>(-8.0),vec2<f32>(8.0))*texel;
+    direction = clamp(direction / (min(abs(direction.x),abs(direction.y))+reduce),vec2<f32>(-span),vec2<f32>(span))*texel;
     let rgb_a = 0.5*(textureSampleLevel(scene_color,scene_sampler,uv-direction/6.0,0.0).rgb + textureSampleLevel(scene_color,scene_sampler,uv+direction/6.0,0.0).rgb);
     let rgb_b = rgb_a*0.5+0.25*(textureSampleLevel(scene_color,scene_sampler,uv-direction*0.5,0.0).rgb+textureSampleLevel(scene_color,scene_sampler,uv+direction*0.5,0.0).rgb);
     let lb = dot(rgb_b,luma);
     return vec4<f32>(select(rgb_b,rgb_a,lb<lo || lb>hi),center.a);
 }
 
+// A compact morphology-based edge search gives SMAA-like spatial stability
+// without temporal history and remains practical on browser GPUs.
+fn smaa_color(uv: vec2<f32>) -> vec4<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(scene_color));
+    let quality = clamp(lighting.render_compat.z, 0.0, 3.0);
+    let center = textureSampleLevel(scene_color, scene_sampler, uv, 0.0);
+    let left = textureSampleLevel(scene_color, scene_sampler, uv - vec2<f32>(texel.x, 0.0), 0.0);
+    let right = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(texel.x, 0.0), 0.0);
+    let up = textureSampleLevel(scene_color, scene_sampler, uv - vec2<f32>(0.0, texel.y), 0.0);
+    let down = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(0.0, texel.y), 0.0);
+    let luma = vec3<f32>(0.299, 0.587, 0.114);
+    let horizontal = abs(dot(left.rgb - right.rgb, luma));
+    let vertical = abs(dot(up.rgb - down.rgb, luma));
+    let contrast = max(horizontal, vertical);
+    var threshold = 0.055;
+    var strength = 1.8;
+    var blend_limit = 0.45;
+    if (quality > 0.5) {
+        threshold = 0.035;
+        strength = 2.5;
+        blend_limit = 0.65;
+    }
+    if (quality > 1.5) {
+        threshold = 0.02;
+        strength = 3.2;
+        blend_limit = 0.75;
+    }
+    if (contrast < threshold) { return center; }
+    var neighbours = select((left + right) * 0.5, (up + down) * 0.5, horizontal < vertical);
+    // High and Ultra pay for a wider edge search. They intentionally share
+    // the same spatial kernel, matching the public quality table.
+    if (quality > 1.5) {
+        let left2 = textureSampleLevel(scene_color, scene_sampler, uv - vec2<f32>(2.0 * texel.x, 0.0), 0.0);
+        let right2 = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(2.0 * texel.x, 0.0), 0.0);
+        let up2 = textureSampleLevel(scene_color, scene_sampler, uv - vec2<f32>(0.0, 2.0 * texel.y), 0.0);
+        let down2 = textureSampleLevel(scene_color, scene_sampler, uv + vec2<f32>(0.0, 2.0 * texel.y), 0.0);
+        let wide = select((left2 + right2) * 0.5, (up2 + down2) * 0.5, horizontal < vertical);
+        neighbours = mix(neighbours, wide, 0.35);
+    }
+    let blend = clamp((contrast - threshold) * strength, 0.0, blend_limit);
+    return mix(center, neighbours, blend);
+}
+
+fn antialiased_color(uv: vec2<f32>) -> vec4<f32> {
+    let method = lighting.surface3.w;
+    if (method < 0.5) { return textureSampleLevel(scene_color, scene_sampler, uv, 0.0); }
+    if (method < 1.5) { return fxaa_color(uv); }
+    if (method < 2.5) { return smaa_color(uv); }
+    return smaa_color(uv);
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let dimensions = vec2<f32>(textureDimensions(scene_color));
-    let pixel = vec2<i32>(clamp(input.uv * dimensions, vec2<f32>(0.0), dimensions - 1.0));
+    // Raster jitter moves geometry in the source buffers. Sampling at the
+    // inverse location places every TAA result back on a stable output grid;
+    // only sub-pixel coverage is allowed to vary between phases.
+    var jitter_uv = select(
+        vec2<f32>(0.0),
+        lighting.preview1.xy / dimensions,
+        lighting.preview0.x > 0.5
+    );
+    let jittered_uv = clamp(input.uv + jitter_uv, vec2<f32>(0.0001), vec2<f32>(0.9999));
+    let jittered_pixel = vec2<i32>(clamp(
+        jittered_uv * dimensions,
+        vec2<f32>(0.0),
+        dimensions - 1.0
+    ));
+    let stable_pixel = vec2<i32>(clamp(
+        input.uv * dimensions,
+        vec2<f32>(0.0),
+        dimensions - 1.0
+    ));
+    // The CPU/LDR background is not rasterized with the projection jitter.
+    // Keep its interior on the stable grid while retaining jitter at geometry
+    // coverage boundaries where either depth sample contains a surface.
+    let jittered_depth = textureLoad(scene_depth, jittered_pixel, 0);
+    let stable_depth = textureLoad(scene_depth, stable_pixel, 0);
+    if (jittered_depth <= 0.000001 && stable_depth <= 0.000001) {
+        jitter_uv = vec2<f32>(0.0);
+    }
+    let sample_uv = clamp(input.uv + jitter_uv, vec2<f32>(0.0001), vec2<f32>(0.9999));
+    let pixel = vec2<i32>(clamp(sample_uv * dimensions, vec2<f32>(0.0), dimensions - 1.0));
     let center_depth = textureLoad(scene_depth, pixel, 0);
     let center_distance = view_distance(center_depth);
     let radius_px = circle_of_confusion(center_distance, dimensions.y);
@@ -149,15 +243,23 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     // below. Browser WebGPU enforces derivative-uniformity more strictly than
     // native Metal; implicit `textureSample` there can invalidate the DoF pass
     // even though the preceding 3D render completed successfully.
-    let center = antialiased_color(input.uv);
+    let center = textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0);
     if (lighting.dof_style.x > 1.5 && lighting.optics0.x > 0.0) {
-        return finish_render_style(filmic_bokeh(input.uv, center_distance), input.uv);
+        return finish_render_style(
+            filmic_bokeh(sample_uv, center_distance),
+            sample_uv,
+            input.uv
+        );
     }
     if (lighting.dof_style.x > 0.5 && lighting.optics0.x > 0.0 && lighting.optics0.w > 0.0) {
-        return finish_render_style(cinematic_bokeh(input.uv, center, center_distance, radius_px), input.uv);
+        return finish_render_style(
+            cinematic_bokeh(sample_uv, center, center_distance, radius_px),
+            sample_uv,
+            input.uv
+        );
     }
     if (radius_px < 0.35) {
-        return finish_render_style(center, input.uv);
+        return finish_render_style(center, sample_uv, input.uv);
     }
 
     let offsets = array<vec2<f32>, 12>(
@@ -172,7 +274,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     var total_weight = 1.0;
     for (var i = 0u; i < 12u; i = i + 1u) {
         let sample_uv = clamp(
-            input.uv + offsets[i] * radius_px / dimensions,
+            sample_uv + offsets[i] * radius_px / dimensions,
             vec2<f32>(0.0001),
             vec2<f32>(0.9999)
         );
@@ -188,5 +290,13 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         accumulated += textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0) * weight;
         total_weight += weight;
     }
-    return finish_render_style(accumulated / total_weight, input.uv);
+    return finish_render_style(accumulated / total_weight, sample_uv, input.uv);
+}
+
+// Motion blur runs after temporal resolve so shutter samples never feed back
+// into the next frame's clean TAA history.
+@fragment
+fn fs_motion_blur(input: VertexOut) -> @location(0) vec4<f32> {
+    let radiance = antialiased_color(input.uv);
+    return preview_sharpen(preview_motion_blur(radiance, input.uv), input.uv);
 }

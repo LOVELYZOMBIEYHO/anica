@@ -11,9 +11,10 @@ mod resolve;
 mod validation;
 
 pub use model::{
-    CelMaterialSettings, ColorStyleNode, DepthOfFieldStyleNode, LightingStyleNode,
-    OutlineStyleNode, PostStyleNode, RenderStyleNode, RenderStyleOverride, ResolvedCelStyle,
-    ResolvedSceneRenderStyle, ResolvedUniversalStyle, SurfaceStyleNode, ToneStyleNode,
+    AntiAliasingStyleNode, CelMaterialSettings, ColorStyleNode, DepthOfFieldStyleNode,
+    LightingStyleNode, OutlineStyleNode, PostStyleNode, RenderStyleNode, RenderStyleOverride,
+    ResolvedAntiAliasingStyle, ResolvedCelStyle, ResolvedSceneRenderStyle, ResolvedUniversalStyle,
+    SurfaceStyleNode, ToneStyleNode,
 };
 pub(crate) use parser::{parse_cel_material, parse_resource};
 pub use resolve::resolve_scene_render_style;

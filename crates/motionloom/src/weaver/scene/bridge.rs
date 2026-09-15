@@ -70,6 +70,12 @@ pub(crate) async fn weaver_snapshot(
         .map_err(|e| WeaverError::Scene(e.to_string()))?;
     let mut diagnostics = vec!["Thin-lens camera replaces legacy screen-space DoF. Light intensities retain scene units; physical unit calibration is not assumed.".into()];
     diagnostics.push("Path-traced geometry casts physical shadows; preview-only AO, contact-shadow strength and per-light shadow-strength hacks are not applied.".into());
+    if !world.attachments.is_empty() {
+        diagnostics.push(format!(
+            "Evaluated {} inline attachment(s) after Action and constraint sampling.",
+            world.attachments.len()
+        ));
+    }
     if world.lighting.atmosphere_fog.is_some() {
         if job.volume.is_some() {
             diagnostics
@@ -82,6 +88,17 @@ pub(crate) async fn weaver_snapshot(
         }
     }
     if let Some(s) = &world.lighting.render_style {
+        if let Some(aa) = &s.anti_aliasing {
+            diagnostics.push(format!(
+                "Requested AA {} {} resolves through Weaver pixel sampling ({}-{} samples); spatial preview fallback is not used.",
+                aa.method, aa.quality, job.sampling.min_samples, job.sampling.max_samples
+            ));
+        } else {
+            diagnostics.push(
+                "RenderStyle omits AntiAliasingStyle: authored AA is off; Weaver still performs the pixel samples required by the render job."
+                    .into(),
+            );
+        }
         if !matches!(s.shading.as_str(), "physical" | "filmic_physical_v1") {
             return Err(WeaverError::Unsupported(format!(
                 "surface preset {}",

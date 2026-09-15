@@ -153,6 +153,7 @@ pub fn parse_world_graph_script(script: &str) -> Result<WorldGraph, GraphParseEr
         apply_actions,
         animation_assets: Vec::new(),
         constraints: Vec::new(),
+        attachments: Vec::new(),
         lighting: crate::world::WorldLighting::default(),
         present,
     })

@@ -58,6 +58,34 @@ pub(super) fn color(value: &str) -> Result<[f32; 3], GraphParseError> {
 pub(crate) fn validate(graph: &GraphScript) -> Result<(), GraphParseError> {
     let mut ids = std::collections::HashSet::new();
     for s in &graph.render_styles {
+        if let Some(aa) = &s.anti_aliasing {
+            one_of(
+                aa.method.as_deref(),
+                &["auto", "off", "fxaa", "smaa", "msaa", "taa", "ssaa"],
+                "AntiAliasingStyle.method",
+            )?;
+            one_of(
+                aa.quality.as_deref(),
+                &["low", "medium", "high", "ultra"],
+                "AntiAliasingStyle.quality",
+            )?;
+            one_of(
+                aa.fallback.as_deref(),
+                &["auto", "off", "fxaa", "smaa"],
+                "AntiAliasingStyle.fallback",
+            )?;
+            range(aa.sharpness, 0.0, 1.0, "AntiAliasingStyle.sharpness")?;
+            if aa.method.as_deref() == aa.fallback.as_deref() && aa.method.is_some() {
+                return Err(error("AntiAliasingStyle.fallback must differ from method"));
+            }
+            if aa.method.as_deref() == Some("off")
+                && aa.fallback.as_deref().is_some_and(|value| value != "off")
+            {
+                return Err(error(
+                    "AntiAliasingStyle method=off cannot request a fallback",
+                ));
+            }
+        }
         if let Some(dof) = &s.depth_of_field {
             one_of(
                 Some(&dof.preset),
@@ -92,6 +120,7 @@ pub(crate) fn validate(graph: &GraphScript) -> Result<(), GraphParseError> {
                     "clay",
                     "cel",
                     "ink_wash_soft_v1",
+                    "pbr_npr_soft_v1",
                 ],
                 "shading",
             )?;

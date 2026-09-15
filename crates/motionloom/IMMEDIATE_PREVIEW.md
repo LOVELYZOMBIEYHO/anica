@@ -32,7 +32,19 @@ optical samples, then profile-controlled shadow and filtering cost. Authored
 materials, animation, camera, colors, and style identity remain unchanged.
 
 The improvements are renderer internals shared by native and WASM WebGPU.
-Existing MotionLoom scripts need no additional tags or quality settings.
+Anti-aliasing is additionally an explicit RenderStyle policy:
+
+```xml
+<AntiAliasingStyle method="taa" quality="high" fallback="smaa" sharpness="0.15" />
+```
+
+Scenes without a RenderStyle retain the host profile policy. A referenced
+RenderStyle without `AntiAliasingStyle` deliberately resolves to `off`; this is
+the compatibility break that makes AA cost explicit. Immediate preview supports
+`off`, FXAA, compact spatial morphology AA, and history-rejected TAA. Portable
+`msaa` and `ssaa` intents use the requested safe fallback until a backend offers
+their required multisample targets or internal-resolution path. The last-frame
+profile reports requested/effective methods and whether a fallback occurred.
 
 - Material textures receive retained mip chains and 8x anisotropic filtering.
   Color filtering uses linear light with alpha-weighted mip generation; normal
@@ -51,11 +63,11 @@ Existing MotionLoom scripts need no additional tags or quality settings.
   HDR. Per-object motion comes from previous model transforms and previous bone
   palettes. This removes the former extra geometry submission and fullscreen
   normal-reconstruction pass.
-- Temporal resolve reprojects the prior display frame. The default `Balanced`
-  profiles use a stable projection, because moving an alpha-tested grass sample
-  every frame is both visually distracting and unnecessary editor work. The
-  eight-sample Halton implementation remains internal but is not enabled until
-  a coverage-aware resolve can guarantee stable thin geometry. History is
+- Temporal resolve reprojects the prior display frame. Host-controlled unstyled
+  scenes retain the profile's stable projection. An explicit `taa` style uses a
+  bounded Halton phase count selected by `quality`; depth, normal, velocity and
+  reactive evidence reject invalid history so thin geometry does not accumulate
+  the former long trails. History is
   rejected after a non-sequential seek, camera cut, size change or
   preview-profile change. Motion vectors use
   interpolated current and previous clip positions instead of a quantized

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenderStyleNode {
+    pub anti_aliasing: Option<AntiAliasingStyleNode>,
     pub depth_of_field: Option<DepthOfFieldStyleNode>,
     pub color: Option<ColorStyleNode>,
     pub tone: Option<ToneStyleNode>,
@@ -17,6 +18,37 @@ pub struct RenderStyleNode {
     pub surface: Option<SurfaceStyleNode>,
     pub lighting: Option<LightingStyleNode>,
     pub post: Option<PostStyleNode>,
+}
+
+/// Authored anti-aliasing intent; the host resolves it against GPU capabilities.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AntiAliasingStyleNode {
+    pub method: Option<String>,
+    pub quality: Option<String>,
+    pub fallback: Option<String>,
+    pub sharpness: Option<f32>,
+}
+
+/// Concrete values reported to renderers after defaults are applied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedAntiAliasingStyle {
+    pub method: String,
+    pub quality: String,
+    pub fallback: String,
+    pub sharpness: f32,
+}
+
+impl Default for ResolvedAntiAliasingStyle {
+    fn default() -> Self {
+        Self {
+            method: "off".into(),
+            quality: "medium".into(),
+            fallback: "auto".into(),
+            sharpness: 0.0,
+        }
+    }
 }
 
 /// Opt-in spatial bokeh; omitted quality resolves to balanced without history.
@@ -163,6 +195,9 @@ impl Default for ResolvedCelStyle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedSceneRenderStyle {
+    /// None means no RenderStyle was authored; host preview policy remains in control.
+    #[serde(default)]
+    pub anti_aliasing: Option<ResolvedAntiAliasingStyle>,
     #[serde(default)]
     pub depth_of_field: Option<DepthOfFieldStyleNode>,
     #[serde(default)]

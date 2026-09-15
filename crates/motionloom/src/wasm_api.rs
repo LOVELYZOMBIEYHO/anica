@@ -1313,6 +1313,56 @@ pub fn wasm_apply_head_fit_proposal(source: &str, proposal: &str) -> Result<Stri
         .map_err(|e| js_error(e.to_string()))
 }
 
+// Universal image references remain host-provided bytes; the core never fetches URLs.
+#[wasm_bindgen(js_name = analyzeImageReference)]
+pub fn wasm_analyze_image_reference(image_bytes: &[u8], request: &str) -> Result<String, JsValue> {
+    crate::mesh_reference::analyze_image_reference_json(image_bytes, request)
+        .map_err(|error| js_error(error.to_string()))
+}
+
+#[wasm_bindgen(js_name = evaluateMeshAssetReference)]
+pub async fn wasm_evaluate_mesh_asset_reference(
+    source: &str,
+    request: &str,
+) -> Result<String, JsValue> {
+    crate::mesh_reference::evaluate_mesh_asset_reference_json(source, request)
+        .await
+        .map_err(|error| js_error(error.to_string()))
+}
+
+#[wasm_bindgen(js_name = applyMeshAssetProposal)]
+pub fn wasm_apply_mesh_asset_proposal(source: &str, proposal: &str) -> Result<String, JsValue> {
+    crate::mesh_reference::apply_mesh_asset_proposal_json(source, proposal)
+        .map_err(|error| js_error(error.to_string()))
+}
+
+#[wasm_bindgen(js_name = meshReferenceSchema)]
+pub fn wasm_mesh_reference_schema() -> String {
+    crate::mesh_reference::mesh_reference_schema_json()
+}
+
+#[wasm_bindgen(js_name = meshAuthoringSchema)]
+pub fn wasm_mesh_authoring_schema() -> String {
+    crate::mesh_authoring::mesh_authoring_schema_json()
+}
+
+#[wasm_bindgen(js_name = executeGeometryRecipe)]
+pub fn wasm_execute_geometry_recipe(recipe: &str) -> Result<String, JsValue> {
+    crate::mesh_authoring::execute_geometry_recipe_json(recipe)
+        .map_err(|error| js_error(error.to_string()))
+}
+
+#[wasm_bindgen(js_name = applyMeshTopologyProposal)]
+pub fn wasm_apply_mesh_topology_proposal(
+    source: &str,
+    analyses: &str,
+    proposal: &str,
+    evaluation: &str,
+) -> Result<String, JsValue> {
+    crate::mesh_authoring::apply_mesh_topology_proposal_json(source, analyses, proposal, evaluation)
+        .map_err(|error| js_error(error.to_string()))
+}
+
 /// Shared PCM renderer; browser hosts own decoding, playback and container codecs.
 #[wasm_bindgen]
 pub struct WasmAudioMixer {

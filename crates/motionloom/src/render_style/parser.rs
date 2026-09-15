@@ -117,6 +117,7 @@ pub(crate) fn parse_resource(
             "ColorStyle" => "color",
             "ToneStyle" => "tone",
             "DepthOfFieldStyle" => "depthOfField",
+            "AntiAliasingStyle" => "antiAliasing",
             _ => return Err(error(format!("Unsupported {name} child {child}"))),
         };
         if root.get(field).is_some() {

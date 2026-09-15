@@ -105,6 +105,8 @@ mod compat;
 mod dsl;
 mod error;
 mod export;
+pub mod mesh_authoring;
+pub mod mesh_reference;
 pub mod preview;
 pub mod preview_protocol;
 mod process;
@@ -164,12 +166,13 @@ pub use rig_diagnostics::{
 pub use common::keyframe::ScalarKeyframe;
 pub use dsl::{
     ActionBoneNode, ActionContactNode, ActionLibraryNode, ActionNode, ActionPoseNode,
-    AnimationKeyNode, AnimationTargetNode, ApplyActionNode, BackgroundNode,
-    CompoundAssetInstanceNode, CompoundAssetNode, ContactSurfaceNode, ControlCageNode, EarNode,
-    EyeNode, EyebrowNode, EyelinerNode, FaceLayoutNode, FaceTextureNode, FacialCageNode,
-    GraphAssetKind, GraphAssetNode, GraphAssetSource, GraphScript, HairGuideNode, HairPointNode,
-    HeadDomeNode, HeadFeatureNode, HeadMorphNode, HeadSectionNode, HeadShapeNode, ImageNode,
-    IrisNode, ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
+    AnimationKeyNode, AnimationTargetNode, ApplyActionNode, AttachmentNode, AttachmentSocketNode,
+    AttachmentTargetNode, BackgroundNode, CompoundAssetInstanceNode, CompoundAssetNode,
+    ContactSurfaceNode, ControlCageNode, EarNode, EyeNode, EyebrowNode, EyelinerNode,
+    FaceLayoutNode, FaceTextureNode, FacialCageNode, GraphAssetKind, GraphAssetNode,
+    GraphAssetSource, GraphScript, HairGuideNode, HairPointNode, HeadDomeNode, HeadFeatureNode,
+    HeadMorphNode, HeadSectionNode, HeadShapeNode, ImageNode, IrisNode,
+    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
     ModelProfileRetargetMapNode, ModelProfileRetargetNode, MouthNode, NativeSkinBindingNode,
     NativeSkinMode, NativeWeightRegionNode, NoseNode, PrimitiveAssetNode, PrimitiveAxis,
     PrimitiveGeometry, PrimitiveLodNode, PrimitiveLoftSectionNode, PrimitiveMeshBuildNode,

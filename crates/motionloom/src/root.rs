@@ -23,6 +23,10 @@ use crate::world::{
 };
 
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Document variants remain inline to preserve the stable public API."
+)]
 pub enum MotionLoomDocument {
     Process(GraphScript),
     Scene(GraphScript),

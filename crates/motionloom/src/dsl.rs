@@ -91,6 +91,9 @@ pub struct GraphScript {
     pub action_libraries: Vec<ActionLibraryNode>,
     #[serde(default)]
     pub apply_actions: Vec<ApplyActionNode>,
+    /// Runtime bindings that align one model-local socket with another model's bone.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentNode>,
     /// Reusable semantic planes used by Action contact correction.
     #[serde(default)]
     pub contact_surfaces: Vec<ContactSurfaceNode>,
@@ -122,6 +125,40 @@ pub struct ActionLibraryNode {
     pub src: String,
     /// Action ids selectively imported from the external document.
     pub actions: Vec<String>,
+}
+
+/// A complete object-socket to target-bone binding evaluated after animation.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentNode {
+    pub id: String,
+    pub object: String,
+    pub sockets: Vec<AttachmentSocketNode>,
+    pub attaches: Vec<AttachmentTargetNode>,
+}
+
+/// Object-local frame that is aligned with the target bone.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentSocketNode {
+    pub id: String,
+    pub position: [String; 3],
+    pub rotation: [String; 3],
+}
+
+/// Target and blend controls for one attachment.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentTargetNode {
+    pub socket: String,
+    pub target: String,
+    pub target_model: String,
+    pub target_bone: String,
+    pub mode: String,
+    pub drive: String,
+    pub position_weight: String,
+    pub rotation_weight: String,
+    pub max_stretch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1525,6 +1562,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut actions = Vec::<ActionNode>::new();
     let mut action_libraries = Vec::<ActionLibraryNode>::new();
     let mut apply_actions = Vec::<ApplyActionNode>::new();
+    let mut attachments = Vec::<AttachmentNode>::new();
     let mut contact_surfaces = Vec::<ContactSurfaceNode>::new();
     let mut scene_constraints = Vec::<SceneConstraintNode>::new();
     let mut audio_clips = Vec::new();
@@ -1658,6 +1696,13 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         if starts_open_tag(line, "ApplyAction") {
             let (tag, end_ix) = collect_self_closing_block(&lines, i)?;
             apply_actions.push(parse_apply_action_node(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+
+        if starts_open_tag(line, "Attachment") {
+            let (attachment, end_ix) = parse_attachment_block(&lines, i)?;
+            attachments.push(attachment);
             i = end_ix + 1;
             continue;
         }
@@ -1962,6 +2007,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         &actions,
         &action_libraries,
         &apply_actions,
+        &attachments,
         &contact_surfaces,
         &scene_constraints,
         &layers,
@@ -2001,6 +2047,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         actions,
         action_libraries,
         apply_actions,
+        attachments,
         contact_surfaces,
         scene_constraints,
         animation_targets,
@@ -2067,6 +2114,167 @@ fn parse_contact_surface_node(
         forward,
         bounds,
         margin,
+    })
+}
+
+/// Parse one complete inline socket-to-bone binding without changing asset definitions.
+fn parse_attachment_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(AttachmentNode, usize), GraphParseError> {
+    let (open, open_end) = collect_tag_block(lines, start, '>', false)?;
+    if is_self_closing_tag(&open) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "Attachment must contain at least one Socket and one Attach child."
+                .to_string(),
+        });
+    }
+    let close = find_matching_close_tag(lines, open_end + 1, "Attachment")?;
+    let id = strip_wrappers(&required_attr_value(&open, "id", start + 1)?)
+        .trim()
+        .to_string();
+    let object = strip_wrappers(&required_attr_value(&open, "object", start + 1)?)
+        .trim()
+        .to_string();
+    let mut sockets = Vec::new();
+    let mut attaches = Vec::new();
+    let mut index = open_end + 1;
+    while index < close {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if starts_open_tag(line, "Socket") {
+            let (tag, end) = collect_self_closing_block(lines, index)?;
+            sockets.push(parse_attachment_socket(&tag, index + 1)?);
+            index = end + 1;
+            continue;
+        }
+        if starts_open_tag(line, "Attach") {
+            let (tag, end) = collect_self_closing_block(lines, index)?;
+            attaches.push(parse_attachment_target(&tag, index + 1)?);
+            index = end + 1;
+            continue;
+        }
+        return Err(GraphParseError {
+            line: index + 1,
+            message: format!("Unsupported Attachment child in '{id}': {line}"),
+        });
+    }
+    let default_socket = sockets
+        .first()
+        .map(|socket| socket.id.clone())
+        .unwrap_or_default();
+    for (index, attach) in attaches.iter_mut().enumerate() {
+        if attach.socket.is_empty() {
+            attach.socket.clone_from(&default_socket);
+        }
+        if attach.drive.is_empty() {
+            attach.drive = if index == 0 { "object" } else { "target" }.to_string();
+        }
+    }
+    Ok((
+        AttachmentNode {
+            id: id.clone(),
+            object,
+            sockets: (!sockets.is_empty())
+                .then_some(sockets)
+                .ok_or_else(|| GraphParseError {
+                    line: start + 1,
+                    message: format!("Attachment '{id}' is missing Socket."),
+                })?,
+            attaches: (!attaches.is_empty()).then_some(attaches).ok_or_else(|| {
+                GraphParseError {
+                    line: start + 1,
+                    message: format!("Attachment '{id}' is missing Attach."),
+                }
+            })?,
+        },
+        close,
+    ))
+}
+
+fn parse_attachment_vec3(
+    block: &str,
+    attr: &str,
+    line: usize,
+) -> Result<[String; 3], GraphParseError> {
+    let raw = attr_value(block, attr)
+        .map(|value| strip_wrappers(&value).trim().to_string())
+        .unwrap_or_else(|| "[0,0,0]".to_string());
+    let inner = raw
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| GraphParseError {
+            line,
+            message: format!("{attr} must be a three-value array."),
+        })?;
+    let parts = inner.split(',').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(GraphParseError {
+            line,
+            message: format!("{attr} must contain exactly three values."),
+        });
+    }
+    Ok(std::array::from_fn(|axis| parts[axis].to_string()))
+}
+
+fn parse_attachment_socket(
+    block: &str,
+    line: usize,
+) -> Result<AttachmentSocketNode, GraphParseError> {
+    Ok(AttachmentSocketNode {
+        id: strip_wrappers(&required_attr_value(block, "id", line)?)
+            .trim()
+            .to_string(),
+        position: parse_attachment_vec3(block, "position", line)?,
+        rotation: parse_attachment_vec3(block, "rotation", line)?,
+    })
+}
+
+fn parse_attachment_target(
+    block: &str,
+    line: usize,
+) -> Result<AttachmentTargetNode, GraphParseError> {
+    let target = strip_wrappers(&required_attr_value(block, "target", line)?)
+        .trim()
+        .to_string();
+    let Some((target_model, target_bone)) = target.split_once('.') else {
+        return Err(GraphParseError {
+            line,
+            message: "Attach.target must use model-id.canonical-bone syntax.".to_string(),
+        });
+    };
+    if target_model.is_empty() || target_bone.is_empty() || target_bone.contains('.') {
+        return Err(GraphParseError {
+            line,
+            message: "Attach.target must use model-id.canonical-bone syntax.".to_string(),
+        });
+    }
+    Ok(AttachmentTargetNode {
+        socket: attr_value(block, "socket")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_default(),
+        target: target.clone(),
+        target_model: target_model.to_string(),
+        target_bone: target_bone.to_string(),
+        mode: attr_value(block, "mode")
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+            .unwrap_or_else(|| "snap".to_string()),
+        drive: attr_value(block, "drive")
+            .map(|value| strip_wrappers(&value).to_ascii_lowercase())
+            .unwrap_or_default(),
+        position_weight: attr_value(block, "positionWeight")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(|| "1".to_string()),
+        rotation_weight: attr_value(block, "rotationWeight")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(|| "1".to_string()),
+        max_stretch: attr_value(block, "maxStretch")
+            .map(|value| strip_wrappers(&value).to_string())
+            .unwrap_or_else(|| "1.05".to_string()),
     })
 }
 
@@ -2342,6 +2550,7 @@ fn validate_graph(
     actions: &[ActionNode],
     action_libraries: &[ActionLibraryNode],
     apply_actions: &[ApplyActionNode],
+    attachments: &[AttachmentNode],
     contact_surfaces: &[ContactSurfaceNode],
     scene_constraints: &[SceneConstraintNode],
     layers: &[LayerNode],
@@ -2433,6 +2642,13 @@ fn validate_graph(
         collect_dynamic_rigid_body_targets(&scene.children, &mut dynamic_rigid_body_targets);
     }
     collect_dynamic_rigid_body_targets(scene_nodes, &mut dynamic_rigid_body_targets);
+    validate_attachments(
+        attachments,
+        scenes,
+        scene_nodes,
+        &dynamic_rigid_body_targets,
+        line,
+    )?;
 
     let mut skeleton_ids = HashSet::<String>::new();
     for skeleton in skeletons {
@@ -3103,6 +3319,236 @@ fn collect_dynamic_rigid_body_targets(nodes: &[SceneNode], targets: &mut HashSet
             }
             SceneNode::Layer(node) => collect_dynamic_rigid_body_targets(&node.children, targets),
             SceneNode::Part(node) => collect_dynamic_rigid_body_targets(&node.children, targets),
+            _ => {}
+        }
+    }
+}
+
+/// Validate attachment ownership and dependency order before any renderer sees the graph.
+fn validate_attachments(
+    attachments: &[AttachmentNode],
+    scenes: &[SceneRootNode],
+    scene_nodes: &[SceneNode],
+    dynamic_targets: &HashSet<String>,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    let mut model_ids = HashSet::new();
+    for scene in scenes {
+        collect_scene_model_ids(&scene.children, &mut model_ids);
+    }
+    collect_scene_model_ids(scene_nodes, &mut model_ids);
+    let mut attachment_ids = HashSet::new();
+    let mut owners = HashSet::new();
+    let mut dependencies = HashMap::<String, String>::new();
+    for attachment in attachments {
+        if attachment.id.is_empty() || !attachment_ids.insert(attachment.id.clone()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate or empty Attachment id: {}", attachment.id),
+            });
+        }
+        if !model_ids.contains(&attachment.object) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Attachment '{}' object Model not found: {}",
+                    attachment.id, attachment.object
+                ),
+            });
+        }
+        if !owners.insert(attachment.object.clone()) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Model '{}' has more than one Attachment transform owner.",
+                    attachment.object
+                ),
+            });
+        }
+        if dynamic_targets.contains(&attachment.object) {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Attachment object '{}' is controlled by a dynamic RigidBody.",
+                    attachment.object
+                ),
+            });
+        }
+        let socket_ids = attachment
+            .sockets
+            .iter()
+            .map(|socket| socket.id.as_str())
+            .collect::<HashSet<_>>();
+        if socket_ids.len() != attachment.sockets.len() || socket_ids.contains("") {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Attachment '{}' has duplicate or empty Socket ids.",
+                    attachment.id
+                ),
+            });
+        }
+        let primary = attachment
+            .attaches
+            .iter()
+            .filter(|attach| attach.drive == "object")
+            .collect::<Vec<_>>();
+        if primary.len() != 1 || primary[0].mode != "snap" {
+            return Err(GraphParseError {
+                line,
+                message: format!(
+                    "Attachment '{}' requires exactly one drive=object mode=snap Attach.",
+                    attachment.id
+                ),
+            });
+        }
+        for attach in &attachment.attaches {
+            if !socket_ids.contains(attach.socket.as_str()) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' references unknown Socket '{}'.",
+                        attachment.id, attach.socket
+                    ),
+                });
+            }
+            if !model_ids.contains(&attach.target_model) || attachment.object == attach.target_model
+            {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' has an invalid target Model '{}'.",
+                        attachment.id, attach.target_model
+                    ),
+                });
+            }
+            if !matches!(attach.target_bone.as_str(), "hand_l" | "hand_r") {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' target must currently be hand_l or hand_r.",
+                        attachment.id
+                    ),
+                });
+            }
+            if attach.drive == "target" && attach.mode != "ik" {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' drive=target requires mode=ik.",
+                        attachment.id
+                    ),
+                });
+            }
+            if !matches!(attach.drive.as_str(), "object" | "target") {
+                return Err(GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' drive must be object or target.",
+                        attachment.id
+                    ),
+                });
+            }
+            for (name, value) in [
+                ("positionWeight", &attach.position_weight),
+                ("rotationWeight", &attach.rotation_weight),
+            ] {
+                let parsed = value.parse::<f32>().map_err(|_| GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' {name} must be a number in 0..1.",
+                        attachment.id
+                    ),
+                })?;
+                if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "Attachment '{}' {name} must be inside 0..1.",
+                            attachment.id
+                        ),
+                    });
+                }
+            }
+            let max_stretch = attach
+                .max_stretch
+                .parse::<f32>()
+                .map_err(|_| GraphParseError {
+                    line,
+                    message: format!(
+                        "Attachment '{}' maxStretch must be a finite number >= 1.",
+                        attachment.id
+                    ),
+                })?;
+            if !max_stretch.is_finite() || max_stretch < 1.0 {
+                return Err(GraphParseError {
+                    line,
+                    message: format!("Attachment '{}' maxStretch must be >= 1.", attachment.id),
+                });
+            }
+        }
+        for socket in &attachment.sockets {
+            for values in [&socket.position, &socket.rotation] {
+                if values
+                    .iter()
+                    .any(|value| !value.parse::<f32>().is_ok_and(f32::is_finite))
+                {
+                    return Err(GraphParseError {
+                        line,
+                        message: format!(
+                            "Attachment '{}' Socket values must contain finite numbers.",
+                            attachment.id
+                        ),
+                    });
+                }
+            }
+        }
+        dependencies.insert(attachment.object.clone(), primary[0].target_model.clone());
+    }
+    for object in dependencies.keys() {
+        let mut visited = HashSet::new();
+        let mut current = object.as_str();
+        while let Some(next) = dependencies.get(current) {
+            if !visited.insert(current.to_string()) {
+                return Err(GraphParseError {
+                    line,
+                    message: format!("Attachment cycle detected at Model '{current}'."),
+                });
+            }
+            current = next;
+        }
+    }
+    Ok(())
+}
+
+fn collect_scene_model_ids(nodes: &[SceneNode], ids: &mut HashSet<String>) {
+    for node in nodes {
+        match node {
+            SceneNode::Group(group) => {
+                if let Some(composite) = &group.composite {
+                    for node in &composite.nodes_3d {
+                        match node {
+                            crate::scene::model::Scene3DNode::Model(model) => {
+                                if let Some(id) = &model.id {
+                                    ids.insert(id.clone());
+                                }
+                            }
+                            crate::scene::model::Scene3DNode::VolumeRepeat(repeat) => {
+                                if let Some(id) = &repeat.template.id {
+                                    ids.insert(id.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                collect_scene_model_ids(&group.children, ids);
+            }
+            SceneNode::Timeline(node) => collect_scene_model_ids(&node.children, ids),
+            SceneNode::Track(node) => collect_scene_model_ids(&node.children, ids),
+            SceneNode::Sequence(node) => collect_scene_model_ids(&node.children, ids),
+            SceneNode::Layer(node) => collect_scene_model_ids(&node.children, ids),
+            SceneNode::Part(node) => collect_scene_model_ids(&node.children, ids),
             _ => {}
         }
     }
@@ -12957,5 +13403,190 @@ Font note: this is not a structured XML comment.
         .expect("standalone library should parse");
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].id, "bow");
+    }
+
+    #[test]
+    fn graph_attachment_pairs_inline_socket_with_left_hand() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={24} duration="2s" size={[640,360]}>
+  <Assets>
+    <ModelAsset id="character_asset" src="character.glb" />
+    <ModelAsset id="sword_asset" src="sword.glb" />
+  </Assets>
+  <Attachment id="hero_sword_left_grip" object="sword">
+    <Socket id="grip" position={[0,-0.12,0]} rotation={[0,0,90]} />
+    <Attach target="character.hand_l" mode="snap"
+            positionWeight="1" rotationWeight="1" />
+  </Attachment>
+  <Scene id="AttachmentScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="2s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <Model id="character" asset="character_asset" />
+              <Model id="sword" asset="sword_asset" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="AttachmentScene" />
+</Graph>"##,
+        )
+        .expect("inline socket attachment should parse");
+        let attachment = &graph.attachments[0];
+        assert_eq!(attachment.object, "sword");
+        assert_eq!(attachment.sockets[0].position, ["0", "-0.12", "0"]);
+        assert_eq!(attachment.attaches[0].target_model, "character");
+        assert_eq!(attachment.attaches[0].target_bone, "hand_l");
+    }
+
+    #[test]
+    fn graph_attachment_defaults_to_snap_and_full_weights() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Assets>
+    <ModelAsset id="a" src="a.glb" />
+    <ModelAsset id="b" src="b.glb" />
+  </Assets>
+  <Attachment id="grip" object="prop">
+    <Socket id="origin" />
+    <Attach target="actor.hand_r" />
+  </Attachment>
+  <Scene id="AttachmentScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Model id="actor" asset="a" />
+              <Model id="prop" asset="b" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="AttachmentScene" />
+</Graph>"##,
+        )
+        .expect("attachment defaults should parse");
+        let attach = &graph.attachments[0].attaches[0];
+        assert_eq!(attach.mode, "snap");
+        assert_eq!(attach.position_weight, "1");
+        assert_eq!(attach.rotation_weight, "1");
+        assert_eq!(attach.drive, "object");
+        assert_eq!(attach.socket, "origin");
+    }
+
+    #[test]
+    fn graph_attachment_pairs_primary_snap_with_secondary_hand_ik() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Assets>
+    <ModelAsset id="hero_asset" src="hero.glb" />
+    <ModelAsset id="sword_asset" src="sword.glb" />
+  </Assets>
+  <Attachment id="two_hand_grip" object="sword">
+    <Socket id="main" />
+    <Socket id="support" position={[0,0.2,0]} />
+    <Attach socket="main" target="hero.hand_r" mode="snap" drive="object" />
+    <Attach socket="support" target="hero.hand_l" mode="ik" drive="target"
+            positionWeight="1" rotationWeight="0.8" maxStretch="1.05" />
+  </Attachment>
+  <Scene id="TwoHandScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Model id="hero" asset="hero_asset" />
+              <Model id="sword" asset="sword_asset" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="TwoHandScene" />
+</Graph>"##,
+        )
+        .expect("two-hand Attachment should parse");
+        let attachment = &graph.attachments[0];
+        assert_eq!(attachment.sockets.len(), 2);
+        assert_eq!(attachment.attaches.len(), 2);
+        assert_eq!(attachment.attaches[1].drive, "target");
+        assert_eq!(attachment.attaches[1].mode, "ik");
+        assert_eq!(attachment.attaches[1].target_bone, "hand_l");
+    }
+
+    #[test]
+    fn graph_attachment_requires_one_socket_and_one_attach() {
+        let error = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Attachment id="broken" object="prop">
+    <Socket id="origin" />
+  </Attachment>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect_err("an incomplete attachment must fail during parsing");
+        assert!(error.message.contains("missing Attach"));
+    }
+
+    #[test]
+    fn graph_attachment_requires_model_dot_bone_target() {
+        let error = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Attachment id="broken" object="prop">
+    <Socket id="origin" />
+    <Attach target="hand_r" />
+  </Attachment>
+  <Background color="#000000" />
+  <Present from="scene" />
+</Graph>"##,
+        )
+        .expect_err("ambiguous bone-only attachment target must fail");
+        assert!(error.message.contains("model-id.canonical-bone"));
+    }
+
+    #[test]
+    fn graph_attachment_rejects_cycles() {
+        let error = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Assets>
+    <ModelAsset id="a" src="a.glb" />
+    <ModelAsset id="b" src="b.glb" />
+  </Assets>
+  <Attachment id="a_to_b" object="a_model">
+    <Socket id="origin" />
+    <Attach target="b_model.hand_r" />
+  </Attachment>
+  <Attachment id="b_to_a" object="b_model">
+    <Socket id="origin" />
+    <Attach target="a_model.hand_l" />
+  </Attachment>
+  <Scene id="AttachmentScene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Model id="a_model" asset="a" />
+              <Model id="b_model" asset="b" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="AttachmentScene" />
+</Graph>"##,
+        )
+        .expect_err("attachment cycles must fail before rendering");
+        assert!(error.message.contains("cycle"));
     }
 }

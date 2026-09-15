@@ -34,6 +34,8 @@ pub(super) const WGPU_WORLD_DOF_SHADER: &str = concat!(
     "\n",
     include_str!("presets/ink_wash_soft_v1.wgsl"),
     "\n",
+    include_str!("presets/pbr_npr_soft_v1.wgsl"),
+    "\n",
     include_str!("universal_style.wgsl"),
 );
 pub(super) const WGPU_GROUND_GRID_SHADER: &str = include_str!("ground_grid.wgsl");

@@ -16,6 +16,7 @@ fn every_render_style_keeps_its_shader_selector() {
     for (name, selector) in expected {
         let lighting = crate::world::WorldLighting {
             render_style: Some(crate::render_style::ResolvedSceneRenderStyle {
+                anti_aliasing: None,
                 depth_of_field: None,
                 universal: Default::default(),
                 cel: Default::default(),

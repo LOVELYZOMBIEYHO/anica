@@ -17,6 +17,32 @@ coding agents.
 - Keep crate-root re-exports for compatibility unless there is an explicit
   migration plan and all Anica usages are updated.
 
+## Skill Routing
+
+- Reusable task workflows live under `skills/<skill-name>/SKILL.md`.
+- Before taking task actions in this crate, inspect the available skill names
+  and frontmatter descriptions under `skills/*/SKILL.md`.
+- If the user names a skill, or the request clearly matches a skill's
+  description, read that `SKILL.md` completely before acting and follow it for
+  the current task.
+- When a selected skill links supporting files such as `references/`, read only
+  the files required for the current workflow, but read each selected file
+  completely.
+- Select the smallest set of skills that covers the request. Do not load every
+  skill or combine unrelated workflows by default.
+- Skills supplement this `AGENTS.md` and the parent repository instructions;
+  they do not override mandatory repository rules. Explicit user instructions
+  take precedence over optional skill guidance.
+- When adding, renaming, or removing a skill, update the registry below in the
+  same change.
+
+### Skill Registry
+
+- `motionloom-image-to-meshasset`: build and iteratively fit a universal
+  `MeshAsset` from one or more image references with the image-analysis,
+  mesh-evaluation, and fingerprint-safe proposal APIs. Read
+  `skills/motionloom-image-to-meshasset/SKILL.md`.
+
 ## DSL Authoring Rules
 
 - Keep MotionLoom scripts parseable by the current parser. Do not invent syntax

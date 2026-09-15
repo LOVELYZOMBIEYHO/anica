@@ -139,7 +139,11 @@ impl GpuWorldLightingParams {
                 lighting
                     .render_style
                     .as_ref()
-                    .is_some_and(|s| s.shading == "ink_wash_soft_v1") as u8 as f32,
+                    .map_or(0.0, |style| match style.shading.as_str() {
+                        "ink_wash_soft_v1" => 1.0,
+                        "pbr_npr_soft_v1" => 2.0,
+                        _ => 0.0,
+                    }),
             ],
             // Disabled styles use exact legacy-neutral multipliers.
             cel0: lighting
@@ -182,6 +186,7 @@ impl GpuWorldLightingParams {
                             "toon" => 2.0,
                             "clay" => 3.0,
                             "filmic_physical_v1" => -1.0,
+                            "pbr_npr_soft_v1" => -2.0,
                             "cel" => 4.0,
                             _ => 0.0,
                         },

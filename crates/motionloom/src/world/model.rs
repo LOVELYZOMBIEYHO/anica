@@ -24,6 +24,9 @@ pub struct WorldGraph {
     /// Cross-actor constraints lowered from the public Scene DSL.
     #[serde(default)]
     pub constraints: Vec<WorldConstraint>,
+    /// Socket-to-bone bindings resolved after animation and IK.
+    #[serde(default)]
+    pub attachments: Vec<WorldAttachment>,
     /// Frame-local lighting lowered from the public Scene 3D DSL.
     #[serde(default)]
     pub lighting: WorldLighting,
@@ -186,6 +189,46 @@ pub struct WorldConstraint {
     pub duration_ms: u64,
     pub solver: String,
     pub weight: String,
+}
+
+/// Renderer-ready inline socket attachment shared by every 3D backend.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldAttachment {
+    pub id: String,
+    pub object: String,
+    pub sockets: Vec<WorldAttachmentSocket>,
+    pub attaches: Vec<WorldAttachmentTarget>,
+    /// Evaluated parent transform retained when a Scene CompoundAsset expands
+    /// into renderer actors named `model::instance`.
+    #[serde(default)]
+    pub object_position: [f32; 3],
+    #[serde(default)]
+    pub object_rotation: [f32; 3],
+    #[serde(default = "default_attachment_object_scale")]
+    pub object_scale: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldAttachmentSocket {
+    pub socket_id: String,
+    pub socket_position: [String; 3],
+    pub socket_rotation: [String; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WorldAttachmentTarget {
+    pub socket_id: String,
+    pub target_model: String,
+    pub target_bone: String,
+    pub mode: String,
+    pub drive: String,
+    pub position_weight: String,
+    pub rotation_weight: String,
+    pub max_stretch: String,
+}
+
+fn default_attachment_object_scale() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

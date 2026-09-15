@@ -289,7 +289,10 @@ fn fs_main_gbuffer(input: VertexOut) -> SurfaceGbufferOutput {
         let previous_ndc = input.previous_clip.xy / input.previous_clip.w;
         let previous_uv = vec2<f32>(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5);
         if (all(previous_uv >= vec2<f32>(-0.05)) && all(previous_uv <= vec2<f32>(1.05))) {
-            velocity = current_uv - previous_uv;
+            // Store physical motion on the stable output grid. Projection
+            // jitter is a sampling pattern, never object or shutter motion.
+            velocity = current_uv - previous_uv
+                - (lighting.preview1.xy - lighting.preview1.zw) / params.canvas.xy;
         }
     }
 
