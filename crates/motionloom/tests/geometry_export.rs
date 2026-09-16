@@ -69,6 +69,7 @@ fn snapshot(source: &str, frame: u32) -> GeometrySnapshot {
             scene_id: "main".into(),
             frame,
             include_hidden: false,
+            selected_model_ids: None,
         },
     ))
     .unwrap()
@@ -255,6 +256,7 @@ fn s86_geometry_baseline_and_static_glb_roundtrip() {
                 scene_id: "S86AnimeHead".into(),
                 frame,
                 include_hidden: false,
+                selected_model_ids: None,
             },
         ))
         .unwrap()

@@ -12,6 +12,7 @@ impl WorldFrameRenderer {
         frame: u32,
         root: &Path,
         overrides: &[WorldMaterialTextureOverride],
+        selected_model_ids: Option<&[String]>,
     ) -> Result<Vec<ResolvedMesh>, GeometryError> {
         let world = graph
             .presented_world()
@@ -52,6 +53,11 @@ impl WorldFrameRenderer {
         let mut result = Vec::new();
         for d in draws {
             if d.params.style[0] <= 0.0 {
+                continue;
+            }
+            if selected_model_ids
+                .is_some_and(|ids| !ids.iter().any(|id| id == &d.instance_key.actor_id))
+            {
                 continue;
             }
             let original = &self.mesh_cache[&d.resource_key.model_path];

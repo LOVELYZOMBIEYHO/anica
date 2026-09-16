@@ -32,6 +32,8 @@ pub struct SceneGeometryOptions {
     pub scene_id: String,
     pub frame: u32,
     pub include_hidden: bool,
+    /// Optional Model ids to include in the flattened export.
+    pub selected_model_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]

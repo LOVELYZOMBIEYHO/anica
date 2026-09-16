@@ -125,11 +125,15 @@ fn visit(
                                 }
                             }
                         }
-                        snapshot.meshes.extend(
-                            renderer
-                                .scene_3d_renderer
-                                .extract_asset_meshes(&world, frame, &root, &overrides)?,
-                        );
+                        snapshot
+                            .meshes
+                            .extend(renderer.scene_3d_renderer.extract_asset_meshes(
+                                &world,
+                                frame,
+                                &root,
+                                &overrides,
+                                options.selected_model_ids.as_deref(),
+                            )?);
                     }
                 }
                 visit(

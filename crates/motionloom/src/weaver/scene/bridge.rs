@@ -66,7 +66,7 @@ pub(crate) async fn weaver_snapshot(
         .clone();
     let meshes = renderer
         .scene_3d_renderer
-        .extract_asset_meshes(&world, frame, &root, &overrides)
+        .extract_asset_meshes(&world, frame, &root, &overrides, None)
         .map_err(|e| WeaverError::Scene(e.to_string()))?;
     let mut diagnostics = vec!["Thin-lens camera replaces legacy screen-space DoF. Light intensities retain scene units; physical unit calibration is not assumed.".into()];
     diagnostics.push("Path-traced geometry casts physical shadows; preview-only AO, contact-shadow strength and per-light shadow-strength hacks are not applied.".into());

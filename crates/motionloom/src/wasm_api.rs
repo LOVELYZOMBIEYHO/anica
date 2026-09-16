@@ -4,6 +4,7 @@
 
 use wasm_bindgen::prelude::*;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Once};
 
 use web_sys::HtmlCanvasElement;
@@ -16,6 +17,9 @@ use crate::authoring::{
     motionloom_showcase_schema_json as showcase_schema_json,
 };
 use crate::dsl::{GraphScript, is_graph_script, parse_graph_script};
+use crate::experimental::geometry::{
+    SceneGeometryOptions, export_scene_glb, extract_scene_geometry_with_resolver,
+};
 use crate::process::cpu_renderer::render_process_frame_cpu;
 #[cfg(target_arch = "wasm32")]
 use crate::process::wasm_webgpu::render_process_frame_to_canvas_gpu as render_process_frame_to_canvas_gpu_impl;
@@ -792,6 +796,92 @@ impl WasmSceneRenderer {
     /// the asset bytes when the hint is absent.
     pub fn add_environment_bounds(&mut self, name: &str, bytes: &[u8]) {
         register_wasm_environment_bounds_asset(self.resolver.as_ref(), name, bytes);
+    }
+
+    /// List active 3D model ids that can be flattened into a static GLB.
+    pub async fn exportable_geometry_json(
+        &self,
+        scene_id: &str,
+        frame: u32,
+    ) -> Result<String, JsValue> {
+        let snapshot = extract_scene_geometry_with_resolver(
+            &self.graph,
+            &SceneGeometryOptions {
+                scene_id: scene_id.to_string(),
+                frame,
+                include_hidden: false,
+                selected_model_ids: None,
+            },
+            self.resolver.clone(),
+        )
+        .await
+        .map_err(|err| js_error(err.to_string()))?;
+        let mut items = BTreeMap::<String, (usize, usize)>::new();
+        for mesh in &snapshot.meshes {
+            let model_id = mesh
+                .name
+                .split(':')
+                .next()
+                .unwrap_or(&mesh.name)
+                .to_string();
+            let entry = items.entry(model_id).or_default();
+            entry.0 += mesh.positions.len();
+            entry.1 += mesh.indices.len() / 3;
+        }
+        let items = items
+            .into_iter()
+            .map(|(model_id, (vertices, triangles))| {
+                serde_json::json!({
+                    "modelId": model_id,
+                    "label": model_id,
+                    "vertices": vertices,
+                    "triangles": triangles,
+                    "exportable": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&serde_json::json!({
+            "sceneId": scene_id,
+            "frame": frame,
+            "items": items,
+            "topologySignature": snapshot.topology_signature,
+            "uvSignature": snapshot.uv_signature,
+            "diagnostics": snapshot.diagnostics,
+        }))
+        .map_err(|err| js_error(err.to_string()))
+    }
+
+    /// Export selected active model ids as one static, world-space GLB.
+    pub async fn export_scene_glb(
+        &self,
+        scene_id: &str,
+        frame: u32,
+        selection_json: &str,
+    ) -> Result<Vec<u8>, JsValue> {
+        let selection: serde_json::Value = serde_json::from_str(selection_json)
+            .map_err(|err| js_error(format!("invalid GLB selection JSON: {err}")))?;
+        let model_ids = selection
+            .get("modelIds")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| js_error("GLB selection requires a non-empty modelIds array".into()))?
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .filter(|ids| !ids.is_empty())
+            .ok_or_else(|| js_error("GLB selection requires a non-empty modelIds array".into()))?;
+        let snapshot = extract_scene_geometry_with_resolver(
+            &self.graph,
+            &SceneGeometryOptions {
+                scene_id: scene_id.to_string(),
+                frame,
+                include_hidden: false,
+                selected_model_ids: Some(model_ids),
+            },
+            self.resolver.clone(),
+        )
+        .await
+        .map_err(|err| js_error(err.to_string()))?;
+        export_scene_glb(&snapshot).map_err(|err| js_error(err.to_string()))
     }
 
     /// Register an in-memory font for this renderer only.

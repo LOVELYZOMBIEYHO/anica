@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| graph.scenes[0].id.clone()),
         frame: args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(0),
         include_hidden: false,
+        selected_model_ids: None,
     };
     let snapshot = pollster::block_on(extract_scene_geometry(&graph, &options))?;
     let check = check_scene_uvs(
