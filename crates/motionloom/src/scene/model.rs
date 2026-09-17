@@ -1173,6 +1173,12 @@ pub struct SceneAtmosphereFogNode {
     pub height_falloff: String,
     #[serde(default = "default_scene_zero")]
     pub scattering: String,
+    /// Per-channel extinction used by the froxel volume. This remains separate
+    /// from the legacy scalar scattering control so old scenes render exactly.
+    #[serde(default)]
+    pub absorption: Option<String>,
+    #[serde(default)]
+    pub scattering_color: Option<String>,
     #[serde(default)]
     pub affect_sky: bool,
     /// Optional world-space volume bounds. Omitting both preserves global fog.
@@ -1182,6 +1188,35 @@ pub struct SceneAtmosphereFogNode {
     pub bounds_max: Option<String>,
     #[serde(default = "default_scene_zero")]
     pub edge_feather: String,
+    #[serde(default)]
+    pub volumetric_scattering: Option<SceneVolumetricScatteringNode>,
+    #[serde(default)]
+    pub water_caustics: Option<SceneWaterCausticsNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneVolumetricScatteringNode {
+    pub id: Option<String>,
+    pub light_ref: String,
+    pub intensity: String,
+    pub anisotropy: String,
+    pub max_distance: String,
+    pub shadowed: bool,
+    pub debug_view: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneWaterCausticsNode {
+    pub id: Option<String>,
+    pub intensity: String,
+    pub scale: String,
+    pub speed: String,
+    pub depth_falloff: String,
+    pub color: String,
+    pub volume_term: bool,
+    pub surface_term: bool,
 }
 
 fn default_scene_fog_mode() -> String {

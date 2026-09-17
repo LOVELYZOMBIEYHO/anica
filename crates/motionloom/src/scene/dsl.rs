@@ -3066,7 +3066,12 @@ fn parse_composite_group_block(
             continue;
         }
         if starts_open_tag(line, "AtmosphereFog") {
-            let (tag, end_ix) = collect_self_closing_block(lines, i)?;
+            let (tag, open_end_ix) = collect_tag_block(lines, i, '>', false)?;
+            let end_ix = if is_self_closing_tag(&tag) {
+                open_end_ix
+            } else {
+                find_matching_close_tag(lines, open_end_ix + 1, "AtmosphereFog")?
+            };
             let mode = scene_attr_or_default(&tag, &["mode"], "linear");
             if !matches!(mode.as_str(), "linear" | "exp" | "height") {
                 return Err(GraphParseError {
@@ -3085,6 +3090,108 @@ fn parse_composite_group_block(
                         .to_string(),
                 });
             }
+            let mut volumetric_scattering = None;
+            let mut water_caustics = None;
+            if !is_self_closing_tag(&tag) {
+                let mut child_ix = open_end_ix + 1;
+                while child_ix < end_ix {
+                    let child = lines[child_ix].trim();
+                    if child.is_empty() || child.starts_with("//") || child.starts_with("<!--") {
+                        child_ix += 1;
+                        continue;
+                    }
+                    if starts_open_tag(child, "VolumetricScattering") {
+                        if volumetric_scattering.is_some() {
+                            return Err(GraphParseError {
+                                line: child_ix + 1,
+                                message:
+                                    "AtmosphereFog accepts at most one VolumetricScattering child."
+                                        .to_string(),
+                            });
+                        }
+                        let (child_tag, child_end) = collect_self_closing_block(lines, child_ix)?;
+                        let debug_view =
+                            scene_attr_or_default(&child_tag, &["debugView", "debug_view"], "none");
+                        if !matches!(
+                            debug_view.as_str(),
+                            "none"
+                                | "density"
+                                | "shadow"
+                                | "inscatter"
+                                | "opticalDepth"
+                                | "transmittance"
+                                | "caustics"
+                        ) {
+                            return Err(GraphParseError {
+                                line: child_ix + 1,
+                                message: format!(
+                                    "unsupported VolumetricScattering debugView: {debug_view}"
+                                ),
+                            });
+                        }
+                        volumetric_scattering = Some(SceneVolumetricScatteringNode {
+                            id: scene_optional_attr(&child_tag, &["id"]),
+                            light_ref: strip_wrappers(&required_attr_value(
+                                &child_tag,
+                                "lightRef",
+                                child_ix + 1,
+                            )?)
+                            .to_string(),
+                            intensity: scene_attr_or_default(&child_tag, &["intensity"], "1"),
+                            anisotropy: scene_attr_or_default(&child_tag, &["anisotropy"], "0"),
+                            max_distance: scene_attr_or_default(
+                                &child_tag,
+                                &["maxDistance", "max_distance"],
+                                "30",
+                            ),
+                            shadowed: scene_bool_attr(&child_tag, &["shadowed"], true),
+                            debug_view,
+                        });
+                        child_ix = child_end + 1;
+                        continue;
+                    }
+                    if starts_open_tag(child, "WaterCaustics") {
+                        if water_caustics.is_some() {
+                            return Err(GraphParseError {
+                                line: child_ix + 1,
+                                message: "AtmosphereFog accepts at most one WaterCaustics child."
+                                    .to_string(),
+                            });
+                        }
+                        let (child_tag, child_end) = collect_self_closing_block(lines, child_ix)?;
+                        water_caustics = Some(SceneWaterCausticsNode {
+                            id: scene_optional_attr(&child_tag, &["id"]),
+                            intensity: scene_attr_or_default(&child_tag, &["intensity"], "0"),
+                            scale: scene_attr_or_default(&child_tag, &["scale"], "0.1"),
+                            speed: scene_attr_or_default(&child_tag, &["speed"], "0.25"),
+                            depth_falloff: scene_attr_or_default(
+                                &child_tag,
+                                &["depthFalloff", "depth_falloff"],
+                                "0.5",
+                            ),
+                            color: scene_attr_or_default(&child_tag, &["color"], "#FFFFFF"),
+                            volume_term: scene_bool_attr(
+                                &child_tag,
+                                &["volumeTerm", "volume_term"],
+                                true,
+                            ),
+                            surface_term: scene_bool_attr(
+                                &child_tag,
+                                &["surfaceTerm", "surface_term"],
+                                true,
+                            ),
+                        });
+                        child_ix = child_end + 1;
+                        continue;
+                    }
+                    return Err(GraphParseError {
+                        line: child_ix + 1,
+                        message: format!(
+                            "<AtmosphereFog> only accepts <VolumetricScattering> or <WaterCaustics> children, got: {child}"
+                        ),
+                    });
+                }
+            }
             nodes_3d.push(Scene3DNode::AtmosphereFog(SceneAtmosphereFogNode {
                 id: scene_optional_attr(&tag, &["id"]),
                 mode,
@@ -3099,10 +3206,17 @@ fn parse_composite_group_block(
                     "0.25",
                 ),
                 scattering: scene_attr_or_default(&tag, &["scattering"], "0"),
+                absorption: scene_optional_attr(&tag, &["absorption"]),
+                scattering_color: scene_optional_attr(
+                    &tag,
+                    &["scatteringColor", "scattering_color"],
+                ),
                 affect_sky: scene_bool_attr(&tag, &["affectSky", "affect_sky"], false),
                 bounds_min,
                 bounds_max,
                 edge_feather: scene_attr_or_default(&tag, &["edgeFeather", "edge_feather"], "0"),
+                volumetric_scattering,
+                water_caustics,
             }));
             i = end_ix + 1;
             continue;
@@ -3550,6 +3664,79 @@ fn parse_composite_group_block(
             continue;
         }
         i += 1;
+    }
+
+    let volumetric_count = nodes_3d
+        .iter()
+        .filter(|node| {
+            matches!(
+                node,
+                Scene3DNode::AtmosphereFog(SceneAtmosphereFogNode {
+                    volumetric_scattering: Some(_),
+                    ..
+                })
+            )
+        })
+        .count();
+    if volumetric_count > 1 {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "A 3D CompositeGroup supports one VolumetricScattering light.".to_string(),
+        });
+    }
+    for volume in nodes_3d.iter().filter_map(|node| match node {
+        Scene3DNode::AtmosphereFog(SceneAtmosphereFogNode {
+            volumetric_scattering: Some(volume),
+            ..
+        }) => Some(volume),
+        _ => None,
+    }) {
+        let light = nodes_3d.iter().find_map(|node| match node {
+            Scene3DNode::DirectionalLight(light)
+                if light.id.as_deref() == Some(volume.light_ref.as_str()) =>
+            {
+                Some((true, light.cast_shadow))
+            }
+            Scene3DNode::SpotLight(light)
+                if light.id.as_deref() == Some(volume.light_ref.as_str()) =>
+            {
+                Some((true, light.cast_shadow))
+            }
+            Scene3DNode::PointLight(light)
+                if light.id.as_deref() == Some(volume.light_ref.as_str()) =>
+            {
+                Some((false, light.cast_shadow))
+            }
+            Scene3DNode::RectAreaLight(light)
+                if light.id.as_deref() == Some(volume.light_ref.as_str()) =>
+            {
+                Some((false, false))
+            }
+            _ => None,
+        });
+        let Some((supported, casts_shadow)) = light else {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "VolumetricScattering lightRef '{}' must resolve to a light in the same 3D CompositeGroup.",
+                    volume.light_ref
+                ),
+            });
+        };
+        if !supported {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: "VolumetricScattering supports DirectionalLight or SpotLight only."
+                    .to_string(),
+            });
+        }
+        if volume.shadowed && !casts_shadow {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: "shadowed VolumetricScattering requires castShadow=true on its light."
+                    .to_string(),
+            });
+        }
     }
 
     let model_ids = nodes_3d

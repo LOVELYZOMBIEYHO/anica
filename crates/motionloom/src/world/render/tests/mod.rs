@@ -147,10 +147,14 @@ fn fog_and_optics_pack_into_distinct_gpu_uniform_slots() {
             base_height: 0.4,
             height_falloff: 0.2,
             scattering: 0.1,
+            absorption: [0.02, 0.04, 0.08],
+            scattering_color: [0.1, 0.2, 0.3],
             affect_sky: true,
             bounds_min: Some([-4.0, 0.0, -8.0]),
             bounds_max: Some([4.0, 6.0, -1.0]),
             edge_feather: 0.75,
+            volumetric_scattering: None,
+            water_caustics: None,
         }),
         ..Default::default()
     };
@@ -173,7 +177,7 @@ fn fog_and_optics_pack_into_distinct_gpu_uniform_slots() {
     assert_eq!(params.fog3, [-4.0, 0.0, -8.0, 1.0]);
     assert_eq!(params.fog4, [4.0, 6.0, -1.0, 0.75]);
     assert_eq!(params.optics0, [5.0, 50.0, 2.8, 8.0]);
-    assert_eq!(super::pack_gpu_world_lighting(params).len(), 1120);
+    assert_eq!(super::pack_gpu_world_lighting(params).len(), 1152);
 }
 
 #[test]
@@ -434,6 +438,25 @@ fn world_dof_shader_is_webgpu_derivative_safe() {
         .expect("world DoF WGSL must validate");
     assert!(super::WGPU_WORLD_DOF_SHADER.contains("textureSampleLevel"));
     assert!(!super::WGPU_WORLD_DOF_SHADER.contains("textureSample(scene_color"));
+}
+
+#[test]
+fn froxel_shaders_parse_and_validate_for_webgpu() {
+    for (name, source) in [
+        ("inject", super::WGPU_FROXEL_INJECT_SHADER),
+        ("integrate", super::WGPU_FROXEL_INTEGRATE_SHADER),
+        ("composite", super::WGPU_FROXEL_COMPOSITE_SHADER),
+    ] {
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("froxel {name} WGSL must parse: {error}"));
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("froxel {name} WGSL must validate: {error}"));
+    }
 }
 
 #[test]

@@ -230,6 +230,8 @@ legacy World implementation types. A `CompositeGroup space="3d"` accepts:
 - `AmbientOcclusion` and `ContactShadow`
 - `ColorManagement` with `aces`, `reinhard`, or `none` tone mapping
 - `AtmosphereFog` with `linear`, `exp`, or height-aware distance attenuation;
+  optional `VolumetricScattering` and `WaterCaustics` children enable the
+  WebGPU froxel path described in [VOLUMETRICS.md](VOLUMETRICS.md).
   optional `boundsMin`/`boundsMax` and `edgeFeather` confine the medium to a
   world-space box without changing unbounded scenes
 - optional `Camera3D` depth-of-field optics (`focusTarget`, `focusDistance`,

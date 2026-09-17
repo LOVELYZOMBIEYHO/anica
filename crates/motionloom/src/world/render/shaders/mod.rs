@@ -39,3 +39,6 @@ pub(super) const WGPU_WORLD_DOF_SHADER: &str = concat!(
     include_str!("universal_style.wgsl"),
 );
 pub(super) const WGPU_GROUND_GRID_SHADER: &str = include_str!("ground_grid.wgsl");
+pub(super) const WGPU_FROXEL_INJECT_SHADER: &str = include_str!("volumetric_inject.wgsl");
+pub(super) const WGPU_FROXEL_INTEGRATE_SHADER: &str = include_str!("volumetric_integrate.wgsl");
+pub(super) const WGPU_FROXEL_COMPOSITE_SHADER: &str = include_str!("volumetric_composite.wgsl");

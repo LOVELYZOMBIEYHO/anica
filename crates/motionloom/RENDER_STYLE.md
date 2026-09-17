@@ -127,7 +127,8 @@ finish function. Unsupported shading names are errors, never silent fallbacks.
 | ToneStyle.highlightColor | #RRGGBB | #FFFFFF |
 | ToneStyle.toneStrength | 0–1 | 0 |
 
-Order: existing scene lighting/fog/grading → DoF/resolve tone mapping → preset
+Order: scene lighting and transparent surfaces → optional froxel volume
+composite → temporal resolve and DoF → display tone mapping → preset
 → universal exposure → contrast → luminance-based shadow/highlight gradient
 blend → multiplicative tint blend → saturation → clamp. Exposure uses the
 renderer's gamma-2.2 working conversion. Tone colours interpolate by display

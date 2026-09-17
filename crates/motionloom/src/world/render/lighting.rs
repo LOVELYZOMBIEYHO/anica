@@ -22,6 +22,7 @@ impl GpuWorldLighting {
             }),
             frame_index: 0,
             temporal_jitter: false,
+            froxel: None,
         }
     }
 }
@@ -80,7 +81,17 @@ impl GpuWorldLightingParams {
                 light.height,
             ]);
         }
-        let shadow_light = lighting.lights.iter().find(|light| light.cast_shadow);
+        let volumetric_light_ref = fog
+            .and_then(|fog| fog.volumetric_scattering.as_ref())
+            .map(|volume| volume.light_ref.as_str());
+        let shadow_light = volumetric_light_ref
+            .and_then(|light_ref| {
+                lighting
+                    .lights
+                    .iter()
+                    .find(|light| light.id.as_deref() == Some(light_ref) && light.cast_shadow)
+            })
+            .or_else(|| lighting.lights.iter().find(|light| light.cast_shadow));
         let (shadow0, shadow1, shadow2, shadow3, shadow_strength) =
             if let Some(light) = shadow_light {
                 let forward = normalize3(light.direction);
@@ -275,7 +286,7 @@ impl GpuWorldLightingParams {
                 fog.map_or(0.0, |value| value.height_falloff),
                 fog.map_or(0.0, |value| value.scattering),
                 fog.is_some_and(|value| value.affect_sky) as u8 as f32,
-                fog.is_some() as u8 as f32,
+                fog.is_some_and(|value| value.volumetric_scattering.is_none()) as u8 as f32,
             ],
             fog3: [
                 fog.and_then(|value| value.bounds_min)
@@ -296,12 +307,37 @@ impl GpuWorldLightingParams {
                     .map_or(0.0, |value| value[2]),
                 fog.map_or(0.0, |value| value.edge_feather),
             ],
+            caustics0: fog.and_then(|value| value.water_caustics.as_ref()).map_or(
+                [0.0; 4],
+                |value| {
+                    [
+                        value.intensity,
+                        value.scale,
+                        value.speed,
+                        value.depth_falloff,
+                    ]
+                },
+            ),
+            caustics1: fog.and_then(|value| value.water_caustics.as_ref()).map_or(
+                [0.0; 4],
+                |value| {
+                    [
+                        value.color[0],
+                        value.color[1],
+                        value.color[2],
+                        value.surface_term as u8 as f32,
+                    ]
+                },
+            ),
             optics0: camera.optics,
             render_compat: [
-                lighting
-                    .lights
-                    .iter()
-                    .position(|l| l.cast_shadow)
+                shadow_light
+                    .and_then(|shadow| {
+                        lighting
+                            .lights
+                            .iter()
+                            .position(|light| std::ptr::eq(light, shadow))
+                    })
                     .map_or(-1.0, |i| i as f32),
                 0.0,
                 0.0,

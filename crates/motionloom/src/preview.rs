@@ -83,6 +83,8 @@ pub enum ImmediatePreviewProfile {
     Balanced,
     /// Highest-quality interactive path for discrete desktop GPUs.
     Cinematic,
+    /// Maximum desktop quality for offline review and short hero renders.
+    Ultra,
 }
 
 /// Host-controlled settings that never mutate the authored graph.
@@ -138,6 +140,8 @@ impl ImmediatePreviewSettings {
                 temporal_jitter: false,
                 screen_space_reflections: false,
                 motion_blur: false,
+                froxel_tile_size: 16,
+                froxel_depth_slices: 32,
             },
             ImmediatePreviewProfile::Balanced => ImmediatePreviewBudget {
                 shadow_map_size: 1536,
@@ -151,6 +155,8 @@ impl ImmediatePreviewSettings {
                 temporal_jitter: false,
                 screen_space_reflections: false,
                 motion_blur: true,
+                froxel_tile_size: 12,
+                froxel_depth_slices: 48,
             },
             ImmediatePreviewProfile::Cinematic => ImmediatePreviewBudget {
                 shadow_map_size: 2048,
@@ -164,6 +170,23 @@ impl ImmediatePreviewSettings {
                 temporal_jitter: false,
                 screen_space_reflections: true,
                 motion_blur: true,
+                froxel_tile_size: 8,
+                froxel_depth_slices: 64,
+            },
+            ImmediatePreviewProfile::Ultra => ImmediatePreviewBudget {
+                shadow_map_size: 4096,
+                texture_anisotropy: 16,
+                max_lights: 8,
+                dof_sample_limit: 256,
+                hdr: true,
+                antialiasing: ImmediatePreviewAntialiasing::Fxaa,
+                screen_space_ao: true,
+                temporal_antialiasing: true,
+                temporal_jitter: false,
+                screen_space_reflections: true,
+                motion_blur: true,
+                froxel_tile_size: 6,
+                froxel_depth_slices: 96,
             },
         }
     }
@@ -191,6 +214,10 @@ pub struct ImmediatePreviewBudget {
     pub temporal_jitter: bool,
     pub screen_space_reflections: bool,
     pub motion_blur: bool,
+    /// Width and height in pixels represented by one froxel column.
+    pub froxel_tile_size: u16,
+    /// Logarithmically distributed depth cells in each froxel column.
+    pub froxel_depth_slices: u16,
 }
 
 /// Honest feature report for host UIs. Features not yet in the immediate path
@@ -1069,6 +1096,11 @@ mod tests {
         }
         .budget();
         let balanced = ImmediatePreviewSettings::default().budget();
+        let ultra = ImmediatePreviewSettings {
+            profile: ImmediatePreviewProfile::Ultra,
+            ..Default::default()
+        }
+        .budget();
         assert!(portable.shadow_map_size < cinematic.shadow_map_size);
         assert!(portable.dof_sample_limit < cinematic.dof_sample_limit);
         assert!(balanced.temporal_antialiasing);
@@ -1079,6 +1111,11 @@ mod tests {
         assert!(!cinematic.temporal_jitter);
         assert_eq!(cinematic.texture_anisotropy, 16);
         assert_eq!(cinematic.antialiasing, ImmediatePreviewAntialiasing::Fxaa);
+        assert_eq!(portable.froxel_tile_size, 16);
+        assert_eq!(balanced.froxel_depth_slices, 48);
+        assert_eq!(cinematic.froxel_depth_slices, 64);
+        assert_eq!(ultra.froxel_tile_size, 6);
+        assert_eq!(ultra.froxel_depth_slices, 96);
     }
 
     #[test]

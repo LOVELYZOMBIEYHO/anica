@@ -21,7 +21,7 @@ pub use model::{
     WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind,
     WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
     WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetarget, WorldRetargetMap,
-    WorldSpritePlayback, WorldTime,
+    WorldSpritePlayback, WorldTime, WorldVolumetricScattering, WorldWaterCaustics,
 };
 pub(crate) use model::{WorldAnimationAsset, WorldConstraint};
 pub use model_inspection::{

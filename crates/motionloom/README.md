@@ -11,6 +11,9 @@ provide `filmic_physical_v1`, `filmic_bokeh_v1` and `filmic_aces_v1` with a
 Experimental [geometry tooling](GEOMETRY_TOOLING.md) provides UV inspection and
 camera-free static GLB export directly from existing Scene DSL.
 
+Opt-in [froxel volumetrics](VOLUMETRICS.md) provide shadowed underwater light
+transport and procedural volume caustics in the immediate WebGPU renderer.
+
 Scene-owned visual style resources are documented in [RENDER_STYLE.md](RENDER_STYLE.md).
 The `ink_wash_soft_v1` WGSL preset provides soft 3D-to-2D ink rendering.
 Optional `ColorStyle` and `ToneStyle` controls work across all GPU shading modes;

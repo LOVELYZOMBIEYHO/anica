@@ -17,7 +17,10 @@ use materials::{TextureRole, build_mips};
 use params::{pack_gpu_world_lighting, pack_gpu_world_params, pack_ground_grid_params};
 use pipeline::create_world_surface_pipeline;
 use resources::{align_to_256, gpu_world_vertex_chunk_bytes};
-use shaders::{WGPU_GROUND_GRID_SHADER, WGPU_WORLD_DOF_SHADER, WGPU_WORLD_SHADER};
+use shaders::{
+    WGPU_FROXEL_COMPOSITE_SHADER, WGPU_FROXEL_INJECT_SHADER, WGPU_FROXEL_INTEGRATE_SHADER,
+    WGPU_GROUND_GRID_SHADER, WGPU_WORLD_DOF_SHADER, WGPU_WORLD_SHADER,
+};
 use shadows::fit_rigid_shadow_volume;
 #[cfg(test)]
 use textures::gpu_world_texture_from_image;
@@ -60,9 +63,9 @@ use crate::world::gltf_loader::{
 use crate::world::model::{
     WorldAction, WorldActionBone, WorldActionPose, WorldActor, WorldApplyAction,
     WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldDirectionFrame,
-    WorldDirectionalCharacter, WorldGraph, WorldLightKind, WorldLighting, WorldMaterialStyle,
-    WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldRetargetMap, WorldSpritePlayback,
-    WorldTime,
+    WorldDirectionalCharacter, WorldGraph, WorldLight, WorldLightKind, WorldLighting,
+    WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle, WorldPlay, WorldRetargetMap,
+    WorldSpritePlayback, WorldTime,
 };
 
 /// Keep native profiling instrumentation out of the browser runtime because
@@ -190,6 +193,8 @@ pub struct Scene3DFrameProfile {
     pub visible_triangles: u64,
     pub light_count: usize,
     pub shadow_map_size: u32,
+    pub froxel_grid: Option<[u32; 3]>,
+    pub froxel_bytes: u64,
     /// True once a sequential prior frame is available for temporal resolve.
     pub temporal_history_valid: bool,
     pub temporal_antialiasing: bool,
@@ -1504,6 +1509,18 @@ impl WorldFrameRenderer {
             .as_ref()
             .map(|renderer| (renderer.width as u64, renderer.height as u64))
             .unwrap_or_default();
+        let froxel_grid = self.gpu_renderer.as_ref().and_then(|renderer| {
+            renderer
+                .froxel_resources
+                .as_ref()
+                .map(|resources| [resources.width, resources.height, resources.depth])
+        });
+        let froxel_bytes = froxel_grid.map_or(0, |[width, height, depth]| {
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(u64::from(depth))
+                .saturating_mul(16)
+        });
         let frame_pixels = target_width.saturating_mul(target_height);
         let temporal_bytes_per_pixel = if self
             .gpu_renderer
@@ -1550,6 +1567,8 @@ impl WorldFrameRenderer {
             visible_triangles,
             light_count,
             shadow_map_size,
+            froxel_grid,
+            froxel_bytes,
             temporal_history_valid,
             temporal_antialiasing: self
                 .gpu_renderer
@@ -1564,7 +1583,7 @@ impl WorldFrameRenderer {
             anti_aliasing_requested: self.last_prepared_draw_stats.anti_aliasing_requested,
             anti_aliasing_effective: self.last_prepared_draw_stats.anti_aliasing_effective,
             anti_aliasing_fallback_used: self.last_prepared_draw_stats.anti_aliasing_fallback_used,
-            render_target_bytes,
+            render_target_bytes: render_target_bytes.saturating_add(froxel_bytes),
         };
     }
 
@@ -1665,6 +1684,39 @@ impl WorldFrameRenderer {
         };
         let mut lighting = self.prepare_gpu_lighting(&graph.lighting, asset_root, camera_view)?;
         let budget = self.immediate_preview_settings.budget();
+        lighting.froxel = graph.lighting.atmosphere_fog.as_ref().and_then(|fog| {
+            let volume = fog.volumetric_scattering.as_ref()?;
+            let light = graph
+                .lighting
+                .lights
+                .iter()
+                .find(|light| light.id.as_deref() == Some(volume.light_ref.as_str()))?
+                .clone();
+            Some(GpuFroxelSettings {
+                tile_size: budget.froxel_tile_size as u32,
+                depth_slices: budget.froxel_depth_slices as u32,
+                density: fog.density,
+                absorption: fog.absorption,
+                scattering: fog.scattering_color,
+                bounds_min: fog.bounds_min,
+                bounds_max: fog.bounds_max,
+                light,
+                intensity: volume.intensity,
+                anisotropy: volume.anisotropy,
+                max_distance: volume.max_distance,
+                shadowed: volume.shadowed,
+                debug_view: match volume.debug_view.as_str() {
+                    "density" => 1,
+                    "shadow" => 2,
+                    "inscatter" => 3,
+                    "opticalDepth" => 4,
+                    "transmittance" => 5,
+                    "caustics" => 6,
+                    _ => 0,
+                },
+                caustics: fog.water_caustics.clone(),
+            })
+        });
         let anti_aliasing = resolve_effective_anti_aliasing(
             graph.lighting.render_style.as_ref(),
             self.immediate_preview_settings,
@@ -1731,6 +1783,7 @@ impl WorldFrameRenderer {
                 environment: image,
                 frame_index: 0,
                 temporal_jitter: false,
+                froxel: None,
             });
         }
         let resolved = resolve_world_asset_source(
@@ -1759,6 +1812,7 @@ impl WorldFrameRenderer {
             environment: image,
             frame_index: 0,
             temporal_jitter: false,
+            froxel: None,
         })
     }
 
@@ -1995,6 +2049,13 @@ struct GpuWorldRenderer {
     grid_pipeline: wgpu::RenderPipeline,
     dof_pipeline: wgpu::RenderPipeline,
     motion_blur_pipeline: wgpu::RenderPipeline,
+    froxel_inject_pipeline: wgpu::ComputePipeline,
+    froxel_integrate_pipeline: wgpu::ComputePipeline,
+    froxel_composite_pipeline: wgpu::RenderPipeline,
+    froxel_inject_layout: wgpu::BindGroupLayout,
+    froxel_integrate_layout: wgpu::BindGroupLayout,
+    froxel_composite_layout: wgpu::BindGroupLayout,
+    froxel_resources: Option<GpuFroxelResources>,
     dof_bind_group_layout: wgpu::BindGroupLayout,
     grid_bind_group: wgpu::BindGroup,
     grid_params_buffer: wgpu::Buffer,
@@ -2034,6 +2095,137 @@ struct GpuWorldRenderer {
     height: u32,
     padded_bytes_per_row: u32,
     texture_anisotropy: u16,
+}
+
+struct GpuFroxelResources {
+    width: u32,
+    height: u32,
+    depth: u32,
+    injection: wgpu::Texture,
+    integrated: wgpu::Texture,
+    params: wgpu::Buffer,
+}
+
+#[derive(Clone, Debug)]
+struct GpuFroxelSettings {
+    tile_size: u32,
+    depth_slices: u32,
+    density: f32,
+    absorption: [f32; 3],
+    scattering: [f32; 3],
+    bounds_min: Option<[f32; 3]>,
+    bounds_max: Option<[f32; 3]>,
+    light: WorldLight,
+    intensity: f32,
+    anisotropy: f32,
+    max_distance: f32,
+    shadowed: bool,
+    debug_view: u32,
+    caustics: Option<crate::world::WorldWaterCaustics>,
+}
+
+fn uniform_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn storage_texture_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba16Float,
+            view_dimension: wgpu::TextureViewDimension::D3,
+        },
+        count: None,
+    }
+}
+
+fn texture_3d_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_2d_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn depth_texture_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn comparison_sampler_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+        count: None,
+    }
+}
+
+fn filtering_sampler_layout_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2145,7 +2337,8 @@ fn resolve_effective_anti_aliasing(
     let automatic = match settings.profile {
         crate::preview::ImmediatePreviewProfile::Portable => "fxaa",
         crate::preview::ImmediatePreviewProfile::Balanced
-        | crate::preview::ImmediatePreviewProfile::Cinematic => "taa",
+        | crate::preview::ImmediatePreviewProfile::Cinematic
+        | crate::preview::ImmediatePreviewProfile::Ultra => "taa",
     };
     let requested = if authored.method == "auto" {
         automatic
@@ -2157,7 +2350,8 @@ fn resolve_effective_anti_aliasing(
             matches!(requested, "off" | "fxaa" | "smaa")
         }
         crate::preview::ImmediatePreviewProfile::Balanced
-        | crate::preview::ImmediatePreviewProfile::Cinematic => {
+        | crate::preview::ImmediatePreviewProfile::Cinematic
+        | crate::preview::ImmediatePreviewProfile::Ultra => {
             matches!(requested, "off" | "fxaa" | "smaa" | "taa")
         }
     };
@@ -2245,6 +2439,300 @@ struct GpuWorldEnvironmentResource {
 }
 
 impl GpuWorldRenderer {
+    fn ensure_froxel_resources(&mut self, settings: &GpuFroxelSettings) {
+        let width = self.width.div_ceil(settings.tile_size).max(1);
+        let height = self.height.div_ceil(settings.tile_size).max(1);
+        let depth = settings.depth_slices.max(1);
+        let reusable = self.froxel_resources.as_ref().is_some_and(|resources| {
+            resources.width == width && resources.height == height && resources.depth == depth
+        });
+        if reusable {
+            return;
+        }
+        let make_volume = |label| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: depth,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        self.froxel_resources = Some(GpuFroxelResources {
+            width,
+            height,
+            depth,
+            injection: make_volume("motionloom-froxel-injection"),
+            integrated: make_volume("motionloom-froxel-integrated"),
+            params: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("motionloom-froxel-params"),
+                size: 19 * 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        });
+    }
+
+    fn encode_froxel_volume(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene_source_view: &wgpu::TextureView,
+        scene_target_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        shadow_view: &wgpu::TextureView,
+        lighting: &GpuWorldLighting,
+        fitted: &GpuWorldLightingParams,
+    ) {
+        let Some(settings) = lighting.froxel.as_ref().cloned() else {
+            self.froxel_resources = None;
+            return;
+        };
+        self.ensure_froxel_resources(&settings);
+        let resources = self
+            .froxel_resources
+            .as_ref()
+            .expect("froxel resources created for an enabled volume");
+        let caustics = settings.caustics.as_ref();
+        let bounds_min = settings.bounds_min.unwrap_or([-1.0e6; 3]);
+        let bounds_max = settings.bounds_max.unwrap_or([1.0e6; 3]);
+        let light_kind = match settings.light.kind {
+            WorldLightKind::Directional => 0.0,
+            WorldLightKind::Spot => 2.0,
+            _ => 1.0,
+        };
+        let vectors = [
+            [
+                settings.tile_size as f32,
+                settings.tile_size as f32,
+                resources.depth as f32,
+                lighting.frame_index as f32 / 30.0,
+            ],
+            [
+                fitted.camera0[0],
+                fitted.camera0[1],
+                fitted.camera0[2],
+                fitted.camera1[3].max(0.001),
+            ],
+            [
+                fitted.camera1[0],
+                fitted.camera1[1],
+                fitted.camera1[2],
+                fitted.camera2[3],
+            ],
+            [
+                fitted.camera2[0],
+                fitted.camera2[1],
+                fitted.camera2[2],
+                fitted.camera0[3],
+            ],
+            fitted.camera3,
+            [
+                settings.absorption[0],
+                settings.absorption[1],
+                settings.absorption[2],
+                settings.density,
+            ],
+            [
+                settings.scattering[0],
+                settings.scattering[1],
+                settings.scattering[2],
+                settings.anisotropy,
+            ],
+            [
+                bounds_min[0],
+                bounds_min[1],
+                bounds_min[2],
+                settings.bounds_min.is_some() as u8 as f32,
+            ],
+            [
+                bounds_max[0],
+                bounds_max[1],
+                bounds_max[2],
+                settings
+                    .max_distance
+                    .min(fitted.camera2[3])
+                    .max(fitted.camera1[3] + 0.001),
+            ],
+            [
+                settings.light.direction[0],
+                settings.light.direction[1],
+                settings.light.direction[2],
+                settings.debug_view as f32 * 2.0 + settings.shadowed as u8 as f32,
+            ],
+            [
+                settings.light.color[0],
+                settings.light.color[1],
+                settings.light.color[2],
+                settings.light.intensity * settings.intensity,
+            ],
+            [
+                settings.light.position[0],
+                settings.light.position[1],
+                settings.light.position[2],
+                settings.light.range,
+            ],
+            [
+                settings.light.inner_cone_degrees.to_radians().cos(),
+                settings.light.outer_cone_degrees.to_radians().cos(),
+                light_kind,
+                0.0,
+            ],
+            [
+                caustics.map_or(0.0, |v| v.intensity),
+                caustics.map_or(0.1, |v| v.scale),
+                caustics.map_or(0.0, |v| v.speed),
+                caustics.map_or(0.0, |v| v.depth_falloff),
+            ],
+            [
+                caustics.map_or(1.0, |v| v.color[0]),
+                caustics.map_or(1.0, |v| v.color[1]),
+                caustics.map_or(1.0, |v| v.color[2]),
+                caustics.is_some_and(|v| v.volume_term) as u8 as f32,
+            ],
+            fitted.shadow0,
+            fitted.shadow1,
+            fitted.shadow2,
+            fitted.shadow3,
+        ];
+        let mut bytes = Vec::with_capacity(19 * 16);
+        for vector in vectors {
+            for value in vector {
+                bytes.extend_from_slice(&value.to_ne_bytes());
+            }
+        }
+        self.queue.write_buffer(&resources.params, 0, &bytes);
+        let injection_view = resources
+            .injection
+            .create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+        let integrated_view = resources
+            .integrated
+            .create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+        let inject_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("motionloom-froxel-inject-bind-group"),
+            layout: &self.froxel_inject_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: resources.params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&injection_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
+                },
+            ],
+        });
+        let integrate_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("motionloom-froxel-integrate-bind-group"),
+            layout: &self.froxel_integrate_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: resources.params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&injection_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&integrated_view),
+                },
+            ],
+        });
+        let composite_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("motionloom-froxel-composite-bind-group"),
+            layout: &self.froxel_composite_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: resources.params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(scene_source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.dof_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&integrated_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&injection_view),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("motionloom-froxel-inject-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.froxel_inject_pipeline);
+            pass.set_bind_group(0, &inject_group, &[]);
+            pass.dispatch_workgroups(
+                resources.width.div_ceil(4),
+                resources.height.div_ceil(4),
+                resources.depth.div_ceil(4),
+            );
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("motionloom-froxel-integrate-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.froxel_integrate_pipeline);
+            pass.set_bind_group(0, &integrate_group, &[]);
+            pass.dispatch_workgroups(resources.width.div_ceil(8), resources.height.div_ceil(8), 1);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("motionloom-froxel-composite-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.froxel_composite_pipeline);
+            pass.set_bind_group(0, &composite_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
     fn reset_temporal_history(&mut self) {
         self.history_valid = false;
         self.last_history_frame = None;
@@ -2342,6 +2830,53 @@ impl GpuWorldRenderer {
             label: Some("anica-motionloom-world-dof-shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(WGPU_WORLD_DOF_SHADER)),
         });
+        let froxel_inject_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("motionloom-froxel-inject-shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(WGPU_FROXEL_INJECT_SHADER)),
+        });
+        let froxel_integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("motionloom-froxel-integrate-shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                WGPU_FROXEL_INTEGRATE_SHADER,
+            )),
+        });
+        let froxel_composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("motionloom-froxel-composite-shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                WGPU_FROXEL_COMPOSITE_SHADER,
+            )),
+        });
+        let froxel_inject_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("motionloom-froxel-inject-layout"),
+                entries: &[
+                    uniform_layout_entry(0, wgpu::ShaderStages::COMPUTE),
+                    storage_texture_layout_entry(1, wgpu::ShaderStages::COMPUTE),
+                    depth_texture_layout_entry(2, wgpu::ShaderStages::COMPUTE),
+                    comparison_sampler_layout_entry(3, wgpu::ShaderStages::COMPUTE),
+                ],
+            });
+        let froxel_integrate_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("motionloom-froxel-integrate-layout"),
+                entries: &[
+                    uniform_layout_entry(0, wgpu::ShaderStages::COMPUTE),
+                    texture_3d_layout_entry(1, wgpu::ShaderStages::COMPUTE),
+                    storage_texture_layout_entry(2, wgpu::ShaderStages::COMPUTE),
+                ],
+            });
+        let froxel_composite_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("motionloom-froxel-composite-layout"),
+                entries: &[
+                    uniform_layout_entry(0, wgpu::ShaderStages::FRAGMENT),
+                    texture_2d_layout_entry(1, wgpu::ShaderStages::FRAGMENT),
+                    filtering_sampler_layout_entry(2, wgpu::ShaderStages::FRAGMENT),
+                    texture_3d_layout_entry(3, wgpu::ShaderStages::FRAGMENT),
+                    depth_texture_layout_entry(4, wgpu::ShaderStages::FRAGMENT),
+                    texture_3d_layout_entry(5, wgpu::ShaderStages::FRAGMENT),
+                ],
+            });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("anica-motionloom-world-gpu-bind-group-layout"),
             entries: &[
@@ -2627,7 +3162,7 @@ impl GpuWorldRenderer {
             });
         let lighting_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("anica-motionloom-world-lighting-params"),
-            size: 1120,
+            size: 1152,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2693,6 +3228,24 @@ impl GpuWorldRenderer {
             bind_group_layouts: &[&dof_bind_group_layout],
             push_constant_ranges: &[],
         });
+        let froxel_inject_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("motionloom-froxel-inject-pipeline-layout"),
+                bind_group_layouts: &[&froxel_inject_layout],
+                push_constant_ranges: &[],
+            });
+        let froxel_integrate_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("motionloom-froxel-integrate-pipeline-layout"),
+                bind_group_layouts: &[&froxel_integrate_layout],
+                push_constant_ranges: &[],
+            });
+        let froxel_composite_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("motionloom-froxel-composite-pipeline-layout"),
+                bind_group_layouts: &[&froxel_composite_layout],
+                push_constant_ranges: &[],
+            });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("anica-motionloom-world-gpu-pipeline"),
             layout: Some(&pipeline_layout),
@@ -3026,6 +3579,50 @@ impl GpuWorldRenderer {
             multiview: None,
             cache: None,
         });
+        let froxel_inject_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("motionloom-froxel-inject-pipeline"),
+                layout: Some(&froxel_inject_pipeline_layout),
+                module: &froxel_inject_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let froxel_integrate_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("motionloom-froxel-integrate-pipeline"),
+                layout: Some(&froxel_integrate_pipeline_layout),
+                module: &froxel_integrate_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let froxel_composite_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("motionloom-froxel-composite-pipeline"),
+                layout: Some(&froxel_composite_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &froxel_composite_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &froxel_composite_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
         let targets = (0..3)
             .map(|_| Arc::new(Self::make_target_texture(&device, width, height)))
             .collect();
@@ -3197,6 +3794,13 @@ impl GpuWorldRenderer {
             grid_pipeline,
             dof_pipeline,
             motion_blur_pipeline,
+            froxel_inject_pipeline,
+            froxel_integrate_pipeline,
+            froxel_composite_pipeline,
+            froxel_inject_layout,
+            froxel_integrate_layout,
+            froxel_composite_layout,
+            froxel_resources: None,
             dof_bind_group_layout,
             grid_bind_group,
             grid_params_buffer,
@@ -4010,6 +4614,46 @@ impl GpuWorldRenderer {
                 pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
             }
+        }
+        if lighting.froxel.is_some() {
+            // The composite samples a stable copy because WebGPU forbids
+            // sampling the render attachment that the same pass writes.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target.as_ref(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.transmission_scene_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let volume_source = self
+                .transmission_scene_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let volume_shadow = self
+                .shadow_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.encode_froxel_volume(
+                &mut encoder,
+                &volume_source,
+                &view,
+                &depth_view,
+                &volume_shadow,
+                lighting,
+                &fitted_lighting,
+            );
+        } else {
+            self.froxel_resources = None;
         }
         // Resolve HDR after transparency and depth-aware optics, even with DoF disabled.
         let output_target = {
@@ -10536,6 +11180,7 @@ struct GpuWorldLighting {
     environment: Arc<WorldEnvironmentImage>,
     frame_index: u32,
     temporal_jitter: bool,
+    froxel: Option<GpuFroxelSettings>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10561,6 +11206,8 @@ struct GpuWorldLightingParams {
     fog2: [f32; 4],
     fog3: [f32; 4],
     fog4: [f32; 4],
+    caustics0: [f32; 4],
+    caustics1: [f32; 4],
     optics0: [f32; 4],
     dof_style: [f32; 4],
     render_compat: [f32; 4],
@@ -10672,6 +11319,7 @@ struct GpuWorldParams {
     material5: [f32; 4],
     material6: [f32; 4],
     material7: [f32; 4],
+    material8: [f32; 4],
     cel_material0: [f32; 4],
     cel_material1: [f32; 4],
     vegetation: [f32; 4],
@@ -10936,17 +11584,22 @@ fn build_actor_mesh_gpu_draws(
         material6: [0.0, 1.5, 0.0, 1_000_000.0],
         // material7: attenuation RGB; w carries a positive alpha-mask cutoff.
         material7: [1.0, 1.0, 1.0, 0.0],
+        // material8.x disables surface caustics for eyes, mouths, and similar surfaces.
+        material8: [1.0, 0.0, 0.0, 0.0],
         cel_material0: [-1.0, 0.0, 0.0, 0.0],
         cel_material1: [0.0; 4],
         // Vegetation wind is gated per actor; all existing asset paths retain zero deformation.
-        vegetation: actor.vegetation.as_ref().map_or([0.0; 4], |vegetation| {
-            [
-                if vegetation.wind { 1.0 } else { 0.0 },
-                vegetation.height,
-                (vegetation.seed % 65_521) as f32 * 0.017,
-                time.time_sec(),
-            ]
-        }),
+        vegetation: actor.vegetation.as_ref().map_or(
+            [0.0, 0.0, 0.0, time.time_sec()],
+            |vegetation| {
+                [
+                    if vegetation.wind { 1.0 } else { 0.0 },
+                    vegetation.height,
+                    (vegetation.seed % 65_521) as f32 * 0.017,
+                    time.time_sec(),
+                ]
+            },
+        ),
         hidden0: hidden_joints[0],
         hidden1: hidden_joints[1],
         hidden2: hidden_joints[2],
@@ -11054,6 +11707,8 @@ fn build_actor_mesh_gpu_draws(
                     value.texture_offset[1],
                 ]
             });
+            draw_params.material8[0] =
+                material.is_none_or(|material| material.receive_caustics) as u8 as f32;
         }
         if let Some(material) = material {
             draw_params.material0 = [

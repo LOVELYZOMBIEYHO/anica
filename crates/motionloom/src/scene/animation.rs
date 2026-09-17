@@ -129,6 +129,7 @@ const SCALE_NODES: &[&str] = &[
     "Pin",
     "SkeletonBone",
     "Model",
+    "WaterCaustics",
 ];
 const OPACITY_NODES: &[&str] = &[
     "Rect",
@@ -336,9 +337,15 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
             "SpotLight",
             "RectAreaLight",
             "AmbientOcclusion",
-            "ContactShadow"
+            "ContactShadow",
+            "VolumetricScattering",
+            "WaterCaustics"
         ]
     ),
+    number_property!("anisotropy", "ratio", "slider", &["VolumetricScattering"]),
+    number_property!("maxDistance", "world", "number", &["VolumetricScattering"]),
+    number_property!("speed", "ratio", "number", &["WaterCaustics"]),
+    number_property!("depthFalloff", "ratio", "number", &["WaterCaustics"]),
     number_property!(
         "backgroundIntensity",
         "ratio",
@@ -687,7 +694,21 @@ fn collect_scene_node_kinds(nodes: &[SceneNode], node_kinds: &mut HashMap<String
                                 collect_optional_id(node_kinds, node.id.as_ref(), "Camera3D")
                             }
                             Scene3DNode::AtmosphereFog(node) => {
-                                collect_optional_id(node_kinds, node.id.as_ref(), "AtmosphereFog")
+                                collect_optional_id(node_kinds, node.id.as_ref(), "AtmosphereFog");
+                                if let Some(volume) = node.volumetric_scattering.as_ref() {
+                                    collect_optional_id(
+                                        node_kinds,
+                                        volume.id.as_ref(),
+                                        "VolumetricScattering",
+                                    );
+                                }
+                                if let Some(caustics) = node.water_caustics.as_ref() {
+                                    collect_optional_id(
+                                        node_kinds,
+                                        caustics.id.as_ref(),
+                                        "WaterCaustics",
+                                    );
+                                }
                             }
                             Scene3DNode::EnvironmentLight(node) => collect_optional_id(
                                 node_kinds,

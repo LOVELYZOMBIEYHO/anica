@@ -529,6 +529,8 @@ pub struct MaterialAssetNode {
     pub emissive_strength: f32,
     pub specular: f32,
     pub double_sided: bool,
+    #[serde(default = "default_material_receive_caustics")]
+    pub receive_caustics: bool,
     pub alpha_mode: String,
     pub alpha_cutoff: f32,
     /// Transmission models a solid surface that passes light; it is distinct
@@ -556,6 +558,10 @@ pub struct MaterialAssetNode {
 
 fn default_material_ior() -> f32 {
     1.5
+}
+
+fn default_material_receive_caustics() -> bool {
+    true
 }
 
 fn default_material_attenuation_color() -> [f32; 3] {
@@ -5869,6 +5875,7 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
         "emissiveStrength",
         "specular",
         "doubleSided",
+        "receiveCaustics",
         "alphaMode",
         "alphaCutoff",
         "transmission",
@@ -6012,6 +6019,10 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
         .map(|value| parse_bool(&value, line, "MaterialAsset.doubleSided"))
         .transpose()?
         .unwrap_or(false);
+    let receive_caustics = attr_value(tag, "receiveCaustics")
+        .map(|value| parse_bool(&value, line, "MaterialAsset.receiveCaustics"))
+        .transpose()?
+        .unwrap_or(true);
     Ok(MaterialAssetNode {
         id: id.clone(),
         shading,
@@ -6034,6 +6045,7 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
         emissive_strength: scalar("emissiveStrength", 1.0, 0.0, 64.0)?,
         specular: scalar("specular", 1.0, 0.0, 2.0)?,
         double_sided,
+        receive_caustics,
         alpha_mode,
         alpha_cutoff: scalar("alphaCutoff", 0.5, 0.0, 1.0)?,
         transmission: scalar("transmission", 0.0, 0.0, 1.0)?,
@@ -9502,6 +9514,80 @@ mod tests {
         assert_eq!(graph.passes.len(), 1);
         assert_eq!(graph.present.from, "out");
         assert_eq!(graph.passes[0].kind, PassKind::Compute);
+    }
+
+    #[test]
+    fn graph_parser_accepts_froxel_volume_children() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={24} duration="1s" size={[320,180]}>
+  <Scene id="volume">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d" depth="true">
+              <DirectionalLight id="sun" direction={[0,-1,0]} castShadow="true" />
+              <AtmosphereFog id="sea" mode="exp" density="0.04"
+                             absorption={[0.08,0.03,0.01]}
+                             scatteringColor={[0.02,0.08,0.12]}>
+                <VolumetricScattering id="shafts" lightRef="sun" intensity="1.4"
+                                      anisotropy="0.72" maxDistance="30" shadowed="true" />
+                <WaterCaustics id="caustics" intensity="0.45" scale="0.09" speed="0.28"
+                               depthFalloff="0.6" color="#BFE9FF"
+                               volumeTerm="true" surfaceTerm="true" />
+              </AtmosphereFog>
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="volume" />
+</Graph>
+"##,
+        )
+        .expect("froxel volume graph should parse");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("sequence");
+        };
+        let SceneNode::Layer(layer) = &sequence.children[0] else {
+            panic!("layer");
+        };
+        let SceneNode::Group(group) = &layer.children[0] else {
+            panic!("composite");
+        };
+        let volume = group
+            .composite
+            .as_ref()
+            .expect("3D composite")
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::AtmosphereFog(fog) => Some(fog),
+                _ => None,
+            })
+            .expect("atmosphere fog");
+        assert_eq!(volume.absorption.as_deref(), Some("[0.08,0.03,0.01]"));
+        assert_eq!(
+            volume
+                .volumetric_scattering
+                .as_ref()
+                .map(|value| value.light_ref.as_str()),
+            Some("sun")
+        );
+        assert!(
+            volume
+                .water_caustics
+                .as_ref()
+                .is_some_and(|value| value.surface_term)
+        );
     }
 
     #[test]

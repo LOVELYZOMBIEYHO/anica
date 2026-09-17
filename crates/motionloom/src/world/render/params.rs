@@ -7,7 +7,7 @@
 use super::{GpuGroundGridParams, GpuWorldLightingParams, GpuWorldParams};
 
 pub(super) fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(528);
+    let mut out = Vec::with_capacity(544);
     for vector in [
         params.canvas,
         params.model,
@@ -26,6 +26,7 @@ pub(super) fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
         params.material5,
         params.material6,
         params.material7,
+        params.material8,
         params.cel_material0,
         params.cel_material1,
         params.vegetation,
@@ -51,7 +52,7 @@ pub(super) fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
 }
 
 pub(super) fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1120);
+    let mut out = Vec::with_capacity(1152);
     for vector in [
         params.environment0,
         params.environment1,
@@ -63,6 +64,8 @@ pub(super) fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8>
         params.fog2,
         params.fog3,
         params.fog4,
+        params.caustics0,
+        params.caustics1,
         params.optics0,
         params.dof_style,
         params.render_compat,

@@ -481,6 +481,14 @@ This is an additive `0.1.x` extension: existing tags without bounds keep their
 previous result. Before, local fog required an approximate compositing mask;
 now the optional bounds provide depth-aware world-space confinement.
 
+For visible light shafts or underwater absorption, make the fog a block and
+author one `VolumetricScattering` child. Its `lightRef` must name a
+shadow-casting DirectionalLight or SpotLight in the same 3D scene. Add
+`WaterCaustics` only when the setting contains water; it is a procedural light
+transport approximation, not a replacement for a material texture. See
+[VOLUMETRICS.md](VOLUMETRICS.md) for the exact attributes, quality grids, pass
+order, animation channels, and platform fallback.
+
 Depth of field is camera-owned and is a real depth-buffer post pass.
 `focusTarget` accepts an Anchor or Model reference; otherwise the camera target
 distance is used. Omit `depthOfField` to preserve the zero-cost sharp render

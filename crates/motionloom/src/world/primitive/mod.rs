@@ -1650,6 +1650,7 @@ mod tests {
             emissive_strength: 1.0,
             specular: 0.3,
             double_sided: false,
+            receive_caustics: true,
             alpha_mode: "opaque".into(),
             alpha_cutoff: 0.5,
             transmission: 0.0,

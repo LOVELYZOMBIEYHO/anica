@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add opt-in WebGPU froxel volumetrics through nested `VolumetricScattering`
+  and `WaterCaustics` children on `AtmosphereFog`. The renderer uses separate
+  injection, integration, and pre-TAA composite passes with preview-profile
+  grid budgets and strict shadow-light validation. Existing fog-only scenes
+  keep the previous zero-cost path.
+
 - BREAKING: rename the universal explicit mesh DSL to `MeshAsset`, `Vertex`,
   and `Face`. The previous subdivision-specific tag names are rejected rather
   than treated as aliases. `MeshAsset` defaults to `subdivision="0"`, supports

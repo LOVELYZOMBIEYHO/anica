@@ -87,6 +87,8 @@ pub struct WorldAtmosphereFog {
     pub base_height: f32,
     pub height_falloff: f32,
     pub scattering: f32,
+    pub absorption: [f32; 3],
+    pub scattering_color: [f32; 3],
     pub affect_sky: bool,
     /// Finite world-space bounds enable local fog; None retains global fog.
     #[serde(default)]
@@ -95,6 +97,29 @@ pub struct WorldAtmosphereFog {
     pub bounds_max: Option<[f32; 3]>,
     #[serde(default)]
     pub edge_feather: f32,
+    pub volumetric_scattering: Option<WorldVolumetricScattering>,
+    pub water_caustics: Option<WorldWaterCaustics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct WorldVolumetricScattering {
+    pub light_ref: String,
+    pub intensity: f32,
+    pub anisotropy: f32,
+    pub max_distance: f32,
+    pub shadowed: bool,
+    pub debug_view: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct WorldWaterCaustics {
+    pub intensity: f32,
+    pub scale: f32,
+    pub speed: f32,
+    pub depth_falloff: f32,
+    pub color: [f32; 3],
+    pub volume_term: bool,
+    pub surface_term: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

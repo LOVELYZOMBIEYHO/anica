@@ -16,6 +16,6 @@ fn world_and_grid_parameter_sizes_match_wgsl_layouts() {
         camera3: [0.0; 4],
         options: [0.0; 4],
     });
-    assert_eq!(world.len(), 33 * 16);
+    assert_eq!(world.len(), 34 * 16);
     assert_eq!(grid.len(), 8 * 16);
 }

@@ -45,6 +45,15 @@ fn authored_area_light_radiance(light: Light, world_position: vec3<f32>, sample_
     return vec4<f32>(direction, attenuation * 0.25);
 }
 
+fn surface_caustic_pattern(world: vec3<f32>) -> f32 {
+    let p = world.xz / max(lighting.caustics0.y, 0.0001);
+    let time = params.vegetation.w * lighting.caustics0.z;
+    let a = sin(p.x * 1.31 + p.y * 0.77 + time);
+    let b = sin(p.x * -0.63 + p.y * 1.67 - time * 1.23);
+    let c = sin(p.x * 1.91 - p.y * 0.41 + time * 0.71);
+    return pow(clamp((a + b + c) * 0.1667 + 0.5, 0.0, 1.0), 5.0);
+}
+
 fn shade_surface(input: VertexOut) -> vec4<f32> {
     if (input.hidden_weight > 0.01) {
         discard;
@@ -181,6 +190,12 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let specular_ambient = environment_fresnel * specular_environment * lighting.surface1.y;
     let material_ao = textureSample(occlusion_texture, actor_sampler, uv).r;
     lit += (diffuse_ambient + specular_ambient) * ao * contact * material_ao;
+    if (lighting.caustics1.w > 0.5 && params.material8.x > 0.5) {
+        let depth_attenuation = exp(-max(0.0, lighting.fog4.y - input.world_position.y) * lighting.caustics0.w);
+        let facing = max(normal.y, 0.0);
+        lit += base_color * lighting.caustics1.rgb * surface_caustic_pattern(input.world_position)
+            * lighting.caustics0.x * depth_attenuation * facing;
+    }
     lit += base_color * lighting.surface0.w * pow(1.0 - n_dot_v, lighting.surface1.x);
     // Tangent-aligned hair highlights are optional and do not change PBR materials.
     if (lighting.surface0.x > 3.5 && params.cel_material0.y > 1.5 && params.cel_material0.y < 2.5) {

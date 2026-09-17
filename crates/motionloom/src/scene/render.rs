@@ -1229,6 +1229,39 @@ fn apply_animation_property_to_3d_nodes(
                 "edgeFeather" => fog.edge_feather = value.to_string(),
                 _ => {}
             },
+            Scene3DNode::AtmosphereFog(fog)
+                if fog
+                    .volumetric_scattering
+                    .as_ref()
+                    .and_then(|volume| volume.id.as_deref())
+                    == Some(node_id) =>
+            {
+                if let Some(volume) = fog.volumetric_scattering.as_mut() {
+                    match property {
+                        "intensity" => volume.intensity = value.to_string(),
+                        "anisotropy" => volume.anisotropy = value.to_string(),
+                        "maxDistance" => volume.max_distance = value.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            Scene3DNode::AtmosphereFog(fog)
+                if fog
+                    .water_caustics
+                    .as_ref()
+                    .and_then(|caustics| caustics.id.as_deref())
+                    == Some(node_id) =>
+            {
+                if let Some(caustics) = fog.water_caustics.as_mut() {
+                    match property {
+                        "intensity" => caustics.intensity = value.to_string(),
+                        "scale" => caustics.scale = value.to_string(),
+                        "speed" => caustics.speed = value.to_string(),
+                        "depthFalloff" => caustics.depth_falloff = value.to_string(),
+                        _ => {}
+                    }
+                }
+            }
             Scene3DNode::EnvironmentLight(light) if light.id.as_deref() == Some(node_id) => {
                 match property {
                     "intensity" => light.intensity = value.to_string(),
@@ -1520,7 +1553,7 @@ use crate::world::{
     WorldConstraint, WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight,
     WorldLightKind, WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode,
     WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetargetMap,
-    parse_world_graph_script,
+    WorldVolumetricScattering, WorldWaterCaustics, parse_world_graph_script,
 };
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use image::{Rgba, RgbaImage, imageops::FilterType};
@@ -1706,11 +1739,80 @@ fn scene_world_lighting(
                         .max(0.0),
                     scattering: eval_scene_number(&node.scattering, time_norm, time_sec)?
                         .clamp(0.0, 1.0),
+                    absorption: node
+                        .absorption
+                        .as_deref()
+                        .map(|value| eval_scene_vec3(value, time_norm, time_sec, [0.0; 3]))
+                        .transpose()?
+                        .unwrap_or([0.0; 3])
+                        .map(|value| value.max(0.0)),
+                    scattering_color: node
+                        .scattering_color
+                        .as_deref()
+                        .map(|value| eval_scene_vec3(value, time_norm, time_sec, [1.0; 3]))
+                        .transpose()?
+                        .unwrap_or([1.0; 3])
+                        .map(|value| value.max(0.0)),
                     affect_sky: node.affect_sky,
                     bounds_min,
                     bounds_max,
                     edge_feather: eval_scene_number(&node.edge_feather, time_norm, time_sec)?
                         .max(0.0),
+                    volumetric_scattering: node
+                        .volumetric_scattering
+                        .as_ref()
+                        .map(|volume| {
+                            Ok::<_, MotionLoomSceneRenderError>(WorldVolumetricScattering {
+                                light_ref: volume.light_ref.clone(),
+                                intensity: eval_scene_number(
+                                    &volume.intensity,
+                                    time_norm,
+                                    time_sec,
+                                )?
+                                .max(0.0),
+                                anisotropy: eval_scene_number(
+                                    &volume.anisotropy,
+                                    time_norm,
+                                    time_sec,
+                                )?
+                                .clamp(-0.95, 0.95),
+                                max_distance: eval_scene_number(
+                                    &volume.max_distance,
+                                    time_norm,
+                                    time_sec,
+                                )?
+                                .max(0.001),
+                                shadowed: volume.shadowed,
+                                debug_view: volume.debug_view.clone(),
+                            })
+                        })
+                        .transpose()?,
+                    water_caustics: node
+                        .water_caustics
+                        .as_ref()
+                        .map(|caustics| {
+                            Ok::<_, MotionLoomSceneRenderError>(WorldWaterCaustics {
+                                intensity: eval_scene_number(
+                                    &caustics.intensity,
+                                    time_norm,
+                                    time_sec,
+                                )?
+                                .max(0.0),
+                                scale: eval_scene_number(&caustics.scale, time_norm, time_sec)?
+                                    .max(0.0001),
+                                speed: eval_scene_number(&caustics.speed, time_norm, time_sec)?,
+                                depth_falloff: eval_scene_number(
+                                    &caustics.depth_falloff,
+                                    time_norm,
+                                    time_sec,
+                                )?
+                                .max(0.0),
+                                color: scene_fog_color(&caustics.color)?,
+                                volume_term: caustics.volume_term,
+                                surface_term: caustics.surface_term,
+                            })
+                        })
+                        .transpose()?,
                 });
             }
             Scene3DNode::EnvironmentLight(node) => {
@@ -1887,6 +1989,54 @@ fn scene_world_lighting(
                 shadow_strength: 0.8,
             });
         }
+    }
+    let volumetric_light_ref = lighting
+        .atmosphere_fog
+        .as_ref()
+        .and_then(|fog| fog.volumetric_scattering.as_ref())
+        .map(|volume| volume.light_ref.clone());
+    if let Some(light_ref) = volumetric_light_ref.as_deref() {
+        let light = lighting
+            .lights
+            .iter()
+            .find(|light| light.id.as_deref() == Some(light_ref))
+            .ok_or_else(|| MotionLoomSceneRenderError::InvalidExpression {
+                expr: light_ref.to_string(),
+                message:
+                    "VolumetricScattering lightRef must resolve to a light in the same 3D scene"
+                        .to_string(),
+            })?;
+        if !matches!(
+            light.kind,
+            WorldLightKind::Directional | WorldLightKind::Spot
+        ) {
+            return Err(MotionLoomSceneRenderError::InvalidExpression {
+                expr: light_ref.to_string(),
+                message: "VolumetricScattering supports DirectionalLight or SpotLight only"
+                    .to_string(),
+            });
+        }
+        let shadowed = lighting
+            .atmosphere_fog
+            .as_ref()
+            .and_then(|fog| fog.volumetric_scattering.as_ref())
+            .is_some_and(|volume| volume.shadowed);
+        if shadowed && !light.cast_shadow {
+            return Err(MotionLoomSceneRenderError::InvalidExpression {
+                expr: light_ref.to_string(),
+                message: "shadowed VolumetricScattering requires castShadow=true on its light"
+                    .to_string(),
+            });
+        }
+    }
+    if let Some(light_ref) = volumetric_light_ref.as_deref()
+        && let Some(index) = lighting
+            .lights
+            .iter()
+            .position(|light| light.id.as_deref() == Some(light_ref))
+        && index >= 4
+    {
+        lighting.lights.swap(3, index);
     }
     lighting.lights.truncate(4);
     Ok(lighting)
@@ -15606,6 +15756,7 @@ impl SceneFrameRenderer {
                         }
                     }
                     crate::preview::ImmediatePreviewProfile::Cinematic => 0.5,
+                    crate::preview::ImmediatePreviewProfile::Ultra => 0.65,
                 };
                 let result = compositor.apply_gpu_bloom_texture_low_res(
                     original,
