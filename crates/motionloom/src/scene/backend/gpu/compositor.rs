@@ -17,7 +17,7 @@ use image::RgbaImage;
 use crate::common::gpu_async::{
     BufferMapAsyncFuture, DevicePoller, request_adapter_async, request_device_async,
 };
-use crate::dsl::GraphScript;
+use crate::dsl::{GraphAssetKind, GraphScript};
 use crate::scene::backend::gpu::shaders::{
     WGPU_BATCH_SHAPE_SHADER, WGPU_BLOOM_SHADER, WGPU_DOWNSAMPLE_SHADER, WGPU_LIGHT_SWEEP_SHADER,
     WGPU_MATTE_TEXTURE_SHADER, WGPU_POST_SHADER, WGPU_PUPPET_DEFORM_SHADER, WGPU_SCENE_SHADER,
@@ -2010,6 +2010,18 @@ impl WgpuSceneCompositor {
         let mut uniform_buffers = Vec::with_capacity(graph.images.len() + graph.svgs.len());
         let mut keepalive = WgpuDispatchKeepalive::default();
 
+        // Image nodes reference declared ImageAssets; resolve ids to sources once per frame.
+        let image_asset_sources = graph
+            .assets
+            .iter()
+            .filter(|asset| asset.kind == GraphAssetKind::Image)
+            .filter_map(|asset| {
+                asset
+                    .external_src()
+                    .map(|src| (asset.id.clone(), src.to_string()))
+            })
+            .collect::<HashMap<_, _>>();
+
         for image_node in &graph.images {
             let opacity =
                 eval_scene_number(&image_node.opacity, time_norm, time_sec)?.clamp(0.0, 1.0);
@@ -2017,7 +2029,12 @@ impl WgpuSceneCompositor {
                 continue;
             }
 
-            let (source_w, source_h, source_texture) = self.load_image_texture(&image_node.src)?;
+            let src = image_asset_sources.get(&image_node.asset).ok_or_else(|| {
+                MotionLoomSceneRenderError::UnknownImageAsset {
+                    id: image_node.asset.clone(),
+                }
+            })?;
+            let (source_w, source_h, source_texture) = self.load_image_texture(src)?;
             let scale =
                 eval_scene_number(&image_node.scale, time_norm, time_sec)?.clamp(0.001, 64.0);
             let target_w = ((source_w as f32) * scale).round().max(1.0);

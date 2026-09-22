@@ -785,8 +785,9 @@ impl WasmSceneRenderer {
 
     /// Register an in-memory asset for this renderer only.
     ///
-    /// The `name` should match the `src` attribute used in `<Image>` or `<Svg>`
-    /// nodes (e.g. `"logo.png"`). The `bytes` argument is the raw file content.
+    /// The `name` should match the `src` attribute used in `<ImageAsset>` or
+    /// `<Svg>` nodes (e.g. `"logo.png"`). The `bytes` argument is the raw file
+    /// content.
     pub fn add_asset(&mut self, name: &str, bytes: &[u8]) {
         self.resolver.insert(name.to_string(), bytes.to_vec());
     }

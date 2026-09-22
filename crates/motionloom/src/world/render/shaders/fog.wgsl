@@ -4,7 +4,7 @@
 
 // Return fog-path length, edge weight, and representative height for either
 // the legacy global medium or an authored local box volume.
-fn atmosphere_fog_ray_sample(
+fn atmosphere_medium_ray_sample(
     ray_direction: vec3<f32>,
     ray_length: f32,
     fallback_height: f32,
@@ -35,7 +35,7 @@ fn atmosphere_fog_ray_sample(
     }
     return vec3<f32>(exit - entry, edge_weight, midpoint.y);
 }
-fn atmosphere_fog_amount(world_position: vec3<f32>) -> f32 {
+fn atmosphere_medium_amount(world_position: vec3<f32>) -> f32 {
     if (lighting.fog2.w < 0.5) {
         return 0.0;
     }
@@ -44,19 +44,8 @@ fn atmosphere_fog_amount(world_position: vec3<f32>) -> f32 {
     if (distance <= 0.000001) {
         return 0.0;
     }
-    let sample = atmosphere_fog_ray_sample(camera_to_surface / distance, distance, world_position.y);
-    let fog_distance = max(sample.x - lighting.fog0.z, 0.0);
-    if (lighting.fog0.x < 1.5) {
-        return smoothstep(
-            lighting.fog0.z,
-            max(lighting.fog0.w, lighting.fog0.z + 0.001),
-            sample.x,
-        ) * sample.y;
-    }
-    let exponential = 1.0 - exp(-lighting.fog0.y * fog_distance);
-    if (lighting.fog0.x < 2.5) {
-        return clamp(exponential * sample.y, 0.0, 1.0);
-    }
-    let height_density = exp(-max(sample.z - lighting.fog1.w, 0.0) * lighting.fog2.x);
-    return clamp(exponential * height_density * sample.y, 0.0, 1.0);
+    let sample = atmosphere_medium_ray_sample(camera_to_surface / distance, distance, world_position.y);
+    let height_density = exp(-max(sample.z - lighting.fog0.z, 0.0) * lighting.fog0.w);
+    let transmittance = exp(-lighting.fog0.x * height_density * sample.x);
+    return clamp((1.0 - transmittance) * sample.y, 0.0, 1.0);
 }

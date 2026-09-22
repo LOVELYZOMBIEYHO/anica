@@ -4,7 +4,7 @@
 
 struct FroxelParams {
     grid: vec4<f32>, camera0: vec4<f32>, camera1: vec4<f32>, camera2: vec4<f32>, camera3: vec4<f32>,
-    medium0: vec4<f32>, medium1: vec4<f32>, bounds_min: vec4<f32>, bounds_max: vec4<f32>,
+    medium0: vec4<f32>, medium1: vec4<f32>, atmosphere0: vec4<f32>, bounds_min: vec4<f32>, bounds_max: vec4<f32>,
     light0: vec4<f32>, light1: vec4<f32>, light2: vec4<f32>, light3: vec4<f32>,
     caustics0: vec4<f32>, caustics1: vec4<f32>,
     shadow0: vec4<f32>, shadow1: vec4<f32>, shadow2: vec4<f32>, shadow3: vec4<f32>,
@@ -28,7 +28,7 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var z = 0u; z < dimensions.z; z = z + 1u) {
         let cell = textureLoad(injection, vec3<u32>(id.xy, z), 0);
         let step_length = slice_distance(f32(z) + 1.0) - slice_distance(f32(z));
-        let extinction = (params.medium0.rgb + params.medium1.rgb) * cell.a;
+        let extinction = vec3<f32>(cell.a);
         let step_transmittance = exp(-extinction * step_length);
         accumulated += transmittance * cell.rgb * step_length;
         transmittance *= step_transmittance;

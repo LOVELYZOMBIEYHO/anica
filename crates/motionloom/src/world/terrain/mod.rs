@@ -169,6 +169,12 @@ pub(crate) fn terrain_surface_primitive(asset: &TerrainAssetNode) -> PrimitiveAs
         material.roughness = 1.0;
         material.normal_scale = 1.0;
         material.occlusion_strength = 1.0;
+        material.metallic_channel = crate::dsl::MaterialTextureChannel::B;
+        material.roughness_channel = crate::dsl::MaterialTextureChannel::G;
+        material.occlusion_channel = crate::dsl::MaterialTextureChannel::R;
+        material.metallic_invert = false;
+        material.roughness_invert = false;
+        material.occlusion_invert = false;
         material.emissive = [0.0; 3];
         material.emissive_strength = 1.0;
         material.texture_scale = [1.0; 2];

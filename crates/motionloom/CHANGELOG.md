@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+- Add resumable Weaver master-sequence export from compositor-complete RGBA16F
+  EXRs. The native pipeline writes a durable sequence manifest, optional 48 kHz
+  float audio master, BT.709 ProRes 4444 XQ with alpha/PCM, and an H.264/AAC
+  review MP4. Final `ffprobe` acceptance validates frame count, dimensions,
+  codec/profile, alpha pixel format, color tags, and audio layout.
+
+- Add the versioned renderer-independent `SceneCompositionPlan`, with formal
+  Screen/Lens/WorldCard/Surface/ThreeD domains and a fixed linear-premultiplied
+  RGBA16F working contract. Add a shared `SceneGpuContext`, a wgpu compositor
+  executor, Weaver `CompositeScene` output, pure-2D bypass, coverage/depth/
+  normal/albedo/motion AOV files, and film-v2 checkpoints. The first mixed
+  2D+3D export path supports 2D layers above camera-compatible 3D islands;
+  layered island textures and populated temporal motion vectors remain strict
+  follow-up gates rather than being silently approximated.
+
+- Fix Weaver first-person camera visibility: meshes hidden by a Camera3D hips
+  selector are skipped by primary camera rays but remain available to shadow
+  and reflection rays. `CompositeScene` now converts authored AtmosphereFog by
+  default instead of silently producing an unfogged final frame.
+
+- Add reusable spatial `CurveAsset` data and renderable `SweepAsset` geometry
+  with inline profiles, linear/Catmull-Rom interpolation, deterministic
+  tessellation, parallel-transport or world-up frames, distance UVs, exact
+  dash intervals, optional open-profile normal smoothing, caps, materials and
+  collision. Sweeps lower through the
+  existing retained primitive mesh path on native, WASM and Weaver. Existing
+  assets and scripts are unchanged. Replace repeated explicit road/path meshes
+  with one curve referenced by multiple sweeps; no `Road` tag is introduced.
+
+- Add opt-in Weaver texture mipmaps through `RenderJob::texture_mips`. Packed
+  textures gain box-filtered mip chains (sRGB levels average in linear space)
+  and the shader selects a level from the per-hit ray footprint, removing
+  minification aliasing on large renders. Off by default, so existing renders
+  keep base-level bilinear sampling and identical output.
+
+- Add renderer-independent `AtmosphereMediumPlan`, consumed directly by both
+  the WebGPU live preview and Weaver final export.
+
+- Add explicit packed-texture channel remapping to `MaterialAsset` through
+  `metallicChannel`, `roughnessChannel`, `occlusionChannel`, and matching
+  inversion flags. Defaults preserve glTF B/G/R behavior. Native/WASM preview,
+  terrain layer baking, and Weaver share the same compiled selectors.
+
+- Add deterministic `<Scatter>` placement for large 3D environments. Scatter
+  places weighted existing assets on a TerrainAsset Model with optional linear
+  density/exclusion masks, slope filtering, scale/rotation variation, and root
+  offset. Existing scenes are unchanged; generated instances reuse the normal
+  Model geometry/material path and require no authored per-instance ids.
+
+- BREAKING: rename the required imported-material selector on `MaterialBinding`
+  from `material` to `modelSourceMaterial`. The explicit name distinguishes a
+  GLB-internal material name from a MotionLoom `MaterialAsset` reference. The
+  old attribute is rejected rather than retained as an alias, and a binding
+  without `modelSourceMaterial` is an error. Migrate
+  `<MaterialBinding material="M_Main" ... />` to
+  `<MaterialBinding modelSourceMaterial="M_Main" ... />`.
+
+- Add per-material overrides for imported GLB models. `MaterialBinding
+  definition="<MaterialAsset id>"` replaces a matching GLB material, while
+  `tint="#RRGGBB"` with optional `tintAmount="0..1"` blends only its base color
+  and keeps the imported metallic/roughness/specular/normal values.
+  `modelSourceMaterial` matches the GLB material name (case-insensitive) or `*`.
+  Scenes without these attributes render unchanged, and both forms stay lit
+  and shadowed.
+
+- `MaterialBinding` also accepts optional `metallic`, `roughness`, `specular`,
+  and `normalScale` scalar overrides. They adjust one imported GLB material
+  without replacing its base color texture, so a scene can tune surface
+  response while keeping the authored maps.
+
+- BREAKING: `<Image>` no longer accepts `src` or `path`. Declare raster
+  sources as `<ImageAsset id="..." src="..." />` under `<Assets>` and
+  reference them with `<Image asset="..." />`. The renderer resolves the
+  ImageAsset id to its source before loading, and unknown ids are rejected
+  during parsing, including images nested in `<Defs>` components or `<Use>`
+  slots. `<Character src="...">` keeps its inline raster source form.
+
 - Add opt-in WebGPU froxel volumetrics through nested `VolumetricScattering`
   and `WaterCaustics` children on `AtmosphereFog`. The renderer uses separate
   injection, integration, and pre-TAA composite passes with preview-profile

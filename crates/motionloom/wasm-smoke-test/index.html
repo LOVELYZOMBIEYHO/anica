@@ -62,13 +62,16 @@
 </Graph>`;
 
     const imageScene = `<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <ImageAsset id="gradient" src="gradient.png" />
+  </Assets>
   <Scene id="stage">
     <Timeline>
       <Track id="main" z="0">
         <Sequence duration="1s">
           <Layer>
             <Background color="#000000" />
-            <Image src="gradient.png" x={0} y={0} width={64} height={64} />
+            <Image asset="gradient" x={0} y={0} />
           </Layer>
         </Sequence>
       </Track>

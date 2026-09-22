@@ -65,6 +65,9 @@ pub struct GraphScript {
     /// Reusable physically based materials referenced by typed geometry assets.
     #[serde(default)]
     pub material_assets: Vec<MaterialAssetNode>,
+    /// Reusable spatial curves consumed by procedural geometry and future motion tools.
+    #[serde(default)]
+    pub curve_assets: Vec<CurveAssetNode>,
     pub inputs: Vec<InputNode>,
     pub textures: Vec<TexNode>,
     pub buffers: Vec<BufferNode>,
@@ -416,6 +419,40 @@ pub struct PrimitiveAssetNode {
     pub lod: PrimitiveLodNode,
 }
 
+/// One reusable ordered spatial curve. Linear interpolation also represents
+/// straight lines and polylines without introducing a separate path type.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurveAssetNode {
+    pub id: String,
+    pub interpolation: CurveInterpolation,
+    pub closed: bool,
+    pub max_segment_length: f32,
+    pub points: Vec<CurvePointNode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CurveInterpolation {
+    Linear,
+    CatmullRom,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurvePointNode {
+    pub position: [f32; 3],
+    pub tilt: f32,
+    pub scale: f32,
+}
+
+/// A two-dimensional cross-section point in the sweep's local side/up frame.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepProfilePointNode {
+    pub position: [f32; 2],
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum PrimitiveModifierNode {
@@ -498,6 +535,50 @@ impl Default for PrimitiveLodNode {
 
 /// A first-class PBR material reuses the glTF renderer without pretending that
 /// a screen-space Scene texture is a physical 3D surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaterialTextureChannel {
+    R,
+    G,
+    B,
+    A,
+    Luminance,
+}
+
+impl MaterialTextureChannel {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::R => 0,
+            Self::G => 1,
+            Self::B => 2,
+            Self::A => 3,
+            Self::Luminance => 4,
+        }
+    }
+
+    pub(crate) fn sample(self, rgba: [f32; 4]) -> f32 {
+        match self {
+            Self::R => rgba[0],
+            Self::G => rgba[1],
+            Self::B => rgba[2],
+            Self::A => rgba[3],
+            Self::Luminance => rgba[0] * 0.2126 + rgba[1] * 0.7152 + rgba[2] * 0.0722,
+        }
+    }
+}
+
+const fn default_metallic_channel() -> MaterialTextureChannel {
+    MaterialTextureChannel::B
+}
+
+const fn default_roughness_channel() -> MaterialTextureChannel {
+    MaterialTextureChannel::G
+}
+
+const fn default_occlusion_channel() -> MaterialTextureChannel {
+    MaterialTextureChannel::R
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MaterialAssetNode {
@@ -509,6 +590,18 @@ pub struct MaterialAssetNode {
     pub normal_texture: Option<String>,
     pub occlusion_texture: Option<String>,
     pub emissive_texture: Option<String>,
+    #[serde(default = "default_metallic_channel")]
+    pub metallic_channel: MaterialTextureChannel,
+    #[serde(default = "default_roughness_channel")]
+    pub roughness_channel: MaterialTextureChannel,
+    #[serde(default = "default_occlusion_channel")]
+    pub occlusion_channel: MaterialTextureChannel,
+    #[serde(default)]
+    pub metallic_invert: bool,
+    #[serde(default)]
+    pub roughness_invert: bool,
+    #[serde(default)]
+    pub occlusion_invert: bool,
     /// Resolved image sources are intentionally retained beside public ids so
     /// generated primitives remain renderable after CompoundAsset expansion.
     #[serde(default)]
@@ -767,6 +860,19 @@ pub enum PrimitiveGeometry {
         cap_end: bool,
         points: Vec<PrimitiveRibbonPointNode>,
     },
+    /// A reusable curve and inline profile compile to an ordinary retained mesh.
+    Sweep {
+        curve: CurveAssetNode,
+        profile_closed: bool,
+        smooth_profile: bool,
+        cap_start: bool,
+        cap_end: bool,
+        frame: String,
+        uv_mode: String,
+        uv_scale: [f32; 2],
+        dash: Option<[f32; 2]>,
+        profile: Vec<SweepProfilePointNode>,
+    },
     /// Guide-authored hair remains representation-neutral even though V1
     /// compiles it to retained card geometry.
     HairCards {
@@ -1023,6 +1129,7 @@ impl PrimitiveGeometry {
             Self::RoundedBox { .. } => "roundedBox",
             Self::Loft { .. } => "loft",
             Self::Ribbon { .. } => "ribbon",
+            Self::Sweep { .. } => "sweep",
             Self::HairCards { .. } => "hairCards",
             Self::HeadSurface { .. } => "headSurface",
         }
@@ -1074,6 +1181,18 @@ impl PrimitiveGeometry {
                     + usize::from(*cap_end) * *segments as usize
             }
             Self::Ribbon { points, .. } => points.len().saturating_sub(1) * 8,
+            Self::Sweep {
+                curve,
+                profile,
+                profile_closed,
+                ..
+            } => {
+                let curve_segments =
+                    curve.points.len().saturating_sub(1) + usize::from(curve.closed);
+                let profile_segments =
+                    profile.len().saturating_sub(1) + usize::from(*profile_closed);
+                curve_segments * profile_segments * 2
+            }
             Self::HairCards {
                 length_segments,
                 width_segments,
@@ -1554,6 +1673,8 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
     let mut inputs = Vec::<InputNode>::new();
     let mut assets = Vec::<GraphAssetNode>::new();
     let mut material_assets = Vec::<MaterialAssetNode>::new();
+    let mut curve_assets = Vec::<CurveAssetNode>::new();
+    let mut pending_sweeps = Vec::<PendingSweepAsset>::new();
     let mut textures = Vec::<TexNode>::new();
     let mut buffers = Vec::<BufferNode>::new();
     let mut backgrounds = Vec::<BackgroundNode>::new();
@@ -1603,9 +1724,17 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         }
 
         if starts_open_tag(line, "Assets") {
-            let (mut parsed_assets, mut parsed_materials, end_ix) = parse_assets_block(&lines, i)?;
+            let (
+                mut parsed_assets,
+                mut parsed_materials,
+                mut parsed_curves,
+                mut parsed_sweeps,
+                end_ix,
+            ) = parse_assets_block(&lines, i)?;
             assets.append(&mut parsed_assets);
             material_assets.append(&mut parsed_materials);
+            curve_assets.append(&mut parsed_curves);
+            pending_sweeps.append(&mut parsed_sweeps);
             i = end_ix + 1;
             continue;
         }
@@ -1992,6 +2121,11 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
 
     lower_parametric_component_uses(&mut scene_nodes, &mut scenes)?;
     resolve_lowered_puppet_targets(&mut scene_nodes, &mut scenes)?;
+    validate_curve_asset_ids(&assets, &curve_assets, graph_start_ix + 1)?;
+    let sweep_assets =
+        resolve_sweep_assets(&assets, &curve_assets, pending_sweeps, graph_start_ix + 1)?;
+    assets.extend(sweep_assets);
+    validate_scene_image_assets(&scene_nodes, &scenes, &assets, graph_start_ix + 1)?;
     resolve_primitive_material_assets(&mut assets, &material_assets, graph_start_ix + 1)?;
 
     validate_graph(
@@ -2039,6 +2173,7 @@ pub fn parse_graph_script(input: &str) -> Result<GraphScript, GraphParseError> {
         render_size,
         assets,
         material_assets,
+        curve_assets,
         inputs,
         textures,
         buffers,
@@ -3598,14 +3733,431 @@ fn parse_process_resource_alias(
     ))
 }
 
+#[derive(Debug)]
+struct PendingSweepAsset {
+    id: String,
+    curve: String,
+    material: Option<String>,
+    color: [f32; 4],
+    profile_closed: bool,
+    smooth_profile: bool,
+    cap_start: bool,
+    cap_end: bool,
+    frame: String,
+    uv_mode: String,
+    uv_scale: [f32; 2],
+    dash: Option<[f32; 2]>,
+    profile: Vec<SweepProfilePointNode>,
+    source_tag: String,
+    line: usize,
+}
+
+/// Parse spatial curves independently so SweepAsset references remain order-independent.
+fn parse_curve_asset_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(CurveAssetNode, usize), GraphParseError> {
+    let (tag, open_end) = collect_tag_block(lines, start, '>', false)?;
+    validate_hair_attributes(
+        &tag,
+        &["id", "interpolation", "closed", "maxSegmentLength"],
+        "CurveAsset",
+        start + 1,
+    )?;
+    if is_self_closing_tag(&tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "CurveAsset requires at least two CurvePoint children.".to_string(),
+        });
+    }
+    let id = strip_wrappers(&required_attr_value(&tag, "id", start + 1)?).to_string();
+    let interpolation = match primitive_string_attribute(&tag, "interpolation", "linear").as_str() {
+        "linear" => CurveInterpolation::Linear,
+        "catmullrom" => CurveInterpolation::CatmullRom,
+        value => {
+            return Err(GraphParseError {
+                line: start + 1,
+                message: format!(
+                    "CurveAsset \"{id}\" interpolation=\"{value}\" is invalid. Use linear or catmullRom."
+                ),
+            });
+        }
+    };
+    let closed = parse_optional_primitive_bool(&tag, "closed", &id, start + 1)?.unwrap_or(false);
+    let max_segment_length =
+        parse_optional_positive_primitive_number(&tag, "maxSegmentLength", &id, start + 1)?
+            .unwrap_or(0.5);
+    let close = find_matching_close_tag(lines, open_end + 1, "CurveAsset")?;
+    let mut points = Vec::new();
+    let mut index = open_end + 1;
+    while index < close {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "CurvePoint") {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("CurveAsset \"{id}\" only accepts CurvePoint children."),
+            });
+        }
+        let (point_tag, end) = collect_self_closing_block(lines, index)?;
+        validate_hair_attributes(
+            &point_tag,
+            &["position", "tilt", "scale"],
+            "CurvePoint",
+            index + 1,
+        )?;
+        points.push(CurvePointNode {
+            position: parse_optional_primitive_vec::<3>(
+                &point_tag,
+                "position",
+                &id,
+                index + 1,
+                false,
+            )?
+            .ok_or_else(|| GraphParseError {
+                line: index + 1,
+                message: format!("CurveAsset \"{id}\" CurvePoint requires position."),
+            })?,
+            tilt: attr_value(&point_tag, "tilt")
+                .map(|_| parse_finite_primitive_number(&point_tag, "tilt", &id, index + 1))
+                .transpose()?
+                .unwrap_or(0.0),
+            scale: parse_optional_positive_primitive_number(&point_tag, "scale", &id, index + 1)?
+                .unwrap_or(1.0),
+        });
+        index = end + 1;
+    }
+    if points.len() < 2 {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("CurveAsset \"{id}\" requires at least two CurvePoint children."),
+        });
+    }
+    let degenerate = points.windows(2).any(|pair| {
+        pair[0]
+            .position
+            .iter()
+            .zip(pair[1].position)
+            .all(|(a, b)| (*a - b).abs() <= 1.0e-6)
+    }) || (closed
+        && points[0]
+            .position
+            .iter()
+            .zip(points[points.len() - 1].position)
+            .all(|(a, b)| (*a - b).abs() <= 1.0e-6));
+    if degenerate {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("CurveAsset \"{id}\" contains a zero-length segment."),
+        });
+    }
+    Ok((
+        CurveAssetNode {
+            id,
+            interpolation,
+            closed,
+            max_segment_length,
+            points,
+        },
+        close,
+    ))
+}
+
+/// Parse a sweep before resolving its curve so declarations may appear in any order.
+fn parse_sweep_asset_block(
+    lines: &[&str],
+    start: usize,
+) -> Result<(PendingSweepAsset, usize), GraphParseError> {
+    let (tag, open_end) = collect_tag_block(lines, start, '>', false)?;
+    let collision_attributes = [
+        "collision",
+        "collider",
+        "colliderSize",
+        "colliderRadius",
+        "colliderHeight",
+        "colliderScale",
+        "colliderOffset",
+        "colliderRotation",
+        "colliderMargin",
+        "collisionGroup",
+        "collisionMask",
+        "friction",
+        "restitution",
+        "density",
+    ];
+    let mut allowed = vec![
+        "id",
+        "curve",
+        "material",
+        "color",
+        "frame",
+        "uvMode",
+        "uvScale",
+        "capStart",
+        "capEnd",
+        "dash",
+        "smoothProfile",
+    ];
+    allowed.extend(collision_attributes);
+    validate_hair_attributes(&tag, &allowed, "SweepAsset", start + 1)?;
+    if is_self_closing_tag(&tag) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: "SweepAsset requires one Profile block.".to_string(),
+        });
+    }
+    let id = strip_wrappers(&required_attr_value(&tag, "id", start + 1)?).to_string();
+    let curve = strip_wrappers(&required_attr_value(&tag, "curve", start + 1)?).to_string();
+    let frame = primitive_string_attribute(&tag, "frame", "paralleltransport");
+    if !matches!(frame.as_str(), "paralleltransport" | "worldup") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("SweepAsset \"{id}\" frame must be parallelTransport or worldUp."),
+        });
+    }
+    let uv_mode = primitive_string_attribute(&tag, "uvMode", "distance");
+    if !matches!(uv_mode.as_str(), "distance" | "normalized") {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("SweepAsset \"{id}\" uvMode must be distance or normalized."),
+        });
+    }
+    let uv_scale = parse_optional_primitive_vec::<2>(&tag, "uvScale", &id, start + 1, false)?
+        .unwrap_or([1.0, 1.0]);
+    if uv_scale.iter().any(|value| *value <= 0.0) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("SweepAsset \"{id}\" uvScale values must be positive."),
+        });
+    }
+    let dash = parse_optional_primitive_vec::<2>(&tag, "dash", &id, start + 1, false)?;
+    if dash.is_some_and(|values| values.iter().any(|value| *value <= 0.0)) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("SweepAsset \"{id}\" dash values must be positive."),
+        });
+    }
+    let close = find_matching_close_tag(lines, open_end + 1, "SweepAsset")?;
+    let mut profile = None;
+    let mut profile_closed = false;
+    let mut index = open_end + 1;
+    while index < close {
+        let line = lines[index].trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("<!--") {
+            index += 1;
+            continue;
+        }
+        if !starts_open_tag(line, "Profile") || profile.is_some() {
+            return Err(GraphParseError {
+                line: index + 1,
+                message: format!("SweepAsset \"{id}\" accepts exactly one Profile block."),
+            });
+        }
+        let (profile_tag, profile_open_end) = collect_tag_block(lines, index, '>', false)?;
+        validate_hair_attributes(&profile_tag, &["closed"], "Profile", index + 1)?;
+        profile_closed =
+            parse_optional_primitive_bool(&profile_tag, "closed", &id, index + 1)?.unwrap_or(false);
+        let profile_close = find_matching_close_tag(lines, profile_open_end + 1, "Profile")?;
+        let mut points = Vec::new();
+        let mut point_index = profile_open_end + 1;
+        while point_index < profile_close {
+            let point_line = lines[point_index].trim();
+            if point_line.is_empty()
+                || point_line.starts_with("//")
+                || point_line.starts_with("<!--")
+            {
+                point_index += 1;
+                continue;
+            }
+            if !starts_open_tag(point_line, "ProfilePoint") {
+                return Err(GraphParseError {
+                    line: point_index + 1,
+                    message: format!(
+                        "SweepAsset \"{id}\" Profile only accepts ProfilePoint children."
+                    ),
+                });
+            }
+            let (point_tag, end) = collect_self_closing_block(lines, point_index)?;
+            validate_hair_attributes(&point_tag, &["position"], "ProfilePoint", point_index + 1)?;
+            points.push(SweepProfilePointNode {
+                position: parse_optional_primitive_vec::<2>(
+                    &point_tag,
+                    "position",
+                    &id,
+                    point_index + 1,
+                    false,
+                )?
+                .ok_or_else(|| GraphParseError {
+                    line: point_index + 1,
+                    message: format!("SweepAsset \"{id}\" ProfilePoint requires position."),
+                })?,
+            });
+            point_index = end + 1;
+        }
+        profile = Some(points);
+        index = profile_close + 1;
+    }
+    let profile = profile.ok_or_else(|| GraphParseError {
+        line: start + 1,
+        message: format!("SweepAsset \"{id}\" requires one Profile block."),
+    })?;
+    let minimum = if profile_closed { 3 } else { 2 };
+    if profile.len() < minimum {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!(
+                "SweepAsset \"{id}\" Profile requires at least {minimum} ProfilePoint children."
+            ),
+        });
+    }
+    if profile.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(GraphParseError {
+            line: start + 1,
+            message: format!("SweepAsset \"{id}\" Profile contains a zero-length edge."),
+        });
+    }
+    Ok((
+        PendingSweepAsset {
+            id: id.clone(),
+            curve,
+            material: attr_value(&tag, "material").map(|value| strip_wrappers(&value).to_string()),
+            color: attr_value(&tag, "color")
+                .map(|value| parse_primitive_color(&value, &id, start + 1))
+                .transpose()?
+                .unwrap_or([1.0; 4]),
+            profile_closed,
+            smooth_profile: parse_optional_primitive_bool(&tag, "smoothProfile", &id, start + 1)?
+                .unwrap_or(false),
+            cap_start: parse_optional_primitive_bool(&tag, "capStart", &id, start + 1)?
+                .unwrap_or(true),
+            cap_end: parse_optional_primitive_bool(&tag, "capEnd", &id, start + 1)?.unwrap_or(true),
+            frame,
+            uv_mode,
+            uv_scale,
+            dash,
+            profile,
+            source_tag: tag,
+            line: start + 1,
+        },
+        close,
+    ))
+}
+
+fn validate_curve_asset_ids(
+    assets: &[GraphAssetNode],
+    curves: &[CurveAssetNode],
+    line: usize,
+) -> Result<(), GraphParseError> {
+    let mut ids = assets
+        .iter()
+        .map(|asset| asset.id.as_str())
+        .collect::<HashSet<_>>();
+    for curve in curves {
+        if !ids.insert(curve.id.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate Asset id: {}", curve.id),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Lower sweeps to the existing primitive renderer while preserving curve metadata.
+fn resolve_sweep_assets(
+    assets: &[GraphAssetNode],
+    curves: &[CurveAssetNode],
+    sweeps: Vec<PendingSweepAsset>,
+    line: usize,
+) -> Result<Vec<GraphAssetNode>, GraphParseError> {
+    let curve_by_id = curves
+        .iter()
+        .map(|curve| (curve.id.as_str(), curve))
+        .collect::<HashMap<_, _>>();
+    let mut ids = assets
+        .iter()
+        .map(|asset| asset.id.clone())
+        .chain(curves.iter().map(|curve| curve.id.clone()))
+        .collect::<HashSet<_>>();
+    let mut resolved = Vec::with_capacity(sweeps.len());
+    for sweep in sweeps {
+        if !ids.insert(sweep.id.clone()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Duplicate Asset id: {}", sweep.id),
+            });
+        }
+        let curve = curve_by_id
+            .get(sweep.curve.as_str())
+            .ok_or_else(|| GraphParseError {
+                line: sweep.line,
+                message: format!(
+                    "SweepAsset \"{}\" references unknown CurveAsset \"{}\".",
+                    sweep.id, sweep.curve
+                ),
+            })?;
+        let geometry = PrimitiveGeometry::Sweep {
+            curve: (*curve).clone(),
+            profile_closed: sweep.profile_closed,
+            smooth_profile: sweep.smooth_profile,
+            cap_start: sweep.cap_start,
+            cap_end: sweep.cap_end,
+            frame: sweep.frame,
+            uv_mode: sweep.uv_mode,
+            uv_scale: sweep.uv_scale,
+            dash: sweep.dash,
+            profile: sweep.profile,
+        };
+        let collision =
+            parse_primitive_collision(&sweep.source_tag, &sweep.id, &geometry, sweep.line)?;
+        resolved.push(GraphAssetNode {
+            id: sweep.id.clone(),
+            kind: GraphAssetKind::Model,
+            source: GraphAssetSource::Primitive(PrimitiveAssetNode {
+                id: sweep.id,
+                geometry,
+                color: sweep.color,
+                material: sweep.material,
+                material_definition: None,
+                bevel_radius: 0.0,
+                bevel_segments: 0,
+                material_seed: None,
+                collision,
+                modifiers: Vec::new(),
+                mesh_build: PrimitiveMeshBuildNode::default(),
+                lod: PrimitiveLodNode::default(),
+            }),
+            decoder: None,
+            color_space: None,
+            profile: None,
+            clip: None,
+        });
+    }
+    Ok(resolved)
+}
+
 fn parse_assets_block(
     lines: &[&str],
     start: usize,
-) -> Result<(Vec<GraphAssetNode>, Vec<MaterialAssetNode>, usize), GraphParseError> {
+) -> Result<
+    (
+        Vec<GraphAssetNode>,
+        Vec<MaterialAssetNode>,
+        Vec<CurveAssetNode>,
+        Vec<PendingSweepAsset>,
+        usize,
+    ),
+    GraphParseError,
+> {
     let (_open_tag, open_end_ix) = collect_tag_block(lines, start, '>', false)?;
     let close_ix = find_matching_close_tag(lines, open_end_ix + 1, "Assets")?;
     let mut assets = Vec::new();
     let mut materials = Vec::new();
+    let mut curves = Vec::new();
+    let mut sweeps = Vec::new();
     let mut i = open_end_ix + 1;
     while i < close_ix {
         let line = lines[i].trim();
@@ -3620,6 +4172,18 @@ fn parse_assets_block(
         if starts_open_tag(line, "MaterialAsset") {
             let (tag, end_ix) = collect_self_closing_block(lines, i)?;
             materials.push(parse_material_asset(&tag, i + 1)?);
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "CurveAsset") {
+            let (curve, end_ix) = parse_curve_asset_block(lines, i)?;
+            curves.push(curve);
+            i = end_ix + 1;
+            continue;
+        }
+        if starts_open_tag(line, "SweepAsset") {
+            let (sweep, end_ix) = parse_sweep_asset_block(lines, i)?;
+            sweeps.push(sweep);
             i = end_ix + 1;
             continue;
         }
@@ -3651,7 +4215,7 @@ fn parse_assets_block(
             return Err(GraphParseError {
                 line: i + 1,
                 message: format!(
-                    "<Assets> only accepts <VideoAsset>, <ImageAsset>, <ModelAsset>, <PrimitiveAsset>, <HairAsset>, <HeadAsset>, <MeshAsset>, <TerrainAsset>, <VegetationAsset>, <CompoundAsset>, <MaterialAsset>, <AudioAsset>, or <AnimationAsset>, got: {line}"
+                    "<Assets> only accepts typed media/model assets, <CurveAsset>, <SweepAsset>, or <MaterialAsset>, got: {line}"
                 ),
             });
         };
@@ -3813,7 +4377,7 @@ fn parse_assets_block(
             message: format!("Duplicate MaterialAsset id: {}", duplicate.id),
         });
     }
-    Ok((assets, materials, close_ix))
+    Ok((assets, materials, curves, sweeps, close_ix))
 }
 
 fn parse_primitive_asset_block(
@@ -5866,9 +6430,15 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
         "metallic",
         "roughness",
         "metallicRoughnessTexture",
+        "metallicChannel",
+        "metallicInvert",
+        "roughnessChannel",
+        "roughnessInvert",
         "normalTexture",
         "normalScale",
         "occlusionTexture",
+        "occlusionChannel",
+        "occlusionInvert",
         "occlusionStrength",
         "emissive",
         "emissiveTexture",
@@ -5933,6 +6503,30 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
     };
     let texture_ref = |attribute: &str| {
         attr_value(tag, attribute).map(|value| strip_wrappers(&value).to_string())
+    };
+    let texture_channel = |attribute: &str, default: MaterialTextureChannel| {
+        let Some(raw) = attr_value(tag, attribute) else {
+            return Ok(default);
+        };
+        match strip_wrappers(&raw).to_ascii_lowercase().as_str() {
+            "r" => Ok(MaterialTextureChannel::R),
+            "g" => Ok(MaterialTextureChannel::G),
+            "b" => Ok(MaterialTextureChannel::B),
+            "a" => Ok(MaterialTextureChannel::A),
+            "luminance" => Ok(MaterialTextureChannel::Luminance),
+            value => Err(GraphParseError {
+                line,
+                message: format!(
+                    "MaterialAsset \"{id}\" {attribute}=\"{value}\" is invalid. Use r, g, b, a, or luminance."
+                ),
+            }),
+        }
+    };
+    let invert = |attribute: &str| {
+        attr_value(tag, attribute)
+            .map(|value| parse_bool(&value, line, &format!("MaterialAsset.{attribute}")))
+            .transpose()
+            .map(|value| value.unwrap_or(false))
     };
     let base_color = attr_value(tag, "baseColor")
         .map(|value| parse_primitive_color(&value, &id, line))
@@ -6032,6 +6626,12 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
         normal_texture: texture_ref("normalTexture"),
         occlusion_texture: texture_ref("occlusionTexture"),
         emissive_texture: texture_ref("emissiveTexture"),
+        metallic_channel: texture_channel("metallicChannel", MaterialTextureChannel::B)?,
+        roughness_channel: texture_channel("roughnessChannel", MaterialTextureChannel::G)?,
+        occlusion_channel: texture_channel("occlusionChannel", MaterialTextureChannel::R)?,
+        metallic_invert: invert("metallicInvert")?,
+        roughness_invert: invert("roughnessInvert")?,
+        occlusion_invert: invert("occlusionInvert")?,
         base_color_texture_src: None,
         metallic_roughness_texture_src: None,
         normal_texture_src: None,
@@ -6070,6 +6670,74 @@ fn parse_material_asset(tag: &str, line: usize) -> Result<MaterialAssetNode, Gra
         texture_rotation: scalar("textureRotation", 0.0, -3600.0, 3600.0)?,
         variation_amount,
     })
+}
+
+/// Rejects `<Image asset="...">` references that do not name a declared `<ImageAsset>`.
+/// Images can live anywhere in the scene tree, including `<Defs>` components and
+/// `<Use>` slots, so the whole structure is validated before rendering starts.
+fn validate_scene_image_assets(
+    scene_nodes: &[SceneNode],
+    scenes: &[SceneRootNode],
+    assets: &[GraphAssetNode],
+    line: usize,
+) -> Result<(), GraphParseError> {
+    let image_asset_ids = assets
+        .iter()
+        .filter(|asset| asset.kind == GraphAssetKind::Image)
+        .map(|asset| asset.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut images = Vec::new();
+    collect_image_nodes(scene_nodes, &mut images);
+    for scene in scenes {
+        collect_image_nodes(&scene.children, &mut images);
+    }
+    for image in images {
+        if !image_asset_ids.contains(image.asset.as_str()) {
+            return Err(GraphParseError {
+                line,
+                message: format!("Image references unknown ImageAsset \"{}\".", image.asset),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_image_nodes<'a>(nodes: &'a [SceneNode], images: &mut Vec<&'a ImageNode>) {
+    for node in nodes {
+        match node {
+            SceneNode::Image(image) => images.push(image),
+            SceneNode::Timeline(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Track(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Sequence(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Chain(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Group(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Puppet(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Part(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Repeat(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Mask(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Precompose(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Layer(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Camera(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Character(node) => collect_image_nodes(&node.children, images),
+            SceneNode::Use(node) => {
+                for slot in &node.slots {
+                    collect_image_nodes(&slot.children, images);
+                }
+            }
+            SceneNode::Defs(defs) => {
+                for mask in &defs.masks {
+                    collect_image_nodes(&mask.children, images);
+                }
+                for precompose in &defs.precomposes {
+                    collect_image_nodes(&precompose.children, images);
+                }
+                for component in &defs.components {
+                    collect_image_nodes(&component.children, images);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn resolve_primitive_material_assets(
@@ -7447,6 +8115,7 @@ fn parse_primitive_collision(
             PrimitiveGeometry::RoundedBox { .. } => PrimitiveColliderShape::Box,
             PrimitiveGeometry::Loft { .. }
             | PrimitiveGeometry::Ribbon { .. }
+            | PrimitiveGeometry::Sweep { .. }
             | PrimitiveGeometry::HairCards { .. }
             | PrimitiveGeometry::HeadSurface { .. }
             | PrimitiveGeometry::Mesh { .. } => PrimitiveColliderShape::Convex,
@@ -9517,6 +10186,73 @@ mod tests {
     }
 
     #[test]
+    fn material_binding_tint_parses_and_validates() {
+        let script = r##"
+<Graph fps={24} duration="1s" size={[128,128]}>
+  <Scene id="tint_scene">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <CompositeGroup id="island" space="3d">
+            <Model id="box" asset="box.glb">
+              <MaterialBinding modelSourceMaterial="M_Main" tint="#EEE0C6" tintAmount="0.5" roughness="0.4" outlineWidth="1.3" />
+            </Model>
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="tint_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(script).expect("graph should parse");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("expected CompositeGroup");
+        };
+        let binding = group
+            .composite
+            .as_ref()
+            .expect("composite")
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Model(model) => model.material_bindings.first(),
+                _ => None,
+            })
+            .expect("binding");
+        assert_eq!(binding.material, "M_Main");
+        assert_eq!(binding.tint.expect("tint")[0], 0xEE as f32 / 255.0);
+        assert!((binding.tint_amount - 0.5).abs() < f32::EPSILON);
+        assert!((binding.roughness.expect("roughness") - 0.4).abs() < f32::EPSILON);
+
+        let bad_hex = script.replace("#EEE0C6", "#EEE0");
+        assert!(parse_graph_script(&bad_hex).is_err());
+        let bad_amount = script.replace("tintAmount=\"0.5\"", "tintAmount=\"2\"");
+        assert!(parse_graph_script(&bad_amount).is_err());
+        let bad_roughness = script.replace("roughness=\"0.4\"", "roughness=\"abc\"");
+        assert!(parse_graph_script(&bad_roughness).is_err());
+
+        let legacy_material = script.replace("modelSourceMaterial", "material");
+        let legacy_error = parse_graph_script(&legacy_material)
+            .expect_err("legacy MaterialBinding material must be rejected");
+        assert!(legacy_error.message.contains("modelSourceMaterial"));
+
+        let missing_material = script.replace(" modelSourceMaterial=\"M_Main\"", "");
+        let missing_error = parse_graph_script(&missing_material)
+            .expect_err("MaterialBinding requires modelSourceMaterial");
+        assert!(missing_error.message.contains("modelSourceMaterial"));
+    }
+
+    #[test]
     fn graph_parser_accepts_froxel_volume_children() {
         let graph = parse_graph_script(
             r##"
@@ -9528,13 +10264,12 @@ mod tests {
           <Layer>
             <CompositeGroup space="3d" depth="true">
               <DirectionalLight id="sun" direction={[0,-1,0]} castShadow="true" />
-              <AtmosphereFog id="sea" mode="exp" density="0.04"
-                             absorption={[0.08,0.03,0.01]}
-                             scatteringColor={[0.02,0.08,0.12]}>
-                <VolumetricScattering id="shafts" lightRef="sun" intensity="1.4"
-                                      anisotropy="0.72" maxDistance="30" shadowed="true" />
+              <AtmosphereFog id="sea" density="0.04" anisotropy="0.72"
+                             scatteringColor="#245E70">
+                <VolumetricScattering id="shafts" lightRef="sun" shaftStrength="1.4"
+                                      maxDistance="30" shadowed="true" quality="high" maxBounces="4" />
                 <WaterCaustics id="caustics" intensity="0.45" scale="0.09" speed="0.28"
-                               depthFalloff="0.6" color="#BFE9FF"
+                               attenuation="0.6" color="#BFE9FF"
                                volumeTerm="true" surfaceTerm="true" />
               </AtmosphereFog>
             </CompositeGroup>
@@ -9574,7 +10309,7 @@ mod tests {
                 _ => None,
             })
             .expect("atmosphere fog");
-        assert_eq!(volume.absorption.as_deref(), Some("[0.08,0.03,0.01]"));
+        assert_eq!(volume.scattering_color, "#245E70");
         assert_eq!(
             volume
                 .volumetric_scattering
@@ -11014,7 +11749,10 @@ Font note: this is not a structured XML comment.
     fn graph_parser_accepts_scene_image_without_passes() -> Result<(), GraphParseError> {
         let script = r##"
 <Graph fps={30} duration="3s" size={[1920,1080]}>
-  <Image src="/tmp/anica-test-image.png"
+  <Assets>
+    <ImageAsset id="test_image" src="/tmp/anica-test-image.png" />
+  </Assets>
+  <Image asset="test_image"
          x="center"
          y="120"
          scale="0.5 + 0.5*$time.norm"
@@ -11024,13 +11762,104 @@ Font note: this is not a structured XML comment.
 "##;
         let graph = parse_graph_script(script)?;
         assert_eq!(graph.images.len(), 1);
-        assert_eq!(graph.images[0].src, "/tmp/anica-test-image.png");
+        assert_eq!(graph.images[0].asset, "test_image");
         assert_eq!(graph.images[0].x, "center");
         assert_eq!(graph.images[0].y, "120");
         assert_eq!(graph.images[0].scale, "0.5 + 0.5*$time.norm");
         assert_eq!(graph.present.from, "scene");
         assert_eq!(graph.resource_size("scene"), Some((1920, 1080)));
         Ok(())
+    }
+
+    #[test]
+    fn graph_parser_rejects_image_src_and_requires_asset() {
+        let removed_src = r##"
+<Graph fps={30} duration="3s" size={[1920,1080]}>
+  <Image src="/tmp/anica-test-image.png" />
+  <Present from="scene" />
+</Graph>
+"##;
+        let error = parse_graph_script(removed_src).expect_err("Image src must be rejected");
+        assert!(
+            error
+                .message
+                .contains("Declare <ImageAsset id=\"...\" src=\"...\" /> under <Assets>"),
+            "unexpected message: {}",
+            error.message
+        );
+
+        let removed_path = r##"
+<Graph fps={30} duration="3s" size={[1920,1080]}>
+  <Image path="/tmp/anica-test-image.png" />
+  <Present from="scene" />
+</Graph>
+"##;
+        let error = parse_graph_script(removed_path).expect_err("Image path must be rejected");
+        assert!(
+            error
+                .message
+                .contains("Declare <ImageAsset id=\"...\" src=\"...\" /> under <Assets>"),
+            "unexpected message: {}",
+            error.message
+        );
+
+        let missing_asset = r##"
+<Graph fps={30} duration="3s" size={[1920,1080]}>
+  <Image x="center" y="center" />
+  <Present from="scene" />
+</Graph>
+"##;
+        let error = parse_graph_script(missing_asset).expect_err("Image asset is required");
+        assert!(
+            error.message.contains("Missing required attribute: asset"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn graph_parser_rejects_unknown_image_asset_reference() {
+        let script = r##"
+<Graph fps={30} duration="3s" size={[1920,1080]}>
+  <Image asset="missing" />
+  <Present from="scene" />
+</Graph>
+"##;
+        let error = parse_graph_script(script).expect_err("unknown asset must be rejected");
+        assert_eq!(
+            error.message,
+            "Image references unknown ImageAsset \"missing\"."
+        );
+    }
+
+    #[test]
+    fn graph_parser_validates_image_assets_inside_defs_components() {
+        let script = r##"
+<Graph fps={30} duration="3s" size={[1920,1080]}>
+  <Scene id="stage">
+    <Defs>
+      <Component id="card">
+        <Image asset="missing_inner" x="0" y="0" />
+      </Component>
+    </Defs>
+    <Timeline>
+      <Track id="main" z="0">
+        <Sequence duration="3s">
+          <Layer>
+            <Use ref="card" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="stage" />
+</Graph>
+"##;
+        let error = parse_graph_script(script).expect_err("nested unknown asset must be rejected");
+        assert_eq!(
+            error.message,
+            "Image references unknown ImageAsset \"missing_inner\"."
+        );
     }
 
     #[test]
@@ -12962,6 +13791,70 @@ Font note: this is not a structured XML comment.
     }
 
     #[test]
+    fn material_texture_channels_are_typed_and_keep_gltf_defaults() {
+        let graph = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <ImageAsset id="orm" src="orm.png" colorSpace="linear-srgb" />
+    <MaterialAsset id="mapped" metallicRoughnessTexture="orm"
+      occlusionTexture="orm" metallicChannel="r" metallicInvert="true"
+      roughnessChannel="a" roughnessInvert="true"
+      occlusionChannel="luminance" occlusionInvert="true" />
+    <MaterialAsset id="default" />
+  </Assets>
+  <Scene id="channel_scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="channel_scene" />
+</Graph>"##,
+        )
+        .expect("typed texture channel remapping should parse");
+        let mapped = &graph.material_assets[0];
+        assert_eq!(mapped.metallic_channel, super::MaterialTextureChannel::R);
+        assert_eq!(mapped.roughness_channel, super::MaterialTextureChannel::A);
+        assert_eq!(
+            mapped.occlusion_channel,
+            super::MaterialTextureChannel::Luminance
+        );
+        assert!(mapped.metallic_invert && mapped.roughness_invert && mapped.occlusion_invert);
+        let default = &graph.material_assets[1];
+        assert_eq!(default.metallic_channel, super::MaterialTextureChannel::B);
+        assert_eq!(default.roughness_channel, super::MaterialTextureChannel::G);
+        assert_eq!(default.occlusion_channel, super::MaterialTextureChannel::R);
+    }
+
+    #[test]
+    fn material_texture_channel_rejects_unknown_selector() {
+        let error = parse_graph_script(
+            r##"<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <MaterialAsset id="bad" roughnessChannel="blue" />
+  </Assets>
+  <Scene id="invalid_channel_scene">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="invalid_channel_scene" />
+</Graph>"##,
+        )
+        .expect_err("channel names must remain a small static vocabulary");
+        assert!(error.message.contains("Use r, g, b, a, or luminance"));
+    }
+
+    #[test]
     fn primitive_material_parses_transmissive_glass_without_changing_collision() {
         let graph = parse_graph_script(
             r##"
@@ -13674,5 +14567,100 @@ Font note: this is not a structured XML comment.
         )
         .expect_err("attachment cycles must fail before rendering");
         assert!(error.message.contains("cycle"));
+    }
+
+    #[test]
+    fn curve_and_sweep_assets_parse_and_resolve_order_independently() {
+        let graph = parse_graph_script(
+            r#"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Assets>
+    <SweepAsset id="pipe" curve="route" frame="parallelTransport"
+                uvMode="distance" uvScale={[1,0.25]} capStart="true" capEnd="true">
+      <Profile closed="true">
+        <ProfilePoint position={[-0.1,-0.1]} />
+        <ProfilePoint position={[0.1,-0.1]} />
+        <ProfilePoint position={[0.1,0.1]} />
+        <ProfilePoint position={[-0.1,0.1]} />
+      </Profile>
+    </SweepAsset>
+    <CurveAsset id="route" interpolation="catmullRom" maxSegmentLength="0.25">
+      <CurvePoint position={[0,0,0]} />
+      <CurvePoint position={[1,0,0]} tilt="5" />
+      <CurvePoint position={[2,1,0]} scale="0.8" />
+    </CurveAsset>
+  </Assets>
+  <Scene id="main">
+    <Timeline>
+      <Track>
+        <Sequence duration="1s">
+          <Layer>
+            <CompositeGroup space="3d">
+              <Model id="pipe_model" asset="pipe" />
+            </CompositeGroup>
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="main" />
+</Graph>"#,
+        )
+        .expect("universal curve and sweep assets should parse");
+        assert_eq!(graph.curve_assets.len(), 1);
+        assert_eq!(graph.curve_assets[0].points.len(), 3);
+        let sweep = graph
+            .assets
+            .iter()
+            .find(|asset| asset.id == "pipe")
+            .unwrap();
+        let PrimitiveGeometry::Sweep {
+            curve,
+            profile,
+            profile_closed,
+            uv_scale,
+            ..
+        } = &sweep.primitive().unwrap().geometry
+        else {
+            panic!("SweepAsset must lower to typed primitive geometry");
+        };
+        assert_eq!(curve.id, "route");
+        assert_eq!(profile.len(), 4);
+        assert!(*profile_closed);
+        assert_eq!(*uv_scale, [1.0, 0.25]);
+    }
+
+    #[test]
+    fn curve_and_sweep_assets_report_invalid_references_and_degenerate_data() {
+        let unknown = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Assets>
+    <SweepAsset id="broken" curve="missing">
+      <Profile>
+        <ProfilePoint position={[-1,0]} />
+        <ProfilePoint position={[1,0]} />
+      </Profile>
+    </SweepAsset>
+  </Assets>
+  <Background id="bg" color="#000000" />
+  <Present from="bg" />
+</Graph>"##,
+        )
+        .expect_err("unknown curve references must fail");
+        assert!(unknown.message.contains("unknown CurveAsset"));
+
+        let degenerate = parse_graph_script(
+            r##"<Graph fps={24} duration="1s" size={[64,64]}>
+  <Assets>
+    <CurveAsset id="broken">
+      <CurvePoint position={[0,0,0]} />
+      <CurvePoint position={[0,0,0]} />
+    </CurveAsset>
+  </Assets>
+  <Background id="bg" color="#000000" />
+  <Present from="bg" />
+</Graph>"##,
+        )
+        .expect_err("zero-length curve segments must fail");
+        assert!(degenerate.message.contains("zero-length segment"));
     }
 }

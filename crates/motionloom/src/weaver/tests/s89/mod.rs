@@ -34,7 +34,10 @@ fn every_pixel_receives_one_sample_batch() {
     .unwrap();
     let raw = std::fs::read(report.output.join("checkpoints/0-0.film")).unwrap();
     let values = crate::weaver::output::floats(&raw);
-    let counts: Vec<_> = values.chunks_exact(16).map(|f| f[3]).collect();
+    let counts: Vec<_> = values
+        .chunks_exact(super::super::backend::wgpu::FILM_FLOATS_PER_PIXEL)
+        .map(|f| f[3])
+        .collect();
     let wrong = counts.iter().filter(|&&count| count != 4.0).count();
     eprintln!(
         "batch accounting: wrong={wrong}, min={}, max={}",
@@ -56,14 +59,6 @@ fn environment_pole_remains_finite() {
     job.sampling.min_samples = 64;
     job.sampling.max_samples = 64;
     job.denoiser_library = None;
-    job.volume = Some(Volume {
-        bounds_min: [-200.0, -10.0, -200.0],
-        bounds_max: [200.0, 90.0, -16.0],
-        extinction: 0.012,
-        albedo: [0.9, 0.94, 0.98],
-        anisotropy: 0.25,
-        max_bounces: 4,
-    });
     let report = pollster::block_on(render(&job, &CancellationToken::default(), |_| {})).unwrap();
     let raw = image::open(report.output.join("beauty.exr"))
         .unwrap()
@@ -124,7 +119,6 @@ fn cancelled_job_resumes_without_changing_samples() {
     job.region = None;
     job.sampling.min_samples = 8;
     job.sampling.max_samples = 8;
-    job.volume = None;
     job.denoiser_library = None;
     let temp = std::env::temp_dir().join(format!("weaver-resume-{}", std::process::id()));
     job.output = temp.clone();

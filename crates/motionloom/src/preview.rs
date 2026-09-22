@@ -100,7 +100,12 @@ pub struct ImmediatePreviewSettings {
 impl Default for ImmediatePreviewSettings {
     fn default() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             profile: ImmediatePreviewProfile::Balanced,
+            // Browser WebGPU implementations expose a narrower and less
+            // predictable budget, so start portable without changing pixels.
+            #[cfg(target_arch = "wasm32")]
+            profile: ImmediatePreviewProfile::Portable,
             target_fps: 30.0,
             dynamic_resolution: true,
             min_resolution_scale: 0.5,
@@ -139,6 +144,7 @@ impl ImmediatePreviewSettings {
                 temporal_antialiasing: false,
                 temporal_jitter: false,
                 screen_space_reflections: false,
+                screen_space_global_illumination: false,
                 motion_blur: false,
                 froxel_tile_size: 16,
                 froxel_depth_slices: 32,
@@ -154,6 +160,7 @@ impl ImmediatePreviewSettings {
                 temporal_antialiasing: true,
                 temporal_jitter: false,
                 screen_space_reflections: false,
+                screen_space_global_illumination: false,
                 motion_blur: true,
                 froxel_tile_size: 12,
                 froxel_depth_slices: 48,
@@ -169,6 +176,7 @@ impl ImmediatePreviewSettings {
                 temporal_antialiasing: true,
                 temporal_jitter: false,
                 screen_space_reflections: true,
+                screen_space_global_illumination: true,
                 motion_blur: true,
                 froxel_tile_size: 8,
                 froxel_depth_slices: 64,
@@ -184,6 +192,7 @@ impl ImmediatePreviewSettings {
                 temporal_antialiasing: true,
                 temporal_jitter: false,
                 screen_space_reflections: true,
+                screen_space_global_illumination: true,
                 motion_blur: true,
                 froxel_tile_size: 6,
                 froxel_depth_slices: 96,
@@ -213,6 +222,7 @@ pub struct ImmediatePreviewBudget {
     /// profiles keep this disabled until thin-geometry coverage is stable.
     pub temporal_jitter: bool,
     pub screen_space_reflections: bool,
+    pub screen_space_global_illumination: bool,
     pub motion_blur: bool,
     /// Width and height in pixels represented by one froxel column.
     pub froxel_tile_size: u16,
@@ -232,6 +242,12 @@ pub struct ImmediatePreviewCapabilities {
     pub temporal_antialiasing: bool,
     pub ambient_occlusion: bool,
     pub screen_space_reflections: bool,
+    pub screen_space_global_illumination: bool,
+    pub screen_space_transmission: bool,
+    pub local_reflection_probes: bool,
+    pub browser_webgpu_tier: bool,
+    pub max_screen_space_reflection_steps: u8,
+    pub max_screen_space_gi_samples: u8,
     pub depth_of_field: bool,
     pub motion_blur: bool,
     pub volumetrics: bool,
@@ -656,6 +672,14 @@ impl WgpuPreviewEngine {
             temporal_antialiasing: gpu,
             ambient_occlusion: gpu,
             screen_space_reflections: gpu,
+            screen_space_global_illumination: gpu,
+            screen_space_transmission: gpu,
+            // Environment IBL is the off-screen fallback. Local capture probes
+            // are not implemented and must not be advertised to editor hosts.
+            local_reflection_probes: false,
+            browser_webgpu_tier: cfg!(target_arch = "wasm32"),
+            max_screen_space_reflection_steps: if cfg!(target_arch = "wasm32") { 20 } else { 40 },
+            max_screen_space_gi_samples: if cfg!(target_arch = "wasm32") { 4 } else { 8 },
             depth_of_field: gpu,
             motion_blur: gpu,
             volumetrics: gpu,
@@ -1107,7 +1131,10 @@ mod tests {
         assert!(!balanced.temporal_jitter);
         assert!(balanced.motion_blur);
         assert!(!balanced.screen_space_reflections);
+        assert!(!balanced.screen_space_global_illumination);
         assert!(cinematic.screen_space_reflections);
+        assert!(cinematic.screen_space_global_illumination);
+        assert!(ultra.screen_space_global_illumination);
         assert!(!cinematic.temporal_jitter);
         assert_eq!(cinematic.texture_anisotropy, 16);
         assert_eq!(cinematic.antialiasing, ImmediatePreviewAntialiasing::Fxaa);

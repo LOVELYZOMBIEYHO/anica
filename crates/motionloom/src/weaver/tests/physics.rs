@@ -13,7 +13,7 @@ fn lens_preserves_focus_and_fov() {
     let mut job = RenderJob::new("scene", QualityPreset::Ultra);
     job.scene_id = "scene".into();
     let camera = WorldCamera::default();
-    let mut p = [[0.0; 4]; 20];
+    let mut p = [[0.0; 4]; 26];
     super::super::camera::configure(&mut p, &camera, &job).unwrap();
     assert!((p[3][3] - (35f32.to_radians() / 2.0).tan()).abs() < 1e-6);
     let radius = p[5][3];
@@ -33,14 +33,19 @@ fn importance_distribution_integrates_to_one() {
         .unwrap();
     let mut data = Vec::new();
     let (tex, cdf) = super::super::lighting::environment(&path, &mut data).unwrap();
-    assert_eq!(data[tex[0] as usize][0], 4.0, "HDR values must not clip");
+    // Offsets are raw u32 bit patterns carried through f32.
+    assert_eq!(
+        data[tex[0].to_bits() as usize][0],
+        4.0,
+        "HDR values must not clip"
+    );
     let mut integral = 0.0;
     for y in 0..4 {
         for x in 0..8 {
             let omega = 2.0 * std::f32::consts::PI / 8.0
                 * ((std::f32::consts::PI * y as f32 / 4.0).cos()
                     - (std::f32::consts::PI * (y + 1) as f32 / 4.0).cos());
-            integral += data[cdf[0] as usize + y * 8 + x][1] * omega;
+            integral += data[cdf[0].to_bits() as usize + y * 8 + x][1] * omega;
         }
     }
     assert!((integral - 1.0).abs() < 1e-5);
@@ -88,13 +93,17 @@ fn gpu_lambertian_energy_and_batch_invariance() {
         meshes: vec![mesh],
         camera: WorldCamera::default(),
         lighting: WorldLighting::default(),
+        time_seconds: 0.0,
         diagnostics: vec![],
+        composition: crate::scene::compositor::SceneCompositionPlan::new([8, 8], [8, 8]),
+        composition_layers: Vec::new(),
+        primary_camera_visibility: vec![true],
     };
-    let mut packed = super::super::geometry::pack(&snapshot).unwrap();
+    let mut packed = super::super::geometry::pack(&snapshot, false, false).unwrap();
     let env = packed.data.len();
     packed.data.push([1.0, 1.0, 1.0, 0.0]);
     let gpu = pollster::block_on(super::super::backend::wgpu::Gpu::new(&packed)).unwrap();
-    let mut p = [[0.0f32; 4]; 20];
+    let mut p = [[0.0f32; 4]; 26];
     p[0] = [8.0, 8.0, 32.0, f32::from_bits(1989)];
     p[1] = [
         packed.triangle_offset as f32,
@@ -112,21 +121,34 @@ fn gpu_lambertian_energy_and_batch_invariance() {
     p[10] = [env as f32, 1.0, 1.0, 0.0];
     p[11] = [1.0, 1.0, 0.0, 0.0];
     p[12] = [0.0, 0.0, 8.0, 8.0];
-    let tile = gpu.tile(64, &vec![0; 64 * 64]);
+    let tile = gpu.tile(
+        64,
+        &vec![0; 64 * super::super::backend::wgpu::FILM_BYTES_PER_PIXEL],
+    );
     let mut raw = Vec::new();
     for _ in 0..16 {
         raw = gpu.batch(&tile, &p).unwrap();
     }
     let film = super::super::output::floats(&raw);
-    let mean = film.chunks_exact(16).map(|f| f[0] / f[3]).sum::<f32>() / 64.0;
+    let mean = film
+        .chunks_exact(super::super::backend::wgpu::FILM_FLOATS_PER_PIXEL)
+        .map(|f| f[0] / f[3])
+        .sum::<f32>()
+        / 64.0;
     assert!(
         (mean - 0.5).abs() < 0.04,
         "Lambertian reflected energy {mean}"
     );
-    assert!(film.chunks_exact(16).all(|f| f[7] == 0.0 && f[3] == 512.0));
+    assert!(
+        film.chunks_exact(super::super::backend::wgpu::FILM_FLOATS_PER_PIXEL)
+            .all(|f| f[7] == 0.0 && f[3] == 512.0)
+    );
     // Splitting a job into smaller dispatches must preserve every sample exactly.
     p[0][2] = 16.0;
-    let other = gpu.tile(64, &vec![0; 64 * 64]);
+    let other = gpu.tile(
+        64,
+        &vec![0; 64 * super::super::backend::wgpu::FILM_BYTES_PER_PIXEL],
+    );
     let mut resumed = Vec::new();
     for _ in 0..32 {
         resumed = gpu.batch(&other, &p).unwrap();
@@ -137,11 +159,17 @@ fn gpu_lambertian_energy_and_batch_invariance() {
     p[0][1] = 1.0;
     p[12][0] = 3.0;
     p[12][1] = 4.0;
-    let cropped = gpu.tile(1, &[0; 64]);
+    let cropped = gpu.tile(
+        1,
+        &vec![0; super::super::backend::wgpu::FILM_BYTES_PER_PIXEL],
+    );
     let mut cropped_bytes = Vec::new();
     for _ in 0..32 {
         cropped_bytes = gpu.batch(&cropped, &p).unwrap();
     }
-    let index = (4 * 8 + 3) * 64;
-    assert_eq!(&raw[index..index + 64], cropped_bytes.as_slice());
+    let index = (4 * 8 + 3) * super::super::backend::wgpu::FILM_BYTES_PER_PIXEL;
+    assert_eq!(
+        &raw[index..index + super::super::backend::wgpu::FILM_BYTES_PER_PIXEL],
+        cropped_bytes.as_slice()
+    );
 }

@@ -155,6 +155,21 @@ println!("{} render passes", render_graph.nodes.len());
 Use `SceneRenderer` for retained multi-frame preview, or the scene export
 helpers for image sequences and video output.
 
+Raster scene images reference a declared `ImageAsset`. Raw `src` on `<Image>` is
+rejected so every image loads through one asset pipeline:
+
+```xml
+<Assets>
+  <ImageAsset id="logo" src="assets/logo.png" />
+</Assets>
+...
+<Image asset="logo" x="center" y="720" scale="0.5" opacity="1" />
+```
+
+`ImageAsset` sources may be native paths, remote URLs, or raster
+`data:image/*;base64,...` URIs. `<Character src="...">` keeps its inline raster
+source form.
+
 Rigid bodies use one explicit tag in both dimensions:
 
 ```xml
@@ -237,6 +252,59 @@ are visual-only and preserve authored bounds; auto collision still uses the
 unbeveled canonical box. `materialSeed` adds deterministic per-instance UV
 variation without moving collision surfaces.
 
+Packed material maps may select `r`, `g`, `b`, `a`, or `luminance` explicitly:
+
+```xml
+<MaterialAsset id="road" metallicRoughnessTexture="road_orm"
+               occlusionTexture="road_orm"
+               metallicChannel="b" roughnessChannel="g"
+               occlusionChannel="r" roughnessInvert="false" />
+```
+
+The defaults remain the glTF convention (`B=metallic`, `G=roughness`,
+`R=occlusion`). `metallicInvert`, `roughnessInvert`, and `occlusionInvert`
+support gloss or inverse masks without preprocessing. These static selectors
+are resolved identically by Immediate Preview, native/WASM rendering, terrain
+layer baking, and Weaver.
+
+Reusable spatial paths and curve-to-mesh geometry use `CurveAsset` and
+`SweepAsset`. A curve is non-rendering data; every sweep that references it
+lowers to the same retained primitive mesh, material, shadow, collision,
+native, WASM, and Weaver paths as other generated geometry:
+
+```xml
+<CurveAsset id="route" interpolation="catmullRom"
+            closed="false" maxSegmentLength="0.25">
+  <CurvePoint position={[0,0,0]} />
+  <CurvePoint position={[2,0.4,-3]} tilt="4" />
+  <CurvePoint position={[6,0,-7]} scale="0.8" />
+</CurveAsset>
+
+<SweepAsset id="pipe" curve="route" material="steel"
+            frame="parallelTransport" uvMode="distance"
+            uvScale={[1,0.5]} capStart="true" capEnd="true">
+  <Profile closed="true">
+    <ProfilePoint position={[-0.1,-0.1]} />
+    <ProfilePoint position={[0.1,-0.1]} />
+    <ProfilePoint position={[0.1,0.1]} />
+    <ProfilePoint position={[-0.1,0.1]} />
+  </Profile>
+</SweepAsset>
+```
+
+`interpolation="linear"` represents straight lines and polylines;
+`catmullRom` passes through every control point. `parallelTransport` is the
+stable general 3D frame for pipes, cables and hair. `worldUp` keeps the inline
+profile aligned to global +Y for roads and terrain strips; near a vertical
+segment it falls back to the stable transported frame. `uvMode="distance"`
+uses normalized profile U and world-distance V; `normalized` maps both axes to
+zero through one. Optional `dash={[on,off]}` cuts geometry at exact cumulative
+curve distances. `smoothProfile="true"` shares one normal across an open
+profile, which is useful for crowned roads and other visually smooth strips.
+Curves require at least two distinct points; open profiles
+require two points and closed profiles require three. Dynamic expressions are
+not accepted in asset geometry.
+
 `HeadAsset` is an additive procedural model asset for continuous cranium and
 facial geometry. `HeadShape` is species-neutral, `FaceLayout` is optional, and
 generic mirrored `HeadFeature` fields support humanoid, feline, canine, dragon,
@@ -315,8 +383,30 @@ from camera distance relative to authored height. Wind is a lightweight GPU
 vertex deformation shared by native and WASM rendering; it does not rebuild
 meshes. `collision="solid"` is intentionally limited to tree and deadwood and
 uses a coarse trunk cylinder rather than foliage triangles. Repeated Models of
-the same resolved asset reuse retained mesh and texture resources. V1 does not
-include a scatter system, biome simulation, or runtime-growing plants.
+the same resolved asset reuse retained mesh and texture resources.
+
+World distribution stays separate from plant generation. Use `Scatter` inside
+a 3D CompositeGroup to place existing model assets on a TerrainAsset-backed
+Model:
+
+```xml
+<Model id="terrain" asset="forest_ground" />
+<Scatter id="forest" surface="terrain" count="12000" seed="97"
+         densityMap="forest_density" exclusionMap="road_clearance"
+         slopeRange={[0,42]} scaleRange={[0.7,1.3]}
+         rotationYRange={[0,360]} surfaceOffset="-0.02">
+  <Variant asset="pine" weight="3" />
+  <Variant asset="oak" weight="1" />
+</Scatter>
+```
+
+`densityMap` and `exclusionMap` reference linear `ImageAsset` masks. White in
+the exclusion mask forbids placement; density controls deterministic acceptance
+from black to white. Variants may reference any existing Model-compatible
+asset, so Scatter reuses PrimitiveAsset, MeshAsset, CompoundAsset,
+VegetationAsset, and imported ModelAsset rendering rather than defining a new
+geometry path. V1 requires a TerrainAsset surface. Biome simulation and
+runtime-growing plants remain out of scope.
 
 Vegetation migration is not required. Existing ModelAsset, PrimitiveAsset,
 CompoundAsset, and TerrainAsset declarations remain unchanged. Authors opt in

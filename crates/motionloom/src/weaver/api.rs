@@ -5,7 +5,8 @@
 #[cfg(test)]
 pub(crate) use super::jobs::converged;
 pub use super::jobs::render;
-pub use super::jobs::sequence::render_sequence;
+pub use super::jobs::sequence::{MasterSequenceReport, render_master_sequence, render_sequence};
+pub use super::preview::{PreviewDenoiser, PreviewSession};
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
@@ -46,6 +47,36 @@ pub struct RenderReport {
     pub converged_pixels: u64,
     pub sample_limit_pixels: u64,
     pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub timings: RenderTimings,
+    #[serde(default)]
+    pub frame_delta: FrameDeltaKind,
+}
+
+/// Work invalidated by this frame relative to the preceding sequence frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameDeltaKind {
+    #[default]
+    FirstFrame,
+    CameraOrUniforms,
+    SceneBufferUpdate,
+    SceneRebuild,
+    TwoDOnly,
+}
+
+/// Stable phase timings make sequence performance regressions attributable
+/// without requiring an external profiler for every render.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderTimings {
+    pub parse_seconds: f64,
+    pub scene_evaluation_seconds: f64,
+    pub geometry_pack_seconds: f64,
+    pub gpu_setup_seconds: f64,
+    pub path_trace_seconds: f64,
+    pub composition_output_seconds: f64,
+    pub denoise_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -535,7 +535,7 @@ fn rendered_modes_differ_and_preserve_output_size() {
 fn cel_material_settings_validate_and_roundtrip() {
     let source = script("", "").replace(
         "<Model id=\"hero\" asset=\"ball\" />",
-        "<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding material=\"*\" celRole=\"hair\" outlineWidth=\"0.5\" celShadowColor=\"#684C71\" hairHighlight=\"0.3\" />\n</Model>",
+        "<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding modelSourceMaterial=\"*\" celRole=\"hair\" outlineWidth=\"0.5\" celShadowColor=\"#684C71\" hairHighlight=\"0.3\" />\n</Model>",
     );
     let graph = parse_graph_script(&source).unwrap();
     let json = serde_json::to_value(&graph).unwrap();
@@ -574,7 +574,7 @@ fn cel_outline_material_override_and_missing_slot() {
             .unwrap();
         assert_ne!(outlined, disabled);
         let override_source = source.replace("<Model id=\"hero\" asset=\"ball\" />",
-            "<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding material=\"*\" outlineWidth=\"0\" />\n</Model>");
+            "<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding modelSourceMaterial=\"*\" outlineWidth=\"0\" />\n</Model>");
         let override_image = renderer
             .render_frame(&parse_graph_script(&override_source).unwrap(), 0)
             .await
@@ -603,7 +603,7 @@ fn cel_control_texture_changes_outline_and_face_shadow() {
         let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
         script("<RenderStyle id=\"c\">\n<SurfaceStyle shading=\"cel\" />\n<OutlineStyle width=\"3\" />\n</RenderStyle>", "renderStyle=\"c\"")
             .replace("<Assets>", &format!("<Assets>\n<ImageAsset id=\"control\" src=\"data:image/png;base64,{data}\" colorSpace=\"linear-srgb\" />"))
-            .replace("<Model id=\"hero\" asset=\"ball\" />", &format!("<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding material=\"*\" celRole=\"{role}\" celControlMap=\"control\" />\n</Model>"))
+            .replace("<Model id=\"hero\" asset=\"ball\" />", &format!("<Model id=\"hero\" asset=\"ball\">\n<MaterialBinding modelSourceMaterial=\"*\" celRole=\"{role}\" celControlMap=\"control\" />\n</Model>"))
     }
     pollster::block_on(async {
         let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();

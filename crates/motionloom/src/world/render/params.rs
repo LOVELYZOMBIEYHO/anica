@@ -52,7 +52,7 @@ pub(super) fn pack_gpu_world_params(params: GpuWorldParams) -> Vec<u8> {
 }
 
 pub(super) fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1152);
+    let mut out = Vec::with_capacity(1168);
     for vector in [
         params.environment0,
         params.environment1,
@@ -79,6 +79,7 @@ pub(super) fn pack_gpu_world_lighting(params: GpuWorldLightingParams) -> Vec<u8>
         params.previous_camera3,
         params.preview0,
         params.preview1,
+        params.preview2,
         params.shadow0,
         params.shadow1,
         params.shadow2,

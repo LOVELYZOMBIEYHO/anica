@@ -319,12 +319,10 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
     number_property!("focalLength", "mm", "number", &["Camera3D"]),
     number_property!("fStop", "ratio", "number", &["Camera3D"]),
     number_property!("maxBlur", "px", "number", &["Camera3D"]),
-    number_property!("density", "ratio", "number", &["AtmosphereFog"]),
-    number_property!("start", "world", "number", &["AtmosphereFog"]),
-    number_property!("end", "world", "number", &["AtmosphereFog"]),
+    number_property!("density", "world_inverse", "number", &["AtmosphereFog"]),
+    number_property!("anisotropy", "ratio", "slider", &["AtmosphereFog"]),
     number_property!("baseHeight", "world", "number", &["AtmosphereFog"]),
     number_property!("heightFalloff", "ratio", "number", &["AtmosphereFog"]),
-    number_property!("scattering", "ratio", "slider", &["AtmosphereFog"]),
     number_property!("edgeFeather", "world", "number", &["AtmosphereFog"]),
     number_property!(
         "intensity",
@@ -338,14 +336,19 @@ pub static ANIMATION_PROPERTY_DESCRIPTORS: &[AnimationPropertyDescriptor] = &[
             "RectAreaLight",
             "AmbientOcclusion",
             "ContactShadow",
-            "VolumetricScattering",
             "WaterCaustics"
         ]
     ),
-    number_property!("anisotropy", "ratio", "slider", &["VolumetricScattering"]),
+    number_property!(
+        "shaftStrength",
+        "ratio",
+        "number",
+        &["VolumetricScattering"]
+    ),
     number_property!("maxDistance", "world", "number", &["VolumetricScattering"]),
+    number_property!("maxBounces", "count", "number", &["VolumetricScattering"]),
     number_property!("speed", "ratio", "number", &["WaterCaustics"]),
-    number_property!("depthFalloff", "ratio", "number", &["WaterCaustics"]),
+    number_property!("attenuation", "world_inverse", "number", &["WaterCaustics"]),
     number_property!(
         "backgroundIntensity",
         "ratio",
@@ -745,6 +748,9 @@ fn collect_scene_node_kinds(nodes: &[SceneNode], node_kinds: &mut HashMap<String
                             }
                             Scene3DNode::VolumeRepeat(node) => {
                                 collect_optional_id(node_kinds, node.id.as_ref(), "Repeat")
+                            }
+                            Scene3DNode::Scatter(node) => {
+                                collect_optional_id(node_kinds, node.id.as_ref(), "Scatter")
                             }
                             Scene3DNode::Anchor(node) => {
                                 node_kinds.insert(node.id.clone(), "Anchor3D");

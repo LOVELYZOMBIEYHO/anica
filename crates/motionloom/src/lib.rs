@@ -77,8 +77,8 @@
 //!   [`ApplyActionNode`] provide 2D character rigging. Actions can contain
 //!   two-bone IK or CCD-chain IK targets.
 //! - [`CharacterNode`] can draw vector children and/or a raster `src`, `image`,
-//!   or `path` using the same loader as `<Image>`, including PNG/JPG paths and
-//!   raster `data:image/*;base64,...` URIs.
+//!   or `path` using the same raster loader as `<ImageAsset>`, including PNG/JPG
+//!   paths and raster `data:image/*;base64,...` URIs.
 //!
 //! ```no_run
 //! use std::path::Path;
@@ -168,17 +168,18 @@ pub use dsl::{
     ActionBoneNode, ActionContactNode, ActionLibraryNode, ActionNode, ActionPoseNode,
     AnimationKeyNode, AnimationTargetNode, ApplyActionNode, AttachmentNode, AttachmentSocketNode,
     AttachmentTargetNode, BackgroundNode, CompoundAssetInstanceNode, CompoundAssetNode,
-    ContactSurfaceNode, ControlCageNode, EarNode, EyeNode, EyebrowNode, EyelinerNode,
-    FaceLayoutNode, FaceTextureNode, FacialCageNode, GraphAssetKind, GraphAssetNode,
-    GraphAssetSource, GraphScript, HairGuideNode, HairPointNode, HeadDomeNode, HeadFeatureNode,
-    HeadMorphNode, HeadSectionNode, HeadShapeNode, ImageNode, IrisNode,
-    ModelProfileBoneAxisMapNode, ModelProfileBoneAxisNode, ModelProfileNode,
-    ModelProfileRetargetMapNode, ModelProfileRetargetNode, MouthNode, NativeSkinBindingNode,
-    NativeSkinMode, NativeWeightRegionNode, NoseNode, PrimitiveAssetNode, PrimitiveAxis,
-    PrimitiveGeometry, PrimitiveLodNode, PrimitiveLoftSectionNode, PrimitiveMeshBuildNode,
-    PrimitiveModifierNode, PrimitiveRibbonPointNode, ProcessDefinitionNode, SkeletonBoneNode,
-    SkeletonConstraintNode, SkeletonControlNode, SkeletonGuideNode, SkeletonLandmarkNode,
-    SkeletonMeasureNode, SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode,
+    ContactSurfaceNode, ControlCageNode, CurveAssetNode, CurveInterpolation, CurvePointNode,
+    EarNode, EyeNode, EyebrowNode, EyelinerNode, FaceLayoutNode, FaceTextureNode, FacialCageNode,
+    GraphAssetKind, GraphAssetNode, GraphAssetSource, GraphScript, HairGuideNode, HairPointNode,
+    HeadDomeNode, HeadFeatureNode, HeadMorphNode, HeadSectionNode, HeadShapeNode, ImageNode,
+    IrisNode, MaterialAssetNode, MaterialTextureChannel, ModelProfileBoneAxisMapNode,
+    ModelProfileBoneAxisNode, ModelProfileNode, ModelProfileRetargetMapNode,
+    ModelProfileRetargetNode, MouthNode, NativeSkinBindingNode, NativeSkinMode,
+    NativeWeightRegionNode, NoseNode, PrimitiveAssetNode, PrimitiveAxis, PrimitiveGeometry,
+    PrimitiveLodNode, PrimitiveLoftSectionNode, PrimitiveMeshBuildNode, PrimitiveModifierNode,
+    PrimitiveRibbonPointNode, ProcessDefinitionNode, SkeletonBoneNode, SkeletonConstraintNode,
+    SkeletonControlNode, SkeletonGuideNode, SkeletonLandmarkNode, SkeletonMeasureNode,
+    SkeletonNode, SkeletonRatioNode, SkeletonRegionNode, SvgNode, SweepProfilePointNode,
     TerrainAssetNode, VegetationAssetNode, VegetationKind, VegetationLod, is_graph_script,
     parse_action_library_document, parse_graph_script,
 };
@@ -303,14 +304,15 @@ pub use shot_validation::{
 pub use world::error::{MotionLoomWorldError, WorldAssetError, WorldError, WorldParseError};
 pub use world::primitive::{ControlCageInspection, generated_control_cage, inspect_control_cage};
 pub use world::{
-    ActorPoseDiagnostic, BodyBasisProposal, BoneAxisProposal, CharacterDesignGpuViewport,
-    CharacterDesignViewportFrame, DetectedHumanoidRig, EnvironmentAnchorProposal,
-    EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic, EnvironmentSurfaceProposal,
-    GlbEnvironmentInspectionReport, GlbHumanoidProfileInspectionReport, GlbLoadError, GlbMeshData,
-    GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HeadBounds, HeadComparisonReport,
-    HeadFitProposal, HumanoidActionCompatibilityReport, HumanoidBoneProposal, JointAlternative,
-    JointPoseDiagnostic, ModelInspectionDiagnostic, ModelInspectionError, PoseDiagnosticError,
-    RestPoseProposal, Scene3DFrameProfile, SemanticAxisProposal, WorldAction, WorldActionBone,
+    ActorPoseDiagnostic, AtmosphereMediumPlan, BodyBasisProposal, BoneAxisProposal,
+    CharacterDesignGpuViewport, CharacterDesignViewportFrame, DetectedHumanoidRig,
+    EnvironmentAnchorProposal, EnvironmentCoordinateProfile, EnvironmentInspectionDiagnostic,
+    EnvironmentSurfaceProposal, GlbEnvironmentInspectionReport, GlbHumanoidProfileInspectionReport,
+    GlbLoadError, GlbMeshData, GlbMetadata, GlbNodeData, GlbSkeletonInspectionReport, HeadBounds,
+    HeadComparisonReport, HeadFitProposal, HumanoidActionCompatibilityReport, HumanoidBoneProposal,
+    JointAlternative, JointPoseDiagnostic, ModelInspectionDiagnostic, ModelInspectionError,
+    PoseDiagnosticError, RestPoseProposal, Scene3DFrameProfile, SemanticAxisProposal,
+    VolumetricQuality, VolumetricScatteringPlan, WaterCausticsPlan, WorldAction, WorldActionBone,
     WorldActionIk, WorldActionPose, WorldActor, WorldApplyAction, WorldBackground,
     WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera, WorldCameraControl,
     WorldCameraMode, WorldCameraProjection, WorldFrameRenderer, WorldGpuDiagnostics, WorldGraph,

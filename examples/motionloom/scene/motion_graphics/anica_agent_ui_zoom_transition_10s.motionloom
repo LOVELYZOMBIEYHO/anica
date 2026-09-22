@@ -1,5 +1,10 @@
 <!-- Image nodes are GPU-native in scene render. Relative paths are resolved from the renderer process cwd; this example assumes the Anica repo root as cwd. -->
 <Graph fps={30} duration="10s" size={[1920,1080]} renderSize={[1920,1080]}>
+
+  <Assets>
+    <ImageAsset id="sample_readme_showcase1" src="examples/motionloom/sample_assets/README/readme_showcase1.png" />
+    <ImageAsset id="sample_readme_showcase2" src="examples/motionloom/sample_assets/README/readme_showcase2.png" />
+  </Assets>
   <Background color="#FF4D8D" />
 
   <Scene id="anica_agent_ui_zoom_transition_10s">
@@ -57,7 +62,7 @@
                    transformOriginY="500"
                    opacity={curve("0:0:linear, 0.95:0:linear, 1.00:1:ease_in_out, 4.86:1:linear, 5.12:0:ease_in_out, 10:0:linear")}>
               <Rect x="-46" y="-46" width="2972" height="1892" radius="60" color="#000000" opacity="0.32" />
-              <Image src="examples/motionloom/sample_assets/README/readme_showcase1.png" x="0" y="0" scale="1" opacity="1" />
+              <Image asset="sample_readme_showcase1" x="0" y="0" scale="1" opacity="1" />
             </Group>
 
             <Group id="shot_01_trail_a"
@@ -67,7 +72,7 @@
                    transformOriginX="780"
                    transformOriginY="500"
                    opacity={curve("0:0:linear, 4.72:0:linear, 4.86:0.28:ease_in_out, 5.18:0:ease_in_out, 10:0:linear")}>
-              <Image src="examples/motionloom/sample_assets/README/readme_showcase1.png" x="0" y="0" scale="1" opacity="1" />
+              <Image asset="sample_readme_showcase1" x="0" y="0" scale="1" opacity="1" />
             </Group>
             <Group id="shot_01_trail_b"
                    x={curve("0:-190:linear, 4.78:-1460:linear, 5.20:-3120:ease_in_out, 10:-3120:linear")}
@@ -76,7 +81,7 @@
                    transformOriginX="780"
                    transformOriginY="500"
                    opacity={curve("0:0:linear, 4.76:0:linear, 4.90:0.16:ease_in_out, 5.22:0:ease_in_out, 10:0:linear")}>
-              <Image src="examples/motionloom/sample_assets/README/readme_showcase1.png" x="0" y="0" scale="1" opacity="1" />
+              <Image asset="sample_readme_showcase1" x="0" y="0" scale="1" opacity="1" />
             </Group>
 
             <!-- Second screenshot: fast left-moving reveal into a full-view frame, then the same right-side punch zoom. -->
@@ -87,7 +92,7 @@
                    transformOriginX="780"
                    transformOriginY="500"
                    opacity={curve("0:0:linear, 4.84:0:linear, 5.00:0.22:ease_in_out, 5.30:0:ease_in_out, 10:0:linear")}>
-              <Image src="examples/motionloom/sample_assets/README/readme_showcase2.png" x="0" y="0" scale="1" opacity="1" />
+              <Image asset="sample_readme_showcase2" x="0" y="0" scale="1" opacity="1" />
             </Group>
             <Group id="shot_02_trail_b"
                    x={curve("0:2460:linear, 4.86:2460:linear, 5.16:620:ease_in_out, 5.38:-190:ease_out, 10:-190:linear")}
@@ -96,7 +101,7 @@
                    transformOriginX="780"
                    transformOriginY="500"
                    opacity={curve("0:0:linear, 4.88:0:linear, 5.04:0.15:ease_in_out, 5.34:0:ease_in_out, 10:0:linear")}>
-              <Image src="examples/motionloom/sample_assets/README/readme_showcase2.png" x="0" y="0" scale="1" opacity="1" />
+              <Image asset="sample_readme_showcase2" x="0" y="0" scale="1" opacity="1" />
             </Group>
             <Group id="shot_02_main"
                    x={curve("0:2260:linear, 4.80:2260:linear, 5.12:-190:ease_in_out, 6.00:-190:linear, 6.28:-1620:ease(0.12,1.0,0.16,1), 6.64:-1606:linear, 6.96:-1642:linear, 7.32:-1612:linear, 7.72:-1636:linear, 8.16:-1608:linear, 8.58:-1640:linear, 9.00:-1620:linear, 9.28:-1620:linear, 9.58:-3300:ease_in_out, 10:-3300:linear")}
@@ -106,7 +111,7 @@
                    transformOriginY="500"
                    opacity={curve("0:0:linear, 4.86:0:linear, 5.08:1:ease_in_out, 9.20:1:linear, 9.62:0:ease_in_out, 10:0:linear")}>
               <Rect x="-46" y="-46" width="2972" height="1892" radius="60" color="#000000" opacity="0.32" />
-              <Image src="examples/motionloom/sample_assets/README/readme_showcase2.png" x="0" y="0" scale="1" opacity="1" />
+              <Image asset="sample_readme_showcase2" x="0" y="0" scale="1" opacity="1" />
             </Group>
 
             <Rect x="0" y="0" width="1920" height="1080" color="#FFFFFF" opacity={curve("0:0.16:linear, 0.70:0:ease_in_out, 9.30:0:linear, 9.78:0.20:ease_in_out, 10:0.34:ease_in_out")} />

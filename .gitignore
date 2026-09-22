@@ -21,6 +21,9 @@ crates/archive_for_reference/
 *.mp3
 *.wav
 
+# Offline render output (Weaver path tracer tiles, EXR/PNG passes, checkpoints)
+.render-output/
+
 # Compiled ACP binary in assets (rebuilt by cargo)
 assets/bin/anica-acp
 

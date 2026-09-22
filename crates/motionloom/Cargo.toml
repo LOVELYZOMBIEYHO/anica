@@ -27,6 +27,7 @@ base64 = "0.22.1"
 draco-gltf = { version = "0.2.0", default-features = false, features = ["read", "draco-decode"] }
 cosmic-text = { version = "0.14.2", features = ["swash"] }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif", "hdr", "exr"] }
+exr = "1.74.0"
 half = "2.6"
 resvg = { version = "0.45.1", default-features = false, features = ["text"] }
 url = "2.5.7"

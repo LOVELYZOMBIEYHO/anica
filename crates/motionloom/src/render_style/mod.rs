@@ -18,6 +18,8 @@ pub use model::{
 };
 pub(crate) use parser::{parse_cel_material, parse_resource};
 pub use resolve::resolve_scene_render_style;
+#[cfg(feature = "weaver")]
+pub(crate) use resolve::sanitize_scene_style;
 pub(crate) use resolve::{apply_scene_style_reference, lower};
 pub(crate) use validation::cel_color;
 

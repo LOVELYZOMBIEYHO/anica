@@ -41,13 +41,7 @@ impl GpuWorldLightingParams {
             "filmic_aces_v1" => 3.0,
             _ => 2.0,
         };
-        let fog = lighting.atmosphere_fog.as_ref();
-        let fog_mode = fog.map_or(0.0, |fog| match fog.mode.as_str() {
-            "linear" => 1.0,
-            "exp" => 2.0,
-            "height" => 3.0,
-            _ => 0.0,
-        });
+        let fog = lighting.atmosphere_medium.as_ref();
         let mut lights = [[0.0; 16]; 8];
         for (output, light) in lights.iter_mut().zip(lighting.lights.iter().take(8)) {
             let kind = match light.kind {
@@ -271,21 +265,23 @@ impl GpuWorldLightingParams {
                 shadow_strength,
             ],
             fog0: [
-                fog_mode,
                 fog.map_or(0.0, |value| value.density),
-                fog.map_or(0.0, |value| value.start),
-                fog.map_or(100.0, |value| value.end),
+                fog.map_or(0.0, |value| value.anisotropy),
+                fog.map_or(0.0, |value| value.base_height),
+                fog.map_or(0.0, |value| value.height_falloff),
             ],
             fog1: [
-                fog.map_or(1.0, |value| value.color[0]),
-                fog.map_or(1.0, |value| value.color[1]),
-                fog.map_or(1.0, |value| value.color[2]),
-                fog.map_or(0.0, |value| value.base_height),
+                fog.map_or(1.0, |value| value.scattering_color[0]),
+                fog.map_or(1.0, |value| value.scattering_color[1]),
+                fog.map_or(1.0, |value| value.scattering_color[2]),
+                fog.is_some_and(|value| value.affect_environment) as u8 as f32,
             ],
             fog2: [
-                fog.map_or(0.0, |value| value.height_falloff),
-                fog.map_or(0.0, |value| value.scattering),
-                fog.is_some_and(|value| value.affect_sky) as u8 as f32,
+                fog.and_then(|value| value.volumetric_scattering.as_ref())
+                    .map_or(0.0, |value| value.shaft_strength),
+                fog.and_then(|value| value.volumetric_scattering.as_ref())
+                    .map_or(0.0, |value| value.max_distance),
+                fog.is_some() as u8 as f32,
                 fog.is_some_and(|value| value.volumetric_scattering.is_none()) as u8 as f32,
             ],
             fog3: [
@@ -307,17 +303,11 @@ impl GpuWorldLightingParams {
                     .map_or(0.0, |value| value[2]),
                 fog.map_or(0.0, |value| value.edge_feather),
             ],
-            caustics0: fog.and_then(|value| value.water_caustics.as_ref()).map_or(
-                [0.0; 4],
-                |value| {
-                    [
-                        value.intensity,
-                        value.scale,
-                        value.speed,
-                        value.depth_falloff,
-                    ]
-                },
-            ),
+            caustics0: fog
+                .and_then(|value| value.water_caustics.as_ref())
+                .map_or([0.0; 4], |value| {
+                    [value.intensity, value.scale, value.speed, value.attenuation]
+                }),
             caustics1: fog.and_then(|value| value.water_caustics.as_ref()).map_or(
                 [0.0; 4],
                 |value| {
@@ -395,6 +385,7 @@ impl GpuWorldLightingParams {
             ],
             preview0: [0.0; 4],
             preview1: [0.0; 4],
+            preview2: [0.0; 4],
             shadow0,
             shadow1,
             shadow2,

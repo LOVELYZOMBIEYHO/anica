@@ -67,7 +67,7 @@ pub fn diagnose_world_actor_pose(
         .presented_world()
         .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
     let actor = world
-        .actors
+        .actor_slice()
         .iter()
         .find(|a| a.id == actor_id)
         .ok_or_else(|| WorldRenderError::MissingActor(actor_id.into()))?;
@@ -134,7 +134,7 @@ pub fn evaluate_world_actor_rig(
         .presented_world()
         .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
     let actor = world
-        .actors
+        .actor_slice()
         .iter()
         .find(|actor| actor.id == request.actor_id)
         .ok_or_else(|| WorldRenderError::MissingActor(request.actor_id.clone()))?;

@@ -4359,6 +4359,7 @@ dependencies = [
  "cosmic-text",
  "draco-gltf",
  "exmex",
+ "exr",
  "half",
  "image",
  "js-sys",

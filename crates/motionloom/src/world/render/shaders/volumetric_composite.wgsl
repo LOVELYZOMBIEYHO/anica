@@ -4,7 +4,7 @@
 
 struct FroxelParams {
     grid: vec4<f32>, camera0: vec4<f32>, camera1: vec4<f32>, camera2: vec4<f32>, camera3: vec4<f32>,
-    medium0: vec4<f32>, medium1: vec4<f32>, bounds_min: vec4<f32>, bounds_max: vec4<f32>,
+    medium0: vec4<f32>, medium1: vec4<f32>, atmosphere0: vec4<f32>, bounds_min: vec4<f32>, bounds_max: vec4<f32>,
     light0: vec4<f32>, light1: vec4<f32>, light2: vec4<f32>, light3: vec4<f32>,
     caustics0: vec4<f32>, caustics1: vec4<f32>,
     shadow0: vec4<f32>, shadow1: vec4<f32>, shadow2: vec4<f32>, shadow3: vec4<f32>,
@@ -28,6 +28,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = position.xy / dimensions;
     let scene = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0);
     let reverse_depth = textureLoad(scene_depth, vec2<u32>(position.xy), 0);
+    if (reverse_depth <= 0.000001 && params.atmosphere0.w < 0.5) {
+        return scene;
+    }
     var distance = params.bounds_max.w;
     if (reverse_depth > 0.000001) {
         distance = clamp(params.camera0.w / reverse_depth, params.camera0.w, params.bounds_max.w);
@@ -40,8 +43,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     if (debug_view == 1u || debug_view == 2u || debug_view == 3u || debug_view == 6u) {
         return vec4<f32>(local.rgb, 1.0);
     }
-    let extinction = params.medium0.rgb + params.medium1.rgb;
-    let optical_depth = extinction * volume.a;
+    let optical_depth = vec3<f32>(volume.a);
     if (debug_view == 4u) { return vec4<f32>(optical_depth, 1.0); }
     if (debug_view == 5u) { return vec4<f32>(exp(-optical_depth), 1.0); }
     let transmittance = exp(-optical_depth);

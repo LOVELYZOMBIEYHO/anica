@@ -138,18 +138,13 @@ fn assert_fitted_shadow_volume(params: super::GpuWorldLightingParams) {
 #[test]
 fn fog_and_optics_pack_into_distinct_gpu_uniform_slots() {
     let lighting = crate::world::WorldLighting {
-        atmosphere_fog: Some(crate::world::WorldAtmosphereFog {
-            mode: "height".to_string(),
-            color: [0.5, 0.6, 0.7],
+        atmosphere_medium: Some(crate::world::AtmosphereMediumPlan {
             density: 0.02,
-            start: 3.0,
-            end: 40.0,
+            scattering_color: [0.1, 0.2, 0.3],
+            anisotropy: 0.35,
             base_height: 0.4,
             height_falloff: 0.2,
-            scattering: 0.1,
-            absorption: [0.02, 0.04, 0.08],
-            scattering_color: [0.1, 0.2, 0.3],
-            affect_sky: true,
+            affect_environment: true,
             bounds_min: Some([-4.0, 0.0, -8.0]),
             bounds_max: Some([4.0, 6.0, -1.0]),
             edge_feather: 0.75,
@@ -172,12 +167,12 @@ fn fog_and_optics_pack_into_distinct_gpu_uniform_slots() {
 
     let params = super::GpuWorldLightingParams::from_world(&lighting, camera, false, 1);
     assert_fitted_shadow_volume(params);
-    assert_eq!(params.fog0, [3.0, 0.02, 3.0, 40.0]);
-    assert_eq!(params.fog2, [0.2, 0.1, 1.0, 1.0]);
+    assert_eq!(params.fog0, [0.02, 0.35, 0.4, 0.2]);
+    assert_eq!(params.fog2, [0.0, 0.0, 1.0, 1.0]);
     assert_eq!(params.fog3, [-4.0, 0.0, -8.0, 1.0]);
     assert_eq!(params.fog4, [4.0, 6.0, -1.0, 0.75]);
     assert_eq!(params.optics0, [5.0, 50.0, 2.8, 8.0]);
-    assert_eq!(super::pack_gpu_world_lighting(params).len(), 1152);
+    assert_eq!(super::pack_gpu_world_lighting(params).len(), 1168);
 }
 
 #[test]
@@ -772,6 +767,7 @@ fn multiple_glb_clip_layers_crossfade_in_source_order() {
         material: None,
         play: Some(play("A")),
         plays: vec![play("B")],
+        material_color_overrides: Vec::new(),
     };
     let graph = crate::world::WorldGraph {
         id: None,
@@ -1082,6 +1078,7 @@ fn external_humanoid_clip_maps_rotation_to_canonical_target_bone() {
         material: None,
         play: None,
         plays: Vec::new(),
+        material_color_overrides: Vec::new(),
     };
     let graph = crate::world::WorldGraph {
         id: None,
@@ -1787,4 +1784,25 @@ fn attachment_parent_delta_keeps_compound_children_rigid() {
     assert!(rotated[0].abs() < 1.0e-5);
     assert!(rotated[1].abs() < 1.0e-5);
     assert!((rotated[2] + 1.0).abs() < 1.0e-5);
+}
+#[test]
+fn material_binding_requires_an_existing_model_source_material() {
+    let error =
+        super::validate_model_source_materials("hero", ["M_DOES_NOT_EXIST"], ["M_Main", "Hair"])
+            .expect_err("an unknown imported material must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("modelSourceMaterial 'M_DOES_NOT_EXIST'")
+    );
+
+    super::validate_model_source_materials("hero", ["m_main", "*"], ["M_Main", "Hair"])
+        .expect("matching is case-insensitive and wildcard is explicit");
+}
+
+#[test]
+fn material_binding_rejects_case_insensitive_duplicates() {
+    let error = super::validate_model_source_materials("hero", ["M_Main", "m_main"], ["M_Main"])
+        .expect_err("one imported material cannot have duplicate bindings");
+    assert!(error.to_string().contains("Duplicate MaterialBinding"));
 }

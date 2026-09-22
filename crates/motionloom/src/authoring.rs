@@ -503,6 +503,8 @@ pub fn motionloom_dsl_schema_json() -> String {
             "vegetation".to_string(),
             "compound".to_string(),
             "material".to_string(),
+            "curve".to_string(),
+            "sweep".to_string(),
         ],
     })
     .expect("MotionLoom DSL schemas are serializable")
@@ -723,6 +725,15 @@ fn append_semantic_diagnostics(
                 "PRIMITIVE_RIBBON",
                 format!("Ribbon compiles {} stable path points.", points.len()),
             )),
+            crate::dsl::PrimitiveGeometry::Sweep { curve, profile, .. } => Some((
+                "PRIMITIVE_SWEEP",
+                format!(
+                    "Sweep compiles CurveAsset \"{}\" with {} control points and {} profile points.",
+                    curve.id,
+                    curve.points.len(),
+                    profile.len()
+                ),
+            )),
             crate::dsl::PrimitiveGeometry::HairCards { guides, .. } => Some((
                 "HAIR_CARDS",
                 format!(
@@ -762,7 +773,12 @@ fn append_semantic_diagnostics(
                 code: code.to_string(),
                 phase: "asset-validation".to_string(),
                 line: {
-                    let primitive_line = find_tag_line(tags, "PrimitiveAsset", Some(&asset.id));
+                    let primitive_line =
+                        if matches!(asset.geometry, crate::dsl::PrimitiveGeometry::Sweep { .. }) {
+                            find_tag_line(tags, "SweepAsset", Some(&asset.id))
+                        } else {
+                            find_tag_line(tags, "PrimitiveAsset", Some(&asset.id))
+                        };
                     if primitive_line == 0 {
                         let hair_line = find_tag_line(tags, "HairAsset", Some(&asset.id));
                         if hair_line == 0 {
@@ -785,6 +801,7 @@ fn append_semantic_diagnostics(
                         crate::dsl::PrimitiveGeometry::HairCards { .. } => "HairAsset",
                         crate::dsl::PrimitiveGeometry::HeadSurface { .. } => "HeadAsset",
                         crate::dsl::PrimitiveGeometry::Mesh { .. } => "MeshAsset",
+                        crate::dsl::PrimitiveGeometry::Sweep { .. } => "SweepAsset",
                         _ => "PrimitiveAsset",
                     }
                     .to_string(),
@@ -1569,6 +1586,7 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
                         crate::dsl::PrimitiveGeometry::Plane { .. } => "static_plane",
                         crate::dsl::PrimitiveGeometry::Loft { .. }
                         | crate::dsl::PrimitiveGeometry::Ribbon { .. }
+                        | crate::dsl::PrimitiveGeometry::Sweep { .. }
                         | crate::dsl::PrimitiveGeometry::HairCards { .. }
                         | crate::dsl::PrimitiveGeometry::HeadSurface { .. }
                         | crate::dsl::PrimitiveGeometry::Mesh { .. } => "convex_hull",
@@ -1597,6 +1615,19 @@ fn effective_graph_summary(graph: &GraphScript, tags: &[ScannedTag]) -> Effectiv
                                 width: point.width,
                                 depth: point.thickness,
                                 roll: Some(point.roll),
+                            })
+                            .collect(),
+                        crate::dsl::PrimitiveGeometry::Sweep { curve, .. } => curve
+                            .points
+                            .iter()
+                            .enumerate()
+                            .map(|(index, point)| PrimitiveControlPointSummary {
+                                kind: "curve_point".to_string(),
+                                index,
+                                position: point.position,
+                                width: Some(point.scale),
+                                depth: None,
+                                roll: Some(point.tilt),
                             })
                             .collect(),
                         crate::dsl::PrimitiveGeometry::HairCards { guides, .. } => guides
@@ -1738,6 +1769,19 @@ fn build_showcase_schema(
                 if !graph.material_assets.is_empty() {
                     kinds.insert("material".to_string());
                 }
+                if !graph.curve_assets.is_empty() {
+                    kinds.insert("curve".to_string());
+                }
+                if graph.assets.iter().any(|asset| {
+                    asset.primitive().is_some_and(|primitive| {
+                        matches!(
+                            primitive.geometry,
+                            crate::dsl::PrimitiveGeometry::Sweep { .. }
+                        )
+                    })
+                }) {
+                    kinds.insert("sweep".to_string());
+                }
                 kinds.into_iter().collect()
             })
             .unwrap_or_default(),
@@ -1748,8 +1792,14 @@ fn required_attributes(tag: &str) -> Vec<String> {
     let attributes: &[&str] = match tag {
         "RenderStyle" => &["id"],
         "Graph" => &["fps", "duration", "size"],
+        "Image" => &["asset"],
         "RigidBody" => &["id", "target", "dimension", "type"],
         "PrimitiveAsset" => &["id", "shape"],
+        "CurveAsset" => &["id"],
+        "CurvePoint" => &["position"],
+        "SweepAsset" => &["id", "curve"],
+        "Profile" => &[],
+        "ProfilePoint" => &["position"],
         "HairAsset" => &["id", "material"],
         "HeadAsset" => &["id", "material", "archetype"],
         "MeshAsset" => &["id", "material"],
@@ -1790,6 +1840,8 @@ fn required_attributes(tag: &str) -> Vec<String> {
             "maxStretch",
         ],
         "Instance" => &["asset"],
+        "Scatter" => &["surface", "count"],
+        "Variant" => &["asset"],
         _ => &[],
     };
     attributes
@@ -2358,9 +2410,15 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "metallic",
             "roughness",
             "metallicRoughnessTexture",
+            "metallicChannel",
+            "metallicInvert",
+            "roughnessChannel",
+            "roughnessInvert",
             "normalTexture",
             "normalScale",
             "occlusionTexture",
+            "occlusionChannel",
+            "occlusionInvert",
             "occlusionStrength",
             "emissive",
             "emissiveTexture",
@@ -2414,6 +2472,37 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "restitution",
             "density",
         ]),
+        "CurveAsset" => strict(&["id", "interpolation", "closed", "maxSegmentLength"]),
+        "CurvePoint" => strict(&["position", "tilt", "scale"]),
+        "SweepAsset" => strict(&[
+            "id",
+            "curve",
+            "material",
+            "color",
+            "frame",
+            "uvMode",
+            "uvScale",
+            "smoothProfile",
+            "capStart",
+            "capEnd",
+            "dash",
+            "collision",
+            "collider",
+            "colliderSize",
+            "colliderRadius",
+            "colliderHeight",
+            "colliderScale",
+            "colliderOffset",
+            "colliderRotation",
+            "colliderMargin",
+            "collisionGroup",
+            "collisionMask",
+            "friction",
+            "restitution",
+            "density",
+        ]),
+        "Profile" => strict(&["closed"]),
+        "ProfilePoint" => strict(&["position"]),
         "HairAsset" => strict(&[
             "id",
             "material",
@@ -2770,52 +2859,35 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         ]),
         "AtmosphereFog" => strict(&[
             "id",
-            "mode",
-            "color",
             "density",
-            "start",
-            "end",
-            "baseHeight",
-            "base_height",
-            "heightFalloff",
-            "height_falloff",
-            "scattering",
-            "absorption",
             "scatteringColor",
-            "scattering_color",
-            "affectSky",
-            "affect_sky",
+            "anisotropy",
+            "baseHeight",
+            "heightFalloff",
+            "affectEnvironment",
             "boundsMin",
-            "bounds_min",
             "boundsMax",
-            "bounds_max",
             "edgeFeather",
-            "edge_feather",
         ]),
         "VolumetricScattering" => strict(&[
             "id",
             "lightRef",
-            "light_ref",
-            "intensity",
-            "anisotropy",
+            "shaftStrength",
             "maxDistance",
-            "max_distance",
             "shadowed",
+            "quality",
+            "maxBounces",
             "debugView",
-            "debug_view",
         ]),
         "WaterCaustics" => strict(&[
             "id",
             "intensity",
             "scale",
             "speed",
-            "depthFalloff",
-            "depth_falloff",
+            "attenuation",
             "color",
             "volumeTerm",
-            "volume_term",
             "surfaceTerm",
-            "surface_term",
         ]),
         "EnvironmentDebug" | "PhysicsDebug" => strict(&[
             "axes",
@@ -2883,9 +2955,15 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
             "color",
         ]),
         "MaterialBinding" => strict(&[
-            "material",
+            "modelSourceMaterial",
             "definition",
             "texture",
+            "tint",
+            "tintAmount",
+            "metallic",
+            "roughness",
+            "specular",
+            "normalScale",
             "celRole",
             "outlineWidth",
             "celShadowColor",
@@ -2923,6 +3001,7 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Polyline" | "Curve" => open(POLYLINE_ATTRIBUTES),
         "Path" | "FaceJaw" => open(PATH_ATTRIBUTES),
         "Text" => strict(TEXT_ATTRIBUTES),
+        "Image" => strict(&["id", "material", "asset", "x", "y", "scale", "opacity"]),
         "TextLayout" => open(TEXT_LAYOUT_ATTRIBUTES),
         "TextAnimator" => open(TEXT_ANIMATOR_ATTRIBUTES),
         "Transform" => strict(TRANSFORM_ATTRIBUTES),
@@ -2930,6 +3009,26 @@ fn tag_capability(tag: &str) -> Option<TagCapability> {
         "Glow" => strict(&["radius", "intensity", "color"]),
         "Shadow" => strict(&["id", "x", "y", "blur", "color", "opacity"]),
         "Repeat" => open(REPEAT_ATTRIBUTES),
+        "Scatter" => strict(&[
+            "id",
+            "surface",
+            "count",
+            "seed",
+            "densityMap",
+            "density_map",
+            "exclusionMap",
+            "exclusion_map",
+            "slopeRange",
+            "scaleRange",
+            "rotationYRange",
+            "surfaceOffset",
+            "surface_offset",
+            "castShadow",
+            "cast_shadow",
+            "receiveShadow",
+            "receive_shadow",
+        ]),
+        "Variant" => strict(&["asset", "weight"]),
         "Layout" => open(LAYOUT_ATTRIBUTES),
         "AudioClip" => strict(&[
             "id",
@@ -3844,6 +3943,11 @@ const KNOWN_TAGS: &[&str] = &[
     "ModelAsset",
     "MaterialAsset",
     "PrimitiveAsset",
+    "CurveAsset",
+    "CurvePoint",
+    "SweepAsset",
+    "Profile",
+    "ProfilePoint",
     "HairAsset",
     "HairGroom",
     "HairGroup",
@@ -3947,6 +4051,8 @@ const KNOWN_TAGS: &[&str] = &[
     "Glow",
     "Shadow",
     "Repeat",
+    "Scatter",
+    "Variant",
     "Layout",
     "AnimationTarget",
     "Key",
@@ -4210,12 +4316,12 @@ mod tests {
     };
 
     #[test]
-    fn atmosphere_fog_and_camera_optics_are_known_authoring_schema() {
+    fn atmosphere_medium_and_camera_optics_are_known_authoring_schema() {
         let script = r##"<Graph fps={30} duration="1s" size={[320,180]}>
   <Scene id="main">
     <Timeline><Track><Sequence duration="1s"><Layer>
       <CompositeGroup space="3d">
-        <AtmosphereFog id="mist" mode="height" color="#BFD9C8" density="0.02" start="2" end="30" baseHeight="0.4" heightFalloff="0.2" scattering="0.1" affectSky="true" boundsMin={[-4,0,-8]} boundsMax={[4,6,-1]} edgeFeather="0.75" />
+        <AtmosphereFog id="mist" scatteringColor="#BFD9C8" density="0.02" baseHeight="0.4" heightFalloff="0.2" affectEnvironment="true" boundsMin={[-4,0,-8]} boundsMax={[4,6,-1]} edgeFeather="0.75" />
         <Camera3D id="portrait" position={[0,1,5]} target={[0,1,0]} depthOfField="true" focusDistance="5" focusOffset="0" focalLength="50" fStop="2.8" maxBlur="8" />
       </CompositeGroup>
     </Layer></Sequence></Track></Timeline>
@@ -4383,6 +4489,65 @@ mod tests {
             .collect::<Vec<_>>();
         for expected in ["method", "quality", "fallback", "sharpness"] {
             assert!(attributes.contains(&expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn complete_schema_exposes_surface_scatter_contract() {
+        let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
+        let attributes_for = |tag: &str| {
+            value["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["tag"] == tag)
+                .unwrap_or_else(|| panic!("missing {tag} schema"))["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect::<Vec<_>>()
+        };
+        let scatter = attributes_for("Scatter");
+        for attribute in [
+            "surface",
+            "count",
+            "seed",
+            "densityMap",
+            "exclusionMap",
+            "slopeRange",
+            "scaleRange",
+            "rotationYRange",
+            "surfaceOffset",
+        ] {
+            assert!(scatter.contains(&attribute), "missing Scatter.{attribute}");
+        }
+        assert_eq!(attributes_for("Variant"), ["asset", "weight"]);
+    }
+
+    #[test]
+    fn complete_schema_exposes_material_channel_remapping() {
+        let value: serde_json::Value = serde_json::from_str(&motionloom_dsl_schema_json()).unwrap();
+        let attributes = value["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["tag"] == "MaterialAsset")
+            .expect("MaterialAsset schema")["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        for attribute in [
+            "metallicChannel",
+            "metallicInvert",
+            "roughnessChannel",
+            "roughnessInvert",
+            "occlusionChannel",
+            "occlusionInvert",
+        ] {
+            assert!(attributes.contains(&attribute), "missing {attribute}");
         }
     }
 

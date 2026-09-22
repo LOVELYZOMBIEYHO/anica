@@ -10,6 +10,7 @@ struct FroxelParams {
     camera3: vec4<f32>,
     medium0: vec4<f32>,
     medium1: vec4<f32>,
+    atmosphere0: vec4<f32>,
     bounds_min: vec4<f32>,
     bounds_max: vec4<f32>,
     light0: vec4<f32>,
@@ -78,6 +79,13 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(injection, id, vec4<f32>(0.0));
         return;
     }
+    let height_density = exp(-max(world.y - params.atmosphere0.x, 0.0) * params.atmosphere0.y);
+    var edge_weight = 1.0;
+    if (params.bounds_min.w > 0.5 && params.atmosphere0.z > 0.000001) {
+        let edge3 = min(world - params.bounds_min.xyz, params.bounds_max.xyz - world);
+        edge_weight = smoothstep(0.0, params.atmosphere0.z, min(edge3.x, min(edge3.y, edge3.z)));
+    }
+    let local_density = params.medium0.w * height_density * edge_weight;
     var light_direction = normalize(-params.light0.xyz);
     var light_attenuation = 1.0;
     if (params.light3.z > 1.5) {
@@ -103,8 +111,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         radiance += caustic_radiance;
     }
     let debug_view = u32(floor(params.light0.w * 0.5) + 0.5);
-    if (debug_view == 1u) { radiance = vec3<f32>(params.medium0.w); }
+    if (debug_view == 1u) { radiance = vec3<f32>(local_density); }
     if (debug_view == 2u) { radiance = vec3<f32>(visibility); }
     if (debug_view == 6u) { radiance = caustic_radiance; }
-    textureStore(injection, id, vec4<f32>(radiance * params.medium1.rgb, params.medium0.w));
+    textureStore(injection, id, vec4<f32>(radiance * params.medium1.rgb, local_density));
 }

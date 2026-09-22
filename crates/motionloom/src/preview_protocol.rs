@@ -95,6 +95,17 @@ pub enum PreviewEvent {
     Rendered {
         frame: u32,
     },
+    /// Periodic host telemetry makes GPU residency and fallback behavior
+    /// visible to editor UIs instead of inferring it from process load.
+    FrameMetrics {
+        frame: u32,
+        backend: String,
+        zero_copy: bool,
+        cpu_ms: f64,
+        gpu_ms: Option<f64>,
+        readback_ms: f64,
+        draw_calls: usize,
+    },
     WindowBounds {
         x: f64,
         y: f64,

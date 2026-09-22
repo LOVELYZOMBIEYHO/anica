@@ -8,16 +8,14 @@ use motionloom::{SceneRenderProfile, SceneRenderer, parse_graph_script};
 
 fn source(with_volume: bool) -> String {
     let fog = if with_volume {
-        r##"<AtmosphereFog mode="exp" density="0.035"
-            absorption={[0.06,0.03,0.01]} scatteringColor={[0.02,0.07,0.12]}
+        r##"<AtmosphereFog density="0.035" anisotropy="0.6" scatteringColor={[0.02,0.07,0.12]}
             boundsMin={[-4,-4,-8]} boundsMax={[4,4,3]}>
-          <VolumetricScattering lightRef="sun" intensity="1.2"
-              anisotropy="0.6" maxDistance="12" shadowed="true" />
+          <VolumetricScattering lightRef="sun" shaftStrength="1.2" maxDistance="12" shadowed="true" />
           <WaterCaustics intensity="0.2" scale="0.4" speed="0.2"
-              depthFalloff="0.3" color="#BFE9FF" volumeTerm="true" surfaceTerm="true" />
+              attenuation="0.3" color="#BFE9FF" volumeTerm="true" surfaceTerm="true" />
         </AtmosphereFog>"##
     } else {
-        r##"<AtmosphereFog mode="exp" density="0.035" color="#16384A" />"##
+        r##"<AtmosphereFog density="0.035" scatteringColor="#16384A" />"##
     };
     format!(
         r##"<Graph fps="24" duration="1s" size={{[96,64]}}>
@@ -47,7 +45,7 @@ fn source(with_volume: bool) -> String {
 #[test]
 fn volumetric_scene_parses_without_gpu_side_effects() {
     parse_graph_script(&source(true)).expect("volumetric graph should parse on CPU hosts");
-    parse_graph_script(&source(false)).expect("legacy fog graph should remain valid");
+    parse_graph_script(&source(false)).expect("simple atmosphere graph should remain valid");
 }
 
 #[test]
@@ -67,7 +65,7 @@ fn shadowed_volume_rejects_a_non_shadow_casting_light() {
 fn froxel_volume_changes_the_rendered_radiance() {
     pollster::block_on(async {
         let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
-        let legacy = renderer
+        let simple = renderer
             .render_frame_gpu_readback(&parse_graph_script(&source(false)).unwrap(), 0)
             .await
             .unwrap();
@@ -75,7 +73,7 @@ fn froxel_volume_changes_the_rendered_radiance() {
             .render_frame_gpu_readback(&parse_graph_script(&source(true)).unwrap(), 0)
             .await
             .unwrap();
-        assert_eq!(legacy.dimensions(), volume.dimensions());
-        assert_ne!(legacy.as_raw(), volume.as_raw());
+        assert_eq!(simple.dimensions(), volume.dimensions());
+        assert_ne!(simple.as_raw(), volume.as_raw());
     });
 }

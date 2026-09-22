@@ -138,6 +138,55 @@ fn preview_sharpen(radiance: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(clamp(radiance.rgb + detail * strength, vec3<f32>(0.0), vec3<f32>(1.0)), radiance.a);
 }
 
+// A bounded diffuse screen-space gather adds local colour bounce while the
+// environment map remains the stable off-screen/global illumination fallback.
+fn preview_screen_space_gi(radiance: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
+    if (lighting.preview2.x < 0.5 || radiance.a < 0.00001) { return radiance; }
+    let dimensions_i = textureDimensions(scene_depth);
+    let dimensions = vec2<f32>(dimensions_i);
+    let pixel = vec2<i32>(clamp(uv * dimensions, vec2<f32>(1.0), dimensions - 2.0));
+    let center_depth = textureLoad(scene_depth, pixel, 0);
+    if (center_depth <= 0.000001) { return radiance; }
+    let center_world = preview_world_position(uv, center_depth);
+    let center_normal = preview_decode_normal(textureLoad(preview_gbuffer, pixel, 0).xy);
+    let material = textureLoad(preview_material, pixel, 0);
+    let center_distance = view_distance(center_depth);
+    let radius = clamp(10.0 + center_distance * 1.5, 10.0, 42.0);
+    let offsets = array<vec2<f32>, 8>(
+        vec2<f32>(0.9239,0.3827), vec2<f32>(-0.3827,0.9239),
+        vec2<f32>(-0.9239,-0.3827), vec2<f32>(0.3827,-0.9239),
+        vec2<f32>(0.3536,0.3536), vec2<f32>(-0.3536,0.3536),
+        vec2<f32>(-0.3536,-0.3536), vec2<f32>(0.3536,-0.3536)
+    );
+    let sample_count = u32(clamp(lighting.preview2.z, 0.0, 8.0));
+    var bounce = vec3<f32>(0.0);
+    var total_weight = 0.0;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        if (i >= sample_count) { break; }
+        let ring = select(1.0, 0.55, i >= 4u);
+        let sample_uv = clamp(uv + offsets[i] * radius * ring / dimensions,
+            vec2<f32>(0.001), vec2<f32>(0.999));
+        let sample_pixel = vec2<i32>(sample_uv * dimensions);
+        let sample_depth = textureLoad(scene_depth, sample_pixel, 0);
+        if (sample_depth <= 0.000001) { continue; }
+        let sample_world = preview_world_position(sample_uv, sample_depth);
+        let delta = sample_world - center_world;
+        let distance = length(delta);
+        if (distance <= 0.0001) { continue; }
+        let direction = delta / distance;
+        let sample_normal = preview_decode_normal(textureLoad(preview_gbuffer, sample_pixel, 0).xy);
+        let facing = max(dot(center_normal, direction), 0.0)
+            * max(dot(sample_normal, -direction), 0.0);
+        let range_weight = exp(-distance / max(center_distance * 0.22, 0.25));
+        let weight = facing * range_weight;
+        bounce += textureLoad(scene_color, sample_pixel, 0).rgb * weight;
+        total_weight += weight;
+    }
+    if (total_weight <= 0.0001) { return radiance; }
+    let diffuse_response = (1.0 - material.g) * material.b * 0.16;
+    return vec4<f32>(radiance.rgb + bounce / total_weight * diffuse_response * radiance.a, radiance.a);
+}
+
 fn preview_screen_space_reflection(radiance: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
     if (lighting.preview0.y < 0.5 || radiance.a < 0.00001) { return radiance; }
     let dimensions_i = textureDimensions(scene_depth);
@@ -159,11 +208,15 @@ fn preview_screen_space_reflection(radiance: vec4<f32>, uv: vec2<f32>) -> vec4<f
     if (grazing < 0.08) { return radiance; }
 
     let center_distance = view_distance(center_depth);
-    let stride = max(center_distance * 0.035, 0.025);
+    let stride = max(center_distance * 0.025, 0.018);
+    let max_steps = u32(clamp(lighting.preview2.y, 1.0, 40.0));
     var hit = vec4<f32>(0.0);
     var confidence = 0.0;
-    for (var step = 1u; step <= 14u; step = step + 1u) {
-        let ray_world = world + reflected * stride * f32(step);
+    var previous_distance = 0.0;
+    for (var step = 1u; step <= 40u; step = step + 1u) {
+        if (step > max_steps) { break; }
+        let ray_distance = stride * f32(step);
+        let ray_world = world + reflected * ray_distance;
         let relative = ray_world - lighting.camera0.xyz;
         let ray_z = dot(relative, lighting.camera3.xyz);
         if (ray_z <= lighting.camera1.w) { continue; }
@@ -176,14 +229,48 @@ fn preview_screen_space_reflection(radiance: vec4<f32>, uv: vec2<f32>) -> vec4<f
         let scene_sample_depth = textureLoad(scene_depth, ray_pixel, 0);
         if (scene_sample_depth > 0.000001) {
             let scene_distance = view_distance(scene_sample_depth);
-            let thickness = max(stride * 1.8, scene_distance * 0.008);
-            if (ray_z >= scene_distance - thickness && ray_z <= scene_distance + thickness) {
-                hit = textureSampleLevel(scene_color, scene_sampler, ray_uv, 0.0);
-                confidence = (1.0 - f32(step) / 15.0)
-                    * (1.0 - smoothstep(0.82, 1.0, max(abs(ray_uv.x - 0.5), abs(ray_uv.y - 0.5)) * 2.0));
+            let thickness = max(stride * 1.4, scene_distance * 0.006);
+            if (ray_z >= scene_distance - thickness) {
+                // Refine the first depth crossing so thin rails and stair edges
+                // do not receive the broad halos produced by a coarse march.
+                var low = previous_distance;
+                var high = ray_distance;
+                var refined_uv = ray_uv;
+                for (var refine = 0u; refine < 4u; refine = refine + 1u) {
+                    let middle = (low + high) * 0.5;
+                    let middle_world = world + reflected * middle;
+                    let middle_relative = middle_world - lighting.camera0.xyz;
+                    let middle_z = dot(middle_relative, lighting.camera3.xyz);
+                    refined_uv = vec2<f32>(
+                        0.5 + dot(middle_relative, lighting.camera1.xyz) * lighting.camera0.w / (middle_z * dimensions.x),
+                        0.5 - dot(middle_relative, lighting.camera2.xyz) * lighting.camera0.w / (middle_z * dimensions.y)
+                    ) + lighting.preview1.xy / dimensions;
+                    let refined_pixel = vec2<i32>(clamp(refined_uv * dimensions,
+                        vec2<f32>(0.0), dimensions - 1.0));
+                    let refined_depth = textureLoad(scene_depth, refined_pixel, 0);
+                    let refined_scene_distance = view_distance(refined_depth);
+                    if (refined_depth > 0.000001 && middle_z >= refined_scene_distance - thickness) {
+                        high = middle;
+                    } else {
+                        low = middle;
+                    }
+                }
+                let hit_pixel = vec2<i32>(clamp(refined_uv * dimensions,
+                    vec2<f32>(0.0), dimensions - 1.0));
+                let hit_normal = preview_decode_normal(textureLoad(preview_gbuffer, hit_pixel, 0).xy);
+                if (dot(hit_normal, -reflected) <= 0.03) { break; }
+                let blur = (0.5 + roughness * 2.5) / dimensions;
+                hit = textureSampleLevel(scene_color, scene_sampler, refined_uv, 0.0) * 0.5
+                    + textureSampleLevel(scene_color, scene_sampler, refined_uv + vec2<f32>(blur.x, 0.0), 0.0) * 0.125
+                    + textureSampleLevel(scene_color, scene_sampler, refined_uv - vec2<f32>(blur.x, 0.0), 0.0) * 0.125
+                    + textureSampleLevel(scene_color, scene_sampler, refined_uv + vec2<f32>(0.0, blur.y), 0.0) * 0.125
+                    + textureSampleLevel(scene_color, scene_sampler, refined_uv - vec2<f32>(0.0, blur.y), 0.0) * 0.125;
+                confidence = (1.0 - f32(step) / (f32(max_steps) + 1.0))
+                    * (1.0 - smoothstep(0.82, 1.0, max(abs(refined_uv.x - 0.5), abs(refined_uv.y - 0.5)) * 2.0));
                 break;
             }
         }
+        previous_distance = ray_distance;
     }
     let surface_response = pow(1.0 - roughness, 2.0) * mix(0.10, 0.32, metallic);
     let reflection_weight = confidence * grazing * surface_response;
@@ -306,7 +393,8 @@ fn finish_render_style(
     sample_uv: vec2<f32>,
     output_uv: vec2<f32>
 ) -> vec4<f32> {
-    let enhanced = preview_screen_space_reflection(radiance, sample_uv);
+    let bounced = preview_screen_space_gi(radiance, sample_uv);
+    let enhanced = preview_screen_space_reflection(bounced, sample_uv);
     let resolved = resolve_display(enhanced);
     let alpha = resolved.a;
     if (alpha < 0.00001) { return vec4<f32>(0.0); }

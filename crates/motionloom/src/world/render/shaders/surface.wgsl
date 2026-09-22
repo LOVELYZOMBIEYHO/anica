@@ -54,6 +54,30 @@ fn surface_caustic_pattern(world: vec3<f32>) -> f32 {
     return pow(clamp((a + b + c) * 0.1667 + 0.5, 0.0, 1.0), 5.0);
 }
 
+fn material_channel(sample: vec4<f32>, encoded: u32) -> f32 {
+    let channel = encoded & 7u;
+    var value = sample.r;
+    if (channel == 1u) {
+        value = sample.g;
+    } else if (channel == 2u) {
+        value = sample.b;
+    } else if (channel == 3u) {
+        value = sample.a;
+    } else if (channel == 4u) {
+        value = dot(sample.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    }
+    return select(value, 1.0 - value, (encoded & 8u) != 0u);
+}
+
+fn material_channels(sample: vec4<f32>) -> vec3<f32> {
+    let packed = u32(params.material8.z + 0.5);
+    return vec3<f32>(
+        material_channel(sample, packed & 15u),
+        material_channel(sample, (packed >> 4u) & 15u),
+        material_channel(sample, (packed >> 8u) & 15u),
+    );
+}
+
 fn shade_surface(input: VertexOut) -> vec4<f32> {
     if (input.hidden_weight > 0.01) {
         discard;
@@ -82,15 +106,23 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         base_color = max(mix(vec3<f32>(dot(base_color, vec3<f32>(0.2126,0.7152,0.0722))), base_color, lighting.surface3.x), vec3<f32>(0.0));
     }
     let mr_sample = textureSample(metallic_roughness_texture, actor_sampler, uv);
-    var metallic = clamp(params.material0.x * mr_sample.b, 0.0, 1.0);
-    var roughness = clamp(params.material0.y * mr_sample.g + lighting.surface1.z, 0.045, 1.0);
+    let material_samples = material_channels(mr_sample);
+    var metallic = clamp(params.material0.x * material_samples.x, 0.0, 1.0);
+    var roughness = clamp(params.material0.y * material_samples.y + lighting.surface1.z, 0.045, 1.0);
     if (lighting.surface0.x > 2.5 && lighting.surface0.x < 3.5) {
         base_color = clay_base_color();
         metallic = clay_metallic();
         roughness = clay_roughness();
     }
 
-    let geometric_normal = normalize(input.normal);
+    // glTF double-sided materials must light backfaces with the front side's
+    // normal; orient the geometric normal toward the viewer before the tangent
+    // frame so the normal map and direct lighting agree.
+    let view = normalize(params.camera0.xyz - input.world_position);
+    var geometric_normal = normalize(input.normal);
+    if (params.material8.y > 0.5 && dot(geometric_normal, view) < 0.0) {
+        geometric_normal = -geometric_normal;
+    }
     let tangent = normalize(input.tangent - geometric_normal * dot(input.tangent, geometric_normal));
     let bitangent_sign = select(-1.0, 1.0, dot(cross(geometric_normal, tangent), input.bitangent) >= 0.0);
     let bitangent = normalize(cross(geometric_normal, tangent)) * bitangent_sign;
@@ -104,7 +136,6 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         tangent * tangent_normal.x + bitangent * tangent_normal.y + geometric_normal * tangent_normal.z
     );
 
-    let view = normalize(params.camera0.xyz - input.world_position);
     let authored_ior = clamp(params.material6.y, 1.0, 3.0);
     let ior_ratio = (authored_ior - 1.0) / (authored_ior + 1.0);
     let dielectric_f0 = vec3<f32>(ior_ratio * ior_ratio) *
@@ -188,7 +219,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         diffuse_ambient = base_color * (1.0 - metallic) * diffuse_environment;
     }
     let specular_ambient = environment_fresnel * specular_environment * lighting.surface1.y;
-    let material_ao = textureSample(occlusion_texture, actor_sampler, uv).r;
+    let material_ao = material_channels(textureSample(occlusion_texture, actor_sampler, uv)).z;
     lit += (diffuse_ambient + specular_ambient) * ao * contact * material_ao;
     if (lighting.caustics1.w > 0.5 && params.material8.x > 0.5) {
         let depth_attenuation = exp(-max(0.0, lighting.fog4.y - input.world_position.y) * lighting.caustics0.w);
@@ -215,8 +246,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let exposed = shaded * surface_exposure;
     var display = display_transform(exposed);
     if (params.material2.w > 0.5) { display = inverse_display_curve(base_srgb); }
-    let fog_amount = atmosphere_fog_amount(input.world_position);
-    let fog_radiance = lighting.fog1.rgb * (1.0 + lighting.fog2.y * 0.35);
+    let fog_amount = atmosphere_medium_amount(input.world_position);
+    let fog_radiance = lighting.fog1.rgb;
     display = mix(display, display_transform(fog_radiance), fog_amount);
     var output_alpha = alpha;
     let transmission = clamp(params.material6.x, 0.0, 1.0);
@@ -266,7 +297,12 @@ fn encode_gbuffer_normal(value: vec3<f32>) -> vec2<f32> {
 fn fs_main_gbuffer(input: VertexOut) -> SurfaceGbufferOutput {
     params = instance_params[input.instance_id];
     let color = shade_surface(input);
-    let geometric_normal = normalize(input.normal);
+    // Match shade_surface so the reflection normal uses the same two-sided side.
+    let gbuffer_view = normalize(params.camera0.xyz - input.world_position);
+    var geometric_normal = normalize(input.normal);
+    if (params.material8.y > 0.5 && dot(geometric_normal, gbuffer_view) < 0.0) {
+        geometric_normal = -geometric_normal;
+    }
     var normal = geometric_normal;
     var metallic = 0.0;
     var roughness = 1.0;
@@ -289,9 +325,10 @@ fn fs_main_gbuffer(input: VertexOut) -> SurfaceGbufferOutput {
         normal = normalize(tangent * tangent_normal.x
             + bitangent * tangent_normal.y + geometric_normal * tangent_normal.z);
         let mr = textureSample(metallic_roughness_texture, actor_sampler, input.uv);
-        metallic = clamp(params.material0.x * mr.b, 0.0, 1.0);
-        roughness = clamp(params.material0.y * mr.g + lighting.surface1.z, 0.045, 1.0);
-        ao = mix(1.0, textureSample(occlusion_texture, actor_sampler, input.uv).r,
+        let remapped = material_channels(mr);
+        metallic = clamp(params.material0.x * remapped.x, 0.0, 1.0);
+        roughness = clamp(params.material0.y * remapped.y + lighting.surface1.z, 0.045, 1.0);
+        ao = mix(1.0, material_channels(textureSample(occlusion_texture, actor_sampler, input.uv)).z,
             clamp(params.material2.w, 0.0, 1.0));
     }
 
@@ -331,7 +368,11 @@ fn fs_transmissive(input: VertexOut) -> @location(0) vec4<f32> {
     let ior = clamp(params.material6.y, 1.0, 3.0);
     let optical_thickness = max(params.material6.z, 0.0);
     let screen_uv = input.pos.xy / params.canvas.xy;
-    let view_normal = normalize(input.normal);
+    var view_normal = normalize(input.normal);
+    if (params.material8.y > 0.5
+        && dot(view_normal, normalize(params.camera0.xyz - input.world_position)) < 0.0) {
+        view_normal = -view_normal;
+    }
     let refractive_scale = (1.0 - 1.0 / ior) *
         (optical_thickness / (1.0 + optical_thickness)) * 0.08;
     let refracted_uv = clamp(
@@ -401,14 +442,13 @@ fn fs_background(input: BackgroundVertexOut) -> @location(0) vec4<f32> {
     let lod = lighting.environment1.y * lighting.environment0.z;
     let color = sample_environment(direction, lod) * lighting.environment1.x;
     var display = display_transform(color);
-    if (lighting.fog2.z > 0.5 && lighting.fog2.w > 0.5) {
+    if (lighting.fog1.w > 0.5 && lighting.fog2.z > 0.5 && lighting.fog2.w > 0.5) {
         let horizon = pow(clamp(1.0 - abs(direction.y), 0.0, 1.0), 3.0);
-        var sky_fog = horizon * clamp(lighting.fog0.y * 8.0 + lighting.fog2.y * 0.15, 0.0, 0.75);
+        var sky_fog = horizon * clamp(lighting.fog0.x * 8.0, 0.0, 0.75);
         if (lighting.fog3.w > 0.5) {
-            let volume_sample = atmosphere_fog_ray_sample(direction, 100000.0, lighting.fog1.w);
-            let volume_distance = max(volume_sample.x - lighting.fog0.z, 0.0);
+            let volume_sample = atmosphere_medium_ray_sample(direction, 100000.0, lighting.camera0.y);
             sky_fog = clamp(
-                (1.0 - exp(-lighting.fog0.y * volume_distance)) * volume_sample.y,
+                (1.0 - exp(-lighting.fog0.x * volume_sample.x)) * volume_sample.y,
                 0.0,
                 0.75,
             );

@@ -28,7 +28,12 @@ pub use crate::{
     render_world_graph_to_video_with_progress,
 };
 
-pub use crate::scene::model::{Scene3DNode, SceneModel3DNode, SceneNode};
+pub use crate::scene::atmosphere::{
+    AtmosphereMediumPlan, VolumetricQuality, VolumetricScatteringPlan, WaterCausticsPlan,
+};
+pub use crate::scene::model::{
+    Scene3DNode, SceneModel3DNode, SceneNode, SceneScatter3DNode, SceneScatterVariantNode,
+};
 pub use crate::world::gltf_loader::{
     GlbAnimationChannelData, GlbAnimationData, GlbAnimationInterpolation, GlbAnimationProperty,
     GlbAnimationValues, GlbSkinData, GlbSkinJointData, load_glb_animation_data,
@@ -93,6 +98,11 @@ pub mod text {
         PreparedTextAnimatorTargets, PreparedTextLayout, prepare_text_layout,
         prepare_text_layout_for_value,
     };
+}
+
+/// Composition IR is experimental while the first executor migration lands.
+pub mod compositor {
+    pub use crate::scene::compositor::*;
 }
 
 // Control cages expose topology for advanced authoring without a separate renderer.

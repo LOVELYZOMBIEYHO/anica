@@ -93,7 +93,8 @@ use crate::scene::model::{
     FaceJawNode, FilterDef, FontDef, GradientDef, GroupNode, LineNode, MaskNode, MaterialDef,
     NoiseDef, PaletteNode, PartNode, PathNode, PixelGridNode, PolylineNode, PrecomposeNode,
     PuppetNode, RectNode, RepeatNode, Scene3DNode, SceneCamera3DNode, SceneEffectRef,
-    SceneLayerNode, SceneNode, SceneRootNode, SceneTrackNode, TextureDef, UseNode,
+    SceneLayerNode, SceneModel3DNode, SceneNode, SceneRootNode, SceneTrackNode, TextureDef,
+    UseNode,
 };
 pub use crate::scene::resource::{clear_scene_asset_roots, set_scene_asset_roots};
 use crate::scene::resource::{
@@ -1221,11 +1222,9 @@ fn apply_animation_property_to_3d_nodes(
             Scene3DNode::AtmosphereFog(fog) if fog.id.as_deref() == Some(node_id) => match property
             {
                 "density" => fog.density = value.to_string(),
-                "start" => fog.start = value.to_string(),
-                "end" => fog.end = value.to_string(),
+                "anisotropy" => fog.anisotropy = value.to_string(),
                 "baseHeight" => fog.base_height = value.to_string(),
                 "heightFalloff" => fog.height_falloff = value.to_string(),
-                "scattering" => fog.scattering = value.to_string(),
                 "edgeFeather" => fog.edge_feather = value.to_string(),
                 _ => {}
             },
@@ -1238,9 +1237,9 @@ fn apply_animation_property_to_3d_nodes(
             {
                 if let Some(volume) = fog.volumetric_scattering.as_mut() {
                     match property {
-                        "intensity" => volume.intensity = value.to_string(),
-                        "anisotropy" => volume.anisotropy = value.to_string(),
+                        "shaftStrength" => volume.shaft_strength = value.to_string(),
                         "maxDistance" => volume.max_distance = value.to_string(),
+                        "maxBounces" => volume.max_bounces = value.to_string(),
                         _ => {}
                     }
                 }
@@ -1257,7 +1256,7 @@ fn apply_animation_property_to_3d_nodes(
                         "intensity" => caustics.intensity = value.to_string(),
                         "scale" => caustics.scale = value.to_string(),
                         "speed" => caustics.speed = value.to_string(),
-                        "depthFalloff" => caustics.depth_falloff = value.to_string(),
+                        "attenuation" => caustics.attenuation = value.to_string(),
                         _ => {}
                     }
                 }
@@ -1547,13 +1546,13 @@ use crate::scene::timeline::{
 use crate::world::model::{WorldNativeSkin, WorldNativeSkinSegment, WorldNativeWeightRegion};
 use crate::world::render::Scene3DRenderer;
 use crate::world::{
+    AtmosphereMediumPlan, VolumetricQuality, VolumetricScatteringPlan, WaterCausticsPlan,
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldAnimationAsset,
-    WorldApplyAction, WorldAtmosphereFog, WorldBackground, WorldBackgroundFit, WorldBoneAxis,
-    WorldBoneAxisMap, WorldCamera, WorldCameraControl, WorldCameraProjection, WorldColorManagement,
-    WorldConstraint, WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight,
-    WorldLightKind, WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode,
-    WorldPathStyle, WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetargetMap,
-    WorldVolumetricScattering, WorldWaterCaustics, parse_world_graph_script,
+    WorldApplyAction, WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap,
+    WorldCamera, WorldCameraControl, WorldCameraProjection, WorldColorManagement, WorldConstraint,
+    WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind,
+    WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
+    WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetargetMap, parse_world_graph_script,
 };
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use image::{Rgba, RgbaImage, imageops::FilterType};
@@ -1653,6 +1652,56 @@ fn repeat_hash_unit(seed: u32, index: u32, channel: u32) -> f32 {
     value as f32 / u32::MAX as f32
 }
 
+/// Sample one scalar authoring mask in normalized terrain coordinates.
+fn scatter_map_value(image: &RgbaImage, u: f32, v: f32) -> f32 {
+    let x = (u.clamp(0.0, 1.0) * image.width().saturating_sub(1) as f32).round() as u32;
+    let y = (v.clamp(0.0, 1.0) * image.height().saturating_sub(1) as f32).round() as u32;
+    image.get_pixel(x, y).0[0] as f32 / 255.0
+}
+
+/// Bilinear height sampling matches the retained TerrainAsset surface rather
+/// than placing vegetation on a separate approximation.
+fn scatter_terrain_height(
+    terrain: &crate::dsl::TerrainAssetNode,
+    image: &RgbaImage,
+    u: f32,
+    v: f32,
+) -> f32 {
+    let fx = u.clamp(0.0, 1.0) * image.width().saturating_sub(1) as f32;
+    let fy = v.clamp(0.0, 1.0) * image.height().saturating_sub(1) as f32;
+    let x0 = fx.floor() as u32;
+    let y0 = fy.floor() as u32;
+    let x1 = (x0 + 1).min(image.width().saturating_sub(1));
+    let y1 = (y0 + 1).min(image.height().saturating_sub(1));
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let sample = |x, y| image.get_pixel(x, y).0[0] as f32 / 255.0;
+    let top = sample(x0, y0) * (1.0 - tx) + sample(x1, y0) * tx;
+    let bottom = sample(x0, y1) * (1.0 - tx) + sample(x1, y1) * tx;
+    terrain.height_offset + (top * (1.0 - ty) + bottom * ty) * terrain.height_scale
+}
+
+/// Approximate the local terrain slope from neighboring height samples so a
+/// compact Scatter can exclude cliffs deterministically on every backend.
+fn scatter_terrain_slope_degrees(
+    terrain: &crate::dsl::TerrainAssetNode,
+    image: &RgbaImage,
+    u: f32,
+    v: f32,
+) -> f32 {
+    let du = 1.0 / image.width().saturating_sub(1).max(1) as f32;
+    let dv = 1.0 / image.height().saturating_sub(1).max(1) as f32;
+    let dx = (terrain.size[0] * du * 2.0).max(0.0001);
+    let dz = (terrain.size[1] * dv * 2.0).max(0.0001);
+    let dhdx = (scatter_terrain_height(terrain, image, u + du, v)
+        - scatter_terrain_height(terrain, image, u - du, v))
+        / dx;
+    let dhdz = (scatter_terrain_height(terrain, image, u, v + dv)
+        - scatter_terrain_height(terrain, image, u, v - dv))
+        / dz;
+    dhdx.hypot(dhdz).atan().to_degrees()
+}
+
 /// Evaluate authored Scene lighting once before crossing the internal 3D bridge.
 fn scene_world_lighting(
     composite: &CompositeGroupConfig,
@@ -1727,33 +1776,27 @@ fn scene_world_lighting(
                                 .to_string(),
                     });
                 }
-                lighting.atmosphere_fog = Some(WorldAtmosphereFog {
-                    mode: node.mode.clone(),
-                    color: scene_fog_color(&node.color)?,
+                let quality = |value: &str| match value {
+                    "low" => Ok(VolumetricQuality::Low),
+                    "medium" => Ok(VolumetricQuality::Medium),
+                    "high" => Ok(VolumetricQuality::High),
+                    _ => Err(MotionLoomSceneRenderError::InvalidExpression {
+                        expr: value.to_string(),
+                        message: "VolumetricScattering quality must be low, medium, or high"
+                            .to_string(),
+                    }),
+                };
+                lighting.atmosphere_medium = Some(AtmosphereMediumPlan {
                     density: eval_scene_number(&node.density, time_norm, time_sec)?
                         .clamp(0.0, 10.0),
-                    start: eval_scene_number(&node.start, time_norm, time_sec)?.max(0.0),
-                    end: eval_scene_number(&node.end, time_norm, time_sec)?.max(0.001),
+                    scattering_color: scene_fog_color(&node.scattering_color)?
+                        .map(|value| value.clamp(0.0, 1.0)),
+                    anisotropy: eval_scene_number(&node.anisotropy, time_norm, time_sec)?
+                        .clamp(-0.99, 0.99),
                     base_height: eval_scene_number(&node.base_height, time_norm, time_sec)?,
                     height_falloff: eval_scene_number(&node.height_falloff, time_norm, time_sec)?
                         .max(0.0),
-                    scattering: eval_scene_number(&node.scattering, time_norm, time_sec)?
-                        .clamp(0.0, 1.0),
-                    absorption: node
-                        .absorption
-                        .as_deref()
-                        .map(|value| eval_scene_vec3(value, time_norm, time_sec, [0.0; 3]))
-                        .transpose()?
-                        .unwrap_or([0.0; 3])
-                        .map(|value| value.max(0.0)),
-                    scattering_color: node
-                        .scattering_color
-                        .as_deref()
-                        .map(|value| eval_scene_vec3(value, time_norm, time_sec, [1.0; 3]))
-                        .transpose()?
-                        .unwrap_or([1.0; 3])
-                        .map(|value| value.max(0.0)),
-                    affect_sky: node.affect_sky,
+                    affect_environment: node.affect_environment,
                     bounds_min,
                     bounds_max,
                     edge_feather: eval_scene_number(&node.edge_feather, time_norm, time_sec)?
@@ -1762,20 +1805,14 @@ fn scene_world_lighting(
                         .volumetric_scattering
                         .as_ref()
                         .map(|volume| {
-                            Ok::<_, MotionLoomSceneRenderError>(WorldVolumetricScattering {
+                            Ok::<_, MotionLoomSceneRenderError>(VolumetricScatteringPlan {
                                 light_ref: volume.light_ref.clone(),
-                                intensity: eval_scene_number(
-                                    &volume.intensity,
+                                shaft_strength: eval_scene_number(
+                                    &volume.shaft_strength,
                                     time_norm,
                                     time_sec,
                                 )?
                                 .max(0.0),
-                                anisotropy: eval_scene_number(
-                                    &volume.anisotropy,
-                                    time_norm,
-                                    time_sec,
-                                )?
-                                .clamp(-0.95, 0.95),
                                 max_distance: eval_scene_number(
                                     &volume.max_distance,
                                     time_norm,
@@ -1783,6 +1820,15 @@ fn scene_world_lighting(
                                 )?
                                 .max(0.001),
                                 shadowed: volume.shadowed,
+                                quality: quality(&volume.quality)?,
+                                max_bounces: eval_scene_number(
+                                    &volume.max_bounces,
+                                    time_norm,
+                                    time_sec,
+                                )?
+                                .round()
+                                .clamp(1.0, 64.0)
+                                    as u32,
                                 debug_view: volume.debug_view.clone(),
                             })
                         })
@@ -1791,7 +1837,7 @@ fn scene_world_lighting(
                         .water_caustics
                         .as_ref()
                         .map(|caustics| {
-                            Ok::<_, MotionLoomSceneRenderError>(WorldWaterCaustics {
+                            Ok::<_, MotionLoomSceneRenderError>(WaterCausticsPlan {
                                 intensity: eval_scene_number(
                                     &caustics.intensity,
                                     time_norm,
@@ -1801,8 +1847,8 @@ fn scene_world_lighting(
                                 scale: eval_scene_number(&caustics.scale, time_norm, time_sec)?
                                     .max(0.0001),
                                 speed: eval_scene_number(&caustics.speed, time_norm, time_sec)?,
-                                depth_falloff: eval_scene_number(
-                                    &caustics.depth_falloff,
+                                attenuation: eval_scene_number(
+                                    &caustics.attenuation,
                                     time_norm,
                                     time_sec,
                                 )?
@@ -1991,7 +2037,7 @@ fn scene_world_lighting(
         }
     }
     let volumetric_light_ref = lighting
-        .atmosphere_fog
+        .atmosphere_medium
         .as_ref()
         .and_then(|fog| fog.volumetric_scattering.as_ref())
         .map(|volume| volume.light_ref.clone());
@@ -2017,7 +2063,7 @@ fn scene_world_lighting(
             });
         }
         let shadowed = lighting
-            .atmosphere_fog
+            .atmosphere_medium
             .as_ref()
             .and_then(|fog| fog.volumetric_scattering.as_ref())
             .is_some_and(|volume| volume.shadowed);
@@ -3283,6 +3329,13 @@ struct SceneFrameRenderer {
     gpu_text_raster_cache: HashMap<u64, CachedGpuTextRaster>,
     gpu_layer3d_texture_cache: HashMap<u64, CachedGpuLayer3dTexture>,
     scene_material_texture_cache: HashMap<u64, Arc<crate::world::render::GpuWorldTexture>>,
+    /// Deterministic Scatter placement is retained separately from animated
+    /// cameras/lights. Large environment scatters otherwise regenerate and
+    /// allocate thousands of Model nodes on every preview frame.
+    expanded_scene_scatter_cache: HashMap<u64, Arc<Vec<Scene3DNode>>>,
+    /// Fully lowered static scatter worlds are retained independently from
+    /// animated cameras and lighting.
+    retained_scene_3d_world_cache: HashMap<u64, Arc<WorldGraph>>,
     rigid_body_timeline_cache:
         HashMap<u64, Arc<Vec<Vec<crate::simulation::rigid::RigidBody3DOutput>>>>,
     animation_source_signature: u64,
@@ -3310,6 +3363,7 @@ struct SceneFrameRenderer {
     texture_defs: HashMap<String, TextureDef>,
     noise_defs: HashMap<String, NoiseDef>,
     material_defs: HashMap<String, MaterialDef>,
+    prepared_material_assets: HashMap<String, crate::dsl::MaterialAssetNode>,
     filter_defs: HashMap<String, FilterDef>,
     scene_node_defs: HashMap<String, SceneNode>,
     scene_follow_nodes: Vec<SceneNode>,
@@ -3354,6 +3408,7 @@ const RETAINED_GPU_SHAPE_SCENE_CACHE_LIMIT: usize = 8;
 const RETAINED_GPU_TRANSFORM_SCENE_CACHE_LIMIT: usize = 64;
 const GPU_TEXT_RASTER_CACHE_LIMIT: usize = 256;
 const RIGID_BODY_TIMELINE_CACHE_LIMIT: usize = 8;
+const EXPANDED_SCENE_SCATTER_CACHE_LIMIT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RetainedGpuShapeSceneKey {
@@ -4844,6 +4899,7 @@ fn resolved_primitive_collider_shape(asset: &PrimitiveAssetNode) -> PrimitiveCol
             PrimitiveGeometry::RoundedBox { .. } => PrimitiveColliderShape::Box,
             PrimitiveGeometry::Loft { .. }
             | PrimitiveGeometry::Ribbon { .. }
+            | PrimitiveGeometry::Sweep { .. }
             | PrimitiveGeometry::HairCards { .. }
             | PrimitiveGeometry::HeadSurface { .. }
             | PrimitiveGeometry::Mesh { .. } => PrimitiveColliderShape::Convex,
@@ -6961,6 +7017,76 @@ fn scene_camera_to_world_camera(
     })
 }
 
+fn scene_static_scatter_world_key(
+    graph_signature: u64,
+    composite: &CompositeGroupConfig,
+    canvas_size: (u32, u32),
+    has_no_actor_runtime_dependencies: bool,
+) -> Option<u64> {
+    if !has_no_actor_runtime_dependencies {
+        return None;
+    }
+    let mut has_large_scatter = false;
+    for node in &composite.nodes_3d {
+        match node {
+            Scene3DNode::Scatter(scatter) => {
+                has_large_scatter |= scatter.count >= 256;
+                if scene_debug_value_has_dynamic_expression(scatter) {
+                    return None;
+                }
+            }
+            Scene3DNode::Model(model) => {
+                if scene_debug_value_has_dynamic_expression(model) {
+                    return None;
+                }
+            }
+            Scene3DNode::Camera(camera) => {
+                if !camera.hidden_bones.is_empty()
+                    || camera.position.trim_start().starts_with('@')
+                    || camera.target.trim_start().starts_with('@')
+                    || camera
+                        .depth_of_field
+                        .as_ref()
+                        .and_then(|optics| optics.focus_target.as_deref())
+                        .is_some_and(|target| target.trim_start().starts_with('@'))
+                {
+                    return None;
+                }
+            }
+            Scene3DNode::VolumeRepeat(_)
+            | Scene3DNode::RigidBody(_)
+            | Scene3DNode::Anchor(_)
+            | Scene3DNode::Debug(_) => return None,
+            Scene3DNode::AtmosphereFog(_)
+            | Scene3DNode::EnvironmentLight(_)
+            | Scene3DNode::DirectionalLight(_)
+            | Scene3DNode::PointLight(_)
+            | Scene3DNode::SpotLight(_)
+            | Scene3DNode::RectAreaLight(_)
+            | Scene3DNode::AmbientOcclusion(_)
+            | Scene3DNode::ContactShadow(_)
+            | Scene3DNode::ColorManagement(_) => {}
+        }
+    }
+    if !has_large_scatter {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    graph_signature.hash(&mut hasher);
+    canvas_size.hash(&mut hasher);
+    format!("{composite:?}").hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn scene_debug_value_has_dynamic_expression(value: &impl std::fmt::Debug) -> bool {
+    let debug = format!("{value:?}");
+    [
+        "curve(", "spring(", "noise(", "wiggle(", "sin(", "cos(", "frame(", "time(",
+    ]
+    .iter()
+    .any(|marker| debug.contains(marker))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedSceneSurface {
     height: f32,
@@ -7166,6 +7292,8 @@ impl SceneFrameRenderer {
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
             scene_material_texture_cache: HashMap::new(),
+            expanded_scene_scatter_cache: HashMap::new(),
+            retained_scene_3d_world_cache: HashMap::new(),
             rigid_body_timeline_cache: HashMap::new(),
             animation_source_signature: 0,
             compiled_animation_graph: None,
@@ -7192,6 +7320,7 @@ impl SceneFrameRenderer {
             texture_defs: HashMap::new(),
             noise_defs: HashMap::new(),
             material_defs: HashMap::new(),
+            prepared_material_assets: HashMap::new(),
             filter_defs: HashMap::new(),
             scene_node_defs: HashMap::new(),
             scene_follow_nodes: Vec::new(),
@@ -7353,6 +7482,8 @@ impl SceneFrameRenderer {
             gpu_text_raster_cache: HashMap::new(),
             gpu_layer3d_texture_cache: HashMap::new(),
             scene_material_texture_cache: HashMap::new(),
+            expanded_scene_scatter_cache: HashMap::new(),
+            retained_scene_3d_world_cache: HashMap::new(),
             rigid_body_timeline_cache: HashMap::new(),
             animation_source_signature: 0,
             compiled_animation_graph: None,
@@ -7379,6 +7510,7 @@ impl SceneFrameRenderer {
             texture_defs: HashMap::new(),
             noise_defs: HashMap::new(),
             material_defs: HashMap::new(),
+            prepared_material_assets: HashMap::new(),
             filter_defs: HashMap::new(),
             scene_node_defs: HashMap::new(),
             scene_follow_nodes: Vec::new(),
@@ -8111,6 +8243,8 @@ impl SceneFrameRenderer {
             self.gpu_text_raster_cache.clear();
             self.gpu_layer3d_texture_cache.clear();
             self.scene_material_texture_cache.clear();
+            self.expanded_scene_scatter_cache.clear();
+            self.retained_scene_3d_world_cache.clear();
             self.rigid_body_timeline_cache.clear();
             self.prepared_graph_signature = graph_signature;
         }
@@ -8120,6 +8254,7 @@ impl SceneFrameRenderer {
         self.texture_defs.clear();
         self.noise_defs.clear();
         self.material_defs.clear();
+        self.prepared_material_assets.clear();
         self.filter_defs.clear();
         self.scene_node_defs.clear();
         self.scene_follow_nodes.clear();
@@ -8155,6 +8290,11 @@ impl SceneFrameRenderer {
         collect_graph_texture_defs(graph, &mut self.texture_defs);
         collect_graph_noise_defs(graph, &mut self.noise_defs);
         collect_graph_material_defs(graph, &mut self.material_defs);
+        self.prepared_material_assets = graph
+            .material_assets
+            .iter()
+            .map(|asset| (asset.id.clone(), asset.clone()))
+            .collect();
         collect_graph_filter_defs(graph, &mut self.filter_defs);
         collect_graph_scene_node_defs(graph, &mut self.scene_node_defs);
         self.scene_follow_nodes = collect_graph_scene_follow_nodes(graph);
@@ -8231,6 +8371,7 @@ impl SceneFrameRenderer {
         self.texture_defs.clear();
         self.noise_defs.clear();
         self.material_defs.clear();
+        self.prepared_material_assets.clear();
         self.filter_defs.clear();
         self.scene_node_defs.clear();
         self.scene_follow_nodes.clear();
@@ -8266,6 +8407,11 @@ impl SceneFrameRenderer {
         collect_graph_texture_defs(graph, &mut self.texture_defs);
         collect_graph_noise_defs(graph, &mut self.noise_defs);
         collect_graph_material_defs(graph, &mut self.material_defs);
+        self.prepared_material_assets = graph
+            .material_assets
+            .iter()
+            .map(|asset| (asset.id.clone(), asset.clone()))
+            .collect();
         collect_graph_filter_defs(graph, &mut self.filter_defs);
         collect_graph_scene_node_defs(graph, &mut self.scene_node_defs);
         self.scene_follow_nodes = collect_graph_scene_follow_nodes(graph);
@@ -10895,6 +11041,250 @@ impl SceneFrameRenderer {
     /// texture. The island is composited by the same Scene pass ordering as
     /// every 2D Layer, so this bridge does not reintroduce a public `<World>`
     /// render family.
+    fn expand_scene_surface_scatters(
+        &mut self,
+        nodes: &[Scene3DNode],
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<Vec<Scene3DNode>, MotionLoomSceneRenderError> {
+        let mut expanded = Vec::new();
+        for (scatter_index, node) in nodes.iter().enumerate() {
+            let Scene3DNode::Scatter(scatter) = node else {
+                expanded.push(node.clone());
+                continue;
+            };
+            let scatter_name = scatter
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("scatter_{scatter_index}"));
+            let surface_model = nodes
+                .iter()
+                .find_map(|candidate| match candidate {
+                    Scene3DNode::Model(model)
+                        if model.id.as_deref() == Some(scatter.surface.as_str()) =>
+                    {
+                        Some(model.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| MotionLoomSceneRenderError::InvalidScatter {
+                    id: scatter_name.clone(),
+                    message: format!("surface '{}' does not name a Model", scatter.surface),
+                })?;
+            let source = surface_model
+                .primitive
+                .clone()
+                .map(GraphAssetSource::Primitive)
+                .or_else(|| self.model_asset_sources.get(&surface_model.asset).cloned())
+                .ok_or_else(|| MotionLoomSceneRenderError::InvalidScatter {
+                    id: scatter_name.clone(),
+                    message: format!(
+                        "surface '{}' references unknown asset '{}'",
+                        scatter.surface, surface_model.asset
+                    ),
+                })?;
+            let GraphAssetSource::Terrain(terrain) = source else {
+                return Err(MotionLoomSceneRenderError::InvalidScatter {
+                    id: scatter_name,
+                    message: "surface must reference a TerrainAsset in Scatter v1".to_string(),
+                });
+            };
+            for variant in &scatter.variants {
+                if !self.model_asset_sources.contains_key(&variant.asset) {
+                    return Err(MotionLoomSceneRenderError::InvalidScatter {
+                        id: scatter_name.clone(),
+                        message: format!(
+                            "Variant references unknown model asset '{}'",
+                            variant.asset
+                        ),
+                    });
+                }
+            }
+
+            let slope_range =
+                eval_scene_vec2(&scatter.slope_range, time_norm, time_sec, [0.0, 90.0])?;
+            let scale_range =
+                eval_scene_vec2(&scatter.scale_range, time_norm, time_sec, [1.0, 1.0])?;
+            let rotation_range =
+                eval_scene_vec2(&scatter.rotation_y_range, time_norm, time_sec, [0.0, 360.0])?;
+            let surface_offset = eval_scene_number(&scatter.surface_offset, time_norm, time_sec)?;
+            let surface_position =
+                eval_scene_vec3(&surface_model.position, time_norm, time_sec, [0.0; 3])?;
+            let surface_scale =
+                eval_scene_number(&surface_model.scale, time_norm, time_sec)?.max(0.0001);
+            let surface_rotation =
+                eval_scene_vec3(&surface_model.rotation, time_norm, time_sec, [0.0; 3])?;
+            let surface_rotation_y = surface_model
+                .rotation_y
+                .as_deref()
+                .map(|value| eval_scene_number(value, time_norm, time_sec))
+                .transpose()?
+                .unwrap_or(surface_rotation[1]);
+            let mut cache_hasher = DefaultHasher::new();
+            self.prepared_graph_signature.hash(&mut cache_hasher);
+            scatter_name.hash(&mut cache_hasher);
+            format!("{scatter:?}").hash(&mut cache_hasher);
+            format!("{terrain:?}").hash(&mut cache_hasher);
+            surface_position.map(f32::to_bits).hash(&mut cache_hasher);
+            surface_rotation.map(f32::to_bits).hash(&mut cache_hasher);
+            surface_scale.to_bits().hash(&mut cache_hasher);
+            slope_range.map(f32::to_bits).hash(&mut cache_hasher);
+            scale_range.map(f32::to_bits).hash(&mut cache_hasher);
+            rotation_range.map(f32::to_bits).hash(&mut cache_hasher);
+            surface_offset.to_bits().hash(&mut cache_hasher);
+            let scatter_cache_key = cache_hasher.finish();
+            if let Some(cached) = self.expanded_scene_scatter_cache.get(&scatter_cache_key) {
+                expanded.extend(cached.iter().cloned());
+                continue;
+            }
+
+            // Clone decoded maps only on a cache miss. Placement maps are
+            // immutable for a graph revision, so warmed frames avoid both the
+            // image copies and the deterministic placement loop.
+            let height_source = terrain
+                .height_map_src
+                .clone()
+                .unwrap_or_else(|| terrain.height_map.clone());
+            let height_map = self.load_image_asset(&height_source)?.clone();
+            let density_map = if let Some(id) = scatter.density_map.as_deref() {
+                let source = self.resolve_image_asset_src(id)?;
+                Some(self.load_image_asset(&source)?.clone())
+            } else {
+                None
+            };
+            let exclusion_map = if let Some(id) = scatter.exclusion_map.as_deref() {
+                let source = self.resolve_image_asset_src(id)?;
+                Some(self.load_image_asset(&source)?.clone())
+            } else {
+                None
+            };
+            let rotation_radians = surface_rotation_y.to_radians();
+            let (rotation_sin, rotation_cos) = rotation_radians.sin_cos();
+            let total_weight = scatter
+                .variants
+                .iter()
+                .map(|variant| variant.weight)
+                .sum::<f32>();
+            let max_attempts = scatter.count.saturating_mul(64).max(scatter.count);
+            let mut placed = 0_u32;
+            // Scatter instances are opaque and depth-tested. Grouping generated
+            // models by variant preserves placement identity while allowing the
+            // GPU backend to collapse thousands of adjacent compatible models
+            // into a handful of instanced draws.
+            let mut models_by_variant = vec![Vec::<Scene3DNode>::new(); scatter.variants.len()];
+            for attempt in 0..max_attempts {
+                if placed >= scatter.count {
+                    break;
+                }
+                // Irrational increments form a stable low-discrepancy sequence
+                // without requiring a platform RNG or storing authored points.
+                let u = ((attempt as f32 + 0.5) * 0.754_877_7
+                    + repeat_hash_unit(scatter.seed, 0, 91))
+                .fract();
+                let v = ((attempt as f32 + 0.5) * 0.569_840_3
+                    + repeat_hash_unit(scatter.seed, 0, 97))
+                .fract();
+                if density_map.as_ref().is_some_and(|map| {
+                    repeat_hash_unit(scatter.seed, attempt, 101) > scatter_map_value(map, u, v)
+                }) {
+                    continue;
+                }
+                if exclusion_map
+                    .as_ref()
+                    .is_some_and(|map| scatter_map_value(map, u, v) >= 0.5)
+                {
+                    continue;
+                }
+                let slope = scatter_terrain_slope_degrees(&terrain, &height_map, u, v);
+                if slope < slope_range[0] || slope > slope_range[1] {
+                    continue;
+                }
+                let local_x = (u - 0.5) * terrain.size[0];
+                let local_z = (v - 0.5) * terrain.size[1];
+                let height = scatter_terrain_height(&terrain, &height_map, u, v);
+                let world_x = surface_position[0]
+                    + (local_x * rotation_cos + local_z * rotation_sin) * surface_scale;
+                let world_z = surface_position[2]
+                    + (-local_x * rotation_sin + local_z * rotation_cos) * surface_scale;
+                let world_y = surface_position[1] + (height + surface_offset) * surface_scale;
+                let choice = repeat_hash_unit(scatter.seed, attempt, 107) * total_weight;
+                let mut accumulated = 0.0;
+                let (variant_index, variant) = scatter
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, variant)| {
+                        accumulated += variant.weight;
+                        choice <= accumulated
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            scatter.variants.len() - 1,
+                            scatter.variants.last().expect("Scatter has a Variant"),
+                        )
+                    });
+                let scale_t = repeat_hash_unit(scatter.seed, attempt, 109);
+                let instance_scale = scale_range[0] + (scale_range[1] - scale_range[0]) * scale_t;
+                let rotation_t = repeat_hash_unit(scatter.seed, attempt, 113);
+                let rotation_y = surface_rotation_y
+                    + rotation_range[0]
+                    + (rotation_range[1] - rotation_range[0]) * rotation_t;
+                models_by_variant[variant_index].push(Scene3DNode::Model(SceneModel3DNode {
+                    id: Some(format!("__{scatter_name}_{placed:06}")),
+                    asset: variant.asset.clone(),
+                    primitive: None,
+                    profile: None,
+                    rig: None,
+                    retarget: None,
+                    position: format!("[{world_x:.6},{world_y:.6},{world_z:.6}]"),
+                    position_x: None,
+                    position_y: None,
+                    position_z: None,
+                    rotation: "[0,0,0]".to_string(),
+                    rotation_x: None,
+                    rotation_y: Some(rotation_y.to_string()),
+                    rotation_z: None,
+                    scale: (instance_scale * surface_scale).to_string(),
+                    environment: false,
+                    r#static: true,
+                    collision: None,
+                    gravity: None,
+                    ground: None,
+                    up: "+Y".to_string(),
+                    forward: "+Z".to_string(),
+                    unit_scale: "1".to_string(),
+                    scale_mode: "none".to_string(),
+                    cast_shadow: scatter.cast_shadow,
+                    receive_shadow: scatter.receive_shadow,
+                    surfaces: Vec::new(),
+                    exposure: "1".to_string(),
+                    material_bindings: Vec::new(),
+                    play: None,
+                    plays: Vec::new(),
+                    bone_overrides: Vec::new(),
+                }));
+                placed += 1;
+            }
+            if placed != scatter.count {
+                return Err(MotionLoomSceneRenderError::InvalidScatter {
+                    id: scatter_name,
+                    message: format!(
+                        "only placed {placed} of {} instances; masks or slopeRange reject too much of the surface",
+                        scatter.count
+                    ),
+                });
+            }
+            let generated = Arc::new(models_by_variant.into_iter().flatten().collect::<Vec<_>>());
+            if self.expanded_scene_scatter_cache.len() >= EXPANDED_SCENE_SCATTER_CACHE_LIMIT {
+                self.expanded_scene_scatter_cache.clear();
+            }
+            self.expanded_scene_scatter_cache
+                .insert(scatter_cache_key, Arc::clone(&generated));
+            expanded.extend(generated.iter().cloned());
+        }
+        Ok(expanded)
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "The render boundary carries independent frame, target and timing inputs."
@@ -10917,10 +11307,67 @@ impl SceneFrameRenderer {
         MotionLoomSceneRenderError,
     > {
         self.last_rig_contact_evaluations.clear();
+        let retained_world_key = scene_static_scatter_world_key(
+            self.prepared_graph_signature,
+            composite,
+            canvas_size,
+            self.prepared_scene_actions.is_empty()
+                && self.prepared_scene_apply_actions.is_empty()
+                && self.prepared_scene_constraints.is_empty()
+                && self.prepared_scene_attachments.is_empty(),
+        );
+        if let Some((cache_key, cached)) = retained_world_key.and_then(|key| {
+            self.retained_scene_3d_world_cache
+                .get(&key)
+                .cloned()
+                .map(|cached| (key, cached))
+        }) {
+            let mut world_graph = cached.as_ref().clone();
+            world_graph.fps = fps;
+            world_graph.duration_ms = duration_ms;
+            world_graph.size = canvas_size;
+            world_graph.render_size = Some(canvas_size);
+            world_graph.lighting =
+                scene_world_lighting(composite, &self.image_asset_sources, time_norm, time_sec)?;
+            let active_camera = composite.nodes_3d.iter().find_map(|node| {
+                let Scene3DNode::Camera(camera) = node else {
+                    return None;
+                };
+                (!composite
+                    .active_camera
+                    .as_deref()
+                    .is_some_and(|active| camera.id.as_deref() != Some(active)))
+                .then_some(camera)
+            });
+            if let Some(camera) = active_camera {
+                let camera = scene_camera_to_world_camera(
+                    camera,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    time_norm,
+                    time_sec,
+                )?;
+                if let Some(world) = world_graph.worlds.first_mut() {
+                    world.camera = camera;
+                }
+            }
+            debug_assert_eq!(
+                retained_world_key,
+                Some(cache_key),
+                "retained Scene 3D cache key changed within one frame"
+            );
+            return Ok((
+                world_graph,
+                crate::scene::resource::default_world_asset_root(),
+                Vec::new(),
+            ));
+        }
         // Expand universal volume instances before the established 3D bridge
         // resolves anchors, surfaces, lighting, and ordinary Model actors.
         let mut expanded_composite = composite.clone();
-        expanded_composite.nodes_3d = expand_scene_volume_repeats(composite, time_norm, time_sec)?;
+        let repeated_nodes = expand_scene_volume_repeats(composite, time_norm, time_sec)?;
+        expanded_composite.nodes_3d =
+            self.expand_scene_surface_scatters(&repeated_nodes, time_norm, time_sec)?;
         let composite = &expanded_composite;
         let island_size = canvas_size;
         let mut camera = WorldCamera::default();
@@ -11339,6 +11786,7 @@ impl SceneFrameRenderer {
                                 }
                                 crate::dsl::PrimitiveGeometry::Loft { .. }
                                 | crate::dsl::PrimitiveGeometry::Ribbon { .. }
+                                | crate::dsl::PrimitiveGeometry::Sweep { .. }
                                 | crate::dsl::PrimitiveGeometry::HairCards { .. }
                                 | crate::dsl::PrimitiveGeometry::HeadSurface { .. }
                                 | crate::dsl::PrimitiveGeometry::Mesh { .. } => {
@@ -11688,7 +12136,8 @@ impl SceneFrameRenderer {
                 | Scene3DNode::AmbientOcclusion(_)
                 | Scene3DNode::ContactShadow(_)
                 | Scene3DNode::ColorManagement(_)
-                | Scene3DNode::VolumeRepeat(_) => {}
+                | Scene3DNode::VolumeRepeat(_)
+                | Scene3DNode::Scatter(_) => {}
                 Scene3DNode::Model(node) => {
                     let actor_id = node
                         .id
@@ -12021,6 +12470,7 @@ impl SceneFrameRenderer {
                                     }),
                                     play: None,
                                     plays: Vec::new(),
+                                    material_color_overrides: Vec::new(),
                                 });
                                 continue;
                             }
@@ -12098,6 +12548,7 @@ impl SceneFrameRenderer {
                                 }),
                                 play: None,
                                 plays: Vec::new(),
+                                material_color_overrides: Vec::new(),
                             });
                         }
                         continue;
@@ -12374,6 +12825,43 @@ impl SceneFrameRenderer {
                                 mask: play.mask.clone(),
                             })
                             .collect(),
+                        // `definition` replaces the material; `tint` adjusts its
+                        // base color without touching the imported PBR values.
+                        material_color_overrides: node
+                            .material_bindings
+                            .iter()
+                            .filter_map(|binding| {
+                                let asset = binding
+                                    .definition
+                                    .as_deref()
+                                    .and_then(|id| self.prepared_material_assets.get(id));
+                                let has_scalar = binding.metallic.is_some()
+                                    || binding.roughness.is_some()
+                                    || binding.specular.is_some()
+                                    || binding.normal_scale.is_some();
+                                if asset.is_none() && binding.tint.is_none() && !has_scalar {
+                                    return None;
+                                }
+                                Some(crate::world::WorldMaterialColorOverride {
+                                    material: binding.material.clone(),
+                                    base_color: asset.map(|asset| asset.base_color),
+                                    metallic: binding
+                                        .metallic
+                                        .or_else(|| asset.map(|asset| asset.metallic)),
+                                    roughness: binding
+                                        .roughness
+                                        .or_else(|| asset.map(|asset| asset.roughness)),
+                                    specular: binding
+                                        .specular
+                                        .or_else(|| asset.map(|asset| asset.specular)),
+                                    normal_scale: binding
+                                        .normal_scale
+                                        .or_else(|| asset.map(|asset| asset.normal_scale)),
+                                    tint: binding.tint,
+                                    tint_amount: binding.tint_amount,
+                                })
+                            })
+                            .collect(),
                     });
                 }
                 Scene3DNode::Anchor(_) | Scene3DNode::RigidBody(_) => {}
@@ -12416,6 +12904,22 @@ impl SceneFrameRenderer {
             }
         }
 
+        // Scatter actors are opaque, depth-tested, and cannot be referenced by
+        // authored constraints. Keep authored actors in source order while
+        // grouping generated children by primitive so the retained renderer
+        // can submit each forest/rock primitive as one instanced GPU batch.
+        // A stable sort preserves deterministic order within every primitive.
+        actors.sort_by(|left, right| {
+            let left_scatter = left.id.starts_with("__");
+            let right_scatter = right.id.starts_with("__");
+            match (left_scatter, right_scatter) {
+                (false, false) => std::cmp::Ordering::Equal,
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                (true, true) => left.model.cmp(&right.model),
+            }
+        });
+
         let world_id = "__scene_3d_island".to_string();
         let mut world_graph = WorldGraph {
             id: Some(world_id.clone()),
@@ -12437,6 +12941,8 @@ impl SceneFrameRenderer {
                 }),
                 camera,
                 actors,
+                retained_actors: None,
+                retained_actor_revision: None,
                 directional_characters: Vec::new(),
             }],
             retargets: Vec::new(),
@@ -13588,6 +14094,15 @@ impl SceneFrameRenderer {
             if let Some(world) = world_graph.worlds.first_mut() {
                 world.camera = camera;
             }
+        }
+        if let Some(cache_key) = retained_world_key
+            && material_overrides.is_empty()
+            && let Some(world) = world_graph.worlds.first_mut()
+        {
+            world.retained_actors = Some(Arc::new(std::mem::take(&mut world.actors)));
+            world.retained_actor_revision = Some(cache_key);
+            self.retained_scene_3d_world_cache
+                .insert(cache_key, Arc::new(world_graph.clone()));
         }
         Ok((world_graph, world_asset_root, material_overrides))
     }
@@ -16761,7 +17276,8 @@ impl SceneFrameRenderer {
         }
 
         let scale = eval_scene_number(&image_node.scale, time_norm, time_sec)?.clamp(0.001, 64.0);
-        let source = self.load_image_asset(&image_node.src)?;
+        let src = self.resolve_image_asset_src(&image_node.asset)?;
+        let source = self.load_image_asset(&src)?;
         let target_w = ((source.width() as f32) * scale).round().max(1.0) as u32;
         let target_h = ((source.height() as f32) * scale).round().max(1.0) as u32;
 
@@ -17614,19 +18130,14 @@ impl SceneFrameRenderer {
             character, time_norm, time_sec,
         )?);
         if let Some(src) = character.src.as_deref() {
-            // Character-level image sources reuse the same raster loader as <Image>.
-            let image = ImageNode {
-                id: character.id.clone(),
-                material: None,
-                src: src.to_string(),
-                x: "0".to_string(),
-                y: "0".to_string(),
-                scale: "1.0".to_string(),
-                opacity: "1.0".to_string(),
-            };
-            self.draw_image_transformed(
+            // Character-level image sources bypass ImageAsset ids and reuse the same raster pipeline.
+            self.draw_image_source_transformed(
                 canvas,
-                &image,
+                src,
+                "0",
+                "0",
+                "1.0",
+                "1.0",
                 character_transform,
                 opacity,
                 time_norm,
@@ -18783,25 +19294,56 @@ impl SceneFrameRenderer {
         time_norm: f32,
         time_sec: f32,
     ) -> Result<(), MotionLoomSceneRenderError> {
-        let opacity = (eval_scene_number(&image.opacity, time_norm, time_sec)? * inherited_opacity)
+        let src = self.resolve_image_asset_src(&image.asset)?;
+        self.draw_image_source_transformed(
+            canvas,
+            &src,
+            &image.x,
+            &image.y,
+            &image.scale,
+            &image.opacity,
+            transform,
+            inherited_opacity,
+            time_norm,
+            time_sec,
+        )
+    }
+
+    /// Shared raster draw for scene images and Character-level sources, which
+    /// bypass ImageAsset ids and use the same loader with an inline source.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_image_source_transformed(
+        &mut self,
+        canvas: &mut RgbaImage,
+        src: &str,
+        x_expr: &str,
+        y_expr: &str,
+        scale_expr: &str,
+        opacity_expr: &str,
+        transform: Affine2,
+        inherited_opacity: f32,
+        time_norm: f32,
+        time_sec: f32,
+    ) -> Result<(), MotionLoomSceneRenderError> {
+        let opacity = (eval_scene_number(opacity_expr, time_norm, time_sec)? * inherited_opacity)
             .clamp(0.0, 1.0);
         if opacity <= 0.0001 {
             return Ok(());
         }
 
-        let scale = eval_scene_number(&image.scale, time_norm, time_sec)?.clamp(0.001, 64.0);
-        let source = self.load_image_asset(&image.src)?;
+        let scale = eval_scene_number(scale_expr, time_norm, time_sec)?.clamp(0.001, 64.0);
+        let source = self.load_image_asset(src)?;
         let target_w = ((source.width() as f32) * scale).round().max(1.0) as u32;
         let target_h = ((source.height() as f32) * scale).round().max(1.0) as u32;
         let x_base = resolve_axis(
-            &image.x,
+            x_expr,
             canvas.width() as f32,
             target_w as f32,
             time_norm,
             time_sec,
         )?;
         let y_base = resolve_axis(
-            &image.y,
+            y_expr,
             canvas.height() as f32,
             target_h as f32,
             time_norm,
@@ -18901,13 +19443,14 @@ impl SceneFrameRenderer {
             return Ok(None);
         }
         let scale = eval_scene_number(&image.scale, time_norm, time_sec)?.clamp(0.001, 64.0);
+        let src = self.resolve_image_asset_src(&image.asset)?;
         let (width, height, texture) = self
             .gpu_compositor
             .as_mut()
             .ok_or_else(|| MotionLoomSceneRenderError::GpuRender {
                 message: "GPU compositor was not initialized".to_string(),
             })?
-            .load_image_texture(&image.src)?;
+            .load_image_texture(&src)?;
 
         raster_texture_layer(
             texture,
@@ -19582,6 +20125,19 @@ impl SceneFrameRenderer {
         });
 
         Ok(layers)
+    }
+
+    /// Resolves an `<Image asset="...">` reference into its declared ImageAsset source.
+    fn resolve_image_asset_src(
+        &self,
+        asset_id: &str,
+    ) -> Result<String, MotionLoomSceneRenderError> {
+        self.image_asset_sources
+            .get(asset_id)
+            .cloned()
+            .ok_or_else(|| MotionLoomSceneRenderError::UnknownImageAsset {
+                id: asset_id.to_string(),
+            })
     }
 
     fn load_image_asset(&mut self, src: &str) -> Result<&RgbaImage, MotionLoomSceneRenderError> {
@@ -22606,6 +23162,178 @@ mod tests {
     }
 
     #[test]
+    fn surface_scatter_parses_as_compact_weighted_asset_placement() {
+        let graph = parse_graph_script(
+            r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" colorSpace="linear-srgb" />
+    <ImageAsset id="exclude" src="exclude.png" colorSpace="linear-srgb" />
+    <MaterialAsset id="ground" baseColor="#808080" />
+    <TerrainAsset id="terrain_asset" heightMap="height" size={[8,4]}
+                  heightScale="2" heightOffset="-1" material="ground" />
+    <PrimitiveAsset id="tree_a" shape="cone" radius="0.2" height="1" />
+    <PrimitiveAsset id="tree_b" shape="cylinder" radius="0.1" height="1" />
+  </Assets>
+  <Scene id="scatter_scene">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <CompositeGroup space="3d">
+            <Model id="terrain" asset="terrain_asset" />
+            <Scatter id="forest" surface="terrain" count="120" seed="97"
+                     exclusionMap="exclude" slopeRange={[0,42]}
+                     scaleRange={[0.7,1.3]} rotationYRange={[0,360]}>
+              <Variant asset="tree_a" weight="3" />
+              <Variant asset="tree_b" weight="1" />
+            </Scatter>
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scatter_scene" />
+</Graph>
+"##,
+        )
+        .expect("surface Scatter should parse");
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("expected composite group");
+        };
+        let scatter = group
+            .composite
+            .as_ref()
+            .expect("3D composite config")
+            .nodes_3d
+            .iter()
+            .find_map(|node| match node {
+                Scene3DNode::Scatter(scatter) => Some(scatter),
+                _ => None,
+            })
+            .expect("typed Scatter node");
+        assert_eq!(scatter.surface, "terrain");
+        assert_eq!(scatter.count, 120);
+        assert_eq!(scatter.exclusion_map.as_deref(), Some("exclude"));
+        assert_eq!(scatter.variants.len(), 2);
+        assert_eq!(scatter.variants[0].asset, "tree_a");
+        assert_eq!(scatter.variants[0].weight, 3.0);
+    }
+
+    #[test]
+    fn surface_scatter_expansion_is_deterministic_and_samples_terrain_height() {
+        let source = r##"
+<Graph fps={30} duration="1s" size={[64,64]}>
+  <Assets>
+    <ImageAsset id="height" src="height.png" colorSpace="linear-srgb" />
+    <ImageAsset id="exclude" src="exclude.png" colorSpace="linear-srgb" />
+    <MaterialAsset id="ground" baseColor="#808080" />
+    <TerrainAsset id="terrain_asset" heightMap="height" size={[8,4]}
+                  heightScale="2" heightOffset="-1" material="ground" />
+    <PrimitiveAsset id="tree_a" shape="cone" radius="0.2" height="1" />
+    <PrimitiveAsset id="tree_b" shape="cylinder" radius="0.1" height="1" />
+  </Assets>
+  <Scene id="scatter_scene">
+    <Timeline>
+      <Track space="3d">
+        <Sequence duration="1s">
+          <CompositeGroup space="3d">
+            <Model id="terrain" asset="terrain_asset" />
+            <Scatter id="forest" surface="terrain" count="24" seed="97"
+                     exclusionMap="exclude" slopeRange={[0,42]}
+                     scaleRange={[0.7,1.3]} rotationYRange={[0,360]}
+                     surfaceOffset="-0.25">
+              <Variant asset="tree_a" weight="3" />
+              <Variant asset="tree_b" weight="1" />
+            </Scatter>
+          </CompositeGroup>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="scatter_scene" />
+</Graph>
+"##;
+        let graph = parse_graph_script(source).expect("surface Scatter should parse");
+        let resolver = Arc::new(MemoryAssetResolver::new());
+        let encode_png = |image: RgbaImage| {
+            let mut bytes = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .expect("encode test PNG");
+            bytes.into_inner()
+        };
+        resolver.insert(
+            "height.png".to_string(),
+            encode_png(RgbaImage::from_pixel(8, 4, Rgba([128, 128, 128, 255]))),
+        );
+        let exclude = RgbaImage::from_fn(8, 4, |x, _| {
+            if x == 0 {
+                Rgba([255, 255, 255, 255])
+            } else {
+                Rgba([0, 0, 0, 255])
+            }
+        });
+        resolver.insert("exclude.png".to_string(), encode_png(exclude));
+        let mut renderer = pollster::block_on(SceneFrameRenderer::new_for_profile_with_resolver(
+            SceneRenderProfile::Cpu,
+            resolver,
+        ));
+        renderer.prepare_frame_caches(&graph);
+        let SceneNode::Timeline(timeline) = &graph.scenes[0].children[0] else {
+            panic!("expected timeline");
+        };
+        let SceneNode::Track(track) = &timeline.children[0] else {
+            panic!("expected track");
+        };
+        let SceneNode::Sequence(sequence) = &track.children[0] else {
+            panic!("expected sequence");
+        };
+        let SceneNode::Group(group) = &sequence.children[0] else {
+            panic!("expected composite group");
+        };
+        let nodes = &group.composite.as_ref().expect("3D composite").nodes_3d;
+        let first = renderer
+            .expand_scene_surface_scatters(nodes, 0.0, 0.0)
+            .expect("expand Scatter");
+        let replay = renderer
+            .expand_scene_surface_scatters(nodes, 0.0, 0.0)
+            .expect("replay Scatter");
+        assert_eq!(first, replay);
+        assert_eq!(renderer.expanded_scene_scatter_cache.len(), 1);
+        let models = first
+            .iter()
+            .filter_map(|node| match node {
+                Scene3DNode::Model(model) if model.id.as_deref() != Some("terrain") => Some(model),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(models.len(), 24);
+        assert!(
+            models
+                .windows(2)
+                .filter(|pair| pair[0].asset != pair[1].asset)
+                .count()
+                <= 1,
+            "generated opaque instances should be grouped for GPU instancing"
+        );
+        assert!(models.iter().all(|model| {
+            let position = super::eval_scene_vec3(&model.position, 0.0, 0.0, [0.0; 3])
+                .expect("generated position");
+            (-0.26..-0.23).contains(&position[1])
+                && matches!(model.asset.as_str(), "tree_a" | "tree_b")
+        }));
+    }
+
+    #[test]
     fn looping_scene_apply_action_still_expires_at_authored_duration() {
         let graph = parse_graph_script(
             r##"
@@ -24006,7 +24734,7 @@ mod tests {
           <CompositeGroup id="device" space="3d">
             <Camera3D position={[0,0,6]} target={[0,0,0]} />
             <Model id="phone" asset="phone_model">
-              <MaterialBinding material="screen" texture="@scene:phone_ui" />
+              <MaterialBinding modelSourceMaterial="screen" texture="@scene:phone_ui" />
             </Model>
           </CompositeGroup>
         </Sequence>
@@ -28563,7 +29291,10 @@ mod tests {
             r##"
 <Graph fps={{30}} duration="1s" size={{[64,48]}}>
   <Background color="#000000" />
-  <Image src="{}"
+  <Assets>
+    <ImageAsset id="test_image" src="{0}" />
+  </Assets>
+  <Image asset="test_image"
          x="10"
          y="12"
          scale="2.0"
@@ -28574,7 +29305,9 @@ mod tests {
             image_path.to_string_lossy()
         ))
         .expect("scene graph parse");
-        let mut renderer = pollster::block_on(SceneFrameRenderer::new());
+
+        let mut renderer =
+            pollster::block_on(SceneFrameRenderer::new_for_profile(SceneRenderProfile::Cpu));
         let rendered = pollster::block_on(renderer.render_frame(&graph, 0)).expect("frame 0");
         let inside = rendered.get_pixel(12, 14);
         let outside = rendered.get_pixel(2, 2);
@@ -28602,6 +29335,10 @@ mod tests {
 <Graph fps={{30}} duration="1s" size={{[64,48]}}>
   <Background color="#000000" />
 
+  <Assets>
+    <ImageAsset id="part_image" src="{0}" />
+  </Assets>
+
   <Scene id="scene0">
     <Timeline>
       <Track id="scene_content" space="world" z="0">
@@ -28609,7 +29346,7 @@ mod tests {
           <Layer>
             <Character id="test_character" x="20" y="10">
               <Part id="image_part" x="4" y="3">
-                <Image src="{}" x="0" y="0" scale="2.0" opacity="1.0" />
+                <Image asset="part_image" x="0" y="0" scale="2.0" opacity="1.0" />
               </Part>
             </Character>
           </Layer>
@@ -28704,6 +29441,10 @@ mod tests {
 <Graph fps={{30}} duration="1s" size={{[64,48]}}>
   <Background color="#000000" />
 
+  <Assets>
+    <ImageAsset id="part_image" src="{0}" />
+  </Assets>
+
   <Scene id="scene0">
     <Timeline>
       <Track id="scene_content" space="world" z="0">
@@ -28711,7 +29452,7 @@ mod tests {
           <Layer>
             <Character id="test_character" x="20" y="10">
               <Part id="image_part" x="4" y="3">
-                <Image src="{}" x="0" y="0" scale="2.0" opacity="1.0" />
+                <Image asset="part_image" x="0" y="0" scale="2.0" opacity="1.0" />
               </Part>
             </Character>
           </Layer>
@@ -28826,7 +29567,10 @@ mod tests {
             r##"
 <Graph fps={{30}} duration="1s" size={{[64,48]}}>
   <Background color="#000000" />
-  <Image src="{}"
+  <Assets>
+    <ImageAsset id="test_image" src="{0}" />
+  </Assets>
+  <Image asset="test_image"
          x="10"
          y="12"
          scale="2.0"
@@ -28917,7 +29661,10 @@ mod tests {
             r##"
 <Graph fps={{30}} duration="1s" size={{[64,48]}}>
   <Background color="#000000" />
-  <Image src="{}"
+  <Assets>
+    <ImageAsset id="test_image" src="{0}" />
+  </Assets>
+  <Image asset="test_image"
          x="10"
          y="12"
          scale="2.0"
@@ -28970,8 +29717,12 @@ mod tests {
             r##"
 <Graph fps={{30}} duration="1s" size={{[64,48]}}>
   <Background color="#000000" />
-  <Image src="{}" x="4" y="10" scale="1.0" opacity="1.0" />
-  <Image src="{}" x="24" y="10" scale="1.0" opacity="1.0" />
+  <Assets>
+    <ImageAsset id="image_one" src="{0}" />
+    <ImageAsset id="image_two" src="{1}" />
+  </Assets>
+  <Image asset="image_one" x="4" y="10" scale="1.0" opacity="1.0" />
+  <Image asset="image_two" x="24" y="10" scale="1.0" opacity="1.0" />
   <Present from="scene" />
 </Graph>
 "##,

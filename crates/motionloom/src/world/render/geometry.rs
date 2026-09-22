@@ -13,15 +13,18 @@ impl WorldFrameRenderer {
         root: &Path,
         overrides: &[WorldMaterialTextureOverride],
         selected_model_ids: Option<&[String]>,
+        allow_terrain_vegetation: bool,
     ) -> Result<Vec<ResolvedMesh>, GeometryError> {
         let world = graph
             .presented_world()
             .ok_or_else(|| GeometryError::Invalid("missing world".into()))?;
-        // Camera-dependent LOD/deformation needs explicit asset tooling support.
-        if world
-            .actors
-            .iter()
-            .any(|a| a.terrain.is_some() || a.vegetation.is_some())
+        // Offline callers opt in so the snapshot API keeps rejecting
+        // camera-dependent terrain/vegetation until it has explicit tooling.
+        if !allow_terrain_vegetation
+            && world
+                .actor_slice()
+                .iter()
+                .any(|a| a.terrain.is_some() || a.vegetation.is_some())
         {
             return Err(GeometryError::Unsupported(
                 "terrain/vegetation snapshot".into(),
@@ -92,12 +95,43 @@ impl WorldFrameRenderer {
                 height: t.height,
                 rgba: Arc::clone(&t.rgba),
             })
-            .collect();
+            .collect::<Vec<_>>();
             let actor = world
-                .actors
+                .actor_slice()
                 .iter()
                 .find(|a| a.id == d.instance_key.actor_id)
                 .unwrap();
+            // `definition` replaces the PBR scalars; `tint` leaves them alone.
+            // Base color already flows through the draw texture and color factor.
+            let material_override = actor
+                .material_color_overrides
+                .iter()
+                .find(|value| {
+                    material
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&value.material))
+                })
+                .or_else(|| {
+                    actor
+                        .material_color_overrides
+                        .iter()
+                        .find(|value| value.material == "*")
+                });
+            if let Some(value) = material_override {
+                if let Some(metallic) = value.metallic {
+                    material.metallic_factor = metallic;
+                }
+                if let Some(roughness) = value.roughness {
+                    material.roughness_factor = roughness;
+                }
+                if let Some(specular) = value.specular {
+                    material.specular_factor = specular;
+                }
+                if let Some(normal_scale) = value.normal_scale {
+                    material.normal_scale = normal_scale;
+                }
+            }
             let fallback = actor.primitive.as_ref().is_some_and(|primitive| {
                 crate::world::primitive::generated_control_cage(primitive).is_some_and(|cage| {
                     cage.positions
@@ -208,7 +242,7 @@ impl WorldFrameRenderer {
             .presented_world()
             .ok_or_else(|| GeometryError::Invalid("missing world".into()))?;
         let actor = world
-            .actors
+            .actor_slice()
             .iter()
             .find(|a| a.id == model_id)
             .ok_or_else(|| GeometryError::Invalid("missing model".into()))?;

@@ -981,10 +981,43 @@ pub enum Scene3DNode {
     ContactShadow(SceneContactShadowNode),
     ColorManagement(SceneColorManagementNode),
     VolumeRepeat(SceneVolumeRepeat3DNode),
+    Scatter(SceneScatter3DNode),
     Model(SceneModel3DNode),
     RigidBody(crate::simulation::model::RigidBodyNode),
     Anchor(SceneAnchor3DNode),
     Debug(SceneEnvironmentDebugNode),
+}
+
+/// Deterministic surface placement keeps large authored environments compact
+/// while every generated item continues through the ordinary Model pipeline.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneScatter3DNode {
+    pub id: Option<String>,
+    pub surface: String,
+    pub count: u32,
+    pub seed: u32,
+    #[serde(default)]
+    pub density_map: Option<String>,
+    #[serde(default)]
+    pub exclusion_map: Option<String>,
+    pub slope_range: String,
+    pub scale_range: String,
+    pub rotation_y_range: String,
+    pub surface_offset: String,
+    #[serde(default = "default_scene_bool_true")]
+    pub cast_shadow: bool,
+    #[serde(default = "default_scene_bool_true")]
+    pub receive_shadow: bool,
+    pub variants: Vec<SceneScatterVariantNode>,
+}
+
+/// Weighted asset choice for one Scatter declaration.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneScatterVariantNode {
+    pub asset: String,
+    pub weight: f32,
 }
 
 /// Deterministic world-space instances authored with the existing Repeat tag.
@@ -1157,30 +1190,18 @@ fn default_scene_dof_max_blur() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct SceneAtmosphereFogNode {
     pub id: Option<String>,
-    #[serde(default = "default_scene_fog_mode")]
-    pub mode: String,
-    #[serde(default = "default_scene_fog_color")]
-    pub color: String,
     #[serde(default = "default_scene_zero")]
     pub density: String,
+    #[serde(default = "default_scene_fog_color")]
+    pub scattering_color: String,
     #[serde(default = "default_scene_zero")]
-    pub start: String,
-    #[serde(default = "default_scene_fog_end")]
-    pub end: String,
+    pub anisotropy: String,
     #[serde(default = "default_scene_zero")]
     pub base_height: String,
     #[serde(default = "default_scene_fog_height_falloff")]
     pub height_falloff: String,
-    #[serde(default = "default_scene_zero")]
-    pub scattering: String,
-    /// Per-channel extinction used by the froxel volume. This remains separate
-    /// from the legacy scalar scattering control so old scenes render exactly.
     #[serde(default)]
-    pub absorption: Option<String>,
-    #[serde(default)]
-    pub scattering_color: Option<String>,
-    #[serde(default)]
-    pub affect_sky: bool,
+    pub affect_environment: bool,
     /// Optional world-space volume bounds. Omitting both preserves global fog.
     #[serde(default)]
     pub bounds_min: Option<String>,
@@ -1199,10 +1220,11 @@ pub struct SceneAtmosphereFogNode {
 pub struct SceneVolumetricScatteringNode {
     pub id: Option<String>,
     pub light_ref: String,
-    pub intensity: String,
-    pub anisotropy: String,
+    pub shaft_strength: String,
     pub max_distance: String,
     pub shadowed: bool,
+    pub quality: String,
+    pub max_bounces: String,
     pub debug_view: String,
 }
 
@@ -1213,22 +1235,14 @@ pub struct SceneWaterCausticsNode {
     pub intensity: String,
     pub scale: String,
     pub speed: String,
-    pub depth_falloff: String,
+    pub attenuation: String,
     pub color: String,
     pub volume_term: bool,
     pub surface_term: bool,
 }
 
-fn default_scene_fog_mode() -> String {
-    "linear".to_string()
-}
-
 fn default_scene_fog_color() -> String {
     "#FFFFFF".to_string()
-}
-
-fn default_scene_fog_end() -> String {
-    "100".to_string()
 }
 
 fn default_scene_fog_height_falloff() -> String {
@@ -1564,6 +1578,25 @@ pub struct SceneMaterialBindingNode {
     pub definition: Option<String>,
     #[serde(default)]
     pub texture: Option<String>,
+    /// Non-destructive base color tint in display-referred 0..1.
+    #[serde(default)]
+    pub tint: Option<[f32; 4]>,
+    /// Blend weight for `tint`; 1 replaces the imported color on textureless materials.
+    #[serde(default = "default_scene_material_tint_amount")]
+    pub tint_amount: f32,
+    /// Optional scalar overrides applied without replacing the base color texture.
+    #[serde(default)]
+    pub metallic: Option<f32>,
+    #[serde(default)]
+    pub roughness: Option<f32>,
+    #[serde(default)]
+    pub specular: Option<f32>,
+    #[serde(default)]
+    pub normal_scale: Option<f32>,
+}
+
+fn default_scene_material_tint_amount() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

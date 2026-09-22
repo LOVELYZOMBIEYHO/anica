@@ -334,6 +334,72 @@ pub(crate) fn apply_scene_style_reference(
     Ok(())
 }
 
+/// Keep an authored style's lighting and tone intent but drop the surface,
+/// outline and post fields Weaver cannot represent, then apply the result.
+#[cfg(feature = "weaver")]
+pub(crate) fn sanitize_scene_style(
+    graph: &mut GraphScript,
+    scene_id: &str,
+) -> Result<Option<String>, GraphParseError> {
+    let index = graph
+        .scenes
+        .iter()
+        .position(|scene| scene.id == scene_id)
+        .ok_or_else(|| error(format!("Unknown Scene {scene_id}")))?;
+    // Prefer the Scene's authored style, otherwise the first declared style so a
+    // look is still honored when the Scene omitted a reference.
+    let source = graph.scenes[index]
+        .render_style
+        .clone()
+        .filter(|id| graph.render_styles.iter().any(|s| &s.id == id))
+        .or_else(|| graph.render_styles.first().map(|s| s.id.clone()));
+    let Some(source_id) = source else {
+        return Ok(None);
+    };
+    let Some(mut style) = graph
+        .render_styles
+        .iter()
+        .find(|s| s.id == source_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let new_id = format!("__weaver_auto_{source_id}");
+    style.id = new_id.clone();
+    if let Some(surface) = style.surface.as_mut() {
+        surface.specular = None;
+        surface.roughness_bias = None;
+        surface.saturation = None;
+        if !matches!(
+            surface.shading.as_deref().unwrap_or("physical"),
+            "physical" | "filmic_physical_v1"
+        ) {
+            surface.shading = Some("physical".into());
+        }
+    }
+    if let Some(outline) = style.outline.as_mut() {
+        outline.enabled = Some(false);
+        outline.width = Some(0.0);
+    }
+    if let Some(post) = style.post.as_mut() {
+        post.bloom_intensity = None;
+        post.white_balance = None;
+        if post.tone_mapping.as_deref().is_some_and(|tm| {
+            !matches!(
+                tm,
+                "none" | "linear" | "aces" | "filmic_aces_v1" | "reinhard"
+            )
+        }) {
+            post.tone_mapping = None;
+        }
+    }
+    if !graph.render_styles.iter().any(|s| s.id == new_id) {
+        graph.render_styles.push(style);
+    }
+    apply_scene_style_reference(graph, scene_id, &new_id)?;
+    Ok(Some(new_id))
+}
+
 fn remove_compiled_bloom(nodes: &mut [SceneNode]) {
     for node in nodes {
         if let SceneNode::Group(group) = node {

@@ -1,27 +1,28 @@
-# Froxel volumetrics
+# Atmosphere medium
 
-MotionLoom's immediate WebGPU renderer supports an opt-in camera-aligned
-froxel volume. It injects single-scattered light into a 3D grid, integrates
+`AtmosphereFog` lowers to renderer-independent `AtmosphereMediumPlan`.
+MotionLoom's immediate WebGPU renderer injects single-scattered light into a
+camera-aligned 3D grid, integrates
 radiance and extinction along each view column, then composites the result
 before temporal resolve, depth of field, and display tone mapping.
 
 ```xml
-<AtmosphereFog id="sea" mode="exp" density="0.04"
-               absorption={[0.08,0.03,0.01]}
+<AtmosphereFog id="sea" density="0.04" anisotropy="0.72"
                scatteringColor={[0.02,0.08,0.12]}
                boundsMin={[-20,-10,-35]} boundsMax={[20,12,4]}>
-  <VolumetricScattering id="shafts" lightRef="sun" intensity="1.4"
-                        anisotropy="0.72" maxDistance="30" shadowed="true" />
+  <VolumetricScattering id="shafts" lightRef="sun" shaftStrength="1.4"
+                        maxDistance="30" shadowed="true"
+                        quality="high" maxBounces="4" />
   <WaterCaustics id="caustics" intensity="0.45" scale="0.09" speed="0.28"
-                 depthFalloff="0.6" color="#BFE9FF"
+                 attenuation="0.6" color="#BFE9FF"
                  volumeTerm="true" surfaceTerm="true" />
 </AtmosphereFog>
 ```
 
 `lightRef` must resolve to a shadow-casting `DirectionalLight` or `SpotLight`
 in the same 3D `CompositeGroup` when `shadowed="true"`. One volume light is
-supported per 3D group. Missing children preserve the prior analytical fog
-path and allocate no froxel textures.
+supported per 3D group. Without children, the live preview uses the lower-cost
+analytical evaluation and allocates no froxel textures.
 
 The host preview profile controls the grid:
 
@@ -50,9 +51,9 @@ renderer parses and validates the feature but does not simulate it. Browser
 rendering requires 3D storage textures; unsupported adapters report the device
 validation failure instead of silently rendering a different effect.
 
-Animated child ids support `intensity`, `anisotropy`, `maxDistance`, `scale`,
-`speed`, and `depthFalloff`. Per-channel absorption and scattering remain
-static for the first implementation.
+Animated ids support `density`, `anisotropy`, `baseHeight`, `heightFalloff`,
+`edgeFeather`, `shaftStrength`, `maxDistance`, `maxBounces`, `intensity`,
+`scale`, `speed`, and `attenuation`.
 
 Set `debugView` on `VolumetricScattering` to `density`, `shadow`, `inscatter`,
 `opticalDepth`, `transmittance`, or `caustics` while diagnosing a scene. Keep

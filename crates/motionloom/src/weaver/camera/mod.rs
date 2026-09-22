@@ -25,7 +25,7 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 /// Match the existing vertical FOV and orbit camera, then derive a physical lens.
 pub(crate) fn configure(
-    p: &mut [[f32; 4]; 20],
+    p: &mut crate::weaver::backend::wgpu::CameraParams,
     c: &WorldCamera,
     job: &RenderJob,
 ) -> Result<(), WeaverError> {

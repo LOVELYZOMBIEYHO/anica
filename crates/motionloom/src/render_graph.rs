@@ -339,6 +339,14 @@ impl<'a> DagBuilder<'a> {
         let mut inputs = Vec::new();
         self.collect_scene_node_outputs(&id, &group.children, &mut inputs, order)?;
         if let Some(composite) = &group.composite {
+            let model_ids = composite
+                .nodes_3d
+                .iter()
+                .filter_map(|node| match node {
+                    Scene3DNode::Model(model) => model.id.as_deref(),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
             for node in &composite.nodes_3d {
                 match node {
                     Scene3DNode::Model(model) => {
@@ -368,6 +376,35 @@ impl<'a> DagBuilder<'a> {
                             GraphAssetKind::Model,
                             "Repeat Model",
                         )?;
+                    }
+                    Scene3DNode::Scatter(scatter) => {
+                        if !model_ids.contains(scatter.surface.as_str()) {
+                            return Err(dag_error(format!(
+                                "Scatter surface=\"{}\" references unknown Model in the same CompositeGroup.",
+                                scatter.surface
+                            )));
+                        }
+                        for variant in &scatter.variants {
+                            self.validate_asset_reference(
+                                &variant.asset,
+                                GraphAssetKind::Model,
+                                "Scatter Variant",
+                            )?;
+                        }
+                        if let Some(asset) = scatter.density_map.as_deref() {
+                            self.validate_asset_reference(
+                                asset,
+                                GraphAssetKind::Image,
+                                "Scatter densityMap",
+                            )?;
+                        }
+                        if let Some(asset) = scatter.exclusion_map.as_deref() {
+                            self.validate_asset_reference(
+                                asset,
+                                GraphAssetKind::Image,
+                                "Scatter exclusionMap",
+                            )?;
+                        }
                     }
                     Scene3DNode::EnvironmentLight(light) => self.validate_asset_reference(
                         &light.asset,
@@ -682,7 +719,7 @@ mod tests {
             <Camera3D id="camera" position={{[0,0,6]}} target={{[0,0,0]}} fov="35" />
             <EnvironmentLight asset="studio_hdri" intensity="1.2" />
             <Model id="phone" asset="phone_model">
-              <MaterialBinding material="screen" texture="{screen_texture}" />
+              <MaterialBinding modelSourceMaterial="screen" texture="{screen_texture}" />
             </Model>
             <Effects>
               <Effect process="fx_grade" id="phone_grade">

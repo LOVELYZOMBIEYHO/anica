@@ -55,7 +55,7 @@ impl AssetSource {
     }
 }
 
-/// Resolves an asset identifier such as `<Image src="...">` into an
+/// Resolves an asset source such as the `src` of an `<ImageAsset>` into an
 /// `AssetSource`. Implementations are provided for filesystem paths (native)
 /// and in-memory maps (WASM).
 ///

@@ -3,10 +3,11 @@
 ## Host quality contract
 
 `ImmediatePreviewSettings` separates editor performance from authored
-`RenderStyle` and offline output. Hosts can select `Portable`, `Balanced`, or
-`Cinematic`; each profile maps to concrete shadow-map, texture-filtering,
-light-count, DoF-sampling, HDR, and antialiasing budgets. The parsed graph is
-never rewritten.
+`RenderStyle` and offline output. Hosts can select `Portable`, `Balanced`,
+`Cinematic`, or `Ultra`; each profile maps to concrete shadow-map,
+texture-filtering, light-count, DoF-sampling, HDR, screen-space lighting, and
+antialiasing budgets. The parsed graph and requested output dimensions are
+never rewritten by selecting a profile.
 
 ```rust
 use motionloom::{
@@ -22,7 +23,9 @@ preview.set_settings(ImmediatePreviewSettings {
 });
 ```
 
-`WgpuPreviewEngine::capabilities()` reports the actual immediate features.
+`WgpuPreviewEngine::capabilities()` reports the actual immediate features,
+including whether the host uses the browser WebGPU tier, its bounded SSR/SSGI
+sample limits, and the deliberate absence of local reflection probes.
 `last_frame_metrics()` combines GPU timing,
 Scene CPU timing, triangle/light counts, retained-cache counts, shadow-map
 resolution, and estimated render-target memory.
@@ -56,8 +59,9 @@ profile reports requested/effective methods and whether a fallback occurred.
   GLB materials and blended terrain carry independent AO; missing AO is neutral.
 - The 3D intermediate target and transmission snapshot use RGBA16Float. Tone
   mapping and output gamma run once after transparency and camera depth of field.
-  Exposure, white balance and contrast remain before blending. The public Scene
-  compositor still receives RGBA8; Scene Process bloom is not HDR bloom.
+  Exposure, white balance and contrast remain before blending. SceneCompositor
+  receives and blends linear-premultiplied RGBA16F; display readback is encoded
+  only after the HDR composition is complete.
 - The primary opaque geometry pass uses MRT to retain material normal, velocity,
   roughness, metallic, AO and a temporal reactive mask while it writes shaded
   HDR. Per-object motion comes from previous model transforms and previous bone
@@ -73,13 +77,30 @@ profile reports requested/effective methods and whether a fallback occurred.
   interpolated current and previous clip positions instead of a quantized
   fragment pixel centre; history confidence and motion blur use de-jittered
   physical velocity.
-- Material-aware SSR ray marches resolved depth using the G-buffer normal and
-  attenuates reflection by roughness and metallic response. It is reserved for
-  `Cinematic`; the default `Balanced` profile keeps TAA and velocity motion blur
-  but omits this relatively expensive ray march.
+- Material-aware SSR uses profile-bounded ray marching, binary
+  hit refinement, back-face rejection, and roughness-dependent filtering. The
+  environment map remains the stable off-screen reflection fallback. This is
+  not a local reflection-probe system.
+- Cinematic and Ultra add bounded diffuse screen-space GI. It samples visible
+  neighbouring radiance with normal, range, metallic, and AO rejection, then
+  keeps environment IBL as the non-screen fallback. It is a realtime indirect
+  bounce approximation, not path-traced or unrestricted multi-bounce GI.
+- Shadow filtering uses a rotated Poisson kernel and slope-aware bias instead
+  of an axis-aligned 3x3 kernel. The same algorithm is compiled for native and
+  browser WebGPU.
+- Native and WASM consume the same graph, atmosphere plan, material data, and
+  WGSL. Browser defaults to Portable and caps the expensive Cinematic/Ultra
+  screen-space loops at 20 SSR steps and 4 GI taps; native caps them at 40 and
+  8. This changes implementation quality and cost, not authored semantics or
+  requested output dimensions.
 
 These changes improve handling of authored surface detail and bright highlights;
 they do not generate rust, dirt, realistic skin, geometry or new illumination.
+Raster transmission remains screen-space refraction, while Weaver is the
+offline physical-lighting path; matching IOR and attenuation semantics does not
+make the two solvers pixel-identical. Atmosphere and lighting share resolved
+scene semantics, but sampling, temporal history, and occlusion can still produce
+different images. Weaver remains the final-quality reference.
 There is no mandatory offline rendering step. Mips are built on texture-cache
 misses. Typical square texture mip storage adds about one third; HDR and
 MRT G-buffer targets add frame-sized GPU memory, and the final resolve adds one

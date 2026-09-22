@@ -29,6 +29,7 @@ impl RenderJob {
             region: None,
             memory_budget_mib: 4096,
             render_style: String::new(),
+            output_mode: SceneOutputMode::ThreeDOnly,
             sampling: Sampling {
                 min_samples: min,
                 max_samples: max,
@@ -55,8 +56,8 @@ impl RenderJob {
             sun_angular_diameter_degrees: 0.53,
             output: PathBuf::from(".render-output/weaver"),
             denoiser_library: None,
-            volume: None,
-            allow_legacy_fog_omission: false,
+            texture_mips: false,
+            allow_transmission_stopgap: false,
         }
     }
 }

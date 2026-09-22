@@ -17,6 +17,7 @@ mod profiled_surface;
 mod ribbon_mesh;
 mod sphere_mesh;
 mod subdivision_surface_mesh;
+mod sweep_mesh;
 mod wedge_mesh;
 
 pub(crate) use facial_cage_mesh::validate_layout as validate_facial_layout;
@@ -239,6 +240,31 @@ pub fn generate_primitive_mesh_textured(
             *cap_end,
             points,
         ),
+        PrimitiveGeometry::Sweep {
+            curve,
+            profile_closed,
+            smooth_profile,
+            cap_start,
+            cap_end,
+            frame,
+            uv_mode,
+            uv_scale,
+            dash,
+            profile,
+            ..
+        } => sweep_mesh::generate(
+            &mut builder,
+            curve,
+            *profile_closed,
+            *smooth_profile,
+            *cap_start,
+            *cap_end,
+            frame,
+            uv_mode,
+            *uv_scale,
+            *dash,
+            profile,
+        ),
         PrimitiveGeometry::HairCards {
             length_segments,
             width_segments,
@@ -390,6 +416,27 @@ pub fn primitive_bounds(geometry: &PrimitiveGeometry) -> ([f32; 3], [f32; 3]) {
             }
             (min, max)
         }
+        PrimitiveGeometry::Sweep { curve, profile, .. } => {
+            let profile_radius = profile
+                .iter()
+                .map(|point| point.position[0].hypot(point.position[1]))
+                .fold(0.0_f32, f32::max);
+            let scale = curve
+                .points
+                .iter()
+                .map(|point| point.scale)
+                .fold(1.0_f32, f32::max);
+            let radius = profile_radius * scale;
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for point in &curve.points {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(point.position[axis] - radius);
+                    max[axis] = max[axis].max(point.position[axis] + radius);
+                }
+            }
+            (min, max)
+        }
         PrimitiveGeometry::HairCards {
             thickness, guides, ..
         } => {
@@ -496,6 +543,17 @@ pub fn primitive_material_cache_key(asset: &PrimitiveAssetNode) -> u64 {
         hash_f32s(&mut hash, &material.texture_scale);
         hash_f32s(&mut hash, &material.texture_offset);
         hash_f32s(&mut hash, &material.variation_amount);
+        hash_bytes(
+            &mut hash,
+            &[
+                material.metallic_channel.code(),
+                material.roughness_channel.code(),
+                material.occlusion_channel.code(),
+                material.metallic_invert as u8,
+                material.roughness_invert as u8,
+                material.occlusion_invert as u8,
+            ],
+        );
     }
     for channel in asset.color {
         hash_bytes(&mut hash, &channel.to_bits().to_le_bytes());
@@ -893,6 +951,45 @@ fn hash_geometry(geometry: &PrimitiveGeometry, hash: &mut u64) {
                         point.roll,
                     ],
                 );
+            }
+        }
+        PrimitiveGeometry::Sweep {
+            curve,
+            profile_closed,
+            smooth_profile,
+            cap_start,
+            cap_end,
+            frame,
+            uv_mode,
+            uv_scale,
+            dash,
+            profile,
+        } => {
+            hash_bytes(
+                hash,
+                &[
+                    15,
+                    *profile_closed as u8,
+                    *smooth_profile as u8,
+                    *cap_start as u8,
+                    *cap_end as u8,
+                ],
+            );
+            hash_bytes(hash, curve.id.as_bytes());
+            hash_bytes(hash, &[curve.interpolation as u8, curve.closed as u8]);
+            hash_bytes(hash, &curve.max_segment_length.to_bits().to_le_bytes());
+            for point in &curve.points {
+                hash_f32s(hash, &point.position);
+                hash_f32s(hash, &[point.tilt, point.scale]);
+            }
+            hash_bytes(hash, frame.as_bytes());
+            hash_bytes(hash, uv_mode.as_bytes());
+            hash_f32s(hash, uv_scale);
+            if let Some(dash) = dash {
+                hash_f32s(hash, dash);
+            }
+            for point in profile {
+                hash_f32s(hash, &point.position);
             }
         }
         PrimitiveGeometry::HairCards {
@@ -1343,6 +1440,24 @@ impl MeshBuilder {
                 normal_scale: material_definition.map_or(1.0, |material| material.normal_scale),
                 occlusion_texture,
                 occlusion_strength: material_definition.map_or(1.0, |m| m.occlusion_strength),
+                metallic_channel: material_definition
+                    .map_or(crate::dsl::MaterialTextureChannel::B, |material| {
+                        material.metallic_channel
+                    }),
+                roughness_channel: material_definition
+                    .map_or(crate::dsl::MaterialTextureChannel::G, |material| {
+                        material.roughness_channel
+                    }),
+                occlusion_channel: material_definition
+                    .map_or(crate::dsl::MaterialTextureChannel::R, |material| {
+                        material.occlusion_channel
+                    }),
+                metallic_invert: material_definition
+                    .is_some_and(|material| material.metallic_invert),
+                roughness_invert: material_definition
+                    .is_some_and(|material| material.roughness_invert),
+                occlusion_invert: material_definition
+                    .is_some_and(|material| material.occlusion_invert),
                 emissive_texture,
                 emissive_factor: material_definition.map_or([0.0; 3], |material| material.emissive),
                 emissive_strength: material_definition
@@ -1372,6 +1487,8 @@ impl MeshBuilder {
                 },
                 sort_priority: material_definition.map_or(0, |material| material.sort_priority),
                 double_sided: material_definition.is_some_and(|material| material.double_sided),
+                receive_caustics: material_definition
+                    .is_none_or(|material| material.receive_caustics),
                 ..GlbMaterialData::default()
             }],
             textures,
@@ -1637,6 +1754,12 @@ mod tests {
             normal_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            metallic_channel: crate::dsl::MaterialTextureChannel::B,
+            roughness_channel: crate::dsl::MaterialTextureChannel::G,
+            occlusion_channel: crate::dsl::MaterialTextureChannel::R,
+            metallic_invert: false,
+            roughness_invert: false,
+            occlusion_invert: false,
             base_color_texture_src: Some("stone.jpg".into()),
             metallic_roughness_texture_src: None,
             normal_texture_src: None,
@@ -2082,6 +2205,161 @@ mod tests {
                 .all(|index| (*index as usize) < mesh.positions.len())
         );
         assert!(mesh.bounds_min[1] < 0.0 && mesh.bounds_max[1] > 0.0);
+    }
+
+    fn test_sweep_asset(
+        points: Vec<[f32; 3]>,
+        profile: Vec<[f32; 2]>,
+        profile_closed: bool,
+        dash: Option<[f32; 2]>,
+    ) -> PrimitiveAssetNode {
+        PrimitiveAssetNode {
+            id: "test_sweep".into(),
+            geometry: PrimitiveGeometry::Sweep {
+                curve: crate::dsl::CurveAssetNode {
+                    id: "test_curve".into(),
+                    interpolation: crate::dsl::CurveInterpolation::Linear,
+                    closed: false,
+                    max_segment_length: 0.25,
+                    points: points
+                        .into_iter()
+                        .map(|position| crate::dsl::CurvePointNode {
+                            position,
+                            tilt: 0.0,
+                            scale: 1.0,
+                        })
+                        .collect(),
+                },
+                profile_closed,
+                smooth_profile: false,
+                cap_start: true,
+                cap_end: true,
+                frame: "paralleltransport".into(),
+                uv_mode: "distance".into(),
+                uv_scale: [1.0, 1.0],
+                dash,
+                profile: profile
+                    .into_iter()
+                    .map(|position| crate::dsl::SweepProfilePointNode { position })
+                    .collect(),
+            },
+            color: [1.0; 4],
+            material: None,
+            material_definition: None,
+            bevel_radius: 0.0,
+            bevel_segments: 0,
+            material_seed: None,
+            collision: Default::default(),
+            modifiers: Vec::new(),
+            mesh_build: Default::default(),
+            lod: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sweep_generates_finite_distance_mapped_geometry_deterministically() {
+        let asset = test_sweep_asset(
+            vec![[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
+            vec![[-1.0, 0.0], [1.0, 0.0]],
+            false,
+            None,
+        );
+        let first = generate_primitive_mesh(&asset);
+        let second = generate_primitive_mesh(&asset);
+        assert_eq!(first.positions, second.positions);
+        assert_eq!(first.indices, second.indices);
+        assert!(!first.indices.is_empty());
+        assert!(
+            first
+                .positions
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            first
+                .normals
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        let maximum_v = first
+            .texcoords
+            .iter()
+            .flatten()
+            .map(|uv| uv[1])
+            .fold(0.0_f32, f32::max);
+        assert!((maximum_v - 2.0).abs() < 1.0e-4);
+        assert!(
+            first
+                .normals
+                .iter()
+                .flatten()
+                .all(|normal| normal[1] > 0.99)
+        );
+    }
+
+    #[test]
+    fn sweep_supports_closed_profiles_curves_and_exact_dash_boundaries() {
+        let solid = test_sweep_asset(
+            vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 0.0, 2.0]],
+            vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+            true,
+            None,
+        );
+        let solid_mesh = generate_primitive_mesh(&solid);
+        assert!(!solid_mesh.indices.is_empty());
+        assert!(
+            solid_mesh
+                .normals
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+
+        let dashed = test_sweep_asset(
+            vec![[0.0, 0.0, 0.0], [0.0, 0.0, 5.0]],
+            vec![[-0.05, 0.0], [0.05, 0.0]],
+            false,
+            Some([1.0, 1.0]),
+        );
+        let dashed_mesh = generate_primitive_mesh(&dashed);
+        let z_values = dashed_mesh
+            .positions
+            .iter()
+            .map(|position| position[2])
+            .collect::<Vec<_>>();
+        assert!(z_values.iter().any(|value| (*value - 1.0).abs() < 1.0e-4));
+        assert!(z_values.iter().any(|value| (*value - 2.0).abs() < 1.0e-4));
+        assert!(!z_values.iter().any(|value| (*value - 1.5).abs() < 1.0e-4));
+    }
+
+    #[test]
+    fn sweep_world_up_keeps_a_smooth_open_profile_upright_on_slopes() {
+        let mut asset = test_sweep_asset(
+            vec![[0.0, 0.0, 0.0], [1.0, 1.0, 2.0], [2.0, 0.5, 4.0]],
+            vec![[-1.0, 0.0], [0.0, 0.08], [1.0, 0.0]],
+            false,
+            None,
+        );
+        let PrimitiveGeometry::Sweep {
+            frame,
+            smooth_profile,
+            ..
+        } = &mut asset.geometry
+        else {
+            unreachable!("test helper always creates a sweep");
+        };
+        *frame = "worldup".into();
+        *smooth_profile = true;
+
+        let mesh = generate_primitive_mesh(&asset);
+        assert!(!mesh.indices.is_empty());
+        assert!(mesh.normals.iter().flatten().all(|normal| {
+            normal[0].abs() < 1.0e-5 && (normal[1] - 1.0).abs() < 1.0e-5 && normal[2].abs() < 1.0e-5
+        }));
     }
 
     #[test]

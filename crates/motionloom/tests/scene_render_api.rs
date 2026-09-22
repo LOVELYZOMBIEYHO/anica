@@ -3,7 +3,7 @@
 use motionloom::{SceneRenderProfile, parse_graph_script, render_scene_graph_frame};
 
 #[test]
-fn atmosphere_fog_and_camera_dof_are_optional_compatible_scene_features() {
+fn atmosphere_medium_and_camera_dof_are_optional_scene_features() {
     let graph = parse_graph_script(
         r##"
 <Graph fps={30} duration="1s" size={[32,24]}>
@@ -13,7 +13,7 @@ fn atmosphere_fog_and_camera_dof_are_optional_compatible_scene_features() {
       <Track id="world" space="3d">
         <Sequence duration="1s">
           <CompositeGroup space="3d" depth="true">
-            <AtmosphereFog id="mist" mode="height" color="#BFD9C8" density="0.02" start="2" end="30" baseHeight="0.4" heightFalloff="0.2" scattering="0.1" affectSky="true" boundsMin={[-4,0,-8]} boundsMax={[4,6,-1]} edgeFeather="0.75" />
+            <AtmosphereFog id="mist" scatteringColor="#BFD9C8" density="0.02" baseHeight="0.4" heightFalloff="0.2" affectEnvironment="true" boundsMin={[-4,0,-8]} boundsMax={[4,6,-1]} edgeFeather="0.75" />
             <Camera3D id="portrait" position={[0,1,5]} target={[0,1,0]} fov="35" depthOfField="true" focusDistance="5" focalLength="50" fStop="2.8" maxBlur="8" />
           </CompositeGroup>
         </Sequence>
@@ -30,7 +30,7 @@ fn atmosphere_fog_and_camera_dof_are_optional_compatible_scene_features() {
 }
 
 #[test]
-fn atmosphere_fog_rejects_unknown_modes() {
+fn atmosphere_medium_rejects_unknown_fields() {
     let error = parse_graph_script(
         r##"
 <Graph fps={30} duration="1s" size={[32,24]}>
@@ -40,7 +40,7 @@ fn atmosphere_fog_rejects_unknown_modes() {
       <Track id="world" space="3d">
         <Sequence duration="1s">
           <CompositeGroup space="3d">
-            <AtmosphereFog mode="volumetric" />
+            <AtmosphereFog unsupported="true" />
           </CompositeGroup>
         </Sequence>
       </Track>
@@ -50,13 +50,17 @@ fn atmosphere_fog_rejects_unknown_modes() {
 </Graph>
 "##,
     )
-    .expect_err("unknown fog mode must fail explicitly");
+    .expect_err("unknown atmosphere fields must fail explicitly");
 
-    assert!(error.message.contains("linear, exp, or height"));
+    assert!(
+        error
+            .message
+            .contains("does not support attribute \"unsupported\"")
+    );
 }
 
 #[test]
-fn atmosphere_fog_requires_complete_local_bounds() {
+fn atmosphere_medium_requires_complete_local_bounds() {
     let error = parse_graph_script(
         r##"
 <Graph fps={30} duration="1s" size={[32,24]}>

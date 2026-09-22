@@ -81,6 +81,10 @@ pub enum MotionLoomSceneRenderError {
     RenderSvg { source_ref: String },
     #[error("invalid image data URI ({source_ref}): {message}")]
     InvalidImageDataUri { source_ref: String, message: String },
+    #[error("Image references unknown ImageAsset '{id}'.")]
+    UnknownImageAsset { id: String },
+    #[error("invalid Scatter '{id}': {message}")]
+    InvalidScatter { id: String, message: String },
     #[error("invalid SVG data URI ({source_ref}): {message}")]
     InvalidSvgDataUri { source_ref: String, message: String },
     #[error("GPU scene render failed: {message}")]

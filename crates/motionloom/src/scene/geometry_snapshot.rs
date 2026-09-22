@@ -133,6 +133,7 @@ fn visit(
                                 &root,
                                 &overrides,
                                 options.selected_model_ids.as_deref(),
+                                false,
                             )?);
                     }
                 }

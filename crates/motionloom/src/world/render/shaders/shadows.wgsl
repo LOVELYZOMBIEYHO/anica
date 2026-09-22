@@ -20,24 +20,34 @@ fn sample_shadow(world: vec3<f32>, normal: vec3<f32>) -> f32 {
         return 1.0;
     }
     let texel = 1.0 / vec2<f32>(textureDimensions(shadow_texture));
-    let bias = lighting.shadow3.w * (1.0 + 2.0 * (1.0 - abs(normal.y)));
+    let light_facing = abs(dot(normalize(normal), normalize(lighting.shadow2.xyz)));
+    let bias = lighting.shadow3.w * (1.0 + 2.0 * (1.0 - light_facing));
     if (lighting.surface3.y > 0.5) {
         return mix(1.0, textureSampleCompareLevel(shadow_texture, shadow_sampler, coordinate.xy, coordinate.z - bias), lighting.color1.w);
     }
+    // Rotated Poisson PCF avoids the axis-aligned 3x3 stair pattern while
+    // retaining explicit level-zero comparison for browser WebGPU.
+    let poisson = array<vec2<f32>, 12>(
+        vec2<f32>(-0.326,-0.406), vec2<f32>(-0.840,-0.074),
+        vec2<f32>(-0.696,0.457), vec2<f32>(-0.203,0.621),
+        vec2<f32>(0.962,-0.195), vec2<f32>(0.473,-0.480),
+        vec2<f32>(0.519,0.767), vec2<f32>(0.185,-0.893),
+        vec2<f32>(0.507,0.064), vec2<f32>(0.896,0.412),
+        vec2<f32>(-0.322,-0.933), vec2<f32>(-0.792,-0.598)
+    );
+    let angle = dot(floor(world.xz * 31.0), vec2<f32>(0.06711056, 0.00583715)) * 6.2831853;
+    let rotation = mat2x2<f32>(cos(angle), -sin(angle), sin(angle), cos(angle));
+    let radius = mix(1.25, 2.75, clamp(lighting.color1.z, 0.0, 1.0));
     var visibility = 0.0;
-    for (var y = -1; y <= 1; y = y + 1) {
-        for (var x = -1; x <= 1; x = x + 1) {
-            // Explicit level-zero comparison avoids derivative-dependent
-            // sampling inside fragment-varying shadow bounds on WebGPU.
-            visibility += textureSampleCompareLevel(
-                shadow_texture,
-                shadow_sampler,
-                coordinate.xy + vec2<f32>(f32(x), f32(y)) * texel,
-                coordinate.z - bias
-            );
-        }
+    for (var i = 0u; i < 12u; i = i + 1u) {
+        visibility += textureSampleCompareLevel(
+            shadow_texture,
+            shadow_sampler,
+            coordinate.xy + rotation * poisson[i] * texel * radius,
+            coordinate.z - bias
+        );
     }
-    return mix(1.0, visibility / 9.0, lighting.color1.w);
+    return mix(1.0, visibility / 12.0, lighting.color1.w);
 }
 
 @vertex

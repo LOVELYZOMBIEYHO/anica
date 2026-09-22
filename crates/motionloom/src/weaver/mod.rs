@@ -14,6 +14,7 @@ mod geometry;
 mod jobs;
 mod lighting;
 mod output;
+pub mod preview;
 pub(crate) mod scene;
 pub use api::*;
 pub use config::*;

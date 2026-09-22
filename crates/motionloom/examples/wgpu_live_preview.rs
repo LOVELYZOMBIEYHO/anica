@@ -381,6 +381,7 @@ struct LivePreviewApp {
     next_redraw_at: Instant,
     last_title_at: Instant,
     last_stats_at: Instant,
+    last_metrics_at: Instant,
     print_stats_enabled: bool,
     auto_advance: bool,
     audio_preview: Option<NativeAudioPreview>,
@@ -518,6 +519,8 @@ impl LivePreviewApp {
             adaptive_quality: {
                 let mut adaptive = WgpuPreviewAdaptiveController::for_fps(fps);
                 adaptive.set_enabled(
+                    // Authored DSL resolution is the default contract. Dynamic
+                    // resolution remains available only as an explicit host opt-in.
                     auto_advance && preview_feature_enabled("MOTIONLOOM_PREVIEW_ADAPTIVE", false),
                 );
                 adaptive
@@ -532,6 +535,7 @@ impl LivePreviewApp {
             next_redraw_at: Instant::now(),
             last_title_at: Instant::now(),
             last_stats_at: Instant::now(),
+            last_metrics_at: Instant::now(),
             print_stats_enabled,
             auto_advance,
             audio_preview,
@@ -575,6 +579,18 @@ impl LivePreviewApp {
         };
         let graph = WgpuPreviewEngine::graph_for_quality(&base_graph, self.quality);
         let (target_width, target_height) = graph.render_size.unwrap_or(graph.size);
+        if let Some(preview_engine) = self.preview_engine.as_mut() {
+            let mut settings = self.preview_settings;
+            if matches!(
+                self.quality,
+                WgpuPreviewQuality::Speed
+                    | WgpuPreviewQuality::HighSpeed
+                    | WgpuPreviewQuality::UltraSpeed
+            ) {
+                settings.profile = ImmediatePreviewProfile::Portable;
+            }
+            preview_engine.set_settings(settings);
+        }
         self.graph = Some(graph);
         self.target_width = target_width.max(1);
         self.target_height = target_height.max(1);
@@ -1911,6 +1927,7 @@ impl LivePreviewApp {
         self.broadcast_event(PreviewEvent::Rendered {
             frame: rendered_frame,
         });
+        self.broadcast_frame_metrics(rendered_frame);
         if let Some(quality) = self.adaptive_quality.observe(self.quality, render_ms) {
             preview_host_debug_log(format!(
                 "adaptive preview quality: {} -> {} after {:.2} ms frame",
@@ -1956,15 +1973,23 @@ impl LivePreviewApp {
         let avg_render = avg(&self.render_times);
         let min_render = min_or_zero(&self.render_times);
         let max_render = max_or_zero(&self.render_times);
-        let fps = self.graph.as_ref().map(|graph| graph.fps).unwrap_or(0.0);
+        let timeline_fps = self.graph.as_ref().map(|graph| graph.fps).unwrap_or(0.0);
+        let actual_fps = if self.last_render_ms > 0.0 {
+            1000.0 / self.last_render_ms
+        } else {
+            0.0
+        };
         let gpu_frame_label = self
             .last_gpu_frame_ms
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "pending".to_string());
+        let measured_cpu_ms = self.measured_cpu_ms();
         window.set_title(&format!(
-            "MotionLoom wgpu live preview | frame {}/{} | CPU submit {:.2} ms | 3D prep/submit {:.2}/{:.2} ms | GPU {} ms | avg {:.2} ms | min/max {:.2}/{:.2} ms | blit {:.2} ms | timeline {:.1} fps | target {}x{} | surface {:?} | quality {} (0 Auto, 1 Full, 2 Balanced, 3 Speed, 4 High Speed, 5 Ultra Speed) | {}",
+            "MotionLoom wgpu live preview | frame {}/{} | FPS {:.1} | CPU {:.2} ms | frame wall {:.2} ms | 3D prep/submit {:.2}/{:.2} ms | GPU {} ms | avg {:.2} ms | min/max {:.2}/{:.2} ms | blit {:.2} ms | timeline {:.1} fps | target {}x{} | surface {:?} | quality {} (0 Auto, 1 Full, 2 Balanced, 3 Speed, 4 High Speed, 5 Ultra Speed) | {}",
             self.frame,
             self.total_frames,
+            actual_fps,
+            measured_cpu_ms,
             self.last_render_ms,
             self.last_3d_profile.prepare_ms,
             self.last_3d_profile.submit_ms,
@@ -1973,7 +1998,7 @@ impl LivePreviewApp {
             min_render,
             max_render,
             self.last_present_ms,
-            fps,
+            timeline_fps,
             self.target_width,
             self.target_height,
             self.surface_format,
@@ -1995,13 +2020,14 @@ impl LivePreviewApp {
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "pending".to_string());
         println!(
-            "quality={} target={}x{} frame={}/{} cpu_submit_last_ms={:.2} expression_ms={:.3} traversal_ms={:.3} upload_ms={:.3} encode_ms={:.3} wait_ms={:.3} scene3d_prepare_ms={:.3} scene3d_asset_resolve_ms={:.3} texture_decode_ms={:.3} texture_decodes={} texture_cache_hits={} texture_decoded_bytes={} scene3d_submit_ms={:.3} scene3d_draw_calls={} scene3d_resources={} scene3d_texture_resources={} scene3d_geometry_resources={} scene3d_targets={} gpu_last_ms={} gpu_timestamp_supported={} render_avg_ms={:.2} render_min_ms={:.2} render_max_ms={:.2} blit_last_ms={:.2} blit_avg_ms={:.2}",
+            "quality={} target={}x{} frame={}/{} frame_wall_last_ms={:.2} cpu_last_ms={:.2} expression_ms={:.3} traversal_ms={:.3} upload_ms={:.3} encode_ms={:.3} wait_ms={:.3} scene3d_prepare_ms={:.3} scene3d_asset_resolve_ms={:.3} texture_decode_ms={:.3} texture_decodes={} texture_cache_hits={} texture_decoded_bytes={} scene3d_submit_ms={:.3} scene3d_draw_calls={} scene3d_resources={} scene3d_texture_resources={} scene3d_geometry_resources={} scene3d_targets={} gpu_last_ms={} gpu_timestamp_supported={} render_avg_ms={:.2} render_min_ms={:.2} render_max_ms={:.2} blit_last_ms={:.2} blit_avg_ms={:.2}",
             self.quality.label(),
             self.target_width,
             self.target_height,
             self.frame,
             self.total_frames,
             self.last_render_ms,
+            self.measured_cpu_ms(),
             self.last_cpu_profile.expression_ms,
             self.last_cpu_profile.traversal_ms,
             self.last_cpu_profile.upload_ms,
@@ -2029,6 +2055,37 @@ impl LivePreviewApp {
             self.last_present_ms,
             avg(&self.present_times)
         );
+    }
+
+    fn broadcast_frame_metrics(&mut self, frame: u32) {
+        if self.last_metrics_at.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last_metrics_at = Instant::now();
+        let cpu_ms = self.measured_cpu_ms();
+        self.broadcast_event(PreviewEvent::FrameMetrics {
+            frame,
+            backend: "wgpu".to_string(),
+            zero_copy: true,
+            cpu_ms,
+            gpu_ms: self.last_gpu_frame_ms,
+            readback_ms: self.last_3d_profile.readback_ms,
+            draw_calls: self.last_3d_profile.draw_calls,
+        });
+    }
+
+    fn measured_cpu_ms(&self) -> f64 {
+        // Traversal includes CPU-side 3D batching, resource lookup, command
+        // encoding, and queue submission, so keep that interval in the CPU
+        // render-thread metric. Explicit readback and queue/device waits are
+        // reported separately because they block the frame without doing
+        // active CPU work.
+        let active_traversal_ms =
+            (self.last_cpu_profile.traversal_ms - self.last_3d_profile.readback_ms).max(0.0);
+        self.last_cpu_profile.expression_ms
+            + active_traversal_ms
+            + self.last_cpu_profile.upload_ms
+            + self.last_cpu_profile.encode_ms
     }
 }
 

@@ -1,7 +1,9 @@
 pub mod animation;
+pub mod atmosphere;
 pub mod backend;
 pub mod compile;
 pub mod composition;
+pub mod compositor;
 pub mod domain;
 pub mod drawable;
 pub mod dsl;

@@ -111,6 +111,12 @@ pub struct GlbMaterialData {
     pub normal_scale: f32,
     pub occlusion_texture: Option<usize>,
     pub occlusion_strength: f32,
+    pub metallic_channel: crate::dsl::MaterialTextureChannel,
+    pub roughness_channel: crate::dsl::MaterialTextureChannel,
+    pub occlusion_channel: crate::dsl::MaterialTextureChannel,
+    pub metallic_invert: bool,
+    pub roughness_invert: bool,
+    pub occlusion_invert: bool,
     pub emissive_texture: Option<usize>,
     pub emissive_factor: [f32; 3],
     pub emissive_strength: f32,
@@ -130,6 +136,7 @@ pub struct GlbMaterialData {
     pub double_sided: bool,
     pub unlit: bool,
     pub specular_glossiness: bool,
+    pub receive_caustics: bool,
 }
 
 impl Default for GlbMaterialData {
@@ -143,6 +150,12 @@ impl Default for GlbMaterialData {
             normal_scale: 1.0,
             occlusion_texture: None,
             occlusion_strength: 1.0,
+            metallic_channel: crate::dsl::MaterialTextureChannel::B,
+            roughness_channel: crate::dsl::MaterialTextureChannel::G,
+            occlusion_channel: crate::dsl::MaterialTextureChannel::R,
+            metallic_invert: false,
+            roughness_invert: false,
+            occlusion_invert: false,
             emissive_texture: None,
             emissive_factor: [0.0, 0.0, 0.0],
             emissive_strength: 1.0,
@@ -162,8 +175,19 @@ impl Default for GlbMaterialData {
             double_sided: false,
             unlit: false,
             specular_glossiness: false,
+            receive_caustics: true,
         }
     }
+}
+
+pub(crate) fn material_channel_remap_code(material: &GlbMaterialData) -> f32 {
+    let encode = |channel: crate::dsl::MaterialTextureChannel, invert: bool| {
+        u16::from(channel.code()) + if invert { 8 } else { 0 }
+    };
+    let metallic = encode(material.metallic_channel, material.metallic_invert);
+    let roughness = encode(material.roughness_channel, material.roughness_invert);
+    let occlusion = encode(material.occlusion_channel, material.occlusion_invert);
+    f32::from(metallic | (roughness << 4) | (occlusion << 8))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1980,9 +2004,28 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        GlbChunks, load_glb_mesh_data, load_glb_metadata, parse_glb_animation_data,
-        parse_glb_mesh_data, read_materials, texture_source_index,
+        GlbChunks, GlbMaterialData, load_glb_mesh_data, load_glb_metadata,
+        material_channel_remap_code, parse_glb_animation_data, parse_glb_mesh_data, read_materials,
+        texture_source_index,
     };
+
+    #[test]
+    fn material_channel_remap_code_preserves_gltf_and_encodes_inversion() {
+        assert_eq!(
+            material_channel_remap_code(&GlbMaterialData::default()),
+            18.0
+        );
+        let material = GlbMaterialData {
+            metallic_channel: crate::dsl::MaterialTextureChannel::R,
+            roughness_channel: crate::dsl::MaterialTextureChannel::A,
+            occlusion_channel: crate::dsl::MaterialTextureChannel::Luminance,
+            metallic_invert: true,
+            roughness_invert: true,
+            occlusion_invert: true,
+            ..Default::default()
+        };
+        assert_eq!(material_channel_remap_code(&material), 3256.0);
+    }
 
     #[test]
     fn animation_only_gltf_is_accepted_without_weakening_model_loading() {

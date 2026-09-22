@@ -5,7 +5,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use base64::Engine;
-use motionloom::{SceneRenderProfile, SceneRenderer, parse_graph_script};
+use motionloom::{
+    ImmediatePreviewProfile, ImmediatePreviewSettings, SceneRenderProfile, SceneRenderer,
+    parse_graph_script,
+};
 
 // An inline texture keeps the regression independent of downloads and asset roots.
 fn black_ao() -> String {
@@ -150,5 +153,24 @@ fn saturated_highlights_keep_energy_when_blurred_over_dark_surfaces() {
             brighter > 30,
             "tone mapping must follow HDR blur: {brighter}"
         );
+    });
+}
+
+#[test]
+#[ignore = "requires a real native GPU"]
+fn cinematic_screen_space_lighting_executes_across_history() {
+    pollster::block_on(async {
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        renderer.set_immediate_preview_settings(ImmediatePreviewSettings {
+            profile: ImmediatePreviewProfile::Cinematic,
+            dynamic_resolution: false,
+            ..Default::default()
+        });
+        let graph = parse_graph_script(&fixture(0.7, 0.4, 0.0, "")).unwrap();
+        let first = renderer.render_frame_gpu_readback(&graph, 0).await.unwrap();
+        let second = renderer.render_frame_gpu_readback(&graph, 1).await.unwrap();
+        assert_eq!(first.dimensions(), (128, 128));
+        assert_eq!(second.dimensions(), (128, 128));
+        assert!(second.pixels().any(|pixel| pixel[3] > 0));
     });
 }

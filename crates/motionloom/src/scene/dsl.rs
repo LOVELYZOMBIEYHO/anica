@@ -6,6 +6,7 @@ use crate::dsl::{
     attr_value, collect_self_closing_block, collect_tag_block, find_matching_close_tag,
     is_self_closing_tag, parse_duration_ms, parse_signed_time_ms, parse_size, parse_time_seconds,
     required_attr_value, required_attr_value_any, starts_open_tag, strip_wrappers,
+    tag_attribute_names,
 };
 use crate::error::GraphParseError;
 use crate::scene::model::*;
@@ -505,7 +506,8 @@ pub struct ImageNode {
     pub id: Option<String>,
     #[serde(default)]
     pub material: Option<String>,
-    pub src: String,
+    /// ImageAsset id declared under <Assets>; the renderer dereferences it to a source.
+    pub asset: String,
     pub x: String,
     pub y: String,
     pub scale: String,
@@ -2652,6 +2654,134 @@ fn parse_composite_group_block(
     let mut i = open_end_ix + 1;
     while i < close_ix {
         let line = lines[i].trim();
+        if starts_open_tag(line, "Scatter") {
+            if space != "3d" {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Scatter requires CompositeGroup space=\"3d\".".to_string(),
+                });
+            }
+            let (scatter_tag, scatter_open_end) = collect_tag_block(lines, i, '>', false)?;
+            let scatter_close = find_matching_close_tag(lines, scatter_open_end + 1, "Scatter")?;
+            let surface =
+                strip_wrappers(&required_attr_value(&scatter_tag, "surface", i + 1)?).to_string();
+            let count = scene_attr_or_default(&scatter_tag, &["count"], "1")
+                .parse::<u32>()
+                .map_err(|_| GraphParseError {
+                    line: i + 1,
+                    message: "Scatter count must be a literal unsigned integer.".to_string(),
+                })?;
+            if !(1..=250_000).contains(&count) {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Scatter count must be between 1 and 250000.".to_string(),
+                });
+            }
+            let seed = scene_attr_or_default(&scatter_tag, &["seed"], "1")
+                .parse::<u32>()
+                .map_err(|_| GraphParseError {
+                    line: i + 1,
+                    message: "Scatter seed must be an unsigned integer.".to_string(),
+                })?;
+            let slope_range = parse_literal_float_array(&scatter_tag, "slopeRange", 2, i + 1)?
+                .unwrap_or_else(|| vec![0.0, 90.0]);
+            if slope_range[0] < 0.0 || slope_range[1] > 90.0 || slope_range[1] < slope_range[0] {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Scatter slopeRange must be ordered within [0,90].".to_string(),
+                });
+            }
+            let scale_range = parse_literal_float_array(&scatter_tag, "scaleRange", 2, i + 1)?
+                .unwrap_or_else(|| vec![1.0, 1.0]);
+            if scale_range[0] <= 0.0 || scale_range[1] < scale_range[0] {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Scatter scaleRange must be positive and ordered.".to_string(),
+                });
+            }
+            let rotation_y_range =
+                parse_literal_float_array(&scatter_tag, "rotationYRange", 2, i + 1)?
+                    .unwrap_or_else(|| vec![0.0, 360.0]);
+            if rotation_y_range[1] < rotation_y_range[0] {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Scatter rotationYRange must be ordered.".to_string(),
+                });
+            }
+
+            // Variants remain ordinary model assets, so Scatter adds placement
+            // semantics without introducing a second geometry or material path.
+            let mut variants = Vec::new();
+            let mut j = scatter_open_end + 1;
+            while j < scatter_close {
+                let child = lines[j].trim();
+                if child.is_empty() || child.starts_with("//") || child.starts_with("<!--") {
+                    j += 1;
+                    continue;
+                }
+                if starts_open_tag(child, "Variant") {
+                    let (variant_tag, variant_end) = collect_self_closing_block(lines, j)?;
+                    let asset = strip_wrappers(&required_attr_value(&variant_tag, "asset", j + 1)?)
+                        .to_string();
+                    let weight = scene_attr_or_default(&variant_tag, &["weight"], "1")
+                        .parse::<f32>()
+                        .map_err(|_| GraphParseError {
+                            line: j + 1,
+                            message: "Scatter Variant weight must be a literal number.".to_string(),
+                        })?;
+                    if !weight.is_finite() || weight <= 0.0 {
+                        return Err(GraphParseError {
+                            line: j + 1,
+                            message: "Scatter Variant weight must be greater than zero."
+                                .to_string(),
+                        });
+                    }
+                    variants.push(SceneScatterVariantNode { asset, weight });
+                    j = variant_end + 1;
+                    continue;
+                }
+                return Err(GraphParseError {
+                    line: j + 1,
+                    message: format!(
+                        "Scatter only accepts self-closing Variant children, got: {child}"
+                    ),
+                });
+            }
+            if variants.is_empty() {
+                return Err(GraphParseError {
+                    line: i + 1,
+                    message: "Scatter requires at least one Variant child.".to_string(),
+                });
+            }
+            nodes_3d.push(Scene3DNode::Scatter(SceneScatter3DNode {
+                id: scene_optional_attr(&scatter_tag, &["id"]),
+                surface,
+                count,
+                seed,
+                density_map: scene_optional_attr(&scatter_tag, &["densityMap", "density_map"]),
+                exclusion_map: scene_optional_attr(
+                    &scatter_tag,
+                    &["exclusionMap", "exclusion_map"],
+                ),
+                slope_range: format!("[{},{}]", slope_range[0], slope_range[1]),
+                scale_range: format!("[{},{}]", scale_range[0], scale_range[1]),
+                rotation_y_range: format!("[{},{}]", rotation_y_range[0], rotation_y_range[1]),
+                surface_offset: scene_attr_or_default(
+                    &scatter_tag,
+                    &["surfaceOffset", "surface_offset"],
+                    "0",
+                ),
+                cast_shadow: scene_bool_attr(&scatter_tag, &["castShadow", "cast_shadow"], true),
+                receive_shadow: scene_bool_attr(
+                    &scatter_tag,
+                    &["receiveShadow", "receive_shadow"],
+                    true,
+                ),
+                variants,
+            }));
+            i = scatter_close + 1;
+            continue;
+        }
         if starts_open_tag(line, "Repeat") {
             let (repeat_tag, repeat_open_end) = collect_tag_block(lines, i, '>', false)?;
             let mode = scene_attr_or_default(&repeat_tag, &["mode"], "linear").to_ascii_lowercase();
@@ -3067,22 +3197,30 @@ fn parse_composite_group_block(
         }
         if starts_open_tag(line, "AtmosphereFog") {
             let (tag, open_end_ix) = collect_tag_block(lines, i, '>', false)?;
+            validate_atmosphere_attributes(
+                &tag,
+                &[
+                    "id",
+                    "density",
+                    "scatteringColor",
+                    "anisotropy",
+                    "baseHeight",
+                    "heightFalloff",
+                    "affectEnvironment",
+                    "boundsMin",
+                    "boundsMax",
+                    "edgeFeather",
+                ],
+                "AtmosphereFog",
+                i + 1,
+            )?;
             let end_ix = if is_self_closing_tag(&tag) {
                 open_end_ix
             } else {
                 find_matching_close_tag(lines, open_end_ix + 1, "AtmosphereFog")?
             };
-            let mode = scene_attr_or_default(&tag, &["mode"], "linear");
-            if !matches!(mode.as_str(), "linear" | "exp" | "height") {
-                return Err(GraphParseError {
-                    line: i + 1,
-                    message: format!(
-                        "AtmosphereFog mode must be linear, exp, or height; found '{mode}'."
-                    ),
-                });
-            }
-            let bounds_min = scene_optional_attr(&tag, &["boundsMin", "bounds_min"]);
-            let bounds_max = scene_optional_attr(&tag, &["boundsMax", "bounds_max"]);
+            let bounds_min = scene_optional_attr(&tag, &["boundsMin"]);
+            let bounds_max = scene_optional_attr(&tag, &["boundsMax"]);
             if bounds_min.is_some() != bounds_max.is_some() {
                 return Err(GraphParseError {
                     line: i + 1,
@@ -3110,8 +3248,31 @@ fn parse_composite_group_block(
                             });
                         }
                         let (child_tag, child_end) = collect_self_closing_block(lines, child_ix)?;
-                        let debug_view =
-                            scene_attr_or_default(&child_tag, &["debugView", "debug_view"], "none");
+                        validate_atmosphere_attributes(
+                            &child_tag,
+                            &[
+                                "id",
+                                "lightRef",
+                                "shaftStrength",
+                                "maxDistance",
+                                "shadowed",
+                                "quality",
+                                "maxBounces",
+                                "debugView",
+                            ],
+                            "VolumetricScattering",
+                            child_ix + 1,
+                        )?;
+                        let debug_view = scene_attr_or_default(&child_tag, &["debugView"], "none");
+                        let quality = scene_attr_or_default(&child_tag, &["quality"], "medium");
+                        if !matches!(quality.as_str(), "low" | "medium" | "high") {
+                            return Err(GraphParseError {
+                                line: child_ix + 1,
+                                message: format!(
+                                    "VolumetricScattering quality must be low, medium, or high; found '{quality}'."
+                                ),
+                            });
+                        }
                         if !matches!(
                             debug_view.as_str(),
                             "none"
@@ -3137,14 +3298,15 @@ fn parse_composite_group_block(
                                 child_ix + 1,
                             )?)
                             .to_string(),
-                            intensity: scene_attr_or_default(&child_tag, &["intensity"], "1"),
-                            anisotropy: scene_attr_or_default(&child_tag, &["anisotropy"], "0"),
-                            max_distance: scene_attr_or_default(
+                            shaft_strength: scene_attr_or_default(
                                 &child_tag,
-                                &["maxDistance", "max_distance"],
-                                "30",
+                                &["shaftStrength"],
+                                "1",
                             ),
+                            max_distance: scene_attr_or_default(&child_tag, &["maxDistance"], "30"),
                             shadowed: scene_bool_attr(&child_tag, &["shadowed"], true),
+                            quality,
+                            max_bounces: scene_attr_or_default(&child_tag, &["maxBounces"], "2"),
                             debug_view,
                         });
                         child_ix = child_end + 1;
@@ -3159,27 +3321,30 @@ fn parse_composite_group_block(
                             });
                         }
                         let (child_tag, child_end) = collect_self_closing_block(lines, child_ix)?;
+                        validate_atmosphere_attributes(
+                            &child_tag,
+                            &[
+                                "id",
+                                "intensity",
+                                "scale",
+                                "speed",
+                                "attenuation",
+                                "color",
+                                "volumeTerm",
+                                "surfaceTerm",
+                            ],
+                            "WaterCaustics",
+                            child_ix + 1,
+                        )?;
                         water_caustics = Some(SceneWaterCausticsNode {
                             id: scene_optional_attr(&child_tag, &["id"]),
                             intensity: scene_attr_or_default(&child_tag, &["intensity"], "0"),
                             scale: scene_attr_or_default(&child_tag, &["scale"], "0.1"),
                             speed: scene_attr_or_default(&child_tag, &["speed"], "0.25"),
-                            depth_falloff: scene_attr_or_default(
-                                &child_tag,
-                                &["depthFalloff", "depth_falloff"],
-                                "0.5",
-                            ),
+                            attenuation: scene_attr_or_default(&child_tag, &["attenuation"], "0.5"),
                             color: scene_attr_or_default(&child_tag, &["color"], "#FFFFFF"),
-                            volume_term: scene_bool_attr(
-                                &child_tag,
-                                &["volumeTerm", "volume_term"],
-                                true,
-                            ),
-                            surface_term: scene_bool_attr(
-                                &child_tag,
-                                &["surfaceTerm", "surface_term"],
-                                true,
-                            ),
+                            volume_term: scene_bool_attr(&child_tag, &["volumeTerm"], true),
+                            surface_term: scene_bool_attr(&child_tag, &["surfaceTerm"], true),
                         });
                         child_ix = child_end + 1;
                         continue;
@@ -3194,27 +3359,15 @@ fn parse_composite_group_block(
             }
             nodes_3d.push(Scene3DNode::AtmosphereFog(SceneAtmosphereFogNode {
                 id: scene_optional_attr(&tag, &["id"]),
-                mode,
-                color: scene_attr_or_default(&tag, &["color"], "#FFFFFF"),
                 density: scene_attr_or_default(&tag, &["density"], "0"),
-                start: scene_attr_or_default(&tag, &["start"], "0"),
-                end: scene_attr_or_default(&tag, &["end"], "100"),
-                base_height: scene_attr_or_default(&tag, &["baseHeight", "base_height"], "0"),
-                height_falloff: scene_attr_or_default(
-                    &tag,
-                    &["heightFalloff", "height_falloff"],
-                    "0.25",
-                ),
-                scattering: scene_attr_or_default(&tag, &["scattering"], "0"),
-                absorption: scene_optional_attr(&tag, &["absorption"]),
-                scattering_color: scene_optional_attr(
-                    &tag,
-                    &["scatteringColor", "scattering_color"],
-                ),
-                affect_sky: scene_bool_attr(&tag, &["affectSky", "affect_sky"], false),
+                scattering_color: scene_attr_or_default(&tag, &["scatteringColor"], "#FFFFFF"),
+                anisotropy: scene_attr_or_default(&tag, &["anisotropy"], "0"),
+                base_height: scene_attr_or_default(&tag, &["baseHeight"], "0"),
+                height_falloff: scene_attr_or_default(&tag, &["heightFalloff"], "0.25"),
+                affect_environment: scene_bool_attr(&tag, &["affectEnvironment"], false),
                 bounds_min,
                 bounds_max,
-                edge_feather: scene_attr_or_default(&tag, &["edgeFeather", "edge_feather"], "0"),
+                edge_feather: scene_attr_or_default(&tag, &["edgeFeather"], "0"),
                 volumetric_scattering,
                 water_caustics,
             }));
@@ -3445,11 +3598,36 @@ fn parse_composite_group_block(
             while j < model_close_ix {
                 if starts_open_tag(lines[j].trim(), "MaterialBinding") {
                     let (binding, binding_end_ix) = collect_self_closing_block(lines, j)?;
+                    let tint = attr_value(&binding, "tint")
+                        .map(|value| parse_scene_tint(&value, j + 1))
+                        .transpose()?;
+                    let tint_amount = match attr_value(&binding, "tintAmount") {
+                        Some(raw) => {
+                            let value: f32 =
+                                strip_wrappers(&raw).parse().map_err(|_| GraphParseError {
+                                    line: j + 1,
+                                    message:
+                                        "MaterialBinding tintAmount must be a number from 0 to 1."
+                                            .into(),
+                                })?;
+                            if !(0.0..=1.0).contains(&value) {
+                                return Err(GraphParseError {
+                                    line: j + 1,
+                                    message:
+                                        "MaterialBinding tintAmount must be a number from 0 to 1."
+                                            .into(),
+                                });
+                            }
+                            value
+                        }
+                        None => 1.0,
+                    };
                     material_bindings.push(SceneMaterialBindingNode {
                         cel: crate::render_style::parse_cel_material(&binding, j + 1)?,
+                        // Keep the runtime field compact while the DSL names the imported-model namespace explicitly.
                         material: strip_wrappers(&required_attr_value(
                             &binding,
-                            "material",
+                            "modelSourceMaterial",
                             j + 1,
                         )?)
                         .to_string(),
@@ -3457,6 +3635,12 @@ fn parse_composite_group_block(
                             .map(|v| strip_wrappers(&v).to_string()),
                         texture: attr_value(&binding, "texture")
                             .map(|v| strip_wrappers(&v).to_string()),
+                        tint,
+                        tint_amount,
+                        metallic: parse_binding_number(&binding, "metallic", j + 1)?,
+                        roughness: parse_binding_number(&binding, "roughness", j + 1)?,
+                        specular: parse_binding_number(&binding, "specular", j + 1)?,
+                        normal_scale: parse_binding_number(&binding, "normalScale", j + 1)?,
                     });
                     j = binding_end_ix + 1;
                     continue;
@@ -5227,6 +5411,24 @@ fn scene_optional_attr(block: &str, names: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn validate_atmosphere_attributes(
+    tag: &str,
+    allowed: &[&str],
+    tag_name: &str,
+    line: usize,
+) -> Result<(), GraphParseError> {
+    if let Some(attribute) = tag_attribute_names(tag)
+        .into_iter()
+        .find(|attribute| !allowed.contains(&attribute.as_str()))
+    {
+        return Err(GraphParseError {
+            line,
+            message: format!("<{tag_name}> does not support attribute \"{attribute}\"."),
+        });
+    }
+    Ok(())
+}
+
 /// Parse a boolean Scene attribute while preserving an explicit default.
 fn scene_bool_attr(block: &str, names: &[&str], default_value: bool) -> bool {
     names
@@ -5824,8 +6026,17 @@ fn parse_text_glow_effect_node(
 }
 
 pub(crate) fn parse_image_node(block: &str, line: usize) -> Result<ImageNode, GraphParseError> {
+    // Raw sources on <Image> are rejected so every raster image goes through a declared ImageAsset.
+    if attr_value(block, "src").is_some() || attr_value(block, "path").is_some() {
+        return Err(GraphParseError {
+            line,
+            message:
+                "Declare <ImageAsset id=\"...\" src=\"...\" /> under <Assets> and use <Image asset=\"...\" />."
+                    .to_string(),
+        });
+    }
     let id = attr_value(block, "id").map(|v| strip_wrappers(&v).to_string());
-    let src = strip_wrappers(&required_attr_value_any(block, &["src", "path"], line)?).to_string();
+    let asset = strip_wrappers(&required_attr_value(block, "asset", line)?).to_string();
     let x = attr_value(block, "x")
         .map(|v| strip_wrappers(&v).to_string())
         .unwrap_or_else(|| "center".to_string());
@@ -5842,7 +6053,7 @@ pub(crate) fn parse_image_node(block: &str, line: usize) -> Result<ImageNode, Gr
     Ok(ImageNode {
         id,
         material: attr_value(block, "material").map(|v| strip_wrappers(&v).to_string()),
-        src,
+        asset,
         x,
         y,
         scale,
@@ -6784,6 +6995,38 @@ fn parse_palette_color_def(block: &str, line: usize) -> Result<PaletteColorDef, 
         key: strip_wrappers(&required_attr_value(block, "key", line)?).to_string(),
         value: strip_wrappers(&required_attr_value(block, "value", line)?).to_string(),
     })
+}
+
+/// Parse a `#RRGGBB` tint into display-referred 0..1 components; no expressions.
+fn parse_scene_tint(value: &str, line: usize) -> Result<[f32; 4], GraphParseError> {
+    let hex = strip_wrappers(value).trim().strip_prefix('#').unwrap_or("");
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(GraphParseError {
+            line,
+            message: "MaterialBinding tint must use #RRGGBB.".into(),
+        });
+    }
+    let channel =
+        |offset: usize| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap() as f32 / 255.0;
+    Ok([channel(0), channel(2), channel(4), 1.0])
+}
+
+/// Parse an optional scalar override such as `roughness`; no expressions.
+fn parse_binding_number(
+    binding: &str,
+    name: &str,
+    line: usize,
+) -> Result<Option<f32>, GraphParseError> {
+    attr_value(binding, name)
+        .map(|raw| {
+            strip_wrappers(&raw)
+                .parse::<f32>()
+                .map_err(|_| GraphParseError {
+                    line,
+                    message: format!("MaterialBinding {name} must be a number."),
+                })
+        })
+        .transpose()
 }
 
 pub(crate) fn parse_pixel_grid_block(

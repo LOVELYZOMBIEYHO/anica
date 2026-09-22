@@ -72,6 +72,8 @@ struct Lighting {
     previous_camera3: vec4<f32>,
     preview0: vec4<f32>,
     preview1: vec4<f32>,
+    // x=SSGI enabled, y=SSR steps, z=SSGI taps, w=browser capability tier.
+    preview2: vec4<f32>,
     shadow0: vec4<f32>,
     shadow1: vec4<f32>,
     shadow2: vec4<f32>,

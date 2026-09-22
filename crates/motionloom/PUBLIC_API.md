@@ -2,7 +2,10 @@
 
 With the native-only `weaver` feature, `motionloom::api::weaver` exposes the initial
 offline renderer API (`RenderJob`, `QualityPreset`, `render`, `RenderProgress`,
-`RenderReport`, `CancellationToken`, `WeaverError`). This new API is provisional;
+`RenderReport`, `CancellationToken`, `WeaverError`). Professional sequence
+delivery uses `MasterSequenceSettings`, `render_master_sequence`, and
+`MasterSequenceReport`; it emits resumable compositor EXRs, ProRes 4444 XQ, an
+H.264 review movie, authored audio, and machine-checked delivery metadata. This API is provisional;
 its detailed contract and limitations live in [Weaver](src/weaver/README.md).
 
 `DepthOfFieldStyleNode` (via `motionloom::api`) supports the opt-in
@@ -68,6 +71,7 @@ Use this when the caller expects a scene/composition graph and wants typed
 control over rendering.
 
 `GraphAssetSource`, `MaterialAssetNode`, `PrimitiveAssetNode`, `PrimitiveGeometry`,
+`CurveAssetNode`, `CurvePointNode`, `CurveInterpolation`, `SweepProfilePointNode`,
 `PrimitiveModifierNode`, `PrimitiveMeshBuildNode`, `PrimitiveLodNode`,
 `PrimitiveCollisionNode`, `TerrainAssetNode`, `VegetationAssetNode`,
 `VegetationKind`, `VegetationLod`, and `CompoundAssetNode` expose the typed asset
@@ -76,6 +80,11 @@ primitives, and compound primitive assets remain distinct through parsing and
 asset resolution. A resolved PrimitiveAsset retains its referenced PBR
 MaterialAsset so native and WASM world renderers consume the same self-contained
 material definition after CompoundAsset expansion.
+`GraphScript::curve_assets` retains reusable non-rendering spatial curves for
+editor inspection and dependency tracking. During parsing, each `SweepAsset`
+resolves its literal curve reference and lowers to `PrimitiveGeometry::Sweep`;
+the geometry cache key includes the curve, profile, frame, UV, cap, and dash
+settings. Existing renderer integrations therefore need no second asset loader.
 The advanced PrimitiveAsset block is additive: compact self-closing assets
 deserialize with empty modifiers and default build/LOD policies. Native and
 WASM renderers consume the same generated triangle mesh and stable cache key.
@@ -88,9 +97,17 @@ bounded generation, LOD, wind, and collision settings. Vegetation is an
 additive `GraphAssetSource::Vegetation` variant and does not change existing
 DSL assets. As with any new public Rust enum variant, downstream exhaustive
 matches over `GraphAssetSource` must add the Vegetation case or a wildcard.
+`SceneScatter3DNode` and `SceneScatterVariantNode` describe deterministic,
+weighted placement on a TerrainAsset-backed Model. Scatter is an additive
+`Scene3DNode::Scatter` variant; renderers may retain it as native instance data
+or lower it through ordinary Model actors without changing authored semantics.
 `MaterialAssetNode` also carries transmissive PBR controls (`transmission`,
 `ior`, optical `thickness`, attenuation, depth-write policy, and sort priority)
 without coupling the visual material to PrimitiveAsset collision.
+It also carries typed metallic, roughness, and occlusion channel selectors plus
+independent inversion flags. Defaults preserve glTF B/G/R channel semantics;
+preview, native/WASM, terrain baking, and Weaver consume the same compiled
+material settings.
 
 ### `parse_process_graph_script`
 
@@ -229,11 +246,11 @@ legacy World implementation types. A `CompositeGroup space="3d"` accepts:
 - `DirectionalLight`, `PointLight`, `SpotLight`, and `RectAreaLight`
 - `AmbientOcclusion` and `ContactShadow`
 - `ColorManagement` with `aces`, `reinhard`, or `none` tone mapping
-- `AtmosphereFog` with `linear`, `exp`, or height-aware distance attenuation;
-  optional `VolumetricScattering` and `WaterCaustics` children enable the
-  WebGPU froxel path described in [VOLUMETRICS.md](VOLUMETRICS.md).
-  optional `boundsMin`/`boundsMax` and `edgeFeather` confine the medium to a
-  world-space box without changing unbounded scenes
+- `AtmosphereFog` with extinction density, linear scattering albedo,
+  anisotropy, and height falloff; optional `VolumetricScattering` and
+  `WaterCaustics` children enable the WebGPU froxel path described in
+  [VOLUMETRICS.md](VOLUMETRICS.md). Optional `boundsMin`/`boundsMax` and
+  `edgeFeather` confine the medium to a world-space box.
 - optional `Camera3D` depth-of-field optics (`focusTarget`, `focusDistance`,
   `focalLength`, `fStop`, and `maxBlur`)
 

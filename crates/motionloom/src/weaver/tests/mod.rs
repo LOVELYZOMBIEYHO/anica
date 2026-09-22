@@ -8,6 +8,25 @@ mod s89;
 mod s90;
 
 #[test]
+fn path_trace_shader_parses_and_validates() {
+    let source = include_str!("../backend/wgpu/shaders/path_trace.wgsl");
+    let uniform_vec4s =
+        super::backend::wgpu::CAMERA_UNIFORM_BYTES as usize / std::mem::size_of::<[f32; 4]>();
+    assert!(
+        source.contains(&format!("array<vec4<f32>, {uniform_vec4s}>")),
+        "Rust camera uniform and WGSL Params layout must have the same vec4 count"
+    );
+    let module =
+        wgpu::naga::front::wgsl::parse_str(source).expect("Weaver path-trace WGSL must parse");
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("Weaver path-trace WGSL must validate");
+}
+
+#[test]
 fn offline_lighting_is_optional_and_validated() {
     let mut job = RenderJob::new("scene", QualityPreset::Ultra);
     job.scene_id = "scene".into();
@@ -101,7 +120,7 @@ fn region_bounds_and_physical_ranges_are_checked() {
     job.sun_angular_diameter_degrees = f32::INFINITY;
     assert!(job.validate().is_err());
     let mut camera = crate::world::WorldCamera::default();
-    let mut p = [[0.0; 4]; 20];
+    let mut p = [[0.0; 4]; 26];
     camera.fov = "180".into();
     assert!(super::camera::configure(&mut p, &camera, &job).is_err());
     camera.fov = "57".into();

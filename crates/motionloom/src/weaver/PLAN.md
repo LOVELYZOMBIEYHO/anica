@@ -4,6 +4,95 @@ All Weaver-specific code, documentation, configurations and tests live under
 `src/weaver/`. The only external integration is Cargo feature/dependency wiring,
 module/API registration, and access to the existing frame-lowering bridge.
 
+## SceneCompositor phase status
+
+1. **Formal contract — implemented.** `SceneCompositionPlan` remains the
+   versioned, serializable, renderer-independent IR and fixes the working format
+   to linear-premultiplied RGBA16F.
+2. **RGBA8 plate removal — implemented.** Mixed snapshots retain independent
+   evaluated 2D runs; no `display_plate` or saved-PNG overlay path remains.
+3. **Raster boundary — implemented.** Raster straight-alpha sRGB output is
+   decoded and premultiplied once when each run enters the compositor. It is not
+   flattened or quantized again before final encoding.
+4. **Shared GPU execution — implemented.** Weaver and SceneCompositor use the
+   same `SceneGpuContext`, device and queue. Canonical layers upload as RGBA16F
+   textures and source-over executes on that device. Weaver's tiled film remains
+   CPU-readable because EXR/AOV/checkpoint writers require it.
+5. **Ordered composition — implemented for the accepted mixed layout.** The 3D
+   beauty is the base and evaluated image-plane runs retain authored order.
+   Camera-compatible 3D islands currently merge into one physical trace.
+6. **Colour stages — implemented.** Scene-linear layers execute before the
+   display transform; Screen/Lens runs execute in display-linear space after it.
+7. **Output split — implemented.** `beauty.exr` remains pure Weaver 3D;
+   `scene-composite.exr` preserves pre-display HDR; `display-master.exr` retains
+   the complete post-display RGBA16F result; and `display.png` is encoded once
+   from that master. Denoised output follows the same contract while root AOV
+   files remain untouched.
+8. **S74 acceptance — implemented on Apple M2.** Frame 0 at authored 1920x1080
+   completed through the RGBA16F path. The hard lower-screen rectangle was
+   migrated to a feathered ground-mist gradient so it no longer creates an
+   opaque-looking horizontal obstruction.
+
+## Master sequence and video phase status
+
+9. **Master profile — implemented.** `MasterSequenceSettings` fixes the source
+   to compositor-complete RGBA16F display masters and an explicit SDR BT.709
+   delivery target. HDR is not exposed until a validated luminance transform
+   exists.
+10. **Resumable scheduler — implemented.** Inclusive frame ranges render with
+    bounded one-frame memory, copy masters atomically, and skip only frames whose
+    source/job signature and expected EXRs still match.
+11. **Sequence manifest — implemented.** `sequence-manifest.json` records source
+    and sequence hashes, rational FPS, resolution, color/alpha contract, every
+    frame, output paths, state, and the final probe evidence.
+12. **Professional video master — implemented.** The display-master EXRs encode
+    to BT.709 ProRes 4444 XQ with retained alpha and 24-bit PCM when audio exists.
+13. **Audio and review output — implemented.** Authored audio is mixed to a
+    48 kHz stereo float WAV, trimmed to the selected frame range, then muxed as
+    PCM in the master and AAC in the H.264 review MP4.
+14. **Acceptance — implemented.** The exporter checks first/middle/last EXRs and
+    uses `ffprobe` to enforce frame count, resolution, codec/profile, alpha pixel
+    format, BT.709 tags, and 48 kHz stereo audio. It also decodes a middle frame
+    and rejects effectively black encoder output. S74 frame 0 completed on M2
+    and a second run resumed the EXR without retracing.
+
+Coverage, depth, normal and albedo AOVs are populated. Sequence renders also
+populate camera motion in output-pixel units from the previous physical camera.
+Per-object deformation motion and independent 3D-island textures remain future
+work rather than being presented as completed behaviour.
+
+## Sequence performance phase status
+
+15. **Phase profiling — implemented.** Every frame report and sequence manifest
+    records parse, scene evaluation, geometry/BVH, GPU setup, path trace,
+    composition/output and denoise timings, plus the frame-delta classification.
+16. **Persistent sequence session — implemented.** Source text and the parsed
+    graph remain live across frames and are invalidated by path, size or modified
+    time. The second S74 frame measured 0.00009 s parser time.
+17. **Static GPU cache — implemented.** One device, queue and path-tracing
+    pipeline remain resident. Exact scenes reuse buffers; animated scenes update
+    existing allocations when capacity permits.
+18. **Frame deltas — implemented.** Reports distinguish first frame,
+    camera/uniform-only, resident scene-buffer update, full scene rebuild and
+    pure-2D work.
+19. **BVH reuse/refit — implemented.** Stable triangle order retains SAH tree
+    topology and refits bounds for animated geometry. Topology/count changes
+    safely fall back to a full build.
+20. **GPU batching/residency — implemented.** Active tiles dispatch in one pass
+    and read back through one collective submit/wait per sampling round. Static
+    textures are not uploaded again when unchanged.
+21. **Motion and temporal denoise — implemented with an explicit boundary.**
+    Camera motion vectors feed an opt-in history pass with normal/albedo rejection
+    and neighbourhood clamping. Independent denoise remains the default;
+    `--temporal-denoise` selects temporal mode. Object/deformation motion is not
+    fabricated and temporal ranges rerender until history sidecars exist.
+22. **Acceptance and bounded storage — implemented.** Completed canonical EXRs
+    are atomic; duplicate job AOV/checkpoint directories are removed by default,
+    while interrupted frames retain recovery data. `checkpoint_retention=all`
+    preserves diagnostic jobs. A two-frame S74 1920x1080 Metal run completed on
+    Apple M2 with 24 MiB of retained masters rather than tens of GiB of duplicate
+    checkpoints.
+
 ## Architecture now on disk
 
 ```text
@@ -69,4 +158,7 @@ medium in the job and tune extinction/albedo/anisotropy against the scene scale.
 Keep HDR radiance and camera exposure separate from final display grading.
 
 No CLI binary, separate crate, HTTP service, new DSL tags or automatic browser
-preview routing is introduced in this implementation.
+preview routing is introduced in this implementation. The opt-in
+`weaver::preview::PreviewSession` API and its `weaver_preview` example host are
+the only additions; they reuse the existing lowering and leave `render` and its
+checkpoints unchanged.

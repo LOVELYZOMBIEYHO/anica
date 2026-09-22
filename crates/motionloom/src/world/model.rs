@@ -2,6 +2,8 @@
 // =========================================
 // crates/motionloom/src/world/model.rs
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -55,9 +57,9 @@ pub struct WorldLighting {
     pub contact_shadow_softness: f32,
     #[serde(default)]
     pub color_management: WorldColorManagement,
-    /// Optional world-space atmospheric fog. None keeps the previous shader result.
+    /// Optional world-space participating medium shared by every renderer.
     #[serde(default)]
-    pub atmosphere_fog: Option<WorldAtmosphereFog>,
+    pub atmosphere_medium: Option<crate::scene::atmosphere::AtmosphereMediumPlan>,
 }
 
 impl Default for WorldLighting {
@@ -72,54 +74,9 @@ impl Default for WorldLighting {
             contact_shadow_distance: default_world_contact_distance(),
             contact_shadow_softness: default_world_contact_softness(),
             color_management: WorldColorManagement::default(),
-            atmosphere_fog: None,
+            atmosphere_medium: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct WorldAtmosphereFog {
-    pub mode: String,
-    pub color: [f32; 3],
-    pub density: f32,
-    pub start: f32,
-    pub end: f32,
-    pub base_height: f32,
-    pub height_falloff: f32,
-    pub scattering: f32,
-    pub absorption: [f32; 3],
-    pub scattering_color: [f32; 3],
-    pub affect_sky: bool,
-    /// Finite world-space bounds enable local fog; None retains global fog.
-    #[serde(default)]
-    pub bounds_min: Option<[f32; 3]>,
-    #[serde(default)]
-    pub bounds_max: Option<[f32; 3]>,
-    #[serde(default)]
-    pub edge_feather: f32,
-    pub volumetric_scattering: Option<WorldVolumetricScattering>,
-    pub water_caustics: Option<WorldWaterCaustics>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct WorldVolumetricScattering {
-    pub light_ref: String,
-    pub intensity: f32,
-    pub anisotropy: f32,
-    pub max_distance: f32,
-    pub shadowed: bool,
-    pub debug_view: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct WorldWaterCaustics {
-    pub intensity: f32,
-    pub scale: f32,
-    pub speed: f32,
-    pub depth_falloff: f32,
-    pub color: [f32; 3],
-    pub volume_term: bool,
-    pub surface_term: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -262,7 +219,29 @@ pub struct WorldNode {
     pub background: Option<WorldBackground>,
     pub camera: WorldCamera,
     pub actors: Vec<WorldActor>,
+    /// Scene bridge actors may be retained behind an Arc so large static
+    /// scatters do not deep-clone tens of thousands of actors every frame.
+    #[serde(skip)]
+    pub(crate) retained_actors: Option<Arc<Vec<WorldActor>>>,
+    #[serde(skip)]
+    pub(crate) retained_actor_revision: Option<u64>,
     pub directional_characters: Vec<WorldDirectionalCharacter>,
+}
+
+impl WorldNode {
+    pub(crate) fn actor_slice(&self) -> &[WorldActor] {
+        self.retained_actors
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(self.actors.as_slice())
+    }
+
+    pub(crate) fn retained_actor_identity(&self) -> Option<(usize, u64)> {
+        self.retained_actors.as_ref().and_then(|actors| {
+            self.retained_actor_revision
+                .map(|revision| (Arc::as_ptr(actors) as usize, revision))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -448,6 +427,37 @@ pub struct WorldActor {
     pub play: Option<WorldPlay>,
     #[serde(default)]
     pub plays: Vec<WorldPlay>,
+    /// Runtime-only per-material overrides resolved from `MaterialBinding definition`.
+    #[serde(default)]
+    pub material_color_overrides: Vec<WorldMaterialColorOverride>,
+}
+
+/// Authored `MaterialBinding` values applied over one imported GLB material.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldMaterialColorOverride {
+    /// GLB material name matched case-insensitively, or `*` for every material.
+    pub material: String,
+    /// Absolute base color from a `definition` MaterialAsset, display-referred 0..1.
+    #[serde(default)]
+    pub base_color: Option<[f32; 4]>,
+    #[serde(default)]
+    pub metallic: Option<f32>,
+    #[serde(default)]
+    pub roughness: Option<f32>,
+    #[serde(default)]
+    pub specular: Option<f32>,
+    #[serde(default)]
+    pub normal_scale: Option<f32>,
+    /// Non-destructive tint blended over the imported base color.
+    #[serde(default)]
+    pub tint: Option<[f32; 4]>,
+    /// Blend weight for `tint`; 1 sets the color on textureless materials.
+    #[serde(default = "default_material_tint_amount")]
+    pub tint_amount: f32,
+}
+
+fn default_material_tint_amount() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

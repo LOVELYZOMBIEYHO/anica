@@ -66,8 +66,11 @@ const SCENE_LIVE_PREVIEW_480P_MAX_DIM: u32 = 854;
 const SCENE_LIVE_SCROLL_RENDER_DEBOUNCE_MS: u64 = 2000;
 const SCENE_LIVE_INPUT_RENDER_DEBOUNCE_MS: u64 = 120;
 const SCENE_LIVE_PRERENDER_MAX_FRAMES: u32 = 6000;
-const SCENE_LIVE_PREVIEW_FRAME_CACHE_CAPACITY: usize = 6000;
-const SCENE_LIVE_PREVIEW_FRAME_CACHE_MAX_BYTES: usize = 768 * 1024 * 1024;
+// Keep compatibility-preview frames bounded. The external WGPU host owns the
+// normal playback path, so retaining an entire clip as CPU BGRA only wastes CPU
+// bandwidth and can pin hundreds of megabytes for complex scenes.
+const SCENE_LIVE_PREVIEW_FRAME_CACHE_CAPACITY: usize = 96;
+const SCENE_LIVE_PREVIEW_FRAME_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const SCENE_LIVE_RENDER_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 const SCENE_LIVE_PRERENDER_POLL_MS: u64 = 16;
 const SCENE_LIVE_IDLE_POLL_MS: u64 = 120;
@@ -2372,6 +2375,28 @@ impl MotionLoomPage {
                 }
                 PreviewEvent::HostFocus { focused } => {
                     self.scene_external_preview_host_focused = focused;
+                }
+                PreviewEvent::FrameMetrics {
+                    backend,
+                    zero_copy,
+                    cpu_ms,
+                    gpu_ms,
+                    readback_ms,
+                    draw_calls,
+                    ..
+                } => {
+                    let gpu = gpu_ms
+                        .map(|value| format!("{value:.1} ms"))
+                        .unwrap_or_else(|| "pending".to_string());
+                    self.scene_live_preview_status = format!(
+                        "Preview: {}{} · CPU {:.1} ms · GPU {} · readback {:.1} ms · {} draws",
+                        backend.to_ascii_uppercase(),
+                        if zero_copy { " zero-copy" } else { "" },
+                        cpu_ms,
+                        gpu,
+                        readback_ms,
+                        draw_calls,
+                    );
                 }
                 _ => {}
             }
@@ -4696,12 +4721,11 @@ impl MotionLoomPage {
         self.preview_frame_accum = 0.0;
         let token = self.preview_play_token;
         self.status_line = format!("Loop playback started at {} fps.", self.playback_fps());
-        if self.has_scene_playback_graph() && !self.scene_external_preview_active() {
-            self.start_scene_live_prerender(window, cx);
-            self.schedule_preview_playback(token, window, cx);
-        } else {
-            self.schedule_preview_playback(token, window, cx);
-        }
+        // Playback renders only the newest requested frame. Full-clip RAM
+        // prerender crossed the GPU/CPU boundary once per frame and made large
+        // scenes unusable when the external zero-readback host was unavailable.
+        self.cancel_scene_live_prerender();
+        self.schedule_preview_playback(token, window, cx);
         cx.notify();
     }
 

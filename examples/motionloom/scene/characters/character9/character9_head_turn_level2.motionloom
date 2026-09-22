@@ -1,4 +1,19 @@
 <Graph fps={30} duration="4s" size={[900,600]} renderSize={[900,600]}>
+
+  <Assets>
+    <ImageAsset id="char9_body_uniform" src="scene/characters/character9/parts/body_uniform.png" />
+    <ImageAsset id="char9_hair_back" src="scene/characters/character9/parts/hair_back.png" />
+    <ImageAsset id="char9_hair_side_r" src="scene/characters/character9/parts/hair_side_r.png" />
+    <ImageAsset id="char9_ear_l" src="scene/characters/character9/parts/ear_l.png" />
+    <ImageAsset id="char9_ear_r" src="scene/characters/character9/parts/ear_r.png" />
+    <ImageAsset id="char9_face_base" src="scene/characters/character9/parts/face_base.png" />
+    <ImageAsset id="char9_eye_l" src="scene/characters/character9/parts/eye_l.png" />
+    <ImageAsset id="char9_eye_r" src="scene/characters/character9/parts/eye_r.png" />
+    <ImageAsset id="char9_nose" src="scene/characters/character9/parts/nose.png" />
+    <ImageAsset id="char9_mouth" src="scene/characters/character9/parts/mouth.png" />
+    <ImageAsset id="char9_hair_front_shell" src="scene/characters/character9/parts/hair_front_shell.png" />
+    <ImageAsset id="char9_bow" src="scene/characters/character9/parts/bow.png" />
+  </Assets>
   <Background color="#F9F4F6" />
 
   <Scene id="character9_head_turn_level2">
@@ -36,60 +51,60 @@
                        opacity="1">
 
               <Part id="body_uniform" role="body" x="-155" y="245" scale="1" opacity="1">
-                <Image src="scene/characters/character9/parts/body_uniform.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_body_uniform" x="0" y="0" scale="1" opacity="1" />
               </Part>
 
               <!-- Back hair narrows slightly, but stays front-readable. -->
               <Part id="hair_back" role="hair_back" x={curve("0:-133:linear, 1.2:-133:linear, 2.4:-116:ease_in_out, 4:-116:linear")} y={curve("0:-31:linear, 1.2:-31:linear, 2.4:-29:ease_in_out, 4:-29:linear")} scale={curve("0:0.88:linear, 1.2:0.88:linear, 2.4:0.86:ease_in_out, 4:0.86:linear")} opacity="0.98">
                 <Group id="hair_back_turn_space" x="0" y="0" scaleX={curve("0:1.00:linear, 1.2:1.00:linear, 2.4:0.86:ease_in_out, 4:0.86:linear")} transformOriginX="149" transformOriginY="160">
-                  <Image src="scene/characters/character9/parts/hair_back.png" x="0" y="0" scale="1" opacity="1" />
+                  <Image asset="char9_hair_back" x="0" y="0" scale="1" opacity="1" />
                 </Group>
               </Part>
 
               <!-- A weak side-hair accent is used only as depth, not as a full side-view replacement. -->
               <Part id="right_side_depth_hair" role="hair_depth" x={curve("0:38:linear, 1.2:38:linear, 2.4:58:ease_in_out, 4:58:linear")} y={curve("0:-22:linear, 1.2:-22:linear, 2.4:-18:ease_in_out, 4:-18:linear")} scale={curve("0:0.42:linear, 1.2:0.42:linear, 2.4:0.56:ease_in_out, 4:0.56:linear")} opacity={curve("0:0:linear, 1.2:0:linear, 2.4:0.20:ease_in_out, 4:0.20:linear")}>
-                <Image src="scene/characters/character9/parts/hair_side_r.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_hair_side_r" x="0" y="0" scale="1" opacity="1" />
               </Part>
 
               <!-- Far ear fades; near ear remains as the head turns right. -->
               <Part id="ear_left" role="ear" x={curve("0:-117:linear, 1.2:-117:linear, 2.4:-86:ease_in_out, 4:-86:linear")} y="128" scale={curve("0:0.62:linear, 1.2:0.62:linear, 2.4:0.42:ease_in_out, 4:0.42:linear")} opacity={curve("0:1:linear, 1.2:1:linear, 2.4:0.18:ease_in_out, 4:0.18:linear")}>
-                <Image src="scene/characters/character9/parts/ear_l.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_ear_l" x="0" y="0" scale="1" opacity="1" />
               </Part>
               <Part id="ear_right" role="ear" x={curve("0:86:linear, 1.2:86:linear, 2.4:76:ease_in_out, 4:76:linear")} y={curve("0:128:linear, 1.2:128:linear, 2.4:126:ease_in_out, 4:126:linear")} scale={curve("0:0.62:linear, 1.2:0.62:linear, 2.4:0.70:ease_in_out, 4:0.70:linear")} opacity="1">
-                <Image src="scene/characters/character9/parts/ear_r.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_ear_r" x="0" y="0" scale="1" opacity="1" />
               </Part>
 
               <!-- Face keeps the same asset, but compresses and shifts right: a fake 45-degree turn. -->
               <Part id="face_base" role="face" x={curve("0:-89:linear, 1.2:-89:linear, 2.4:-68:ease_in_out, 4:-68:linear")} y={curve("0:-2:linear, 1.2:-2:linear, 2.4:0:ease_in_out, 4:0:linear")} scale="0.68" opacity="1">
                 <Group id="face_turn_space" x="0" y="0" scaleX={curve("0:1.00:linear, 1.2:1.00:linear, 2.4:0.78:ease_in_out, 4:0.78:linear")} transformOriginX="132" transformOriginY="170">
-                  <Image src="scene/characters/character9/parts/face_base.png" x="0" y="0" scale="1" opacity="1" />
+                  <Image asset="char9_face_base" x="0" y="0" scale="1" opacity="1" />
                 </Group>
               </Part>
 
               <Part id="eye_far_left" role="eye_far" x={curve("0:-72:linear, 1.2:-72:linear, 2.4:-28:ease_in_out, 4:-28:linear")} y={curve("0:116:linear, 1.2:116:linear, 2.4:118:ease_in_out, 4:118:linear")} scale={curve("0:0.43:linear, 1.2:0.43:linear, 2.4:0.24:ease_in_out, 4:0.24:linear")} opacity={curve("0:1:linear, 1.2:1:linear, 2.4:0.38:ease_in_out, 4:0.38:linear")}>
-                <Image src="scene/characters/character9/parts/eye_l.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_eye_l" x="0" y="0" scale="1" opacity="1" />
               </Part>
               <Part id="eye_near_right" role="eye_near" x={curve("0:28:linear, 1.2:28:linear, 2.4:38:ease_in_out, 4:38:linear")} y={curve("0:116:linear, 1.2:116:linear, 2.4:115:ease_in_out, 4:115:linear")} scale={curve("0:0.43:linear, 1.2:0.43:linear, 2.4:0.46:ease_in_out, 4:0.46:linear")} opacity="1">
-                <Image src="scene/characters/character9/parts/eye_r.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_eye_r" x="0" y="0" scale="1" opacity="1" />
               </Part>
 
               <Part id="nose" role="nose" x={curve("0:-6:linear, 1.2:-6:linear, 2.4:25:ease_in_out, 4:25:linear")} y={curve("0:168:linear, 1.2:168:linear, 2.4:166:ease_in_out, 4:166:linear")} scale={curve("0:0.54:linear, 1.2:0.54:linear, 2.4:0.50:ease_in_out, 4:0.50:linear")} opacity="0.78">
-                <Image src="scene/characters/character9/parts/nose.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_nose" x="0" y="0" scale="1" opacity="1" />
               </Part>
               <Part id="mouth" role="mouth" x={curve("0:-4:linear, 1.2:-4:linear, 2.4:23:ease_in_out, 4:23:linear")} y={curve("0:189:linear, 1.2:189:linear, 2.4:188:ease_in_out, 4:188:linear")} scale={curve("0:0.24:ease_in_out, 1.2:0.24:linear, 2.4:0.20:ease_in_out, 4:0.20:linear")} opacity="0.90">
-                <Image src="scene/characters/character9/parts/mouth.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_mouth" x="0" y="0" scale="1" opacity="1" />
               </Part>
 
               <!-- Front hair remains the main silhouette, but compresses and reveals the near side. -->
               <Part id="hair_front" role="hair_front" x={curve("0:-155:linear, 1.2:-155:linear, 2.4:-136:ease_in_out, 4:-136:linear")} y={curve("0:-45:linear, 1.2:-45:linear, 2.4:-43:ease_in_out, 4:-43:linear")} scale={curve("0:0.94:linear, 1.2:0.94:linear, 2.4:0.91:ease_in_out, 4:0.91:linear")} rotation={curve("0:-0.7:ease_in_out, 1.2:-0.7:linear, 2.4:1.8:ease_in_out, 4:1.8:linear")} opacity="1">
                 <Group id="hair_front_turn_space" x="0" y="0" scaleX={curve("0:1.00:linear, 1.2:1.00:linear, 2.4:0.84:ease_in_out, 4:0.84:linear")} transformOriginX="166" transformOriginY="178">
-                  <Image src="scene/characters/character9/parts/hair_front_shell.png" x="0" y="0" scale="1" opacity="1" />
+                  <Image asset="char9_hair_front_shell" x="0" y="0" scale="1" opacity="1" />
                 </Group>
               </Part>
 
 
               <Part id="bow" role="accessory" x="-75" y="297" scale="0.74" opacity="0">
-                <Image src="scene/characters/character9/parts/bow.png" x="0" y="0" scale="1" opacity="1" />
+                <Image asset="char9_bow" x="0" y="0" scale="1" opacity="1" />
               </Part>
             </Character>
           </Layer>

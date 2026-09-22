@@ -1,5 +1,9 @@
 <!-- Scene full-feature showcase: covers Defs, resources, timeline, composition, primitives, camera, character, component/repeat, mask/matte, image, svg, pixel art, and local-time Precompose. -->
 <Graph fps={30} duration="8s" size={[1280,720]} renderSize={[1280,720]}>
+
+  <Assets>
+    <ImageAsset id="sample_readme_showcase1" src="examples/motionloom/sample_assets/README/readme_showcase1.png" />
+  </Assets>
   <Background color="#05070B" />
 
   <Scene id="scene_full_feature_showcase_level1">
@@ -168,7 +172,7 @@
       <Track id="background_composite" z="0">
         <Sequence from="0s" duration="8s" out="hold">
           <Layer id="soft_ui_image" blend="screen" opacity="0.14">
-            <Image src="examples/motionloom/sample_assets/README/readme_showcase1.png"
+            <Image asset="sample_readme_showcase1"
                    x="348"
                    y="236"
                    scale="0.18"

@@ -254,6 +254,40 @@ directly below `<Scene>`.
 authoring grammar. Keeping one structure makes scripts easier for parsers, UI
 editors, humans, and other LLMs to modify safely.
 
+### Raster scene images
+
+`<Image>` never carries a raw source. Declare the source once as an
+`<ImageAsset>` under `<Assets>`, then reference its id:
+
+```xml
+<Graph fps={30} duration="3s" size={[1920,1080]}>
+  <Assets>
+    <ImageAsset id="logo" src="assets/logo.png" />
+  </Assets>
+  <Background color="#090B12" />
+  <Scene id="image_scene">
+    <Timeline>
+      <Track id="main" space="world" z="0">
+        <Sequence from="0s" duration="3s" out="hold">
+          <Layer>
+            <Image asset="logo" x="center" y="center" scale="0.5" opacity="1" />
+          </Layer>
+        </Sequence>
+      </Track>
+    </Timeline>
+  </Scene>
+  <Present from="image_scene" />
+</Graph>
+```
+
+- `<ImageAsset src>` accepts native paths, absolute `https://` URLs, and raster
+  `data:image/*;base64,...` URIs.
+- `<Image>` accepts `asset`, `id`, `material`, `x`, `y`, `scale`, and `opacity`.
+- `<Image src="...">` and `<Image path="...">` are rejected. The parser reports
+  that the asset must be declared and referenced by id.
+- `<Character src="...">` keeps its inline raster source form and is the only
+  scene node that still embeds a source directly.
+
 For true 3D, keep the same Scene timeline and place the 3D island inside its
 own track:
 
@@ -317,6 +351,21 @@ resource and only enters the Scene through `Model`:
            type="dynamic" shape="auto" mass="1" />
 ```
 
+For packed maps, name the channels instead of assuming the source convention:
+`metallicChannel`, `roughnessChannel`, and `occlusionChannel` accept only
+`r|g|b|a|luminance`. Their matching `*Invert` flags default to `false`.
+Omitting all six attributes preserves glTF's B/G/R convention exactly.
+
+Use one `CurveAsset` plus one or more `SweepAsset` declarations for repeated
+geometry along the same spatial route. Do not emit thousands of `Vertex`,
+`Face`, or duplicated path-point lines for roads, pipes, cables, rails, walls,
+or hair guides. Use `interpolation="linear"` for exact straight segments and
+polylines, or `catmullRom` for a smooth curve through control points. Use
+`frame="parallelTransport"` for arbitrary 3D routes and `frame="worldUp"` for
+road-like profiles that must remain upright. Put the 2D cross-section inside
+`Profile`; `ProfilePoint.position` is `[side, up]`. A CurveAsset is not a Model
+and cannot be rendered directly; place the resulting SweepAsset with `Model`.
+
 For a native head without GLB geometry, use `HeadAsset`. `HeadShape` is the
 required species-neutral volume; `FaceLayout` is optional and must not be
 forced onto creature heads. Use `HeadFeature center/size/amount` for sockets,
@@ -368,6 +417,20 @@ remain shared. Prefer one ImageAsset/MaterialAsset reused by many instances;
 duplicating image declarations with different source strings prevents source
 identity sharing.
 
+Imported GLB materials accept a per-material override on the owning `Model`.
+`modelSourceMaterial` matches the GLB material name case-insensitively, or `*`
+for every material. It is required so imported-model names cannot be confused
+with MotionLoom `MaterialAsset` references. `definition="<MaterialAsset id>"`
+replaces that material with the
+asset values. `tint="#RRGGBB"` (with optional `tintAmount="0..1"`, default 1)
+blends only the base color toward the tint while keeping the imported
+metallic, roughness, specular, and normal values; a textureless material takes
+the tint as its color, while a textured material is colorized. Optional
+`metallic`, `roughness`, `specular`, and `normalScale` attributes override
+individual scalars without touching the base color texture. Both forms stay
+lit and shadowed; only `texture="@scene:..."` turns a material into an unlit
+display surface, so reserve it for rendered Scene content.
+
 Use `VegetationAsset` for bounded procedural plants, then place it with normal
 `Model` nodes. V1 kinds are `tree`, `shrub`, `grass`, `flower`, `fern`, and
 `deadwood`:
@@ -389,6 +452,27 @@ it as a world scatter count. Reuse one asset with multiple Model nodes instead
 of duplicating declarations. Keep generated leaf, grass, flower, and fern
 atlases transparent and reference them through alpha-mask PBR MaterialAssets.
 Existing asset kinds require no migration; VegetationAsset is opt-in.
+
+For a large forest, do not emit thousands of individual Model nodes. Place a
+TerrainAsset Model once and use one deterministic Scatter with weighted asset
+variants:
+
+```xml
+<Model id="terrain" asset="terrain_asset" />
+<Scatter id="forest" surface="terrain" count="12000" seed="97"
+  densityMap="forest_density" exclusionMap="road_clearance"
+  slopeRange={[0,42]} scaleRange={[0.7,1.3]}
+  rotationYRange={[0,360]}>
+  <Variant asset="pine" weight="3" />
+  <Variant asset="oak" weight="1" />
+</Scatter>
+```
+
+Scatter v1 accepts a TerrainAsset-backed `surface`, a literal count and seed,
+and one or more positive-weight Variant children. Its masks must be linear
+ImageAssets. Use `surfaceOffset` only to sink roots into the terrain; do not
+compensate for an incorrect TerrainAsset height scale. Generated instances use
+runtime structured identities and therefore do not need authored ids.
 
 For architectural glass, water, or transparent plastic, prefer physical
 transmission over lowering base-colour alpha:
@@ -440,10 +524,9 @@ as a floating-point mip chain; LDR inputs are converted from display gamma.
                  distance="0.35" softness="0.6" />
   <ColorManagement id="grade" toneMapping="aces" exposure="1"
                    whiteBalance="5600" contrast="1.06" />
-  <AtmosphereFog id="mist" mode="height" color="#BFD9C8"
-                 density="0.018" start="3" end="34"
-                 baseHeight="0.35" heightFalloff="0.12"
-                 scattering="0.1" affectSky="true" />
+  <AtmosphereFog id="mist" scatteringColor="#BFD9C8"
+                 density="0.018"
+                 baseHeight="0.35" heightFalloff="0.12" affectEnvironment="true" />
   <Camera3D position={[6,4,8]} target={[0,1,0]} fov="38"
             depthOfField="true" focusTarget="@hero_model"
             focalLength="50" fStop="2.8" maxBlur="8" />
@@ -464,29 +547,26 @@ Lighting and grading values such as `rotationY`, `intensity`, `exposure`,
 Query the animation property schema before writing keys rather than inventing
 properties.
 
-`AtmosphereFog` is world-owned: use `linear`, `exp`, or `height` mode and keep
-density low for bright outdoor scenes. Omit `boundsMin` and `boundsMax` for the
-legacy global medium. Provide both to confine fog to a world-space box; use
-`edgeFeather` to soften its boundary. A camera outside the box can still see
-fog along rays that pass through it, so indoor-to-outdoor shots do not require
-a screen mask or a timeline switch.
+`AtmosphereFog` is a world-owned participating medium. `density` is extinction
+per world unit, `scatteringColor` is linear single-scattering albedo, and
+`anisotropy` is the Henyey-Greenstein direction bias from `-0.99` through
+`0.99`. Omit `boundsMin` and `boundsMax` for an unbounded medium. Provide both
+to confine it to a world-space box; use `edgeFeather` to soften its boundary.
+A camera outside the box can still see atmosphere along rays that pass through
+it, so indoor-to-outdoor shots do not require a screen mask or timeline switch.
 
 ```xml
-<AtmosphereFog mode="exp" color="#668FA8" density="0.045"
+<AtmosphereFog scatteringColor="#668FA8" density="0.045"
                boundsMin={[-20,-2,-30]} boundsMax={[20,20,-3.2]}
-               edgeFeather="1.5" affectSky="true" />
+               edgeFeather="1.5" affectEnvironment="true" />
 ```
 
-This is an additive `0.1.x` extension: existing tags without bounds keep their
-previous result. Before, local fog required an approximate compositing mask;
-now the optional bounds provide depth-aware world-space confinement.
-
-For visible light shafts or underwater absorption, make the fog a block and
+For visible light shafts or underwater attenuation, make the fog a block and
 author one `VolumetricScattering` child. Its `lightRef` must name a
 shadow-casting DirectionalLight or SpotLight in the same 3D scene. Add
 `WaterCaustics` only when the setting contains water; it is a procedural light
 transport approximation, not a replacement for a material texture. See
-[VOLUMETRICS.md](VOLUMETRICS.md) for the exact attributes, quality grids, pass
+[VOLUMETRICS.md](VOLUMETRICS.md) for exact attributes, quality grids, pass
 order, animation channels, and platform fallback.
 
 Depth of field is camera-owned and is a real depth-buffer post pass.

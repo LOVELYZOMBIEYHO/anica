@@ -36,7 +36,7 @@ Rules:
 - MotionLoom scene render trigger must use `anica.motionloom/render_scene`.
 - For MotionLoom `scene` DSL generation (text/image/svg/motion-graphics scene), use scene-node style:
   - Preferred skeleton: `<Graph scope="scene" ...>`, `<Scene id="scene0">...</Scene>`, `<Present from="scene0" />`.
-  - Simple direct scene nodes remain valid (`<Solid>`, `<Text>`, `<Image>`, `<Svg>`, `<Present from="scene" />`), but prefer `<Scene id="scene0">` for new scripts.
+  - Simple direct scene nodes remain valid (`<Solid>`, `<Text>`, `<Image>`, `<Svg>`, `<Present from="scene" />`), but prefer `<Scene id="scene0">` for new scripts. `<Image>` requires `asset="..."` naming an `<ImageAsset>` declared under `<Assets>`; raw `src` on `<Image>` is rejected.
   - `<Scene>` children should use `<Timeline><Track><Sequence><Layer>...`; visual layers may include `<Text>`, `<Image>`, `<Svg>`, `<Group>`, `<Mask>`, `<Character>`, `<Rect>`, `<Circle>`, `<Line>`, `<Polyline>`, `<Path>`, `<Shadow>`, and `<Repeat>`.
   - If the full-frame background is static, use `<Background color="..."/>` only; do not add a full-canvas `<Rect>` that duplicates the same background color.
   - Only use a full-canvas `<Rect>` as a background when it needs timeline animation, blend mode, opacity animation, masking, clipping, or scene-local layering.

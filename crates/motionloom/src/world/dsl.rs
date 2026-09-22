@@ -205,6 +205,8 @@ fn parse_world_block(
         background,
         camera,
         actors,
+        retained_actors: None,
+        retained_actor_revision: None,
         directional_characters,
     })
 }
@@ -483,6 +485,7 @@ fn parse_actor_node(open: &str, inner: &str) -> Result<WorldActor, GraphParseErr
         material,
         play,
         plays: parsed_plays,
+        material_color_overrides: Vec::new(),
     })
 }
 
@@ -790,7 +793,7 @@ fn validate_world_graph_refs(
     let line = 1;
     let actor_ids = worlds
         .iter()
-        .flat_map(|world| world.actors.iter().map(|actor| actor.id.as_str()))
+        .flat_map(|world| world.actor_slice().iter().map(|actor| actor.id.as_str()))
         .collect::<HashSet<_>>();
     let retarget_ids = retargets
         .iter()
@@ -806,7 +809,7 @@ fn validate_world_graph_refs(
         .collect::<HashSet<_>>();
 
     for world in worlds {
-        for actor in &world.actors {
+        for actor in world.actor_slice() {
             if let Some(retarget) = actor.retarget.as_deref()
                 && !retarget_ids.contains(retarget)
             {

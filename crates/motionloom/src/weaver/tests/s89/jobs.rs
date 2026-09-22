@@ -71,17 +71,6 @@ pub(super) fn baseline() -> RenderJob {
         .map(|s| s.parse::<u32>().expect("numeric frame"))
         .unwrap_or(0);
     job.denoiser_library = std::env::var_os("WEAVER_DENOISER_LIBRARY").map(Into::into);
-    if std::env::var_os("WEAVER_TEST_VOLUME").is_some() {
-        job.volume = Some(Volume {
-            bounds_min: [-200.0, -10.0, -200.0],
-            bounds_max: [200.0, 90.0, -16.0],
-            extinction: 0.012,
-            albedo: [0.9, 0.94, 0.98],
-            anisotropy: 0.25,
-            max_bounces: 4,
-        });
-    }
-    job.allow_legacy_fog_omission = true;
     job.output = workspace.join(".render-output/weaver-s89");
     job
 }

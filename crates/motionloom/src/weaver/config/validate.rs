@@ -35,6 +35,9 @@ impl RenderJob {
             }
         }
         if let Some([x, y, w, h]) = self.region {
+            if self.output_mode == SceneOutputMode::CompositeScene {
+                return fail("region rendering is not yet compatible with composite_scene");
+            }
             if w == 0
                 || h == 0
                 || x.checked_add(w).is_none_or(|end| end > self.resolution[0])
@@ -82,27 +85,6 @@ impl RenderJob {
         }
         if self.scene_id.is_empty() || self.output.as_os_str().is_empty() {
             return fail("scene_id and output are required");
-        }
-        if let Some(v) = &self.volume {
-            if !v.extinction.is_finite()
-                || v.extinction <= 0.0
-                || !v.anisotropy.is_finite()
-                || v.anisotropy.abs() >= 0.99
-                || v.max_bounces == 0
-                || v.max_bounces > b.total
-            {
-                return fail("invalid volume scattering settings");
-            }
-            for i in 0..3 {
-                if !v.bounds_min[i].is_finite()
-                    || !v.bounds_max[i].is_finite()
-                    || v.bounds_min[i] >= v.bounds_max[i]
-                    || !v.albedo[i].is_finite()
-                    || !(0.0..=1.0).contains(&v.albedo[i])
-                {
-                    return fail("invalid volume bounds/albedo");
-                }
-            }
         }
         Ok(())
     }

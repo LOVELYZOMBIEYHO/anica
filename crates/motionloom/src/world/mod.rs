@@ -8,6 +8,9 @@ pub mod render;
 pub mod terrain;
 pub mod vegetation;
 
+pub use crate::scene::atmosphere::{
+    AtmosphereMediumPlan, VolumetricQuality, VolumetricScatteringPlan, WaterCausticsPlan,
+};
 pub use dsl::{is_world_graph_script, parse_world_graph_script};
 pub use gltf_loader::{
     GlbLoadError, GlbMeshData, GlbMetadata, GlbNodeData, load_glb_mesh_data, load_glb_metadata,
@@ -15,13 +18,13 @@ pub use gltf_loader::{
 };
 pub use model::{
     WorldAction, WorldActionBone, WorldActionIk, WorldActionPose, WorldActor, WorldApplyAction,
-    WorldAtmosphereFog, WorldAttachment, WorldAttachmentSocket, WorldAttachmentTarget,
-    WorldBackground, WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera,
-    WorldCameraControl, WorldCameraMode, WorldCameraProjection, WorldColorManagement,
-    WorldDepthOfField, WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind,
-    WorldLighting, WorldMaterial, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
+    WorldAttachment, WorldAttachmentSocket, WorldAttachmentTarget, WorldBackground,
+    WorldBackgroundFit, WorldBoneAxis, WorldBoneAxisMap, WorldCamera, WorldCameraControl,
+    WorldCameraMode, WorldCameraProjection, WorldColorManagement, WorldDepthOfField,
+    WorldEnvironmentLighting, WorldGraph, WorldLight, WorldLightKind, WorldLighting, WorldMaterial,
+    WorldMaterialColorOverride, WorldMaterialStyle, WorldModelProfile, WorldNode, WorldPathStyle,
     WorldPlay, WorldPresent, WorldProfileRetarget, WorldRetarget, WorldRetargetMap,
-    WorldSpritePlayback, WorldTime, WorldVolumetricScattering, WorldWaterCaustics,
+    WorldSpritePlayback, WorldTime,
 };
 pub(crate) use model::{WorldAnimationAsset, WorldConstraint};
 pub use model_inspection::{

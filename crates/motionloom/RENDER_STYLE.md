@@ -367,16 +367,16 @@ Optional Model material-slot bindings avoid changing shared materials or GLBs:
 
 ```xml
 <Model id="hero" asset="character">
-  <MaterialBinding material="*" outlineWidth="2" />
-  <MaterialBinding material="Face" celRole="face" outlineWidth="0.5"
+  <MaterialBinding modelSourceMaterial="*" outlineWidth="2" />
+  <MaterialBinding modelSourceMaterial="Face" celRole="face" outlineWidth="0.5"
                    celShadowColor="#B87E87" celControlMap="face_control" />
-  <MaterialBinding material="Hair" celRole="hair" hairHighlight="0.3"
+  <MaterialBinding modelSourceMaterial="Hair" celRole="hair" hairHighlight="0.3"
                    celControlMap="hair_control" />
 </Model>
 ```
 
-Exact, case-sensitive slot names override the wildcard. Missing slots and
-duplicates produce rendering errors. outlineWidth accepts 0–12 pixels,
+Exact slot names (matched case-insensitively) override the wildcard. Missing
+slots and duplicates produce rendering errors. outlineWidth accepts 0–12 pixels,
 celShadowColor accepts #RRGGBB, hairHighlight accepts 0–2. Roles are body/skin/hair/face.
 Skin currently uses the same band calculation, with separately authored shadow
 color; hair adds a tangent-aligned highlight band. Correct UVs/tangents and model

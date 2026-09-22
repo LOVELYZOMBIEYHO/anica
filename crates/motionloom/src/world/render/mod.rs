@@ -199,6 +199,7 @@ pub struct Scene3DFrameProfile {
     pub temporal_history_valid: bool,
     pub temporal_antialiasing: bool,
     pub screen_space_reflections: bool,
+    pub screen_space_global_illumination: bool,
     pub motion_blur: bool,
     pub anti_aliasing_requested: &'static str,
     pub anti_aliasing_effective: &'static str,
@@ -507,10 +508,10 @@ pub fn diagnose_world_graph_actor_gpu_frame(
         .presented_world()
         .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
     let actor = world
-        .actors
+        .actor_slice()
         .iter()
         .find(|actor| actor.id == actor_id)
-        .or_else(|| world.actors.first())
+        .or_else(|| world.actor_slice().first())
         .ok_or_else(|| WorldRenderError::GpuRender {
             message: "GPU diagnostics found no Actor in presented world".to_string(),
         })?;
@@ -901,6 +902,7 @@ pub struct WorldFrameRenderer {
     primitive_texture_cache: HashMap<PrimitiveTextureSourceKey, Arc<GlbTextureData>>,
     effective_bounds_cache: HashMap<PathBuf, ([f32; 3], [f32; 3])>,
     gpu_static_draw_cache: HashMap<GpuWorldStaticPlanKey, Vec<GpuWorldStaticDraw>>,
+    retained_world_draw_cache: HashMap<RetainedWorldDrawCacheKey, Arc<Vec<GpuWorldDraw>>>,
     skinning_strategy_cache: HashMap<SkinningStrategyKey, SkinningMatrixStrategy>,
     humanoid_rig_metrics_cache: HashMap<HumanoidRigMetricsKey, Scene3DHumanoidRigMetrics>,
     gpu_renderer: Option<GpuWorldRenderer>,
@@ -952,6 +954,14 @@ struct PreparedDrawStats {
 struct PrimitiveTextureSourceKey {
     identity: PathBuf,
     revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct RetainedWorldDrawCacheKey {
+    actor_identity: usize,
+    actor_revision: u64,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1065,6 +1075,7 @@ impl WorldFrameRenderer {
             primitive_texture_cache: HashMap::new(),
             effective_bounds_cache: HashMap::new(),
             gpu_static_draw_cache: HashMap::new(),
+            retained_world_draw_cache: HashMap::new(),
             skinning_strategy_cache: HashMap::new(),
             humanoid_rig_metrics_cache: HashMap::new(),
             gpu_renderer: None,
@@ -1132,7 +1143,7 @@ impl WorldFrameRenderer {
             .presented_world()
             .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
         let actor = world
-            .actors
+            .actor_slice()
             .iter()
             .find(|actor| actor.id == actor_id)
             .ok_or_else(|| WorldRenderError::MissingActor(actor_id.to_string()))?;
@@ -1575,6 +1586,7 @@ impl WorldFrameRenderer {
                 .as_ref()
                 .is_some_and(|renderer| renderer.temporal_history_enabled),
             screen_space_reflections: preview_budget.screen_space_reflections,
+            screen_space_global_illumination: preview_budget.screen_space_global_illumination,
             motion_blur: preview_budget.motion_blur
                 && self
                     .gpu_renderer
@@ -1640,25 +1652,61 @@ impl WorldFrameRenderer {
             )?;
         }
         let background_ms = background_started.elapsed().as_secs_f64() * 1000.0;
+        let camera_view = perspective_camera_view(world, width, height, time)?;
         let actor_started = ProfileClock::now();
-        let (draw_calls, actor, editor_joints, rig_reports) = build_actor_gpu_draws(
-            canvas.as_mut(),
-            width,
-            height,
-            self.collect_editor_rig_snapshot,
-            self.collect_rig_diagnostics,
-            graph,
-            world,
-            asset_root,
-            resolver,
-            time,
-            &mut self.mesh_cache,
-            &mut self.primitive_texture_cache,
-            &mut self.effective_bounds_cache,
-            &mut self.gpu_static_draw_cache,
-            &mut self.skinning_strategy_cache,
-            material_overrides,
-        )?;
+        let retained_key =
+            world
+                .retained_actor_identity()
+                .and_then(|(actor_identity, actor_revision)| {
+                    material_overrides
+                        .is_empty()
+                        .then_some(RetainedWorldDrawCacheKey {
+                            actor_identity,
+                            actor_revision,
+                            width,
+                            height,
+                        })
+                });
+        let (mut draw_calls, actor, editor_joints, rig_reports) = if let Some(cached) =
+            retained_key.and_then(|key| self.retained_world_draw_cache.get(&key))
+        {
+            (
+                cached.as_ref().clone(),
+                ActorBuildStages::default(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let built = build_actor_gpu_draws(
+                canvas.as_mut(),
+                width,
+                height,
+                self.collect_editor_rig_snapshot,
+                self.collect_rig_diagnostics,
+                graph,
+                world,
+                asset_root,
+                resolver,
+                time,
+                &mut self.mesh_cache,
+                &mut self.primitive_texture_cache,
+                &mut self.effective_bounds_cache,
+                &mut self.gpu_static_draw_cache,
+                &mut self.skinning_strategy_cache,
+                material_overrides,
+            )?;
+            if let Some(key) = retained_key {
+                if self.retained_world_draw_cache.len() >= 8 {
+                    self.retained_world_draw_cache.clear();
+                }
+                self.retained_world_draw_cache
+                    .insert(key, Arc::new(built.0.clone()));
+            }
+            built
+        };
+        for draw in &mut draw_calls {
+            update_gpu_world_draw_camera(draw, camera_view);
+        }
         let actor_build_ms = actor_started.elapsed().as_secs_f64() * 1000.0;
         self.last_prepare_stages = Scene3DPrepareStages {
             canvas_ms,
@@ -1672,7 +1720,6 @@ impl WorldFrameRenderer {
             joints: editor_joints,
             rig_reports,
         });
-        let camera_view = perspective_camera_view(world, width, height, time)?;
         let grid_params = if ground_grid {
             Some(if ground_grid_debug {
                 GpuGroundGridParams::debug_from_camera(width, height, camera_view)
@@ -1684,7 +1731,7 @@ impl WorldFrameRenderer {
         };
         let mut lighting = self.prepare_gpu_lighting(&graph.lighting, asset_root, camera_view)?;
         let budget = self.immediate_preview_settings.budget();
-        lighting.froxel = graph.lighting.atmosphere_fog.as_ref().and_then(|fog| {
+        lighting.froxel = graph.lighting.atmosphere_medium.as_ref().and_then(|fog| {
             let volume = fog.volumetric_scattering.as_ref()?;
             let light = graph
                 .lighting
@@ -1692,17 +1739,34 @@ impl WorldFrameRenderer {
                 .iter()
                 .find(|light| light.id.as_deref() == Some(volume.light_ref.as_str()))?
                 .clone();
+            let (tile_size, depth_slices) = match volume.quality {
+                crate::scene::atmosphere::VolumetricQuality::Low => (
+                    (budget.froxel_tile_size as u32).saturating_mul(2),
+                    (budget.froxel_depth_slices as u32 / 2).max(8),
+                ),
+                crate::scene::atmosphere::VolumetricQuality::Medium => (
+                    budget.froxel_tile_size as u32,
+                    budget.froxel_depth_slices as u32,
+                ),
+                crate::scene::atmosphere::VolumetricQuality::High => (
+                    (budget.froxel_tile_size as u32 / 2).max(2),
+                    (budget.froxel_depth_slices as u32).saturating_mul(2),
+                ),
+            };
             Some(GpuFroxelSettings {
-                tile_size: budget.froxel_tile_size as u32,
-                depth_slices: budget.froxel_depth_slices as u32,
+                tile_size,
+                depth_slices,
                 density: fog.density,
-                absorption: fog.absorption,
                 scattering: fog.scattering_color,
+                base_height: fog.base_height,
+                height_falloff: fog.height_falloff,
+                edge_feather: fog.edge_feather,
+                affect_environment: fog.affect_environment,
                 bounds_min: fog.bounds_min,
                 bounds_max: fog.bounds_max,
                 light,
-                intensity: volume.intensity,
-                anisotropy: volume.anisotropy,
+                intensity: volume.shaft_strength,
+                anisotropy: fog.anisotropy,
                 max_distance: volume.max_distance,
                 shadowed: volume.shadowed,
                 debug_view: match volume.debug_view.as_str() {
@@ -1733,6 +1797,26 @@ impl WorldFrameRenderer {
             budget.screen_space_reflections as u8 as f32,
             budget.motion_blur as u8 as f32,
             0.0,
+        ];
+        // Native profiles can afford longer reflection rays and more diffuse
+        // gather taps. Browser WebGPU keeps the same semantics at lower cost.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (ssr_steps, gi_samples) = match self.immediate_preview_settings.profile {
+            crate::preview::ImmediatePreviewProfile::Ultra => (40.0, 8.0),
+            crate::preview::ImmediatePreviewProfile::Cinematic => (28.0, 6.0),
+            _ => (0.0, 0.0),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (ssr_steps, gi_samples) = match self.immediate_preview_settings.profile {
+            crate::preview::ImmediatePreviewProfile::Ultra => (20.0, 4.0),
+            crate::preview::ImmediatePreviewProfile::Cinematic => (14.0, 4.0),
+            _ => (0.0, 0.0),
+        };
+        lighting.params.preview2 = [
+            budget.screen_space_global_illumination as u8 as f32,
+            ssr_steps,
+            gi_samples,
+            cfg!(target_arch = "wasm32") as u8 as f32,
         ];
         lighting.frame_index = frame;
         lighting.temporal_jitter = anti_aliasing.jitter_phases > 1;
@@ -1886,10 +1970,10 @@ impl CharacterDesignGpuViewport {
             .presented_world()
             .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
         let actor = world
-            .actors
+            .actor_slice()
             .iter()
             .find(|actor| actor.id == actor_id)
-            .or_else(|| world.actors.first());
+            .or_else(|| world.actor_slice().first());
         let diagnostics = if let Some(actor) = actor {
             let (model_key, mesh) = load_glb_mesh_resolved(
                 asset_root,
@@ -1962,10 +2046,10 @@ impl CharacterDesignGpuViewport {
             .presented_world()
             .ok_or_else(|| WorldRenderError::MissingWorld(graph.present.from.clone()))?;
         let actor = world
-            .actors
+            .actor_slice()
             .iter()
             .find(|actor| actor.id == actor_id)
-            .or_else(|| world.actors.first());
+            .or_else(|| world.actor_slice().first());
         let diagnostics = if let Some(actor) = actor {
             let (model_key, mesh) = load_glb_mesh_resolved(
                 asset_root,
@@ -2111,8 +2195,11 @@ struct GpuFroxelSettings {
     tile_size: u32,
     depth_slices: u32,
     density: f32,
-    absorption: [f32; 3],
     scattering: [f32; 3],
+    base_height: f32,
+    height_falloff: f32,
+    edge_feather: f32,
+    affect_environment: bool,
     bounds_min: Option<[f32; 3]>,
     bounds_max: Option<[f32; 3]>,
     light: WorldLight,
@@ -2121,7 +2208,7 @@ struct GpuFroxelSettings {
     max_distance: f32,
     shadowed: bool,
     debug_view: u32,
-    caustics: Option<crate::world::WorldWaterCaustics>,
+    caustics: Option<crate::scene::atmosphere::WaterCausticsPlan>,
 }
 
 fn uniform_layout_entry(
@@ -2473,7 +2560,7 @@ impl GpuWorldRenderer {
             integrated: make_volume("motionloom-froxel-integrated"),
             params: self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("motionloom-froxel-params"),
-                size: 19 * 16,
+                size: 20 * 16,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -2533,17 +2620,18 @@ impl GpuWorldRenderer {
                 fitted.camera0[3],
             ],
             fitted.camera3,
-            [
-                settings.absorption[0],
-                settings.absorption[1],
-                settings.absorption[2],
-                settings.density,
-            ],
+            [0.0, 0.0, 0.0, settings.density],
             [
                 settings.scattering[0],
                 settings.scattering[1],
                 settings.scattering[2],
                 settings.anisotropy,
+            ],
+            [
+                settings.base_height,
+                settings.height_falloff,
+                settings.edge_feather,
+                settings.affect_environment as u8 as f32,
             ],
             [
                 bounds_min[0],
@@ -2588,7 +2676,7 @@ impl GpuWorldRenderer {
                 caustics.map_or(0.0, |v| v.intensity),
                 caustics.map_or(0.1, |v| v.scale),
                 caustics.map_or(0.0, |v| v.speed),
-                caustics.map_or(0.0, |v| v.depth_falloff),
+                caustics.map_or(0.0, |v| v.attenuation),
             ],
             [
                 caustics.map_or(1.0, |v| v.color[0]),
@@ -2601,7 +2689,7 @@ impl GpuWorldRenderer {
             fitted.shadow2,
             fitted.shadow3,
         ];
-        let mut bytes = Vec::with_capacity(19 * 16);
+        let mut bytes = Vec::with_capacity(20 * 16);
         for vector in vectors {
             for value in vector {
                 bytes.extend_from_slice(&value.to_ne_bytes());
@@ -3162,7 +3250,7 @@ impl GpuWorldRenderer {
             });
         let lighting_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("anica-motionloom-world-lighting-params"),
-            size: 1152,
+            size: 1168,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -4010,7 +4098,10 @@ impl GpuWorldRenderer {
         let mut active_texture_keys = HashSet::<GpuWorldTextureKey>::new();
         let mut buffer_writes = 0usize;
         // Keep authoring order (including coplanar ties); only adjacent compatible
-        // opaque draws coalesce. Transparent and skinned draws remain independent.
+        // opaque draws coalesce. Visibility is aggregated across a batch instead
+        // of splitting on every in/out transition: the GPU clips off-screen
+        // instances, while splitting a spatially shuffled scatter would create
+        // tens of thousands of tiny buffers and submissions.
         let mut batches: Vec<(Vec<&GpuWorldDraw>, bool)> = Vec::new();
         let max_instances = (self.device.limits().max_storage_buffer_binding_size as usize
             / std::mem::size_of::<GpuWorldParams>())
@@ -4028,10 +4119,9 @@ impl GpuWorldRenderer {
                 if rigid { geometry.rigid_bounds } else { None },
                 draw.params,
             );
-            let compatible = batches.last().is_some_and(|(batch, previous_visible)| {
+            let compatible = batches.last().is_some_and(|(batch, _)| {
                 let previous = batch[0];
                 batch.len() < max_instances
-                    && *previous_visible == visible
                     && draw.phase == GpuWorldDrawPhase::Opaque
                     && draw.depth_write
                     && previous.phase == draw.phase
@@ -4051,7 +4141,9 @@ impl GpuWorldRenderer {
                     && geometry.rigid_bounds.is_some()
             });
             if compatible {
-                batches.last_mut().unwrap().0.push(draw);
+                let (batch, batch_visible) = batches.last_mut().unwrap();
+                batch.push(draw);
+                *batch_visible |= visible;
             } else {
                 batches.push((vec![draw], visible));
             }
@@ -6395,7 +6487,7 @@ fn draw_actor_debug_projections(
     let fov = eval_number(&world.camera.fov, 35.0, time)?.clamp(10.0, 100.0);
     let distance = eval_number(&world.camera.distance, 3.2, time)?.max(0.2);
 
-    for actor in &world.actors {
+    for actor in world.actor_slice() {
         let (_, mesh) = load_cached_actor_mesh(
             asset_root,
             actor,
@@ -6503,7 +6595,7 @@ fn build_actor_gpu_draws(
     // Prepare every actor before drawing so cross-actor constraints can inspect
     // both sampled skeletons at the same frame.
     let mut model_keys = HashMap::<String, PathBuf>::new();
-    for actor in &world.actors {
+    for actor in world.actor_slice() {
         let mut lod_actor = actor.clone();
         if let Some(vegetation) = lod_actor.vegetation.as_mut()
             && vegetation.lod == crate::dsl::VegetationLod::Auto
@@ -6529,7 +6621,7 @@ fn build_actor_gpu_draws(
     let animation_started = ProfileClock::now();
     let mut sampled_by_actor = HashMap::<String, HashMap<usize, SampledNodeTrs>>::new();
     let mut poses = HashMap::<String, ActorFramePose>::new();
-    for actor in &world.actors {
+    for actor in world.actor_slice() {
         let model_key = model_keys
             .get(&actor.id)
             .expect("actor model key prepared before animation sampling");
@@ -6559,7 +6651,7 @@ fn build_actor_gpu_draws(
         &poses,
         time,
     )?;
-    let mut render_actors = world.actors.clone();
+    let mut render_actors = world.actor_slice().to_vec();
     apply_world_attachments(
         graph,
         &mut render_actors,
@@ -7589,7 +7681,7 @@ fn scene_constraint_overrides(
             continue;
         };
         let Some(source_actor) = world
-            .actors
+            .actor_slice()
             .iter()
             .find(|actor| actor.id == source_actor_id)
         else {
@@ -7615,7 +7707,7 @@ fn scene_constraint_overrides(
                 continue;
             };
             let Some(target_actor) = world
-                .actors
+                .actor_slice()
                 .iter()
                 .find(|actor| actor.id == target_actor_id)
             else {
@@ -11134,7 +11226,7 @@ struct GpuWorldVertex {
     color: [f32; 4],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GpuWorldDraw {
     resource_key: GpuWorldResourceKey,
     instance_key: GpuWorldInstanceKey,
@@ -11221,6 +11313,7 @@ struct GpuWorldLightingParams {
     previous_camera3: [f32; 4],
     preview0: [f32; 4],
     preview1: [f32; 4],
+    preview2: [f32; 4],
     shadow0: [f32; 4],
     shadow1: [f32; 4],
     shadow2: [f32; 4],
@@ -11407,6 +11500,31 @@ struct PerspectiveCameraView {
     optics: [f32; 4],
 }
 
+fn update_gpu_world_draw_camera(draw: &mut GpuWorldDraw, camera: PerspectiveCameraView) {
+    draw.params.camera0 = [camera.eye[0], camera.eye[1], camera.eye[2], camera.focal_px];
+    draw.params.camera1 = [
+        camera.right[0],
+        camera.right[1],
+        camera.right[2],
+        camera.near,
+    ];
+    draw.params.camera2 = [camera.up[0], camera.up[1], camera.up[2], camera.far];
+    draw.params.camera3 = [camera.forward[0], camera.forward[1], camera.forward[2], 0.0];
+    let actor = [
+        draw.params.actor[0],
+        draw.params.actor[1],
+        draw.params.actor[2],
+    ];
+    draw.camera_depth = dot3(
+        [
+            actor[0] - camera.eye[0],
+            actor[1] - camera.eye[1],
+            actor[2] - camera.eye[2],
+        ],
+        camera.forward,
+    );
+}
+
 fn actor_yxz_quaternion(pitch_deg: f32, yaw_deg: f32, roll_deg: f32) -> [f32; 4] {
     fn axis_angle(axis: [f32; 3], angle: f32) -> [f32; 4] {
         let (sine, cosine) = (angle * 0.5).sin_cos();
@@ -11462,34 +11580,16 @@ fn build_actor_mesh_gpu_draws(
     external_sampled: &HashMap<usize, SampledNodeTrs>,
     constraint_overrides: &HashMap<String, BoneOverride>,
 ) -> Result<Vec<GpuWorldDraw>, WorldRenderError> {
-    let mut cel_slots = std::collections::HashSet::new();
-    for binding in actor
-        .cel_materials
-        .iter()
-        .filter(|b| b.cel != crate::render_style::CelMaterialSettings::default())
-    {
-        if !cel_slots.insert(&binding.material) {
-            return Err(WorldRenderError::GpuRender {
-                message: format!(
-                    "Duplicate MaterialBinding on actor '{}' for '{}'",
-                    actor.id, binding.material
-                ),
-            });
-        }
-        if binding.material != "*"
-            && !mesh
-                .materials
-                .iter()
-                .any(|m| m.name.as_deref() == Some(binding.material.as_str()))
-        {
-            return Err(WorldRenderError::GpuRender {
-                message: format!(
-                    "MaterialBinding on actor '{}' references missing material '{}'",
-                    actor.id, binding.material
-                ),
-            });
-        }
-    }
+    validate_model_source_materials(
+        &actor.id,
+        actor
+            .cel_materials
+            .iter()
+            .map(|binding| binding.material.as_str()),
+        mesh.materials
+            .iter()
+            .filter_map(|material| material.name.as_deref()),
+    )?;
     for binding in material_overrides
         .iter()
         .filter(|binding| binding.actor_id == actor.id)
@@ -11503,7 +11603,7 @@ fn build_actor_mesh_gpu_draws(
         if !exists {
             return Err(WorldRenderError::GpuRender {
                 message: format!(
-                    "MaterialBinding on actor '{}' references missing GLB material '{}'",
+                    "MaterialBinding on actor '{}' modelSourceMaterial '{}' does not match any imported GLB material",
                     actor.id, binding.material
                 ),
             });
@@ -11584,8 +11684,9 @@ fn build_actor_mesh_gpu_draws(
         material6: [0.0, 1.5, 0.0, 1_000_000.0],
         // material7: attenuation RGB; w carries a positive alpha-mask cutoff.
         material7: [1.0, 1.0, 1.0, 0.0],
-        // material8.x disables surface caustics for eyes, mouths, and similar surfaces.
-        material8: [1.0, 0.0, 0.0, 0.0],
+        // material8: x receives caustics, y is double-sided, z packs texture channels.
+        // 18 encodes the glTF defaults B=metallic, G=roughness, R=occlusion.
+        material8: [1.0, 0.0, 18.0, 0.0],
         cel_material0: [-1.0, 0.0, 0.0, 0.0],
         cel_material1: [0.0; 4],
         // Vegetation wind is gated per actor; all existing asset paths retain zero deformation.
@@ -11665,12 +11766,31 @@ fn build_actor_mesh_gpu_draws(
             .draw_key
             .material
             .and_then(|index| mesh.materials.get(index));
+        // `MaterialBinding definition=` replaces this material's PBR values while
+        // keeping normal lighting; exact names win over the `*` wildcard.
+        let material_name = material.and_then(|value| value.name.as_deref());
+        let material_override = actor
+            .material_color_overrides
+            .iter()
+            .find(|value| {
+                material_name.is_some_and(|name| name.eq_ignore_ascii_case(&value.material))
+            })
+            .or_else(|| {
+                actor
+                    .material_color_overrides
+                    .iter()
+                    .find(|value| value.material == "*")
+            });
         let mut draw_params = params;
         // Exact material slots take precedence over an explicit wildcard.
         let cel_binding = actor
             .cel_materials
             .iter()
-            .find(|b| material.and_then(|m| m.name.as_deref()) == Some(b.material.as_str()))
+            .find(|binding| {
+                material
+                    .and_then(|value| value.name.as_deref())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(binding.material.as_str()))
+            })
             .or_else(|| actor.cel_materials.iter().find(|b| b.material == "*"));
         if let Some(binding) = cel_binding {
             let c = &binding.cel;
@@ -11745,6 +11865,11 @@ fn build_actor_mesh_gpu_draws(
                     0.0
                 },
             ];
+            // material8: x receives caustics, y enables glTF two-sided shading,
+            // z keeps the packed texture-channel remap shared with Weaver.
+            draw_params.material8[1] = if material.double_sided { 1.0 } else { 0.0 };
+            draw_params.material8[2] =
+                crate::world::gltf_loader::material_channel_remap_code(material);
             // Generated foliage atlases already contain photographic/baked colour.
             // Preserve it for the thin alpha-mask cards while woody submeshes stay PBR.
             if actor.vegetation.is_some() && material.alpha_mode == GlbAlphaMode::Mask {
@@ -11758,10 +11883,54 @@ fn build_actor_mesh_gpu_draws(
                 binding.actor_id == actor.id && binding.material.eq_ignore_ascii_case(material_name)
             })
         });
-        let texture = texture_override.map_or_else(
-            || Arc::clone(&static_draw.texture),
-            |binding| Arc::clone(&binding.texture),
-        );
+        // `definition` replaces base color with a solid texel and PBR scalars;
+        // `tint` blends toward a color while keeping the imported PBR values.
+        // Both stay lit and shadowed, unlike a bound Scene texture.
+        let textureless = material.is_none_or(|value| value.base_color_texture.is_none());
+        let mut solid_base_color = None;
+        if let Some(value) = material_override {
+            if let Some(metallic) = value.metallic {
+                draw_params.material0[0] = metallic.clamp(0.0, 1.0);
+            }
+            if let Some(roughness) = value.roughness {
+                draw_params.material0[1] = roughness.clamp(0.04, 1.0);
+            }
+            if let Some(normal_scale) = value.normal_scale {
+                draw_params.material0[2] = normal_scale.clamp(0.0, 4.0);
+            }
+            if let Some(specular) = value.specular {
+                draw_params.material0[3] = specular.clamp(0.0, 2.0);
+            }
+            if let Some(base_color) = value.base_color {
+                solid_base_color = Some(base_color);
+            } else if let Some(tint) = value.tint {
+                let amount = value.tint_amount.clamp(0.0, 1.0);
+                if textureless {
+                    let imported = material.map_or([1.0; 4], |value| value.base_color_factor);
+                    solid_base_color = Some(std::array::from_fn(|index| {
+                        imported[index] + (tint[index] - imported[index]) * amount
+                    }));
+                } else {
+                    // Textured materials keep their detail and are tinted through
+                    // the shader color factor; this path is best-effort.
+                    for channel in 0..3 {
+                        draw_params.material4[channel] *= 1.0 + (tint[channel] - 1.0) * amount;
+                    }
+                }
+            }
+        }
+        let texture = if let Some(color) = solid_base_color {
+            let channel = |index: usize| (color[index].clamp(0.0, 1.0) * 255.0).round() as u8;
+            Arc::new(GpuWorldTexture::new(
+                1,
+                1,
+                vec![channel(0), channel(1), channel(2), channel(3)],
+            ))
+        } else if let Some(binding) = texture_override {
+            Arc::clone(&binding.texture)
+        } else {
+            Arc::clone(&static_draw.texture)
+        };
         if texture_override.is_some() {
             // A bound Scene is a display surface: preserve the authored UI rather than
             // allowing the room lighting to turn it grey or black.
@@ -11769,7 +11938,10 @@ fn build_actor_mesh_gpu_draws(
             draw_params.material2[3] = 1.0;
         }
         let mut resource_key = static_draw.resource_key.clone();
-        if texture_override.is_some() || cel_binding.is_some_and(|b| b.cel.control_map.is_some()) {
+        if texture_override.is_some()
+            || material_override.is_some()
+            || cel_binding.is_some_and(|b| b.cel.control_map.is_some())
+        {
             resource_key.binding_actor = Some(actor.id.clone());
         }
         let phase = gpu_world_material_phase(material);
@@ -11806,6 +11978,37 @@ fn build_actor_mesh_gpu_draws(
         });
     }
     Ok(draws)
+}
+
+fn validate_model_source_materials<'binding, 'material>(
+    actor_id: &str,
+    bindings: impl IntoIterator<Item = &'binding str>,
+    model_materials: impl IntoIterator<Item = &'material str>,
+) -> Result<(), WorldRenderError> {
+    // Resolve authored selectors against the imported GLB before any draw can silently skip them.
+    let model_materials = model_materials
+        .into_iter()
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::HashSet<_>>();
+    let mut binding_names = std::collections::HashSet::new();
+    for binding in bindings {
+        let binding_key = binding.to_ascii_lowercase();
+        if !binding_names.insert(binding_key.clone()) {
+            return Err(WorldRenderError::GpuRender {
+                message: format!(
+                    "Duplicate MaterialBinding on actor '{actor_id}' for modelSourceMaterial '{binding}'"
+                ),
+            });
+        }
+        if binding != "*" && !model_materials.contains(&binding_key) {
+            return Err(WorldRenderError::GpuRender {
+                message: format!(
+                    "MaterialBinding on actor '{actor_id}' modelSourceMaterial '{binding}' does not match any imported GLB material"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn actor_material_light_mix(actor: &WorldActor) -> f32 {
@@ -13391,7 +13594,7 @@ fn blend_terrain_layers(
             let mut occlusion_value = 0.0_f32;
             for (layer_index, (material, textures)) in layers.iter().enumerate() {
                 let weight = weights[layer_index];
-                let layer_ao = terrain_texture_pixel(
+                let layer_ao_pixel = terrain_texture_pixel(
                     textures.occlusion.as_ref(),
                     x,
                     y,
@@ -13400,7 +13603,14 @@ fn blend_terrain_layers(
                     material.texture_scale,
                     material.texture_offset,
                     [255.0; 4],
-                )[0] / 255.0;
+                );
+                let layer_ao_rgba = layer_ao_pixel.map(|value| value / 255.0);
+                let layer_ao = material.occlusion_channel.sample(layer_ao_rgba);
+                let layer_ao = if material.occlusion_invert {
+                    1.0 - layer_ao
+                } else {
+                    layer_ao
+                };
                 occlusion_value += (1.0 - material.occlusion_strength * (1.0 - layer_ao)) * weight;
                 let color = terrain_texture_pixel(
                     textures.base_color.as_ref(),
@@ -13412,7 +13622,7 @@ fn blend_terrain_layers(
                     material.texture_offset,
                     material.base_color.map(|value| value * 255.0),
                 );
-                let mr = terrain_texture_pixel(
+                let mr_source = terrain_texture_pixel(
                     textures.metallic_roughness.as_ref(),
                     x,
                     y,
@@ -13420,13 +13630,27 @@ fn blend_terrain_layers(
                     height,
                     material.texture_scale,
                     material.texture_offset,
-                    [
-                        255.0,
-                        material.roughness * 255.0,
-                        material.metallic * 255.0,
-                        255.0,
-                    ],
+                    [255.0; 4],
                 );
+                let mr_rgba = mr_source.map(|value| value / 255.0);
+                let metallic = material.metallic_channel.sample(mr_rgba);
+                let roughness = material.roughness_channel.sample(mr_rgba);
+                let metallic = if material.metallic_invert {
+                    1.0 - metallic
+                } else {
+                    metallic
+                };
+                let roughness = if material.roughness_invert {
+                    1.0 - roughness
+                } else {
+                    roughness
+                };
+                let mr = [
+                    255.0,
+                    roughness * material.roughness * 255.0,
+                    metallic * material.metallic * 255.0,
+                    255.0,
+                ];
                 let encoded_normal = terrain_texture_pixel(
                     textures.normal.as_ref(),
                     x,

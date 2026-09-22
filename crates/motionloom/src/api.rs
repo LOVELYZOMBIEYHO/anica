@@ -89,6 +89,12 @@ pub use crate::render_style::{
     ResolvedAntiAliasingStyle, ResolvedSceneRenderStyle, ResolvedUniversalStyle, ToneStyleNode,
     resolve_scene_render_style,
 };
+pub mod compositor {
+    pub use crate::scene::compositor::*;
+}
+pub use crate::scene::atmosphere::{
+    AtmosphereMediumPlan, VolumetricQuality, VolumetricScatteringPlan, WaterCausticsPlan,
+};
 // Image-reference analysis and safe MeshAsset proposals stay outside the DSL.
 /// Deterministic, recipe-driven MeshAsset construction and revision workflow.
 pub use crate::mesh_authoring;
@@ -100,18 +106,19 @@ pub use crate::{
     AssetSource, AttachmentNode, AttachmentSocketNode, AttachmentTargetNode, AuthoringDiagnostic,
     AuthoringDiagnosticSeverity, AuthoringStatus, AuthoringSuggestion, AuthoringSummary,
     CameraClearanceObservation, CompositionObservation, ContactSurfaceNode, ControlCageInspection,
-    ControlCageNode, EarNode, EffectiveGraphSummary, ExposureObservation, EyeNode, EyebrowNode,
-    EyelinerNode, FaceLayoutNode, FaceTextureNode, FacialCageNode, GpuCompatibilityIssue,
-    GpuCompatibilityReport, GpuCompatibilitySeverity, GpuCompatibilityTarget, GpuFrameTexture,
-    GraphAssetSource, GraphParseError, GraphScript, HeadBounds, HeadComparisonReport, HeadDomeNode,
-    HeadFitProposal, HeadSectionNode, IrisNode, MemoryAssetResolver, MotionLoomAuthoringReport,
-    MotionLoomDocument, MotionLoomError, MotionLoomRenderProgress, MotionLoomSceneRenderError,
-    MotionLoomShowcaseSchema, MouthNode, NoseNode, PathAssetResolver, PenetrationObservation,
-    PrimitiveAssetNode, PrimitiveAuthoringSummary, PrimitiveAxis, PrimitiveGeometry,
-    PrimitiveLodNode, PrimitiveMeshBuildNode, PrimitiveModifierNode, ProcessCategory,
-    ProcessEffectDefinition, ProcessGraph, ProjectedJointObservation, RenderPassDag,
-    RenderPassDagEdge, RenderPassDagKind, RenderPassDagNode, RenderPassSpace, RootGraphError,
-    RuntimeCompileError, RuntimeFrameOutput, RuntimeProcessEffectInstance,
+    ControlCageNode, CurveAssetNode, CurveInterpolation, CurvePointNode, EarNode,
+    EffectiveGraphSummary, ExposureObservation, EyeNode, EyebrowNode, EyelinerNode, FaceLayoutNode,
+    FaceTextureNode, FacialCageNode, GpuCompatibilityIssue, GpuCompatibilityReport,
+    GpuCompatibilitySeverity, GpuCompatibilityTarget, GpuFrameTexture, GraphAssetSource,
+    GraphParseError, GraphScript, HeadBounds, HeadComparisonReport, HeadDomeNode, HeadFitProposal,
+    HeadSectionNode, IrisNode, MaterialAssetNode, MaterialTextureChannel, MemoryAssetResolver,
+    MotionLoomAuthoringReport, MotionLoomDocument, MotionLoomError, MotionLoomRenderProgress,
+    MotionLoomSceneRenderError, MotionLoomShowcaseSchema, MouthNode, NoseNode, PathAssetResolver,
+    PenetrationObservation, PrimitiveAssetNode, PrimitiveAuthoringSummary, PrimitiveAxis,
+    PrimitiveGeometry, PrimitiveLodNode, PrimitiveMeshBuildNode, PrimitiveModifierNode,
+    ProcessCategory, ProcessEffectDefinition, ProcessGraph, ProjectedJointObservation,
+    RenderPassDag, RenderPassDagEdge, RenderPassDagKind, RenderPassDagNode, RenderPassSpace,
+    RootGraphError, RuntimeCompileError, RuntimeFrameOutput, RuntimeProcessEffectInstance,
     RuntimeProcessParamValue, RuntimeProgram, SceneGpuTexture, ScenePlatformPreviewSurface,
     ScenePreviewBackend, ScenePreviewPath, ScenePreviewPixelFormat, ScenePreviewSurface,
     ScenePreviewSurfaceOptions, SceneRenderError, SceneRenderProfile, SceneRenderProgress,
@@ -119,9 +126,9 @@ pub use crate::{
     ShotValidationIssue, ShotValidationOptions, ShotValidationReport, ShotValidationSeverity,
     ShotValidationStatus, ShotValidationSummary, ShotValidator, SkeletonDiagnostic,
     SkeletonDiagnosticSeverity, SkeletonOverlayPrimitive, SkeletonValidationReport,
-    TerrainAssetNode, VegetationAssetNode, VegetationKind, VegetationLod, analyze_exposure,
-    analyze_motionloom_script, analyze_motionloom_script_for_target, analyze_shot_observations,
-    animation_properties_for_node_kind, animation_property_descriptor,
+    SweepProfilePointNode, TerrainAssetNode, VegetationAssetNode, VegetationKind, VegetationLod,
+    analyze_exposure, analyze_motionloom_script, analyze_motionloom_script_for_target,
+    analyze_shot_observations, animation_properties_for_node_kind, animation_property_descriptor,
     animation_property_schema_json, auto_correct_skeleton, build_skeleton_overlay,
     builtin_proportion_profile, builtin_proportion_profiles, builtin_skeleton_pose_presets,
     clear_scene_asset_roots, compare_glb_head_to_head_asset_json,
