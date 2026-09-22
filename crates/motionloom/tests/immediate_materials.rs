@@ -174,3 +174,37 @@ fn cinematic_screen_space_lighting_executes_across_history() {
         assert!(second.pixels().any(|pixel| pixel[3] > 0));
     });
 }
+
+#[test]
+#[ignore = "requires a real native GPU"]
+fn authored_aa_reaches_display_pass_and_builds_temporal_history() {
+    pollster::block_on(async {
+        let source = fixture(0.7, 0.4, 0.0, "");
+        let fxaa_source = source.replace(
+            "</RenderStyle>",
+            "<AntiAliasingStyle method=\"fxaa\" quality=\"high\" fallback=\"off\" sharpness=\"0\" />\n</RenderStyle>",
+        );
+        let taa_source = source.replace(
+            "</RenderStyle>",
+            "<AntiAliasingStyle method=\"taa\" quality=\"high\" fallback=\"smaa\" sharpness=\"0\" />\n</RenderStyle>",
+        );
+        let mut renderer = SceneRenderer::new(SceneRenderProfile::Gpu).await.unwrap();
+        let off = renderer
+            .render_frame_gpu_readback(&parse_graph_script(&source).unwrap(), 0)
+            .await
+            .unwrap();
+        let fxaa = renderer
+            .render_frame_gpu_readback(&parse_graph_script(&fxaa_source).unwrap(), 0)
+            .await
+            .unwrap();
+        assert_ne!(off, fxaa, "FXAA must alter high-contrast geometry edges");
+
+        let taa = parse_graph_script(&taa_source).unwrap();
+        renderer.render_frame_gpu_readback(&taa, 0).await.unwrap();
+        renderer.render_frame_gpu_readback(&taa, 1).await.unwrap();
+        let profile = renderer.last_3d_frame_profile();
+        assert_eq!(profile.anti_aliasing_effective, "taa");
+        assert!(profile.temporal_antialiasing);
+        assert!(profile.temporal_history_valid);
+    });
+}

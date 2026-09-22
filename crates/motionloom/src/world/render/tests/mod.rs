@@ -472,6 +472,10 @@ fn temporal_jitter_is_bounded_and_camera_cuts_reset_history() {
     let mut cut = camera;
     cut.camera3 = [0.0, 0.0, -1.0, 0.0];
     assert!(super::preview_camera_cut(camera, cut));
+    assert!(super::preview_history_frame_compatible(10, 10));
+    assert!(super::preview_history_frame_compatible(10, 13));
+    assert!(!super::preview_history_frame_compatible(13, 10));
+    assert!(!super::preview_history_frame_compatible(10, 19));
 }
 
 #[test]
@@ -525,10 +529,11 @@ fn temporal_velocity_separates_projection_jitter_from_physical_motion() {
             .contains("let physical_velocity = preview_physical_velocity(sample_uv)")
     );
     assert!(super::WGPU_WORLD_DOF_SHADER.contains("return preview_velocity(uv)"));
+    assert!(super::WGPU_WORLD_DOF_SHADER.contains("let center = antialiased_color(sample_uv)"));
 }
 
 #[test]
-fn authored_anti_aliasing_overrides_host_policy_and_portable_falls_back() {
+fn authored_anti_aliasing_overrides_host_policy_including_portable_taa() {
     let source = r#"<Graph fps={30} duration="1s" size={[320,180]}>
   <RenderStyle id="styled_off"><SurfaceStyle shading="physical" /></RenderStyle>
   <RenderStyle id="styled_taa">
@@ -560,9 +565,10 @@ fn authored_anti_aliasing_overrides_host_policy_and_portable_falls_back() {
         profile: crate::preview::ImmediatePreviewProfile::Portable,
         ..Default::default()
     };
-    let fallback = super::resolve_effective_anti_aliasing(Some(&taa_style), portable);
-    assert!(!fallback.temporal);
-    assert_eq!(fallback.spatial_selector, 2.0);
+    let portable_taa = super::resolve_effective_anti_aliasing(Some(&taa_style), portable);
+    assert!(portable_taa.temporal);
+    assert_eq!(portable_taa.effective, "taa");
+    assert_eq!(portable_taa.jitter_phases, 4);
 }
 
 #[test]

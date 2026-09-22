@@ -244,7 +244,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     // below. Browser WebGPU enforces derivative-uniformity more strictly than
     // native Metal; implicit `textureSample` there can invalidate the DoF pass
     // even though the preceding 3D render completed successfully.
-    let center = textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0);
+    let center = antialiased_color(sample_uv);
     if (lighting.dof_style.x > 1.5 && lighting.optics0.x > 0.0) {
         return finish_render_style(
             filmic_bokeh(sample_uv, center_distance),

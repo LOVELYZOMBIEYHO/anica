@@ -1789,7 +1789,7 @@ fn scene_world_lighting(
                 lighting.atmosphere_medium = Some(AtmosphereMediumPlan {
                     density: eval_scene_number(&node.density, time_norm, time_sec)?
                         .clamp(0.0, 10.0),
-                    scattering_color: scene_fog_color(&node.scattering_color)?
+                    scattering_color: scene_fog_color(&node.scattering_color, time_norm, time_sec)?
                         .map(|value| value.clamp(0.0, 1.0)),
                     anisotropy: eval_scene_number(&node.anisotropy, time_norm, time_sec)?
                         .clamp(-0.99, 0.99),
@@ -1853,7 +1853,7 @@ fn scene_world_lighting(
                                     time_sec,
                                 )?
                                 .max(0.0),
-                                color: scene_fog_color(&caustics.color)?,
+                                color: scene_fog_color(&caustics.color, time_norm, time_sec)?,
                                 volume_term: caustics.volume_term,
                                 surface_term: caustics.surface_term,
                             })
@@ -2100,7 +2100,16 @@ fn scene_light_color(value: &str) -> Result<[f32; 3], MotionLoomSceneRenderError
 
 /// Fog is a new linear medium and therefore uses the parser's canonical RGBA
 /// order without inheriting the legacy authored-light channel convention.
-fn scene_fog_color(value: &str) -> Result<[f32; 3], MotionLoomSceneRenderError> {
+fn scene_fog_color(
+    value: &str,
+    time_norm: f32,
+    time_sec: f32,
+) -> Result<[f32; 3], MotionLoomSceneRenderError> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') || trimmed.starts_with("{[") {
+        return eval_scene_vec3(value, time_norm, time_sec, [1.0; 3])
+            .map(|color| color.map(|channel| channel.clamp(0.0, 1.0)));
+    }
     let rgba = parse_color(value)?;
     Ok([
         (rgba[0] as f32 / 255.0).powf(2.2),
@@ -25714,8 +25723,16 @@ mod tests {
 
     #[test]
     fn scene_fog_color_preserves_canonical_rgb_order() {
-        let color = super::scene_fog_color("#668FA8").unwrap();
+        let color = super::scene_fog_color("#668FA8", 0.0, 0.0).unwrap();
         assert!(color[0] < color[1] && color[1] < color[2], "got {color:?}");
+    }
+
+    #[test]
+    fn scene_fog_color_accepts_linear_rgb_vector() {
+        assert_eq!(
+            super::scene_fog_color("{[0.018,0.060,0.095]}", 0.0, 0.0).unwrap(),
+            [0.018, 0.060, 0.095]
+        );
     }
 
     #[test]

@@ -2434,7 +2434,7 @@ fn resolve_effective_anti_aliasing(
     };
     let supported = match settings.profile {
         crate::preview::ImmediatePreviewProfile::Portable => {
-            matches!(requested, "off" | "fxaa" | "smaa")
+            matches!(requested, "off" | "fxaa" | "smaa" | "taa")
         }
         crate::preview::ImmediatePreviewProfile::Balanced
         | crate::preview::ImmediatePreviewProfile::Cinematic
@@ -2492,6 +2492,10 @@ fn preview_camera_cut(previous: PreviewCameraHistory, current: PreviewCameraHist
     eye_delta > current.camera2[3].max(1.0) * 0.2
         || forward_dot < 0.65
         || !(0.5..=2.0).contains(&focal_ratio)
+}
+
+fn preview_history_frame_compatible(previous: u32, current: u32) -> bool {
+    current >= previous && current - previous <= 8
 }
 
 fn preview_temporal_style_signature(params: &GpuWorldLightingParams) -> u64 {
@@ -4062,7 +4066,7 @@ impl GpuWorldRenderer {
         };
         let current_style_signature = preview_temporal_style_signature(&fitted_lighting);
         let sequential = self.last_history_frame.is_some_and(|previous| {
-            lighting.frame_index == previous || lighting.frame_index == previous.saturating_add(1)
+            preview_history_frame_compatible(previous, lighting.frame_index)
         });
         let usable_previous = self.last_camera.filter(|previous| {
             sequential
@@ -4273,8 +4277,10 @@ impl GpuWorldRenderer {
                             .get(&draw.instance_key)
                             .filter(|previous| {
                                 history_valid
-                                    && (lighting.frame_index == previous.frame
-                                        || lighting.frame_index == previous.frame.saturating_add(1))
+                                    && preview_history_frame_compatible(
+                                        previous.frame,
+                                        lighting.frame_index,
+                                    )
                                     && previous.bone_matrices.len() == draw.bone_matrices.len()
                             });
                     let previous_params = previous.map_or(draw.params, |state| state.params);
@@ -4296,8 +4302,7 @@ impl GpuWorldRenderer {
                 .get(&draw.instance_key)
                 .filter(|previous| {
                     history_valid
-                        && (lighting.frame_index == previous.frame
-                            || lighting.frame_index == previous.frame.saturating_add(1))
+                        && preview_history_frame_compatible(previous.frame, lighting.frame_index)
                         && previous.bone_matrices.len() == draw.bone_matrices.len()
                 })
                 .map_or(draw.bone_matrices.as_slice(), |previous| {
