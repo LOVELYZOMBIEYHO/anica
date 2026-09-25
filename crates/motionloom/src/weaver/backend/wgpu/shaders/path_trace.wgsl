@@ -144,7 +144,10 @@ fn surface(hit:Hit, d:vec3<f32>) -> Surface {
     // Normal-based hemisphere occlusion mirrors the preview AO strength.
     let ao_normal=clamp(1.0-p.v[15].y*(1.0-max(n.y,0.0))*0.35,0.15,1.0);
     let ao=clamp(ao_tex*ao_normal,0.0,1.0);
-    return Surface(n,gn,color.rgb,alpha,metal,rough,mix(0.04*scene[m+2u].rgb*scene[m+2u].w,color.rgb,metal),ao,scene[m+1u].rgb*scene[m+1u].w*texture_auto(scene[m+7u],uv,true,lod_bias).rgb,scene[m+9u].z);
+    let authored_ior=clamp(scene[m+3u].y,1.0,3.0);
+    let ior_ratio=(authored_ior-1.0)/(authored_ior+1.0);
+    let dielectric_f0=ior_ratio*ior_ratio*scene[m+2u].rgb*scene[m+2u].w;
+    return Surface(n,gn,color.rgb,alpha,metal,rough,mix(dielectric_f0,color.rgb,metal),ao,scene[m+1u].rgb*scene[m+1u].w*texture_auto(scene[m+7u],uv,true,lod_bias).rgb,scene[m+9u].z);
 }
 fn basis(n:vec3<f32>, q:vec3<f32>) -> vec3<f32> {
     let a=select(vec3<f32>(0,1,0),vec3<f32>(1,0,0),abs(n.y)>0.95);

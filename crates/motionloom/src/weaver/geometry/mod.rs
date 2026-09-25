@@ -309,7 +309,9 @@ fn pack_with_bvh(
             m.specular_color_factor[2],
             m.specular_factor,
         ]);
-        materials.push([m.alpha_cutoff, 0.0, 0.0, 0.0]);
+        // The path tracer needs the authored dielectric IOR to match Preview's
+        // specular F0; x remains the alpha-mask cutoff.
+        materials.push([m.alpha_cutoff, m.ior, 0.0, 0.0]);
         for (slot, t) in mesh.textures.iter().take(5).enumerate() {
             if t.width == 0
                 || t.height == 0

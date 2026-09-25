@@ -107,13 +107,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         job.output.display()
     );
 
+    // Fixed-sample jobs keep every tile active until the final round, so report
+    // sample-round progress even when the completed-tile count does not change.
     let mut last_tile = u32::MAX;
+    let mut last_samples = u32::MAX;
     let report = pollster::block_on(render(&job, &CancellationToken::default(), |progress| {
-        if progress.completed_tiles != last_tile {
+        if progress.completed_tiles != last_tile || progress.tile_min_samples != last_samples {
             last_tile = progress.completed_tiles;
+            last_samples = progress.tile_min_samples;
             eprintln!(
-                "weaver tile {}/{} ({:.1}s)",
-                progress.completed_tiles, progress.total_tiles, progress.elapsed_seconds
+                "weaver tile {}/{} samples {}/{} ({:.1}s)",
+                progress.completed_tiles,
+                progress.total_tiles,
+                progress.tile_min_samples,
+                job.sampling.max_samples,
+                progress.elapsed_seconds
             );
         }
     }))?;
